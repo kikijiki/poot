@@ -129,7 +129,13 @@ fn attention_spec(
         mask,
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
-        schedule: kg::AttentionSchedule::Streaming { lanes },
+        schedule: kg::AttentionSchedule::Streaming {
+            lanes,
+            walk: kg::KeyWalk {
+                cluster: d.next_power_of_two().min(32),
+                run: 1,
+            },
+        },
         precision: poot_graph_ir::OperandPrecision::Exact,
     }
 }
@@ -173,15 +179,15 @@ fn synthesized_kernels_compile_to_valid_ptx() {
         ),
         (
             "attention_decode",
-            // 3 lanes do not divide 8 keys: exercises the tail-lane (partial-slice) path.
+            // 4 clusters of 4 lanes against 6 keys: the second step has two clusters past the range.
             attention(&attention_spec(
                 1,
                 4,
                 2,
                 1,
-                8,
+                6,
                 4,
-                3,
+                32,
                 kg::MaskKind::Broadcast,
             ))
             .body,
@@ -194,7 +200,7 @@ fn synthesized_kernels_compile_to_valid_ptx() {
                     scale_bits: 0.5f32.to_bits(),
                     cap_bits: 30.0f32.to_bits(),
                 },
-                ..attention_spec(1, 4, 2, 6, 6, 4, 4, kg::MaskKind::PerHead)
+                ..attention_spec(1, 4, 2, 6, 6, 4, 32, kg::MaskKind::PerHead)
             })
             .body,
         ),
@@ -1464,12 +1470,13 @@ fn attention_inputs(spec: &kg::AttentionSpec) -> [Vec<f32>; 3] {
 
 #[test]
 fn attention_decode_validates_and_matches_cpu() {
-    // Decode: `lanes` lanes per (batch, head) workgroup each run an online softmax over a strided slice of
-    // the cache, then the LDS combine. 13 keys over 5 lanes is ragged (lanes 3 and 4 take one key fewer).
+    // Decode: a workgroup per (batch, key/value head) whose clusters each run an online softmax over a strided
+    // slice of the cache, then the LDS combine. 13 keys over 8 clusters is ragged (the second step has three
+    // clusters past the range).
     // spirv-val is the strict check for an LDS + nested-loop + barrier kernel; the output is compared with
     // the textbook two-pass attention. The combine reassociates the sum, so the tolerance is looser than
     // a serial kernel's.
-    let spec = attention_spec(2, 4, 2, 1, 13, 4, 5, kg::MaskKind::Broadcast);
+    let spec = attention_spec(2, 4, 2, 1, 13, 4, 32, kg::MaskKind::Broadcast);
     let [q, k, v] = attention_inputs(&spec);
     let mask: Vec<f32> = (0..2 * 13)
         .map(|i| {
@@ -1496,7 +1503,7 @@ fn attention_decode_validates_and_matches_cpu() {
 #[test]
 fn attention_prefill_validates_and_matches_cpu() {
     // Prefill: every query row attends to the prompt through a causal mask, one workgroup per (head, row).
-    let spec = attention_spec(1, 4, 2, 6, 6, 4, 4, kg::MaskKind::Broadcast);
+    let spec = attention_spec(1, 4, 2, 6, 6, 4, 32, kg::MaskKind::Broadcast);
     let [q, k, v] = attention_inputs(&spec);
     let mut mask = vec![0.0f32; 6 * 6];
     for row in 0..6 {
@@ -1756,7 +1763,7 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 1,
                 8,
                 4,
-                3,
+                32,
                 kg::MaskKind::Broadcast,
             ))
             .body,

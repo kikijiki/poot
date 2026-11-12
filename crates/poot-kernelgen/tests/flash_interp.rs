@@ -36,17 +36,74 @@ fn spec(
         mask: kg::MaskKind::Broadcast,
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
-        schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
+        schedule: kg::AttentionSchedule::Streaming {
+            lanes: LANES,
+            walk: walk_of(d, d, d),
+        },
         precision: poot_graph_ir::OperandPrecision::Exact,
     }
 }
 
-fn with_lanes(spec: kg::AttentionSpec, lanes: usize) -> kg::AttentionSpec {
-    kg::AttentionSpec {
-        kv: poot_kernelgen::KvLane::F32,
-        schedule: kg::AttentionSchedule::Streaming { lanes },
-        ..spec
+/// The workgroup width of the fixtures: one aligned run of 32 lanes, the least a shuffling body admits.
+const LANES: usize = 32;
+
+/// The lanes of a fixture cluster, so four clusters at [`LANES`] and four keys per step.
+const CLUSTER: usize = 8;
+
+/// The clustered walk of a fixture whose key is `dk` wide (`head_dim` of it in the first part of a split key) and
+/// whose value is `dv` wide: clusters of [`CLUSTER`] lanes, each lane a run of the narrowest width that lets the
+/// cluster cover both heads and divides every width. A head of 4 leaves four lanes of a cluster idle.
+fn walk_of(dk: usize, dv: usize, head_dim: usize) -> kg::KeyWalk {
+    let run = (0..)
+        .map(|shift| 1usize << shift)
+        .find(|run| {
+            [dk, dv, head_dim].iter().all(|d| d % run == 0)
+                && dk.div_ceil(*run) <= CLUSTER
+                && dv.div_ceil(*run) <= CLUSTER
+        })
+        .expect("a run of one channel divides every width");
+    kg::KeyWalk {
+        cluster: CLUSTER,
+        run,
     }
+}
+
+/// `spec` with the walk its head widths admit ([`walk_of`]): call it after the widths and the key layout are set.
+fn walked(spec: kg::AttentionSpec) -> kg::AttentionSpec {
+    let head_dim = match spec.key {
+        kg::KeyLayout::Single | kg::KeyLayout::Paged => spec.dk,
+        kg::KeyLayout::Split { shared_dim } => spec.dk - shared_dim,
+    };
+    let walk = walk_of(spec.dk, spec.dv, head_dim);
+    let schedule = match spec.schedule {
+        kg::AttentionSchedule::Streaming { lanes, .. } => {
+            kg::AttentionSchedule::Streaming { lanes, walk }
+        }
+        kg::AttentionSchedule::SplitKv {
+            lanes,
+            splits,
+            min_units,
+            ..
+        } => kg::AttentionSchedule::SplitKv {
+            lanes,
+            splits,
+            min_units,
+            walk,
+        },
+        tiled @ kg::AttentionSchedule::Tiled { .. } => tiled,
+    };
+    kg::AttentionSpec { schedule, ..spec }
+}
+
+fn with_lanes(spec: kg::AttentionSpec, lanes: usize) -> kg::AttentionSpec {
+    walked(kg::AttentionSpec {
+        kv: poot_kernelgen::KvLane::F32,
+        schedule: kg::AttentionSchedule::Streaming {
+            lanes,
+            walk: walk_of(spec.dk, spec.dv, spec.dk),
+        },
+        ..spec
+    })
 }
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -266,40 +323,16 @@ fn additive_mask(batch: usize, lq: usize, lk: usize, valid: Option<&[usize]>) ->
     mask
 }
 
-/// Decode, one query row against a 13-key cache over 5 lanes: 13 is not a multiple of 5, so lanes 3 and 4
-/// take one key fewer, and every lane takes more than one key (the running state is rescaled).
+/// Decode, one query row against a 13-key cache over 64 lanes, eight clusters of eight: 13 is not a multiple of
+/// the eight keys a step takes, so the second step has three clusters past the range, and every cluster that has
+/// two keys rescales its running state.
 #[test]
-fn decode_over_ragged_lanes_matches_the_reference() {
-    let spec = with_lanes(spec(1, 4, 2, 1, 13, 8), 5);
+fn decode_over_ragged_clusters_matches_the_reference() {
+    let spec = with_lanes(spec(1, 4, 2, 1, 13, 8), 64);
     let operands = Operands::new(&spec, additive_mask(1, 1, 13, Some(&[10])));
     let got = interpret(&spec, &caps(), &operands);
     let want = attention_reference(&spec, &operands.q, &operands.k, &operands.v, &operands.mask);
     assert_close(&got, &want, 1e-5);
-}
-
-/// A head width that is a multiple of the 32 workgroup-memory banks swizzles each lane's partial `o` by the lane
-/// (`channel ^ lane % 32`, see `OSlots`) in the dense schedule too: at 64 channels and 40, 64 and 66 lanes (the lane
-/// index wraps the 32 banks) a causal prefill and a split-KV decode match the reference. Mutation: swizzle by
-/// `lane` instead of `lane % 32`; lane 65 indexes past its row (65 ^ 63 = 126) and the 66-lane row goes red.
-#[test]
-fn a_bank_swizzled_dense_partial_matches_the_reference() {
-    for lanes in [40, 64, 66] {
-        let prefill = with_lanes(spec(1, 4, 2, 6, 6, 64), lanes);
-        let operands = Operands::new(&prefill, additive_mask(1, 6, 6, None));
-        let got = interpret(&prefill, &caps(), &operands);
-        let want = attention_reference(
-            &prefill,
-            &operands.q,
-            &operands.k,
-            &operands.v,
-            &operands.mask,
-        );
-        assert_close(&got, &want, 1e-5);
-    }
-    let split = with_splits(with_lanes(spec(1, 3, 1, 1, 131, 64), 40), 40, 3);
-    let operands = Operands::new(&split, additive_mask(1, 1, 131, Some(&[120])));
-    let (got, _) = interpret_split(&split, &caps(), &operands, f32::NAN);
-    assert_close(&got, &operands.reference(&split), SPLIT_KV_TOLERANCE);
 }
 
 /// Batched decode: four batch rows, each with its own visible length, so the per-batch mask plane and the
@@ -335,15 +368,15 @@ fn prefill_matches_the_reference() {
 fn a_prefill_split_into_runs_of_rows_matches_the_reference() {
     let spec = spec(2, 4, 2, 6, 6, 8);
     let operands = Operands::new(&spec, additive_mask(2, 6, 6, None));
-    let rows = spec.rows();
-    let per_run = 7;
-    let runs: Vec<_> = (0..rows.div_ceil(per_run))
+    let groups = spec.row_groups();
+    let per_run = 5;
+    let runs: Vec<_> = (0..groups.div_ceil(per_run))
         .map(|run| {
             let first = run * per_run;
             kg::KernelRequest::AttentionRows(kg::AttentionRows {
                 spec: spec.clone(),
                 first,
-                count: per_run.min(rows - first),
+                count: per_run.min(groups - first),
             })
         })
         .collect();
@@ -362,18 +395,19 @@ fn a_run_of_rows_outside_the_grid_is_a_typed_error() {
         max_instructions: std::num::NonZeroUsize::new(1 << 22).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 18).unwrap(),
     };
-    let rows = spec.rows();
+    let groups = spec.row_groups();
     let split = kg::AttentionSpec {
         kv: poot_kernelgen::KvLane::F32,
         schedule: kg::AttentionSchedule::SplitKv {
-            lanes: 4,
+            lanes: LANES,
             splits: 2,
             min_units: 1,
+            walk: walk_of(spec.dk, spec.dv, spec.dk),
         },
         ..spec.clone()
     };
     for (spec, first, count) in [
-        (spec.clone(), rows - 1, 2),
+        (spec.clone(), groups - 1, 2),
         (spec.clone(), 0, 0),
         (split, 0, 1),
     ] {
@@ -401,7 +435,7 @@ fn a_sink_joins_the_softmax_and_no_value_sum() {
             sink: kg::AttentionSink::PerHead,
             ..spec(2, 4, 2, 1, 13, 8)
         },
-        5,
+        64,
     );
     let operands = Operands::new(&decode, additive_mask(2, 1, 13, Some(&[10, 13]))).with_sinks(4);
     let got = interpret(&decode, &caps(), &operands);
@@ -458,7 +492,7 @@ fn softcapped_prefill_matches_the_reference() {
             scale_bits: 1.5f32.to_bits(),
             cap_bits: 2.0f32.to_bits(),
         },
-        ..with_lanes(spec(1, 2, 1, 9, 9, 8), 2)
+        ..with_lanes(spec(1, 2, 1, 9, 9, 8), LANES)
     };
     let operands = Operands::new(&softcapped, additive_mask(1, 9, 9, None));
     let got = interpret(&softcapped, &caps(), &operands);
@@ -562,8 +596,8 @@ fn a_folded_grid_covers_every_row_once() {
     .launch;
     assert_eq!(
         launch.grid,
-        [5 * 4, 5, 1],
-        "24 workgroups of 4 lanes fold onto 5 across and 5 down"
+        [5 * 32, 3, 1],
+        "12 workgroups of 32 lanes (2 batch rows x 2 key/value heads x 3 rows) fold onto 5 across and 3 down"
     );
     let got = interpret(&spec, &narrow, &operands);
     let want = attention_reference(&spec, &operands.q, &operands.k, &operands.v, &operands.mask);
@@ -576,7 +610,7 @@ fn a_folded_grid_covers_every_row_once() {
 /// fold in lanes whose maximum is `-inf`.
 #[test]
 fn a_true_inf_mask_and_idle_lanes_do_not_make_nan() {
-    let leading = with_lanes(spec(1, 2, 1, 1, 2, 4), 1);
+    let leading = with_lanes(spec(1, 2, 1, 1, 2, 4), LANES);
     let operands = Operands::new(&leading, vec![f32::NEG_INFINITY, 0.0]);
     let got = interpret(&leading, &caps(), &operands);
     let want = attention_reference(
@@ -588,7 +622,7 @@ fn a_true_inf_mask_and_idle_lanes_do_not_make_nan() {
     );
     assert_close(&got, &want, 1e-5);
 
-    let idle = with_lanes(spec(1, 2, 1, 1, 3, 4), 8);
+    let idle = with_lanes(spec(1, 2, 1, 1, 3, 4), LANES);
     let operands = Operands::new(&idle, vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0]);
     let got = interpret(&idle, &caps(), &operands);
     let want = attention_reference(&idle, &operands.q, &operands.k, &operands.v, &operands.mask);
@@ -617,13 +651,13 @@ fn a_row_with_no_visible_key_is_nan_and_its_neighbours_are_not() {
 /// from the dot product, or wrote the output with the key width differs from the reference.
 #[test]
 fn a_split_key_with_a_narrower_value_matches_the_reference() {
-    let mla = kg::AttentionSpec {
+    let mla = walked(kg::AttentionSpec {
         kv: poot_kernelgen::KvLane::F32,
         dk: 24,
         dv: 16,
         key: kg::KeyLayout::Split { shared_dim: 8 },
-        ..with_lanes(spec(2, 4, 1, 1, 11, 8), 4)
-    };
+        ..with_lanes(spec(2, 4, 1, 1, 11, 8), LANES)
+    });
     let operands = Operands::new(&mla, additive_mask(2, 1, 11, Some(&[11, 6])));
     let got = interpret(&mla, &caps(), &operands);
     assert_eq!(got.len(), 2 * 4 * 16, "the output is `dv` wide");
@@ -644,7 +678,7 @@ fn a_split_key_with_a_narrower_value_matches_the_reference() {
 /// reads them either. Softcap and a split key ride along.
 #[test]
 fn a_live_bound_never_reads_the_poisoned_tail() {
-    let live = kg::AttentionSpec {
+    let live = walked(kg::AttentionSpec {
         kv: poot_kernelgen::KvLane::F32,
         dk: 12,
         dv: 8,
@@ -654,8 +688,8 @@ fn a_live_bound_never_reads_the_poisoned_tail() {
             cap_bits: 3.0f32.to_bits(),
         },
         bound: kg::KeyBound::Live,
-        ..with_lanes(spec(3, 4, 2, 1, 37, 8), 4)
-    };
+        ..with_lanes(spec(3, 4, 2, 1, 37, 8), LANES)
+    });
     let len = [5, 37, 1];
     let mut operands = Operands::new(&live, vec![0.0; 3 * 37]).with_len(&len);
     let (hkv, head_dim, shared_dim) = (2, 8, 4);
@@ -697,7 +731,7 @@ fn an_out_of_range_live_length_is_safe_and_selects_what_the_decomposition_select
     let live = kg::AttentionSpec {
         kv: poot_kernelgen::KvLane::F32,
         bound: kg::KeyBound::Live,
-        ..with_lanes(spec(5, 2, 1, 1, 9, 4), 4)
+        ..with_lanes(spec(5, 2, 1, 1, 9, 4), LANES)
     };
     let len = [-1, 0, 10, i32::MIN, i32::MAX];
     let operands = Operands::new(&live, vec![0.0; 5 * 9]).with_len(&len);
@@ -746,15 +780,16 @@ fn with_split_floor(
     splits: usize,
     min_units: usize,
 ) -> kg::AttentionSpec {
-    kg::AttentionSpec {
+    walked(kg::AttentionSpec {
         kv: poot_kernelgen::KvLane::F32,
         schedule: kg::AttentionSchedule::SplitKv {
             lanes,
             splits,
             min_units,
+            walk: walk_of(spec.dk, spec.dv, spec.dk),
         },
         ..spec
-    }
+    })
 }
 
 const LIMITS: kg::BodyLimits = kg::BodyLimits {
@@ -856,8 +891,8 @@ fn interpret_split_scratch(
 /// every chunk is itself ragged over the lanes. The two launches match the textbook reference.
 #[test]
 fn split_kv_decode_matches_the_reference() {
-    let base = with_lanes(spec(2, 3, 1, 1, 41, 8), 4);
-    let split = with_splits(base, 4, 4);
+    let base = with_lanes(spec(2, 3, 1, 1, 41, 8), LANES);
+    let split = with_splits(base, LANES, 4);
     let operands = Operands::new(&split, additive_mask(2, 1, 41, Some(&[33, 41])));
     let (got, workgroups) = interpret_split(&split, &caps(), &operands, f32::NAN);
     assert_eq!(workgroups, [2 * 3 * 4, 2 * 3], "rows x splits, then rows");
@@ -874,9 +909,9 @@ fn a_sink_under_split_kv_is_counted_once() {
     let base = kg::AttentionSpec {
         kv: poot_kernelgen::KvLane::F32,
         sink: kg::AttentionSink::PerHead,
-        ..with_lanes(spec(2, 3, 1, 1, 41, 8), 4)
+        ..with_lanes(spec(2, 3, 1, 1, 41, 8), LANES)
     };
-    let split = with_splits(base, 4, 4);
+    let split = with_splits(base, LANES, 4);
     let operands = Operands::new(&split, additive_mask(2, 1, 41, Some(&[33, 41]))).with_sinks(3);
     let (got, _) = interpret_split(&split, &caps(), &operands, f32::NAN);
     assert_close(&got, &operands.reference(&split), SPLIT_KV_TOLERANCE);
@@ -904,9 +939,9 @@ fn a_poisoned_scratch_with_trailing_empty_splits_matches_the_reference() {
     let live = kg::AttentionSpec {
         kv: poot_kernelgen::KvLane::F32,
         bound: kg::KeyBound::Live,
-        ..with_lanes(spec(3, 2, 1, 1, 41, 8), 4)
+        ..with_lanes(spec(3, 2, 1, 1, 41, 8), LANES)
     };
-    let split = with_splits(live, 4, 4);
+    let split = with_splits(live, LANES, 4);
     let operands = Operands::new(&split, vec![0.0; 3 * 41]).with_len(&[5, 41, 12]);
     for poison in [f32::NAN, f32::INFINITY, -1.0e30] {
         let (got, _) = interpret_split(&split, &caps(), &operands, poison);
@@ -922,7 +957,7 @@ fn a_poisoned_scratch_with_trailing_empty_splits_matches_the_reference() {
 /// matches: that split's `m` stays `-inf` and weighs zero in the combine.
 #[test]
 fn a_split_whose_keys_are_all_masked_weighs_zero() {
-    let split = with_splits(with_lanes(spec(1, 2, 1, 1, 24, 4), 4), 4, 4);
+    let split = with_splits(with_lanes(spec(1, 2, 1, 1, 24, 4), LANES), LANES, 4);
     let mut mask = vec![0.0; 24];
     mask[..6].fill(-f32::INFINITY);
     let operands = Operands::new(&split, mask);
@@ -936,9 +971,9 @@ fn a_split_row_with_no_visible_key_is_nan_and_its_neighbour_is_not() {
     let live = kg::AttentionSpec {
         kv: poot_kernelgen::KvLane::F32,
         bound: kg::KeyBound::Live,
-        ..with_lanes(spec(2, 1, 1, 1, 16, 4), 4)
+        ..with_lanes(spec(2, 1, 1, 1, 16, 4), LANES)
     };
-    let split = with_splits(live, 4, 2);
+    let split = with_splits(live, LANES, 2);
     let operands = Operands::new(&split, vec![0.0; 2 * 16]).with_len(&[0, 9]);
     let (got, _) = interpret_split(&split, &caps(), &operands, 0.0);
     assert!(got[..4].iter().all(|x| x.is_nan()), "{got:?}");
@@ -953,7 +988,7 @@ fn a_split_row_with_no_visible_key_is_nan_and_its_neighbour_is_not() {
 /// device allows is a typed refusal from `generate`, not a launch the device would reject (or wrap).
 #[test]
 fn a_split_launch_past_the_grid_is_a_typed_refusal() {
-    let split = with_splits(with_lanes(spec(1, 8, 1, 1, 64, 4), 4), 4, 8);
+    let split = with_splits(with_lanes(spec(1, 8, 1, 1, 64, 4), LANES), LANES, 8);
     let narrow = DeviceCaps {
         max_grid: [4, 3, 65_535],
         ..caps()
@@ -984,7 +1019,7 @@ fn a_split_launch_past_the_grid_is_a_typed_refusal() {
 /// More splits than keys would leave a split with no key by construction: refused as a precondition.
 #[test]
 fn more_splits_than_keys_is_a_typed_error() {
-    let split = with_splits(with_lanes(spec(1, 2, 1, 1, 4, 4), 4), 4, 5);
+    let split = with_splits(with_lanes(spec(1, 2, 1, 1, 4, 4), LANES), LANES, 5);
     let error = kg::generate(&kg::KernelRequest::Attention(split), &caps(), &LIMITS)
         .expect_err("5 splits over 4 keys");
     assert!(
@@ -1052,7 +1087,7 @@ fn a_paged_key_equals_the_dense_kernel_over_its_gathered_views() {
             scale_bits: 0.5f32.to_bits(),
             cap_bits: 3.0f32.to_bits(),
         },
-        ..with_lanes(spec(batch, hq, n_rep, 1, lk, d), 4)
+        ..with_lanes(spec(batch, hq, n_rep, 1, lk, d), LANES)
     };
     let mask = additive_mask(batch, 1, lk, Some(&visible));
     let read = scattered_read(batch, lk, slots, &visible);
@@ -1084,7 +1119,7 @@ fn a_paged_split_kv_with_a_live_bound_never_reads_past_the_length() {
         kv: poot_kernelgen::KvLane::F32,
         key: kg::KeyLayout::Paged,
         bound: kg::KeyBound::Live,
-        ..with_splits(spec(batch, hq, n_rep, 1, lk, d), 4, 4)
+        ..with_splits(spec(batch, hq, n_rep, 1, lk, d), LANES, 4)
     };
     let len = [9, 41];
     let visible = [9, 41];
@@ -1136,14 +1171,22 @@ fn causal(spec: kg::AttentionSpec, window: Option<usize>) -> kg::AttentionSpec {
     }
 }
 
-/// Key and value rows `t` of batch row `b`, every head, set to NaN: a kernel that reads one has poisoned its
-/// output.
+/// Key and value rows `t` of batch row `b`, every head (and a split key's shared part), set to NaN: a kernel that
+/// reads one has poisoned its output.
 fn poison_key(operands: &mut Operands, spec: &kg::AttentionSpec, b: usize, t: usize) {
     let hkv = spec.hq / spec.n_rep;
+    let (head_dim, shared_dim) = match spec.key {
+        kg::KeyLayout::Single | kg::KeyLayout::Paged => (spec.dk, 0),
+        kg::KeyLayout::Split { shared_dim } => (spec.dk - shared_dim, shared_dim),
+    };
     for h in 0..hkv {
         let row = (b * hkv + h) * spec.lk + t;
-        operands.k[row * spec.dk..(row + 1) * spec.dk].fill(f32::NAN);
+        operands.k[row * head_dim..(row + 1) * head_dim].fill(f32::NAN);
         operands.v[row * spec.dv..(row + 1) * spec.dv].fill(f32::NAN);
+    }
+    if let Some(k_shared) = operands.k_shared.as_mut() {
+        let row = b * spec.lk + t;
+        k_shared[row * shared_dim..(row + 1) * shared_dim].fill(f32::NAN);
     }
 }
 
@@ -1157,18 +1200,22 @@ fn poison_key(operands: &mut Operands, spec: &kg::AttentionSpec, b: usize, t: us
 #[test]
 fn a_causal_mask_is_the_additive_mask_of_its_positions() {
     let rows = [
-        (with_lanes(spec(2, 4, 2, 1, 13, 8), 5), vec![4, 12], None),
+        (with_lanes(spec(2, 4, 2, 1, 13, 8), 64), vec![4, 12], None),
         (
-            with_lanes(spec(1, 4, 2, 9, 9, 8), 4),
+            with_lanes(spec(1, 4, 2, 9, 9, 8), LANES),
             (0..9).collect(),
             Some(3),
         ),
         (
-            with_lanes(spec(2, 2, 1, 1, 40, 8), 4),
+            with_lanes(spec(2, 2, 1, 1, 40, 8), LANES),
             vec![37, 20],
             Some(5),
         ),
-        (with_lanes(spec(1, 2, 1, 1, 40, 8), 4), vec![39], Some(40)),
+        (
+            with_lanes(spec(1, 2, 1, 1, 40, 8), LANES),
+            vec![39],
+            Some(40),
+        ),
     ];
     for (additive, positions, window) in rows {
         let structural = causal(additive.clone(), window);
@@ -1188,7 +1235,7 @@ fn a_causal_mask_is_the_additive_mask_of_its_positions() {
 /// position reaches the row and the output goes NaN.
 #[test]
 fn a_causal_row_never_reads_a_key_it_cannot_see() {
-    let spec = causal(with_lanes(spec(2, 2, 1, 1, 30, 8), 4), Some(6));
+    let spec = causal(with_lanes(spec(2, 2, 1, 1, 30, 8), LANES), Some(6));
     let positions = [17, 5];
     let mut operands = Operands::new(&spec, Vec::new()).with_positions(&positions);
     for (b, &position) in positions.iter().enumerate() {
@@ -1226,7 +1273,7 @@ fn a_causal_row_never_reads_a_key_it_cannot_see() {
 /// A padded query (position `-1`) sees key 0 and no NaN reaches its row or its neighbour's.
 #[test]
 fn a_causal_row_at_a_negative_position_sees_the_first_key() {
-    let spec = causal(with_lanes(spec(2, 2, 1, 1, 9, 8), 4), None);
+    let spec = causal(with_lanes(spec(2, 2, 1, 1, 9, 8), LANES), None);
     let operands = Operands::new(&spec, Vec::new()).with_positions(&[-1, 6]);
     let got = interpret(&spec, &caps(), &operands);
     assert!(got.iter().all(|x| x.is_finite()), "{got:?}");
@@ -1242,8 +1289,8 @@ fn a_causal_row_at_a_negative_position_sees_the_first_key() {
 #[test]
 fn a_causal_row_under_split_kv_matches_the_reference() {
     let split = with_splits(
-        causal(with_lanes(spec(2, 3, 1, 1, 41, 8), 4), Some(9)),
-        4,
+        causal(with_lanes(spec(2, 3, 1, 1, 41, 8), LANES), Some(9)),
+        LANES,
         4,
     );
     let positions = [40, 12];
@@ -1282,7 +1329,7 @@ const ROW_SHARES: [(i32, usize); 6] = [(1, 1), (5, 1), (16, 1), (17, 2), (100, 7
 fn the_combine_reads_only_the_splits_stage_one_published() {
     let live = kg::AttentionSpec {
         bound: kg::KeyBound::Live,
-        ..with_split_floor(with_lanes(spec(6, 2, 1, 1, 1024, 8), 4), 4, 8, 16)
+        ..with_split_floor(with_lanes(spec(6, 2, 1, 1, 1024, 8), LANES), LANES, 8, 16)
     };
     let lens = ROW_SHARES.map(|(len, _)| len);
     let operands = Operands::new(&live, vec![0.0; 6 * 1024]).with_len(&lens);
@@ -1327,7 +1374,7 @@ fn the_combine_reads_only_the_splits_stage_one_published() {
 fn no_published_split_is_an_empty_share() {
     let live = kg::AttentionSpec {
         bound: kg::KeyBound::Live,
-        ..with_split_floor(with_lanes(spec(5, 1, 1, 1, 64, 8), 4), 4, 8, 2)
+        ..with_split_floor(with_lanes(spec(5, 1, 1, 1, 64, 8), LANES), LANES, 8, 2)
     };
     let expected = [(1, 1), (2, 1), (3, 1), (33, 5), (64, 8)];
     let lens = expected.map(|(len, _)| len);
@@ -1357,7 +1404,12 @@ fn capacity_spec(lk: usize, splits: usize) -> kg::AttentionSpec {
     kg::AttentionSpec {
         bound: kg::KeyBound::Live,
         ..causal(
-            with_split_floor(with_lanes(spec(1, 2, 1, 1, lk, 8), 4), 4, splits, 128),
+            with_split_floor(
+                with_lanes(spec(1, 2, 1, 1, lk, 8), LANES),
+                LANES,
+                splits,
+                128,
+            ),
             None,
         )
     }
@@ -1420,7 +1472,7 @@ fn the_partition_does_not_depend_on_the_cache_capacity() {
 #[test]
 fn a_window_is_partitioned_not_the_cache() {
     let windowed = causal(
-        with_split_floor(with_lanes(spec(1, 2, 1, 1, 1024, 8), 4), 4, 8, 16),
+        with_split_floor(with_lanes(spec(1, 2, 1, 1, 1024, 8), LANES), LANES, 8, 16),
         Some(64),
     );
     let mut operands = Operands::new(&windowed, Vec::new()).with_positions(&[900]);
@@ -1432,6 +1484,528 @@ fn a_window_is_partitioned_not_the_cache() {
     assert_close(&run.out, &operands.reference(&windowed), SPLIT_KV_TOLERANCE);
     for row in 0..2 {
         assert_eq!(run.published_splits(&windowed, row), 4.0, "row {row}");
+    }
+}
+
+// ---- The clustered key walk (POOT-1554): the matrix, the butterfly, the resource claim, GQA sharing ----
+
+/// The workgroup width of the matrix rows: two clusters at the widest cluster, eight at the narrowest.
+const MATRIX_LANES: usize = 64;
+
+/// The walk the matrix gives a key `dk` wide and a value `dv` wide of `kv` elements: a run of what one 16-byte
+/// load covers, grown only while one 32-lane cluster could not cover the wider head, and the cluster that does.
+fn matrix_walk(dk: usize, dv: usize, kv: kg::KvLane) -> kg::KeyWalk {
+    let mut run = 16 / kv.bytes();
+    while dk.max(dv).div_ceil(run) > 32 {
+        run *= 2;
+    }
+    kg::KeyWalk {
+        cluster: dk.max(dv).div_ceil(run).next_power_of_two(),
+        run,
+    }
+}
+
+/// One way the matrix varies everything but the shape: the mask, the bound, a sink, a softcap and the key layout.
+#[derive(Clone, Copy)]
+struct Variant {
+    mask: kg::MaskKind,
+    live: bool,
+    sink: bool,
+    softcap: bool,
+    paged: bool,
+}
+
+/// Seven variants, so that stepping through the matrix by one cell cycles all of them against every other axis
+/// (7 is coprime to the 5 head widths x 5 group sizes x 3 lanes x 2 schedules). Between them every mask kind, both
+/// bounds, a sink, a softcap and both single-part layouts occur, a causal window shorter and longer than the cache.
+const VARIANTS: [Variant; 7] = [
+    Variant {
+        mask: kg::MaskKind::Broadcast,
+        live: false,
+        sink: false,
+        softcap: false,
+        paged: false,
+    },
+    Variant {
+        mask: kg::MaskKind::PerHead,
+        live: true,
+        sink: true,
+        softcap: true,
+        paged: false,
+    },
+    Variant {
+        mask: kg::MaskKind::Causal { window: None },
+        live: false,
+        sink: true,
+        softcap: false,
+        paged: false,
+    },
+    Variant {
+        mask: kg::MaskKind::Causal { window: Some(11) },
+        live: true,
+        sink: false,
+        softcap: true,
+        paged: false,
+    },
+    Variant {
+        mask: kg::MaskKind::Broadcast,
+        live: true,
+        sink: true,
+        softcap: false,
+        paged: true,
+    },
+    Variant {
+        mask: kg::MaskKind::PerHead,
+        live: false,
+        sink: false,
+        softcap: true,
+        paged: true,
+    },
+    Variant {
+        mask: kg::MaskKind::Causal { window: Some(40) },
+        live: false,
+        sink: false,
+        softcap: false,
+        paged: true,
+    },
+];
+
+/// The `[B, Hq, 1, Lk]` ALiBi-like mask of the matrix: a per-head slope over the distance to a per-row position,
+/// and a hard `-1e9` past it.
+fn per_head_bias(batch: usize, hq: usize, lk: usize) -> Vec<f32> {
+    let mut mask = Vec::new();
+    for b in 0..batch {
+        for h in 0..hq {
+            for t in 0..lk {
+                let position = 30 + 7 * b;
+                mask.push(if t <= position {
+                    -0.02 * (h + 1) as f32 * (position - t) as f32
+                } else {
+                    -1.0e9
+                });
+            }
+        }
+    }
+    mask
+}
+
+/// One cell of the matrix: the spec and operands of a decode over a 37-key cache of two batch rows and two key/value
+/// heads, with the live length, causal position and window of `variant`. Every key a row cannot visit carries NaN
+/// (a dense key in its rows, a paged one in the slot its read names), so a walk that strays shows in the output.
+fn matrix_cell(
+    (dk, dv, shared): (usize, usize, Option<usize>),
+    n_rep: usize,
+    kv: kg::KvLane,
+    split: bool,
+    variant: Variant,
+) -> (kg::AttentionSpec, Operands) {
+    let (batch, hkv, lq, lk, slots) = (2usize, 2usize, 1usize, 37usize, 96usize);
+    let hq = hkv * n_rep;
+    // A split key has no paged form: the variants that page it keep its two parts.
+    let paged = variant.paged && shared.is_none();
+    let walk = matrix_walk(dk, dv, kv);
+    let schedule = if split {
+        kg::AttentionSchedule::SplitKv {
+            lanes: MATRIX_LANES,
+            splits: 3,
+            min_units: 2,
+            walk,
+        }
+    } else {
+        kg::AttentionSchedule::Streaming {
+            lanes: MATRIX_LANES,
+            walk,
+        }
+    };
+    let scale_bits = (1.0 / (dk as f32).sqrt()).to_bits();
+    let spec = kg::AttentionSpec {
+        kv,
+        batch,
+        hq,
+        n_rep,
+        lq,
+        lk,
+        dk,
+        dv,
+        key: match shared {
+            Some(shared_dim) => kg::KeyLayout::Split { shared_dim },
+            None if paged => kg::KeyLayout::Paged,
+            None => kg::KeyLayout::Single,
+        },
+        score: if variant.softcap {
+            kg::ScoreTransform::ScaleSoftcap {
+                scale_bits,
+                cap_bits: 4.0f32.to_bits(),
+            }
+        } else {
+            kg::ScoreTransform::Scale { scale_bits }
+        },
+        mask: variant.mask,
+        bound: if variant.live {
+            kg::KeyBound::Live
+        } else {
+            kg::KeyBound::Static
+        },
+        sink: if variant.sink {
+            kg::AttentionSink::PerHead
+        } else {
+            kg::AttentionSink::Absent
+        },
+        schedule,
+        precision: poot_graph_ir::OperandPrecision::Exact,
+    };
+    let positions = [30, 12];
+    let lens = [29, 37];
+    let window = match variant.mask {
+        kg::MaskKind::Causal { window } => window,
+        _ => None,
+    };
+    // Whether batch row `b`'s walk visits key `t`: inside the live length and, for a causal row, inside its window.
+    let visits = |b: usize, t: usize| {
+        let live = !variant.live || t < lens[b] as usize;
+        let causal = !matches!(variant.mask, kg::MaskKind::Causal { .. })
+            || (t <= positions[b] as usize && window.is_none_or(|w| positions[b] as usize - t < w));
+        live && causal
+    };
+    let mask = match variant.mask {
+        kg::MaskKind::Broadcast => additive_mask(batch, lq, lk, Some(&[30, 37])),
+        kg::MaskKind::PerHead => per_head_bias(batch, hq, lk),
+        kg::MaskKind::Causal { .. } | kg::MaskKind::Blocks { .. } => Vec::new(),
+    };
+    let mut operands = Operands::new(&spec, mask);
+    if paged {
+        let visible: Vec<usize> = (0..batch)
+            .map(|b| (0..lk).rev().find(|&t| visits(b, t)).map_or(0, |t| t + 1))
+            .collect();
+        // The last slot is the poisoned one: no visible key may name it.
+        let mut read = scattered_read(batch, lk, slots - 1, &visible);
+        let poison = (slots - 1) as i32;
+        for b in 0..batch {
+            for t in (0..lk).filter(|&t| !visits(b, t)) {
+                read[b * lk + t] = poison;
+            }
+        }
+        operands = operands.with_pools(&spec, slots, read);
+        for g in 0..hkv {
+            let row = (slots - 1) * hkv + g;
+            operands.k[row * dk..(row + 1) * dk].fill(f32::NAN);
+            operands.v[row * dv..(row + 1) * dv].fill(f32::NAN);
+        }
+    }
+    if matches!(variant.mask, kg::MaskKind::Causal { .. }) {
+        operands = operands.with_positions(&positions);
+    }
+    if variant.live {
+        operands = operands.with_len(&lens);
+    }
+    if variant.sink {
+        operands = operands.with_sinks(hq);
+    }
+    if !paged {
+        for b in 0..batch {
+            for t in (0..lk).filter(|&t| !visits(b, t)) {
+                poison_key(&mut operands, &spec, b, t);
+            }
+        }
+    }
+    (spec, operands.stored(kv))
+}
+
+/// Row 6 of the POOT-1549 design: the clustered body matches the f64 reference across the matrix. Head widths
+/// `dk/dv` of 64/64, 96/96 (12 of a cluster of 16 lanes active), 128/128, 256/256 (a run of 8 across a full cluster of
+/// 32) and the MLA 192/128 split key (a value narrower than the key, the run inside one part); group sizes `n_rep` of 1, 2, 6, 7 and 8;
+/// f32, f16 and bf16 keys and values; the additive, per-head and causal masks (with a window shorter and longer
+/// than the cache), static and live bounds, a sink, a softcap, single, split and paged keys; the streaming and the
+/// split-KV stage one with its combine. 150 cells, each variant of [`VARIANTS`] against every shape. A key a row
+/// does not visit carries NaN.
+///
+/// Mutation: skip the butterfly's last round (`distance > 1` in the round loop); the lanes of a cluster hold
+/// partial scores that differ, and the cells go red. Mutation: start a lane's run at `j * run + 1`; every score
+/// reads the wrong channels. Mutation: stride the value rows by `dk` instead of `dv`; the 192/128 cells go red.
+#[test]
+fn the_clustered_body_matches_the_reference_across_the_matrix() {
+    const DIMS: [(usize, usize, Option<usize>); 5] = [
+        (64, 64, None),
+        (96, 96, None),
+        (128, 128, None),
+        (256, 256, None),
+        (192, 128, Some(64)),
+    ];
+    const GROUPS: [usize; 5] = [1, 2, 6, 7, 8];
+    let mut cell = 0;
+    for dims in DIMS {
+        for n_rep in GROUPS {
+            for kv in [kg::KvLane::F32, kg::KvLane::F16, kg::KvLane::Bf16] {
+                for split in [false, true] {
+                    let variant = VARIANTS[cell % VARIANTS.len()];
+                    cell += 1;
+                    let (spec, operands) = matrix_cell(dims, n_rep, kv, split, variant);
+                    let label = format!(
+                        "cell {cell}: dk/dv {}/{} n_rep {n_rep} {kv:?} split {split} {:?} live {} sink {} softcap {} paged {}",
+                        dims.0,
+                        dims.1,
+                        variant.mask,
+                        variant.live,
+                        variant.sink,
+                        variant.softcap,
+                        variant.paged,
+                    );
+                    let got = if split {
+                        interpret_split(&spec, &caps(), &operands, f32::NAN).0
+                    } else {
+                        interpret(&spec, &caps(), &operands)
+                    };
+                    assert!(got.iter().all(|x| x.is_finite()), "{label}: {got:?}");
+                    let want = operands.reference(&spec);
+                    let error = max_abs_error(&got, &want);
+                    assert!(
+                        error <= SPLIT_KV_TOLERANCE,
+                        "{label}: max abs error {error:e} against the reference"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(cell, 150);
+}
+
+/// Row 7: every lane of a cluster holds the bit-identical score after the butterfly, so the redundant online
+/// softmax keeps one `(m, l)` per cluster without a broadcast. The state is not observable from outside (the
+/// kernel has no debug output), so it is checked through behaviour: scores spread wide enough that a lane whose
+/// maximum or denominator differs from its neighbour's weighs its value run on another scale than the rest of the
+/// cluster, so the output row is inconsistent with the reference. Cluster widths 2 to 32 of one head, so every round
+/// count of the butterfly (1 to 5) runs; the query is scaled so the softmax is peaked, and the row is checked
+/// against the reference and against the same row at every other width: one bit pattern of scores for all of them.
+///
+/// Mutation: reduce into lane 0 of each cluster only (`part += shuffle` where `j == 0`, the others keep their
+/// partial); lanes other than 0 hold partial scores, their `m` and `l` diverge from lane 0's, and the first width
+/// goes red on the reference comparison.
+#[test]
+fn every_lane_of_a_cluster_scores_alike() {
+    let (batch, hq, n_rep, lk, d) = (1, 4, 2, 21, 64);
+    let mut rows: Vec<(usize, Vec<f32>)> = Vec::new();
+    for cluster in [2usize, 4, 8, 16, 32] {
+        let walk = kg::KeyWalk {
+            cluster,
+            run: d / cluster,
+        };
+        let base = kg::AttentionSpec {
+            score: kg::ScoreTransform::Scale {
+                scale_bits: 2.0f32.to_bits(),
+            },
+            schedule: kg::AttentionSchedule::Streaming { lanes: 64, walk },
+            ..spec(batch, hq, n_rep, 1, lk, d)
+        };
+        let operands = Operands::new(&base, additive_mask(batch, 1, lk, Some(&[lk])));
+        let got = interpret(&base, &caps(), &operands);
+        assert_close(&got, &operands.reference(&base), 1e-5);
+        rows.push((cluster, got));
+    }
+    let (first, rest) = rows.split_first().unwrap();
+    for (cluster, row) in rest {
+        assert_close(row, &first.1, 1e-5);
+        assert!(
+            max_abs_error(row, &first.1) <= 1e-5,
+            "cluster {cluster} differs from cluster {}",
+            first.0
+        );
+    }
+}
+
+/// `reach[a][b]`: whether control can get from block `a` to block `b` in one step or more. A block is on a cycle when
+/// it reaches itself.
+fn reachability(body: &poot_kernel_ir::Body) -> Vec<Vec<bool>> {
+    use poot_kernel_ir::Terminator;
+    let successors = |block: usize| -> Vec<usize> {
+        match &body.blocks[block].terminator {
+            Terminator::Goto { target }
+            | Terminator::Barrier { target }
+            | Terminator::ThreadIndexCall { target, .. } => vec![target.index as usize],
+            Terminator::SwitchInt { targets, .. } => targets
+                .branches
+                .iter()
+                .map(|(_, target)| target.index as usize)
+                .chain([targets.otherwise.index as usize])
+                .collect(),
+            Terminator::Return | Terminator::Trap { .. } => Vec::new(),
+        }
+    };
+    (0..body.blocks.len())
+        .map(|from| {
+            let mut seen = vec![false; body.blocks.len()];
+            let mut work = successors(from);
+            while let Some(next) = work.pop() {
+                if !std::mem::replace(&mut seen[next], true) {
+                    work.extend(successors(next));
+                }
+            }
+            seen
+        })
+        .collect()
+}
+
+/// Row 8: the schedule's resource claim (ADR-0112 section 4). The generated stage one declares workgroup memory of
+/// exactly `clusters * n_rep * (dv + 2)` words and holds exactly one barrier, outside every loop, and the key loop
+/// (the cycle that holds the butterfly's shuffle) neither reads nor writes workgroup memory: the walk keeps its
+/// state in registers. Checked for the streaming and the split-KV schedule, on a key 192 wide and a value 128 wide.
+///
+/// Mutation: keep `o` in workgroup memory with a per-key read-modify-write (a second array of `lanes * dv` words,
+/// read and written in the key loop); the declared bytes and the key-loop claim both go red.
+#[test]
+fn the_walk_keeps_its_state_in_registers() {
+    use poot_kernel_ir::{Rvalue, Statement, Terminator};
+    let (dk, dv, n_rep, lanes) = (192usize, 128usize, 6usize, 128usize);
+    let walk = kg::KeyWalk {
+        cluster: 32,
+        run: 8,
+    };
+    let base = kg::AttentionSpec {
+        kv: kg::KvLane::F16,
+        key: kg::KeyLayout::Split { shared_dim: 64 },
+        dk,
+        dv,
+        schedule: kg::AttentionSchedule::Streaming { lanes, walk },
+        ..spec(2, 4 * n_rep, n_rep, 1, 50, 8)
+    };
+    let split = kg::AttentionSpec {
+        schedule: kg::AttentionSchedule::SplitKv {
+            lanes,
+            splits: 3,
+            min_units: 1,
+            walk,
+        },
+        ..base.clone()
+    };
+    for spec in [base, split] {
+        let body = kg::generate(
+            &kg::KernelRequest::Attention(spec.clone()),
+            &caps(),
+            &LIMITS,
+        )
+        .expect("the request generates")
+        .body;
+        let words = (lanes / walk.cluster) * n_rep * (dv + 2);
+        assert_eq!(
+            kg::BodyUse::measure(&body).unwrap().lds_bytes,
+            4 * words as u64,
+            "{:?}: the end combine's slab is the whole workgroup memory",
+            spec.schedule
+        );
+        let reach = reachability(&body);
+        let barriers: Vec<usize> = (0..body.blocks.len())
+            .filter(|&block| matches!(body.blocks[block].terminator, Terminator::Barrier { .. }))
+            .collect();
+        assert_eq!(barriers.len(), 1, "{:?}: one barrier", spec.schedule);
+        assert!(
+            !reach[barriers[0]][barriers[0]],
+            "{:?}: the barrier is outside every loop",
+            spec.schedule
+        );
+        let shuffles: Vec<usize> = (0..body.blocks.len())
+            .filter(|&block| {
+                body.blocks[block].statements.iter().any(|statement| {
+                    matches!(
+                        statement,
+                        Statement::Assign(_, Rvalue::SubgroupShuffleXor { .. })
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            !shuffles.is_empty(),
+            "{:?}: the walk shuffles",
+            spec.schedule
+        );
+        // The key loop holds every block that shares a cycle with a shuffle.
+        let in_key_loop = |block: usize| {
+            shuffles.iter().any(|&shuffle| {
+                shuffle == block || (reach[shuffle][block] && reach[block][shuffle])
+            })
+        };
+        let touches_workgroup_memory = |statement: &Statement| {
+            matches!(
+                statement,
+                Statement::WorkgroupLocalWrite { .. }
+                    | Statement::Assign(_, Rvalue::WorkgroupLocalRead { .. })
+            )
+        };
+        let strays: Vec<usize> = (0..body.blocks.len())
+            .filter(|&block| {
+                in_key_loop(block)
+                    && body.blocks[block]
+                        .statements
+                        .iter()
+                        .any(touches_workgroup_memory)
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "{:?}: blocks {strays:?} of the key loop touch workgroup memory",
+            spec.schedule
+        );
+    }
+}
+
+/// Row 9: GQA sharing. The grid is one workgroup per `(batch, key/value head, query row[, split])`, and the body
+/// reads each key and value element once per query row that visits it, however many query heads share them: the
+/// interpreter counts reads per buffer element. A 2-batch, 2-kv-head, 4-heads-per-kv-head, 2-row decode over 50 keys
+/// (not a multiple of the 8 clusters of a step, so the last step is ragged) reads every element of `k` and `v`
+/// exactly twice (the two query rows), under both schedules.
+///
+/// Mutation: `heads_per_workgroup` returns 1; the grid assertion (`workgroups() == batch * hkv * lq * splits`) goes
+/// red, and a body launched on the old grid reads every element `n_rep` times.
+#[test]
+fn every_key_is_read_once_per_workgroup_whatever_the_group_size() {
+    let (batch, hkv, n_rep, lq, lk, d) = (2usize, 2usize, 4usize, 2usize, 50usize, 64usize);
+    let walk = kg::KeyWalk { cluster: 8, run: 8 };
+    let streaming = kg::AttentionSpec {
+        schedule: kg::AttentionSchedule::Streaming { lanes: 64, walk },
+        ..spec(batch, hkv * n_rep, n_rep, lq, lk, d)
+    };
+    let split = kg::AttentionSpec {
+        schedule: kg::AttentionSchedule::SplitKv {
+            lanes: 64,
+            splits: 3,
+            min_units: 1,
+            walk,
+        },
+        ..streaming.clone()
+    };
+    assert_eq!(streaming.workgroups(), batch * hkv * lq);
+    assert_eq!(split.workgroups(), batch * hkv * lq * 3);
+    for spec in [streaming, split] {
+        let operands = Operands::new(&spec, vec![0.0; batch * lq * lk]);
+        let mut buffers = operands.buffers(&spec);
+        let partial = spec.partial_elems();
+        let scratch = Buffer::from_f32s(&vec![f32::NAN; partial.unwrap_or(spec.rows() * spec.dv)]);
+        buffers.push(scratch);
+        let generated = kg::generate(
+            &kg::KernelRequest::Attention(spec.clone()),
+            &caps(),
+            &LIMITS,
+        )
+        .expect("the request generates");
+        let grid = generated.launch.grid;
+        let workgroups = [grid[0] / 64, grid[1], grid[2]];
+        assert_eq!(
+            workgroups.iter().product::<u32>() as usize,
+            spec.workgroups(),
+            "{:?}: the launch is the row groups",
+            spec.schedule
+        );
+        run(&generated.body, workgroups, &mut buffers).unwrap();
+        for (name, operand) in [("k", 1), ("v", 2)] {
+            let reads = buffers[operand].read_counts();
+            assert!(
+                reads.iter().all(|&count| count == lq as u32),
+                "{:?}: some element of {name} was not read once per query row: {:?}",
+                spec.schedule,
+                reads
+                    .iter()
+                    .enumerate()
+                    .find(|(_, count)| **count != lq as u32)
+            );
+        }
     }
 }
 
@@ -1634,11 +2208,11 @@ fn a_tiled_prefill_reads_its_keys_and_values_through_a_two_byte_lane() {
             kv,
             ..causal(spec(2, 4, 2, l, l, 8), None)
         };
-        let split = kg::AttentionSpec {
+        let split = walked(kg::AttentionSpec {
             dk: 12,
             key: kg::KeyLayout::Split { shared_dim: 4 },
             ..dense.clone()
-        };
+        });
         for streaming in [dense, split] {
             let operands = Operands::new(&streaming, Vec::new())
                 .with_positions(&positions)
@@ -1731,8 +2305,8 @@ fn a_tiling_that_does_not_fit_the_block_is_a_typed_error() {
 #[test]
 fn a_streaming_or_split_attention_refuses_a_narrowed_precision() {
     use poot_graph_ir::{FragmentDtype, OperandPrecision};
-    let streaming = with_lanes(spec(1, 4, 2, 1, 13, 8), 5);
-    let split = with_splits(with_lanes(spec(2, 3, 1, 1, 41, 8), 4), 4, 4);
+    let streaming = with_lanes(spec(1, 4, 2, 1, 13, 8), 64);
+    let split = with_splits(with_lanes(spec(2, 3, 1, 1, 41, 8), LANES), LANES, 4);
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 22).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 18).unwrap(),

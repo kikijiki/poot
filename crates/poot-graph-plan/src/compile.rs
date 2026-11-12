@@ -1126,6 +1126,11 @@ pub fn compile(
     if gpu.is_some() {
         pipeline.run("fuse_index_casts", transform::fuse_index_casts)?;
     }
+    // After `fuse`, which takes an I32 pack's concat and unit-last lane slices as one region's `pack` and
+    // `PackLane`s: a slice that reads one part of a concat reads the part instead (the conv window's taps), and
+    // the concat goes when its last reader does.
+    pipeline.run("slice_of_concat", transform::slice_of_concat)?;
+    pipeline.run("dce_after_slice_of_concat", transform::dce)?;
     // POOT-1448: a value whose every reader narrows it is stored narrow, rounded once by the region that computes
     // it, on the final regions (after every fusion). It probes the planner before it commits each value, so its
     // graph is final: a value the target cannot store narrow stays f32, and nothing is reverted.

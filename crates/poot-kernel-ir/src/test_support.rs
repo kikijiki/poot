@@ -19,6 +19,11 @@ use crate::{
 
 mod fragment_probe;
 pub use fragment_probe::{AccInit, FragmentProbe, Readout};
+mod subgroup_shuffle;
+pub use subgroup_shuffle::{
+    SHUFFLE_F32_SCALE, SHUFFLE_MASKS, SHUFFLE_U32_MARK, subgroup_shuffle_xor_expected,
+    subgroup_shuffle_xor_kernel,
+};
 
 // --- small IR-builder primitives, duplicated from `poot_kernelgen`'s crate-private `helpers` module ---------
 

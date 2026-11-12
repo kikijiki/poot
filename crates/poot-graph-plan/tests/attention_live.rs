@@ -495,8 +495,8 @@ fn the_compiled_live_decode_plans_a_live_bound_and_a_length_independent_launch()
         assert_eq!(launches, 2, "{name}: partials, then combine");
         assert_eq!(
             spec.workgroups(),
-            2 * splits,
-            "{name}: the grid is (batch, head, row, split)"
+            splits,
+            "{name}: the grid is (batch, key/value head, row, split): the two query heads share one"
         );
     }
 }

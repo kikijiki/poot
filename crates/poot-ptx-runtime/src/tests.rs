@@ -1942,3 +1942,59 @@ fn u32x4_vector_load_matches_scalar_loads_on_ptx() {
         assert_eq!(got, case.want, "{name}");
     }
 }
+
+/// SC-4 (PTX, run on a pod): the `Rvalue::SubgroupShuffleXor` fixtures, compiled for NVPTX and dispatched at 128
+/// lanes, store what the interpreter does: lane `LocalX` receives the value of lane `LocalX ^ mask`
+/// (`shfl.sync.bfly`). Mutation (kept out of the tree): in `emit_subgroup_shuffle_xor`'s NVPTX arm, pass the
+/// butterfly `mask << 1`; every received value is the wrong lane's and this row goes red. Skips with no CUDA device.
+#[test]
+fn subgroup_shuffle_xor_matches_the_interpreter_on_ptx() {
+    use poot_kernel_ir::Ty;
+    use poot_kernel_ir::test_support::{
+        SHUFFLE_MASKS, subgroup_shuffle_xor_expected, subgroup_shuffle_xor_kernel,
+    };
+    const THREADS: u32 = 512;
+    const WORKGROUP: u32 = 128;
+    let Ok(ctx) = PtxContext::new() else {
+        eprintln!("POOT-SKIP subgroup_shuffle_xor_matches_the_interpreter_on_ptx: no NVIDIA GPU");
+        return;
+    };
+    let dir = std::env::temp_dir().join("poot-ptx-runtime-subgroup-shuffle-test");
+    std::fs::create_dir_all(&dir).expect("create fixture artifact dir");
+    for ty in [Ty::U32, Ty::F32] {
+        let body = subgroup_shuffle_xor_kernel(ty.clone(), WORKGROUP);
+        let name = body.name.clone();
+        let out = poot_codegen::artifact_path(&dir, &name, poot_codegen::Target::Nvptx);
+        let artifact = poot_codegen::compile_kernel(&body, poot_target::Backend::Nvptx, &out)
+            .unwrap_or_else(|e| panic!("compile {name}: {e}"));
+        let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
+        let words = THREADS as usize * SHUFFLE_MASKS.len();
+        let storage = match ty {
+            Ty::U32 => BufferStorage::i32(),
+            _ => BufferStorage::f32(),
+        };
+        let output = ctx
+            .alloc_storage(BufferRole::Output, storage, words)
+            .expect("alloc output");
+        ctx.dispatch_dev(
+            &name,
+            &kernel,
+            body.workgroup_size,
+            [THREADS, 1, 1],
+            &[],
+            &[],
+            &output,
+            words,
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut raw = vec![0u8; words * 4];
+        ctx.read_bytes(&output, &mut raw).expect("read output");
+        let got: Vec<u32> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        assert_eq!(got, subgroup_shuffle_xor_expected(&ty, THREADS), "{name}");
+    }
+}

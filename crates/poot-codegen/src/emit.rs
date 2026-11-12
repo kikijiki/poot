@@ -80,6 +80,7 @@ struct Emitter<'a> {
 }
 mod core;
 mod memory;
+mod subgroup;
 mod targets;
 mod value;
 mod wmma;

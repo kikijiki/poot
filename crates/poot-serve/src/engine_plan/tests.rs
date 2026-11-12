@@ -833,6 +833,9 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// at four, two and one rows.
 /// POOT-1544 forms the router's `StableRank` composite, so the rank's `[rows, E, E]` pairwise workspace leaves the arena:
 /// `Activation` 1151108 -> 970628, 575708 -> 485468 and 288408 -> 243288 at four, two and one rows.
+/// POOT-1564 plans a reshape of a view as a view and reads the conv window's taps from its parts, so the q/k/v and tap
+/// slices and the conv-kernel transposes leave the arena: `Activation` 970628 -> 937428, 485468 -> 468868
+/// and 243288 -> 234988 at four, two and one rows.
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
 /// is no longer 5216 and this row goes red.
@@ -851,17 +854,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=970628 Input=189100 Meta=16884 State=12416 Weight=5216",
+            "Activation=937428 Input=189100 Meta=16884 State=12416 Weight=5216",
         ),
         (
             2,
             64,
-            "Activation=485468 Input=117748 Meta=16884 State=6208 Weight=5216",
+            "Activation=468868 Input=117748 Meta=16884 State=6208 Weight=5216",
         ),
         (
             1,
             64,
-            "Activation=243288 Input=82072 Meta=15564 State=3104 Weight=5216",
+            "Activation=234988 Input=82072 Meta=15564 State=3104 Weight=5216",
         ),
     ];
     let domain = candidates(&handle, &args);

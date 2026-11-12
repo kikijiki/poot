@@ -2,6 +2,7 @@
 # A row the lane runs and passes that is in neither kernels.txt nor here fails scripts/check-required-cases.py;
 # a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
 poot-kernelgen	attention::tests::a_spec_outside_the_generators_contract_is_a_typed_error	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	attention::tests::a_walk_outside_the_clusters_contract_is_a_typed_error	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::dense::tests::a_narrow_stored_activation_and_a_narrowed_store_match_the_f32_body	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::dense::tests::the_dense_tiled_body_matches_a_host_product_at_every_planned_tiling	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::fit::tests::an_underdetermined_corpus_gives_no_fit	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -174,7 +175,6 @@ poot-kernelgen::expert_group_interp	a_grouped_contraction_writes_each_rows_own_p
 poot-kernelgen::expert_group_interp	an_invalid_expert_id_lands_in_the_last_bucket_and_is_never_dropped	kernelgen `expert_group_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::expert_group_interp	the_grouping_pads_each_experts_rows_to_whole_tiles	kernelgen `expert_group_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::f16_matmul_probe	f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv	kernelgen `f16_matmul_probe` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::flash_interp	a_bank_swizzled_dense_partial_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_causal_mask_is_the_additive_mask_of_its_positions	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_causal_row_at_a_negative_position_sees_the_first_key	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_causal_row_never_reads_a_key_it_cannot_see	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
@@ -207,7 +207,9 @@ poot-kernelgen::flash_interp	a_true_inf_mask_and_idle_lanes_do_not_make_nan	kern
 poot-kernelgen::flash_interp	a_window_is_partitioned_not_the_cache	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	an_out_of_range_live_length_is_safe_and_selects_what_the_decomposition_selects	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	batched_decode_reads_each_rows_own_operands	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::flash_interp	decode_over_ragged_lanes_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::flash_interp	decode_over_ragged_clusters_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::flash_interp	every_key_is_read_once_per_workgroup_whatever_the_group_size	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::flash_interp	every_lane_of_a_cluster_scores_alike	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	every_tiling_of_a_prefill_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	more_splits_than_keys_is_a_typed_error	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	no_published_split_is_an_empty_share	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
@@ -215,8 +217,10 @@ poot-kernelgen::flash_interp	per_head_mask_reads_each_heads_plane	kernelgen `fla
 poot-kernelgen::flash_interp	prefill_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	softcapped_prefill_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	split_kv_decode_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::flash_interp	the_clustered_body_matches_the_reference_across_the_matrix	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	the_combine_reads_only_the_splits_stage_one_published	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	the_partition_does_not_depend_on_the_cache_capacity	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::flash_interp	the_walk_keeps_its_state_in_registers	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	tiled_runs_empty_rows_and_padded_queries_match_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::fragment_lds_probe	fragment_probes_match_the_host_reference_on_rocm	kernelgen `fragment_lds_probe` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::fragment_lds_probe	fragment_probes_match_the_host_reference_on_vulkan	kernelgen `fragment_lds_probe` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
@@ -308,12 +312,13 @@ poot-kernelgen::scan	the_body_does_not_grow_with_the_sequence_and_obeys_its_limi
 poot-kernelgen::select_interp	a_folded_float_select_covers_every_element_once	kernelgen `select_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::select_interp	float_select_equals_the_hand_written_words	kernelgen `select_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::select_interp	i32_select_takes_the_true_branch_for_any_nonzero_word	kernelgen `select_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::selected_attention	a_bank_swizzled_partial_equals_the_reference	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::selected_attention	a_grouped_step_never_crosses_a_block	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::selected_attention	a_padded_cache_and_a_stray_id_read_no_key_past_the_stored_extent	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::selected_attention	a_step_of_clusters_may_cross_a_block	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::selected_attention	a_wide_head_equals_the_reference	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::selected_attention	an_id_naming_a_future_block_reads_no_key_after_the_query	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::selected_attention	the_kernel_attends_over_exactly_the_selected_blocks	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::selected_attention	the_kernel_lowers_to_spirv_and_ptx	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::selected_attention	the_walk_serves_every_group_size_and_head_width	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::stable_rank	an_extent_no_rank_can_name_is_refused	kernelgen `stable_rank` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::stable_rank	rows_are_independent	kernelgen `stable_rank` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::stable_rank	the_kernel_lowers_to_spirv_and_ptx	kernelgen `stable_rank` test binary (emit, interpreter or dispatch rows); the lane runs the package whole

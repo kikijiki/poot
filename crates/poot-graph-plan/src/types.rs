@@ -733,8 +733,8 @@ pub enum Plan {
     Alias(ValueId),
     /// The output is a strided view of `src`'s buffer (spec 132): no dispatch, like [`Plan::Alias`], but
     /// with its own (possibly non-row-major) `strides` and element `offset`. Emitted only when every
-    /// consumer can read a strided input (`is_strided_capable`); see `compute_views`. Reshape still lowers
-    /// to `Plan::Alias`; this variant is for Transpose/Slice/Broadcast.
+    /// consumer can read a strided input (`is_strided_capable`); see `compute_views`. A Reshape of a dense
+    /// value lowers to `Plan::Alias`; this variant is for Transpose/Slice/Broadcast and a Reshape of a view.
     View {
         /// The value whose buffer the view reads.
         src: ValueId,

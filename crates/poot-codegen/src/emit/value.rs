@@ -325,11 +325,9 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(w, "  {out} = extractelement {vecty} {v}, i32 {lane}");
                 Ok((out, elem_llty))
             }
-            // The per-target lowerings (`shfl.sync.bfly`, `ds_bpermute`, `OpGroupNonUniformShuffleXor`) are
-            // POOT-1549 W2; until they land no target emits the node.
-            Rvalue::SubgroupShuffleXor { .. } => Err(EmitError::Unsupported(
-                "SubgroupShuffleXor has no lowering on any target yet".into(),
-            )),
+            Rvalue::SubgroupShuffleXor { value, mask } => {
+                self.emit_subgroup_shuffle_xor(value, *mask, w)
+            }
         }
     }
 

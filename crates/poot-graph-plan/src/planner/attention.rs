@@ -8,8 +8,7 @@ use super::{
 use crate::graph_validation::flash_mask_per_head;
 use crate::planner::{GraphTables, StorageDtypes};
 use crate::predicates::{
-    SelectedSchedule, attention_lanes, attention_rows_per_dispatch, attention_splits,
-    attention_tiling, selected_attention_schedule,
+    attention_key_walk, attention_rows_per_dispatch, attention_splits, attention_tiling,
 };
 use crate::refusal::Site;
 use crate::types::ScratchDecl;
@@ -81,12 +80,6 @@ pub(super) fn plan(
         MaskOperand::Additive => MaskKind::Broadcast,
         MaskOperand::Causal { window } => MaskKind::Causal { window: *window },
     };
-    let lanes = attention_lanes(dv, caps).ok_or_else(|| {
-        site.refuse(Capability::AttentionLds {
-            dv,
-            lds_bytes: caps.lds_bytes,
-        })
-    })?;
     let score = match softcap {
         None => ScoreTransform::Scale {
             scale_bits: scale.to_bits(),
@@ -102,6 +95,17 @@ pub(super) fn plan(
         stored.push(k_dtype(4));
     }
     let kv = kv_lane(&site, &stored, caps)?;
+    let shared_dim = match key {
+        KeyLayout::Split { shared_dim } => *shared_dim,
+        KeyLayout::Single | KeyLayout::Paged => 0,
+    };
+    let (lanes, walk) = attention_key_walk((dk, dv, shared_dim), *n_rep, kv.bytes(), caps)
+        .ok_or_else(|| {
+            site.refuse(Capability::AttentionLds {
+                dv,
+                lds_bytes: caps.lds_bytes,
+            })
+        })?;
     let streaming = AttentionSpec {
         kv,
         batch,
@@ -128,7 +132,7 @@ pub(super) fn plan(
             SinkOperand::Absent => AttentionSink::Absent,
             SinkOperand::PerHead => AttentionSink::PerHead,
         },
-        schedule: AttentionSchedule::Streaming { lanes },
+        schedule: AttentionSchedule::Streaming { lanes, walk },
         precision: *precision,
     };
     // This is the GPU planner: an AIE target never reaches it (an NPU target plans through its own schedule).
@@ -157,11 +161,8 @@ pub(super) fn plan(
 
 /// Plan a block-selected attention: the streaming kernel with its mask derived from the selection operands.
 /// The `n_rep` query heads of a key/value head read the same selected keys (the ids are per query, not per
-/// head), so where the rows keep the device full a workgroup serves all of them: each key and value row is
-/// loaded once for the group, not once per head ([`selected_attention_schedule`]; the group-centric loading of Native
-/// Sparse Attention, arXiv 2502.11089 section 3.4). The lanes of a group are `n_rep` head lanes times the slices
-/// the device's workgroup memory takes; a decode row, or a device that cannot hold the head lanes, keeps the lanes of
-/// a dense one ([`selected_attention_schedule`]).
+/// head), so a workgroup serves all of them: each key and value row is loaded once for the group, not once per
+/// head (the group-centric loading of Native Sparse Attention, arXiv 2502.11089 section 3.4).
 fn plan_selected(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -178,18 +179,6 @@ fn plan_selected(
     let layout = attrs
         .layout(&operand_types)
         .map_err(|e| PlanError::BadShape(format!("selected attention: {e}")))?;
-    let SelectedSchedule { grouped, lanes } = selected_attention_schedule(
-        layout.batch * layout.hq * layout.lq,
-        attrs.n_rep,
-        layout.dv,
-        caps,
-    )
-    .ok_or_else(|| {
-        site.refuse(Capability::AttentionLds {
-            dv: layout.dv,
-            lds_bytes: caps.lds_bytes,
-        })
-    })?;
     let score = match attrs.softcap {
         None => ScoreTransform::Scale {
             scale_bits: attrs.scale.to_bits(),
@@ -204,6 +193,15 @@ fn plan_selected(
         &[operand_types[1].dtype, operand_types[2].dtype],
         caps,
     )?;
+    let (lanes, walk) =
+        attention_key_walk((layout.dk, layout.dv, 0), attrs.n_rep, kv.bytes(), caps).ok_or_else(
+            || {
+                site.refuse(Capability::AttentionLds {
+                    dv: layout.dv,
+                    lds_bytes: caps.lds_bytes,
+                })
+            },
+        )?;
     let spec = AttentionSpec {
         kv,
         batch: layout.batch,
@@ -218,11 +216,10 @@ fn plan_selected(
         mask: MaskKind::Blocks {
             ratio: attrs.ratio,
             k: attrs.k,
-            grouped,
         },
         bound: KeyBound::Static,
         sink: AttentionSink::Absent,
-        schedule: AttentionSchedule::Streaming { lanes },
+        schedule: AttentionSchedule::Streaming { lanes, walk },
         precision: attrs.precision,
     };
     super::matmul::refuse_unless_exact(site, attrs.precision)?;

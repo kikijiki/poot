@@ -308,6 +308,7 @@ poot-ptx-runtime	tests::card305_ptx_lifecycle_repeated_contexts_and_surviving_ch
 poot-ptx-runtime	tests::native_buffer_contract_roundtrip_ptx
 poot-ptx-runtime	tests::no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows
 poot-ptx-runtime	tests::ptx_buffer_and_its_context_move_into_another_thread
+poot-ptx-runtime	tests::subgroup_shuffle_xor_matches_the_interpreter_on_ptx
 poot-ptx-runtime	tests::u32x4_vector_load_matches_scalar_loads_on_ptx
 poot-serve::bin/poot-serve	tests::lifecycle::device::a_hot_loaded_adapter_serves_requests_and_unload_frees_it_ptx
 poot-serve::bin/poot-serve	tests::lifecycle::device::a_multimodal_job_through_the_loop_matches_generate_with_inputs_ptx

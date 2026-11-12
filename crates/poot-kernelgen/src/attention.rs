@@ -5,31 +5,29 @@
 //! against a capacity-long cache), prefill (`lq == lk`) and prefill into a cache (`1 < lq < lk`) differ only in
 //! the extents they pass.
 //!
-//! The [`AttentionSchedule::Streaming`] schedule is one workgroup of `lanes` threads per `(batch, head,
-//! query row)`. Each lane strides over the keys (`t = lane, lane + lanes, ..`), keeping its own running
-//! `(m, l, o[dv])` triple: `m` the running score maximum, `l` the running sum of `exp(score - m)`, `o` the
-//! running `exp(score - m)`-weighted sum of value rows. Admitting a key at score `s` moves the maximum to
-//! `m' = max(m, s)` and rescales what the lane holds by `exp(m - m')` before adding the key's own term, so
-//! the `[lq, lk]` scores are never materialized. The partials live in workgroup memory (`o` in array 0,
-//! `lanes * dv` wide, lane `i` at `[i*dv, i*dv + dv)` with its channels XOR-swizzled by the lane (see
-//! [`OSlots`]); `m` and `l` in arrays 1 and 2, `lanes` wide each),
-//! because a dynamically indexed private array cannot be stated on SPIR-V. One barrier, on the straight-line
-//! path after the key loops, separates the per-lane work (disjoint LDS regions, barrier-free) from the
-//! combine. The combine then runs on every lane over a slice of the output channels: with `M` the maximum of
-//! the lane maxima, `out[c] = sum_i o_i[c] * exp(m_i - M) / sum_i l_i * exp(m_i - M)`.
+//! The [`AttentionSchedule::Streaming`] schedule is the clustered key walk (see [`clustered`]): one workgroup
+//! of `lanes` threads per `(batch, key/value head, query row)`, serving all `n_rep` query heads of the key/value
+//! head. The lanes form clusters of [`KeyWalk::cluster`] lanes and a cluster walks one key per step, each lane
+//! holding a contiguous run of the key and value channels. Every lane keeps the heads' queries, running maxima
+//! `m`, denominators `l` and weighted value sums `o` in registers: admitting a key at score `s` moves the maximum
+//! to `m' = max(m, s)` and rescales what the lane holds by `exp(m - m')` before adding the key's own term, so the
+//! `[lq, lk]` scores are never materialized. A dot product is a per-lane sum over the run and a subgroup xor
+//! butterfly over the cluster. One barrier, on the straight-line path after the key loops, separates the walk
+//! from the combine of the clusters' states in workgroup memory: with `M` the maximum of the cluster maxima,
+//! `out[c] = sum_i o_i[c] * exp(m_i - M) / sum_i l_i * exp(m_i - M)`.
 //!
-//! [`AttentionSchedule::SplitKv`] is the same row split over the keys across `splits` workgroups (decode,
-//! where `batch * heads` workgroups leave a many-CU device idle). Stage one is this body with each
+//! [`AttentionSchedule::SplitKv`] is the same row group split over the keys across `splits` workgroups (decode,
+//! where `batch * kv heads` workgroups leave a many-CU device idle). Stage one is this body with each
 //! workgroup visiting only its own contiguous share of the keys and publishing the combine's inputs
 //! instead of dividing: `o[dv]` unnormalized, then `m` and `l`, at `[(row * splits + split) * (dv + 2)]` of
-//! the scratch it writes. The grid is fixed by `splits`, but the shares are not: a workgroup first works out
-//! the range `[lo, hi)` its row visits (live length, causal position, window), then `active`, the number of
-//! shares that range is cut into (at most `splits`, each at least `min_units` steps, balanced to whole lane
-//! steps), and walks share `split` of it. A workgroup with `split >= active` returns and writes nothing;
-//! split 0 publishes `active` in the row's word after the partials. Nothing in the partition depends on the
-//! capacity `lk`, so a cache of any capacity partitions a live prefix identically. Stage two
-//! ([`AttentionCombineSpec`]) is the `lanes`-wide combine over the `active` splits the row published, so the
-//! scratch needs no initialization.
+//! the scratch it writes, for each of the group's rows. The grid is fixed by `splits`, but the shares are not: a
+//! workgroup first works out the range `[lo, hi)` its row visits (live length, causal position, window), then
+//! `active`, the number of shares that range is cut into (at most `splits`, each at least `min_units` steps,
+//! balanced to whole cluster steps), and walks share `split` of it. A workgroup with `split >= active` returns
+//! and writes nothing; split 0 publishes `active` in each row's word after the partials. Nothing in the
+//! partition depends on the capacity `lk`, so a cache of any capacity partitions a live prefix identically.
+//! Stage two ([`AttentionCombineSpec`]) is the `lanes`-wide combine over the `active` splits the row
+//! published, so the scratch needs no initialization.
 //!
 //! [`AttentionSchedule::Tiled`] is the multi-row schedule (FlashAttention-2): one workgroup per block of query
 //! rows of a key/value head, the head's query heads packed into the block, each block of keys and values staged
@@ -50,8 +48,8 @@
 //! which is the NaN the oracle's softmax gives.
 
 use poot_kernel_ir::{
-    BinOp, Body, Constant, IndexAxis, LocalDecl, MathOp, Operand, Place, Rvalue, Ty,
-    WorkgroupLocalDecl,
+    BinOp, Body, COLLECTIVE_LANES, Constant, IndexAxis, LocalDecl, MathOp, Operand, Place, Rvalue,
+    Ty, WorkgroupLocalDecl,
 };
 
 use crate::KernelGenError;
@@ -63,6 +61,7 @@ use crate::precision::require_exact;
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
 use poot_target::RoundingConversions;
 
+mod clustered;
 mod tiled;
 
 /// What the planner asks the attention generator for: the region's shape, its score transform, mask and
@@ -116,7 +115,7 @@ pub enum KvLane {
 
 impl KvLane {
     /// Bytes one element takes in its buffer.
-    pub(crate) const fn bytes(self) -> usize {
+    pub const fn bytes(self) -> usize {
         match self {
             KvLane::F32 => 4,
             KvLane::F16 | KvLane::Bf16 => 2,
@@ -168,22 +167,11 @@ impl AttentionSpec {
         self.batch * self.hq * self.lq
     }
 
-    /// Query heads one workgroup serves: the `n_rep` heads of a key/value head under a grouped
-    /// [`MaskKind::Blocks`] (they read the same selected keys, so the workgroup loads each key and value
-    /// once for all of them), one otherwise.
-    /// The tiled schedule always serves the `n_rep` heads of a key/value head, packed into its tile rows.
+    /// Query heads one workgroup serves: the `n_rep` heads of a key/value head, which read the same keys and
+    /// values, so a workgroup loads each key and value once for all of them. Every schedule groups the heads
+    /// (the clustered walk holds them in registers, the tiled schedule packs them into its tile rows).
     pub fn heads_per_workgroup(&self) -> usize {
-        match (self.schedule, self.mask) {
-            (AttentionSchedule::Tiled { .. }, _) => self.n_rep,
-            (_, MaskKind::Blocks { grouped: true, .. }) => self.n_rep,
-            (
-                _,
-                MaskKind::Blocks { grouped: false, .. }
-                | MaskKind::Broadcast
-                | MaskKind::PerHead
-                | MaskKind::Causal { .. },
-            ) => 1,
-        }
+        self.n_rep
     }
 
     /// The query rows one workgroup serves: its heads' rows of one query position, or under the tiled schedule
@@ -197,8 +185,9 @@ impl AttentionSpec {
         }
     }
 
-    /// Row groups: the rows one workgroup serves, `rows() / heads_per_workgroup()`, or under the tiled schedule
-    /// one per `(batch, key/value head, block of br query positions)`.
+    /// Row groups: the rows one workgroup serves, `rows() / heads_per_workgroup()` (one per `(batch, key/value
+    /// head, query row)`), or under the tiled schedule one per `(batch, key/value head, block of br query
+    /// positions)`.
     pub fn row_groups(&self) -> usize {
         match self.schedule {
             AttentionSchedule::Tiled { br, .. } => {
@@ -220,28 +209,9 @@ impl AttentionSpec {
         }
     }
 
-    /// The steps a row walks: its keys one at a time, or under [`MaskKind::Blocks`] runs of [`block_step`]
-    /// consecutive keys of one block.
-    pub fn walk_units(&self) -> usize {
-        match self.mask {
-            MaskKind::Blocks { ratio, k, grouped } => {
-                (k + 1) * (ratio / block_step(ratio, grouped))
-            }
-            MaskKind::Broadcast | MaskKind::PerHead | MaskKind::Causal { .. } => self.lk,
-        }
-    }
-
-    /// The key positions one walk step covers: one, or under [`MaskKind::Blocks`] a run of [`block_step`] keys.
-    /// A planner states a floor in keys; the split schedule's `min_units` is that floor in steps.
-    pub fn keys_per_unit(&self) -> usize {
-        match self.mask {
-            MaskKind::Blocks { ratio, grouped, .. } => block_step(ratio, grouped),
-            MaskKind::Broadcast | MaskKind::PerHead | MaskKind::Causal { .. } => 1,
-        }
-    }
-
-    /// The key positions a row considers: all `lk`, or under [`MaskKind::Blocks`] the `(K + 1) * ratio` of its
-    /// selected blocks and its unfinished block. The split schedule's grid is bounded by these.
+    /// The key positions a row considers (the steps its walk takes, a key each): all `lk`, or under
+    /// [`MaskKind::Blocks`] the `(K + 1) * ratio` of its selected blocks and its unfinished block. The split
+    /// schedule's grid is bounded by these, and its `min_units` floor counts them.
     pub fn candidates(&self) -> usize {
         match self.mask {
             MaskKind::Blocks { ratio, k, .. } => (k + 1) * ratio,
@@ -283,9 +253,9 @@ impl AttentionSpec {
     }
 }
 
-/// A contiguous run of a streaming or tiled attention's row groups ([`AttentionSpec::row_groups`]: its rows, under
-/// a grouped block selection the key/value heads' rows, under the tiled schedule its blocks of rows), launched as one dispatch of its own: `count` row groups
-/// of `spec` starting at `first`. A prefill whose whole grid would run past the device's watchdog is several
+/// A contiguous run of a streaming or tiled attention's row groups ([`AttentionSpec::row_groups`]: its
+/// key/value heads' rows, under the tiled schedule its blocks of rows), launched as one dispatch of its own:
+/// `count` row groups of `spec` starting at `first`. A prefill whose whole grid would run past the device's watchdog is several
 /// of these over disjoint rows of one output, all this one body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttentionRows {
@@ -365,18 +335,15 @@ pub enum MaskKind {
     /// No mask operand: the parameters that follow the value are the `I32 [B, Lq, K]` ids of the blocks each
     /// query selected (ascending, `-1` after the last) and the `I32 [B, Lq]` query positions. A row visits
     /// only the keys of its selected blocks of `ratio` positions and its own unfinished block, `(K + 1) *
-    /// ratio` candidates in all, instead of the `lk` positions; the scores need no mask. Dense keys and the
-    /// static bound only; the split schedule divides the candidates.
+    /// ratio` candidates in all, instead of the `lk` positions; the scores need no mask. The `n_rep` query
+    /// heads of a key/value head select the same blocks (the ids are per query, not per head), so the
+    /// workgroup loads each candidate once for all of them. Dense keys and the static bound only; the split
+    /// schedule divides the candidates.
     Blocks {
         /// Positions per block.
         ratio: usize,
         /// Selected blocks per query: the width of `ids`.
         k: usize,
-        /// Whether a workgroup serves the `n_rep` query heads of a key/value head together. They select the
-        /// same blocks (the ids are per query, not per head), so the workgroup loads each key and value row
-        /// once for all of them instead of once per head: a row group of `n_rep` head lanes times the
-        /// schedule's slices, `lanes` a multiple of `n_rep`. Off, a workgroup is one head, as for a dense row.
-        grouped: bool,
     },
 }
 
@@ -421,27 +388,48 @@ pub enum AttentionSink {
     PerHead,
 }
 
+/// How the lanes of a clustered key walk ([`AttentionSchedule::Streaming`], [`AttentionSchedule::SplitKv`]) divide
+/// the head dimension: a mechanism the planner chooses from the device, not a policy of the generator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KeyWalk {
+    /// Lanes of one cluster, `G`: a power of two, at most [`poot_kernel_ir::COLLECTIVE_LANES`]. A cluster walks
+    /// one key per step, and its dot product is the butterfly over these lanes.
+    pub cluster: usize,
+    /// Channels each lane of a cluster owns, of the key and of the value: lane `j` reads and accumulates the
+    /// contiguous channels `[j * run, (j + 1) * run)`, so a cluster reads one contiguous key row. The planner
+    /// takes the widest run the device loads at once (16 bytes). It divides `dk` and `dv` (and a split key's
+    /// parts), and `ceil(dk / run)` and `ceil(dv / run)` are at most `cluster`: a lane past a head's last run
+    /// holds zeros.
+    pub run: usize,
+}
+
 /// How the region's keys are walked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionSchedule {
-    /// One workgroup of `lanes` threads per `(batch, head, query row)`, lanes striding over the keys.
+    /// The clustered key walk: one workgroup of `lanes` threads per `(batch, key/value head, query row)`,
+    /// serving the head's `n_rep` query heads, the lanes in clusters of `walk.cluster` each walking a key per
+    /// step (see [`clustered`](self::clustered) for the body).
     Streaming {
-        /// Threads per workgroup, each striding over the keys.
+        /// Threads per workgroup: a multiple of 32, so a cluster never straddles an aligned 32-lane group.
         lanes: usize,
+        /// How the lanes divide the head dimension.
+        walk: KeyWalk,
     },
-    /// Stage one of split-KV attention: one workgroup of `lanes` threads per `(batch, head, query row,
-    /// split)`, each walking its own contiguous share of the row's visited keys and writing a partial state
-    /// to a scratch instead of the output. The shares are cut from the keys the row visits at run time (its
-    /// live length, causal position and window), never from the cache capacity; `splits` only bounds the
-    /// grid. [`AttentionCombineSpec`] reduces the partials.
+    /// Stage one of split-KV attention: one workgroup of `lanes` threads per `(batch, key/value head, query
+    /// row, split)`, each walking its own contiguous share of the row's visited keys and writing the partial
+    /// state of each of the group's heads to a scratch instead of the output. The shares are cut from the keys
+    /// the row visits at run time (its live length, causal position and window), never from the cache capacity;
+    /// `splits` only bounds the grid. [`AttentionCombineSpec`] reduces the partials.
     SplitKv {
-        /// Threads per workgroup, each striding over its share's keys.
+        /// Threads per workgroup: a multiple of 32.
         lanes: usize,
-        /// Workgroups of one row: the most shares its visited keys are divided into.
+        /// Workgroups of one row group: the most shares its visited keys are divided into.
         splits: usize,
-        /// The fewest walk steps ([`AttentionSpec::walk_units`]) a share takes: a row with fewer visited
+        /// The fewest walk steps (keys, [`AttentionSpec::candidates`]) a share takes: a row with fewer visited
         /// steps than `splits * min_units` uses fewer shares, and the workgroups past them return.
         min_units: usize,
+        /// How the lanes divide the head dimension.
+        walk: KeyWalk,
     },
     /// FlashAttention-2 form (Dao, arXiv 2307.08691): one workgroup of `lanes` threads per `(batch, key/value
     /// head, block of br query positions)`, the `n_rep` query heads of the key/value head packed into the
@@ -462,12 +450,20 @@ pub enum AttentionSchedule {
 }
 
 impl AttentionSchedule {
-    /// The workgroup width: the lanes that stride the keys.
+    /// The workgroup width.
     pub fn lanes(self) -> usize {
         match self {
-            Self::Streaming { lanes } | Self::SplitKv { lanes, .. } | Self::Tiled { lanes, .. } => {
-                lanes
-            }
+            Self::Streaming { lanes, .. }
+            | Self::SplitKv { lanes, .. }
+            | Self::Tiled { lanes, .. } => lanes,
+        }
+    }
+
+    /// How the lanes divide the head dimension, for the schedules that walk keys in clusters.
+    pub fn walk(self) -> Option<KeyWalk> {
+        match self {
+            Self::Streaming { walk, .. } | Self::SplitKv { walk, .. } => Some(walk),
+            Self::Tiled { .. } => None,
         }
     }
 }
@@ -543,11 +539,6 @@ impl LaneTile {
 
 const GENERATOR: &str = "attention_body";
 
-/// The `(m, l, o)` partial arrays, in the workgroup-local declaration order the body uses.
-const O_ARRAY: u8 = 0;
-const M_ARRAY: u8 = 1;
-const L_ARRAY: u8 = 2;
-
 fn bad(what: &str, value: usize, min: usize) -> KernelGenError {
     KernelGenError::BelowMinimum {
         generator: GENERATOR,
@@ -588,7 +579,7 @@ fn validate_rows(
 
 /// Check the spec's own preconditions: every extent nonzero, `hq` a multiple of `n_rep`, and a split key's
 /// shared part a proper, nonempty slice of the key width.
-fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
+fn validate(spec: &AttentionSpec) -> Result<(), KernelGenError> {
     let lanes = spec.schedule.lanes();
     let (splits, min_units) = match spec.schedule {
         AttentionSchedule::Streaming { .. } | AttentionSchedule::Tiled { .. } => (1, 1),
@@ -632,7 +623,10 @@ fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
     if spec.mask == (MaskKind::Causal { window: Some(0) }) {
         return Err(bad("window", 0, 1));
     }
-    if let MaskKind::Blocks { ratio, k, grouped } = spec.mask {
+    if let Some(walk) = spec.schedule.walk() {
+        validate_walk(spec, walk)?;
+    }
+    if let MaskKind::Blocks { ratio, k } = spec.mask {
         for (what, value) in [("ratio", ratio), ("k", k)] {
             if value == 0 {
                 return Err(bad(what, value, 1));
@@ -642,15 +636,6 @@ fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
             return Err(KernelGenError::Unsupported {
                 request: "attention",
                 reason: "a block-selected attention reads a dense key under the static bound",
-            });
-        }
-        // The lanes of a grouped selection are `n_rep` head lanes per key-walking slice.
-        if grouped && !lanes.is_multiple_of(spec.n_rep) {
-            return Err(KernelGenError::NotDivisible {
-                generator: GENERATOR,
-                dim: "lanes".to_string(),
-                value: lanes,
-                divisor: spec.n_rep,
             });
         }
     }
@@ -667,18 +652,66 @@ fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
             });
         }
     }
-    Ok(lanes)
+    Ok(())
 }
 
-/// `acc + a * b`.
-fn add_product(
-    c: &mut Cfg,
-    a: poot_kernel_ir::Local,
-    b: poot_kernel_ir::Local,
-    acc: poot_kernel_ir::Local,
-) -> poot_kernel_ir::Local {
-    let term = fbin(c, BinOp::Mul, a, b);
-    fbin(c, BinOp::Add, acc, term)
+/// Check a clustered walk's geometry: a cluster is a power of two of at most [`COLLECTIVE_LANES`] lanes (its
+/// butterfly masks stay inside one aligned run of that many lanes), the workgroup is whole such runs, and the
+/// runs tile the heads: the run width divides both head widths, and a split key's two parts (so no lane's run
+/// straddles them), and the lanes of a cluster cover each head.
+fn validate_walk(spec: &AttentionSpec, walk: KeyWalk) -> Result<(), KernelGenError> {
+    let KeyWalk { cluster, run } = walk;
+    let lanes = spec.schedule.lanes();
+    if cluster == 0 || !cluster.is_power_of_two() {
+        return Err(KernelGenError::Unsupported {
+            request: "attention",
+            reason: "a key-walk cluster is a power of two of lanes",
+        });
+    }
+    if cluster > COLLECTIVE_LANES as usize {
+        return Err(KernelGenError::ExceedsBound {
+            generator: GENERATOR,
+            what: "cluster".to_string(),
+            value: cluster,
+            bound: COLLECTIVE_LANES as usize,
+        });
+    }
+    if run == 0 {
+        return Err(bad("run", run, 1));
+    }
+    if !lanes.is_multiple_of(COLLECTIVE_LANES as usize) {
+        return Err(KernelGenError::NotDivisible {
+            generator: GENERATOR,
+            dim: "lanes".to_string(),
+            value: lanes,
+            divisor: COLLECTIVE_LANES as usize,
+        });
+    }
+    let mut widths = vec![("dk", spec.dk), ("dv", spec.dv)];
+    if let KeyLayout::Split { shared_dim } = spec.key {
+        widths.push(("dk - shared_dim", spec.dk - shared_dim));
+    }
+    for (dim, width) in widths {
+        if !width.is_multiple_of(run) {
+            return Err(KernelGenError::NotDivisible {
+                generator: GENERATOR,
+                dim: dim.to_string(),
+                value: width,
+                divisor: run,
+            });
+        }
+    }
+    for (what, width) in [("dk", spec.dk), ("dv", spec.dv)] {
+        if width / run > cluster {
+            return Err(KernelGenError::ExceedsBound {
+                generator: GENERATOR,
+                what: format!("{what} / run"),
+                value: width / run,
+                bound: cluster,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn f32_array(len: usize) -> WorkgroupLocalDecl {
@@ -777,239 +810,10 @@ pub(crate) fn count_to(
     );
 }
 
-/// The workgroup-memory banks (4-byte words wide) of the devices: consecutive words fall in consecutive banks.
-const BANKS: usize = 32;
-
-/// Where the channels of one lane's partial `o` sit in workgroup memory: lane `i` at `[i * dv, i * dv + dv)`,
-/// channel `c` at `i * dv + (c ^ (i % 32))` when `dv` is a multiple of the bank count. Without the XOR every
-/// lane of a warp touching one channel would hit the same bank (the stride `dv` is a multiple of 32), a
-/// 32-way conflict on each access; with it the lanes of a warp land in 32 different banks, and so do the
-/// lanes of a combine that each read their own channel of one lane's partial. The XOR permutes the channels of
-/// a 32-aligned group among themselves, so the footprint is exactly `lanes * dv` words (a padded stride cost
-/// an occupancy step at 128K on RTX PRO 6000). A `dv` that is not a multiple of 32 keeps the plain layout.
-struct OSlots {
-    start: poot_kernel_ir::Local,
-    bank: Option<poot_kernel_ir::Local>,
-}
-
-impl OSlots {
-    fn new(c: &mut Cfg, dv: usize, lane: poot_kernel_ir::Local) -> Self {
-        Self {
-            start: uc(c, BinOp::Mul, lane, dv),
-            bank: dv
-                .is_multiple_of(BANKS)
-                .then(|| uc(c, BinOp::Rem, lane, BANKS)),
-        }
-    }
-
-    /// The slot of `channel`.
-    fn at(&self, c: &mut Cfg, channel: poot_kernel_ir::Local) -> poot_kernel_ir::Local {
-        let within = match self.bank {
-            Some(bank) => ubin(c, BinOp::BitXor, channel, bank),
-            None => channel,
-        };
-        ubin(c, BinOp::Add, self.start, within)
-    }
-}
-
-/// Where a row's keys and values start in their operands.
-#[derive(Clone, Copy)]
-enum KeyRows {
-    /// Dense operands: the element offsets of the row's `(batch, head)` plane in `k`, `k_shared` and `v`.
-    Dense {
-        k: poot_kernel_ir::Local,
-        shared: poot_kernel_ir::Local,
-        v: poot_kernel_ir::Local,
-    },
-    /// Pools read through the slot map parameter `read`, whose words for this batch row start at `read_base`.
-    Paged {
-        read: poot_kernel_ir::Local,
-        read_base: poot_kernel_ir::Local,
-    },
-}
-
-/// A key a block-selected row considers: its position, and whether the row reads it.
-struct Candidate {
-    key: poot_kernel_ir::Local,
-    valid: poot_kernel_ir::Local,
-    /// The query's position (a negative one read as 0).
-    position: poot_kernel_ir::Local,
-}
-
-/// The keys of one block a block-selected row reads in one step. A grouped workgroup (a prefill chunk, whose
-/// rows fill the device) takes the largest of 4, 2 and 1 that divides the block, so a step never crosses a
-/// block and its keys are consecutive rows. A per-head row (decode, which splits its few rows across the
-/// device) takes one key, so its lanes stay as many as the candidates.
-fn block_step(ratio: usize, grouped: bool) -> usize {
-    if !grouped {
-        return 1;
-    }
-    [4, 2, 1]
-        .into_iter()
-        .find(|step| ratio.is_multiple_of(*step))
-        .expect("1 divides every block size")
-}
-
-/// Candidate `candidate` of query `query` (an index into `ids` and `pos`) among the `(k + 1) * ratio` a
-/// block-selected row considers: the positions of its `k` selected blocks in order, then the positions of its
-/// own unfinished block. `(k, ratio, lk)` are the selection width, the block size and the stored key
-/// extent. A position is read when it is real (`id >= 0`, or inside the unfinished block), at or before
-/// the query, and inside the stored keys: whatever `ids` holds, no address leaves the key buffers.
-fn block_candidate(
-    c: &mut Cfg,
-    ids: poot_kernel_ir::Local,
-    pos: poot_kernel_ir::Local,
-    query: poot_kernel_ir::Local,
-    (k, ratio, lk): (usize, usize, usize),
-    candidate: poot_kernel_ir::Local,
-) -> Candidate {
-    let i32c = |value: i32| Operand::Const(Constant::I32(value));
-    let widen = |c: &mut Cfg, word: poot_kernel_ir::Local| {
-        c.let_(
-            Ty::Usize,
-            Rvalue::Cast {
-                to: Ty::Usize,
-                operand: local_op(word),
-            },
-        )
-    };
-    let raw = c.let_(Ty::I32, Rvalue::Use(copy(elem(pos, query))));
-    let at = c.bin(Ty::I32, BinOp::Max, local_op(raw), i32c(0));
-    let position = widen(c, at);
-    let next = uc(c, BinOp::Add, position, 1);
-    let complete = uc(c, BinOp::Div, next, ratio);
-    let tail_start = uc(c, BinOp::Mul, complete, ratio);
-
-    let slot = uc(c, BinOp::Div, candidate, ratio);
-    let offset = uc(c, BinOp::Rem, candidate, ratio);
-    let in_ids = c.bin(Ty::Bool, BinOp::Lt, local_op(slot), cu(k));
-    // Read a real slot of `ids` even for a tail candidate: the value is discarded there.
-    let last_slot = c.usize_const(k - 1);
-    let slot_read =
-        crate::block_top_k::select(c, Ty::Usize, in_ids, local_op(slot), local_op(last_slot));
-    let id_at = {
-        let row = uc(c, BinOp::Mul, query, k);
-        ubin(c, BinOp::Add, row, slot_read)
-    };
-    let id = c.let_(Ty::I32, Rvalue::Use(copy(elem(ids, id_at))));
-    let id_real = c.bin(Ty::Bool, BinOp::Ge, local_op(id), i32c(0));
-    let id_clamped = c.bin(Ty::I32, BinOp::Max, local_op(id), i32c(0));
-    let block = widen(c, id_clamped);
-    let block_start = uc(c, BinOp::Mul, block, ratio);
-    let selected_key = ubin(c, BinOp::Add, block_start, offset);
-    let tail_key = ubin(c, BinOp::Add, tail_start, offset);
-    let key = crate::block_top_k::select(
-        c,
-        Ty::Usize,
-        in_ids,
-        local_op(selected_key),
-        local_op(tail_key),
-    );
-    let tail_real = c.bin(Ty::Bool, BinOp::Le, local_op(tail_key), local_op(position));
-    let real =
-        crate::block_top_k::select(c, Ty::Bool, in_ids, local_op(id_real), local_op(tail_real));
-    let causal = c.bin(Ty::Bool, BinOp::Le, local_op(key), local_op(position));
-    let stored = c.bin(Ty::Bool, BinOp::Lt, local_op(key), cu(lk));
-    let readable = c.both(real, causal);
-    let valid = c.both(readable, stored);
-    Candidate {
-        key,
-        valid,
-        position,
-    }
-}
-
-/// The grid of a split-KV schedule ([`AttentionSchedule::SplitKv`]) the partition is cut against.
-#[derive(Clone, Copy)]
-struct SplitGrid {
-    splits: usize,
-    min_units: usize,
-}
-
-/// A split workgroup's place in its row's partition: whether it has a share of the visited range to walk, and
-/// how many shares the row has.
-#[derive(Clone, Copy)]
-struct Share {
-    live: poot_kernel_ir::Local,
-    active: poot_kernel_ir::Local,
-}
-
-/// Cut the `n = hi - lo` steps of a split-KV row's visited range into `active` shares, returning `(active,
-/// per)`: `per` steps in each share but the last, which may be shorter.
-///
-/// `active = max(1, min(splits, ceil(n / min_units)))` shares, each `ceil(ceil(n / slices) / active)` whole
-/// lane steps of `slices` keys, so the shares are balanced to the granularity the cost has. The last share may
-/// be shorter, so `active` is then recounted as `ceil(n / per)`: no share is empty. The result depends on
-/// `(n, splits, min_units, slices)` alone, never on the cache capacity.
-fn split_shares(
-    c: &mut Cfg,
-    lo: poot_kernel_ir::Local,
-    hi: poot_kernel_ir::Local,
-    grid: SplitGrid,
-    slices: usize,
-) -> (poot_kernel_ir::Local, poot_kernel_ir::Local) {
-    // A window can start past a short live length: the range is then empty, not negative.
-    let n = c.var(Ty::Usize, Rvalue::Use(cu(0)));
-    let ahead = c.bin(Ty::Bool, BinOp::Gt, local_op(hi), local_op(lo));
-    c.if_then(ahead, |c| {
-        let steps = ubin(c, BinOp::Sub, hi, lo);
-        c.assign(Place::local(n), Rvalue::Use(local_op(steps)));
-    });
-    let wanted = {
-        let padded = uc(c, BinOp::Add, n, grid.min_units - 1);
-        uc(c, BinOp::Div, padded, grid.min_units)
-    };
-    let shares = c.var(Ty::Usize, Rvalue::Use(local_op(wanted)));
-    raise_to(c, shares, 1);
-    cap_at(c, shares, grid.splits);
-    let lane_steps = {
-        let padded = uc(c, BinOp::Add, n, slices - 1);
-        uc(c, BinOp::Div, padded, slices)
-    };
-    let steps_per = {
-        let padded = ubin(c, BinOp::Add, lane_steps, shares);
-        let padded = uc(c, BinOp::Sub, padded, 1);
-        let steps = ubin(c, BinOp::Div, padded, shares);
-        c.var(Ty::Usize, Rvalue::Use(local_op(steps)))
-    };
-    // An empty range has no lane steps; its one share still steps by a lane step.
-    raise_to(c, steps_per, 1);
-    let per = uc(c, BinOp::Mul, steps_per, slices);
-    let active = {
-        let padded = ubin(c, BinOp::Add, n, per);
-        let padded = uc(c, BinOp::Sub, padded, 1);
-        let shares = ubin(c, BinOp::Div, padded, per);
-        c.var(Ty::Usize, Rvalue::Use(local_op(shares)))
-    };
-    raise_to(c, active, 1);
-    (active, per)
-}
-
-/// `var <- max(var, floor)`.
-fn raise_to(c: &mut Cfg, var: poot_kernel_ir::Local, floor: usize) {
-    let below = c.bin(Ty::Bool, BinOp::Lt, local_op(var), cu(floor));
-    c.if_then(below, |c| {
-        c.assign(Place::local(var), Rvalue::Use(cu(floor)));
-    });
-}
-
-/// `var <- min(var, ceiling)`.
-fn cap_at(c: &mut Cfg, var: poot_kernel_ir::Local, ceiling: usize) {
-    let above = c.bin(Ty::Bool, BinOp::Gt, local_op(var), cu(ceiling));
-    c.if_then(above, |c| {
-        c.assign(Place::local(var), Rvalue::Use(cu(ceiling)));
-    });
-}
-
 /// Build the attention kernel `spec` describes over its workgroups `rows` (all of them, except for a streaming
-/// schedule split into runs of rows). The launch is `rows.len()` workgroups of `lanes` threads laid over a
-/// 2-D grid `x_groups` workgroups across: `GroupY * x_groups + GroupX` is the workgroup's place in the run,
-/// `gi = rows.start +` that place is the flat `(batch, head, row)` index, and a workgroup past the run (the
-/// fold's remainder) returns.
-/// Parameters: `q`, `k`, `v`, `mask`, then `k_shared` for a split key or `read` for a paged one, then `len` for a
-/// live bound, then `sinks` for a sink, then `out`
-/// (the partial-state scratch under [`AttentionSchedule::SplitKv`]: the `x_groups`/`gi` index then runs over
-/// `(row, split)`, `gi = row * splits + split`).
+/// or tiled schedule split into runs of row groups). The launch is `rows.len()` workgroups laid over a 2-D grid
+/// `x_groups` workgroups across: `GroupY * x_groups + GroupX` is the workgroup's place in the run. The streaming
+/// and split-KV schedules take their body from [`clustered`], the tiled schedule from [`tiled`].
 pub(crate) fn attention_body(
     name: &str,
     spec: &AttentionSpec,
@@ -1017,632 +821,14 @@ pub(crate) fn attention_body(
     x_groups: usize,
     conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
-    let lanes = validate(spec)?;
+    validate(spec)?;
     validate_rows(spec, &rows)?;
     if let AttentionSchedule::Tiled { .. } = spec.schedule {
         return tiled::tiled_body(name, spec, rows, x_groups, conversions);
     }
-    // The streaming and split-KV bodies multiply the operands as stored: only a matrix unit narrows them.
+    // The clustered body multiplies the operands as stored: only a matrix unit narrows them.
     require_exact(spec.precision, GENERATOR)?;
-    let AttentionSpec {
-        batch: _,
-        hq,
-        n_rep,
-        lq,
-        lk,
-        dk,
-        dv,
-        key,
-        score,
-        mask: mask_kind,
-        bound,
-        sink,
-        schedule,
-        kv,
-        precision: _,
-    } = *spec;
-    let grid = match schedule {
-        AttentionSchedule::Streaming { .. } => None,
-        AttentionSchedule::SplitKv {
-            splits, min_units, ..
-        } => Some(SplitGrid { splits, min_units }),
-        AttentionSchedule::Tiled { .. } => unreachable!("the tiled schedule has its own body"),
-    };
-    let splits = grid.map(|grid| grid.splits);
-    let hkv = hq / n_rep;
-    let mask_heads = match mask_kind {
-        MaskKind::Broadcast | MaskKind::Causal { .. } | MaskKind::Blocks { .. } => 1,
-        MaskKind::PerHead => hq,
-    };
-
-    let mut params = vec![
-        ld(Ty::Unit, false),
-        ld(slice_f32(false), false), // 1 q
-        kv.param(),                  // 2 k
-        kv.param(),                  // 3 v
-    ];
-    // 4 the additive mask, the query positions, or the selected block ids and the query positions (5)
-    match mask_kind {
-        MaskKind::Broadcast | MaskKind::PerHead => params.push(ld(slice_f32(false), false)),
-        MaskKind::Causal { .. } => params.push(ld(slice_dtype(Ty::I32, false), false)),
-        MaskKind::Blocks { .. } => {
-            params.push(ld(slice_dtype(Ty::I32, false), false));
-            params.push(ld(slice_dtype(Ty::I32, false), false));
-        }
-    }
-    let mut next_param = |decl| {
-        params.push(decl);
-        poot_kernel_ir::Local {
-            index: params.len() as u32 - 1,
-        }
-    };
-    let k_shared = match key {
-        KeyLayout::Single | KeyLayout::Paged => None,
-        KeyLayout::Split { .. } => Some(next_param(kv.param())),
-    };
-    let read = match key {
-        KeyLayout::Single | KeyLayout::Split { .. } => None,
-        KeyLayout::Paged => Some(next_param(ld(slice_dtype(Ty::I32, false), false))),
-    };
-    let len = match bound {
-        KeyBound::Static => None,
-        KeyBound::Live => Some(next_param(ld(slice_dtype(Ty::I32, false), false))),
-    };
-    let sinks = match sink {
-        AttentionSink::Absent => None,
-        AttentionSink::PerHead => Some(next_param(ld(slice_f32(false), false))),
-    };
-    let out = next_param(ld(slice_f32(true), true));
-    let (q, k, v, mask) = (
-        poot_kernel_ir::Local { index: 1 },
-        poot_kernel_ir::Local { index: 2 },
-        poot_kernel_ir::Local { index: 3 },
-        poot_kernel_ir::Local { index: 4 },
-    );
-    let mut c = Cfg::new(params);
-    let shared_dim = match key {
-        KeyLayout::Single | KeyLayout::Paged => 0,
-        KeyLayout::Split { shared_dim } => shared_dim,
-    };
-    let head_dim = dk - shared_dim;
-
-    let group_x = c.index(IndexAxis::GroupX);
-    let group_y = c.index(IndexAxis::GroupY);
-    let lane = c.index(IndexAxis::LocalX);
-    // Under a block selection the lanes are `group` head lanes (the query heads of one key/value head) for each
-    // of `slices` key-walking slices, lane `l` being head lane `l % group` of slice `l / group`; elsewhere every
-    // lane is its own slice of the one head.
-    let group = spec.heads_per_workgroup();
-    let slices = lanes / group;
-    let lane_split = (group > 1).then(|| {
-        (
-            uc(&mut c, BinOp::Rem, lane, group),
-            uc(&mut c, BinOp::Div, lane, group),
-        )
-    });
-    let slice = lane_split.map_or(lane, |(_, slice)| slice);
-    let row_offset = uc(&mut c, BinOp::Mul, group_y, x_groups);
-    let place = ubin(&mut c, BinOp::Add, row_offset, group_x);
-    let in_range = c.bin(Ty::Bool, BinOp::Lt, local_op(place), cu(rows.len()));
-
-    c.if_then(in_range, |c| {
-        let gi = uc(c, BinOp::Add, place, rows.start);
-        // unit = the row group the workgroup serves: the row (b * hq + h) * lq + i itself, or under a block
-        // selection `(b * hkv + kv_head) * lq + i`, whose `n_rep` head lanes are the rows of the key/value
-        // head's query heads. Under the split schedule gi = unit * splits + split.
-        let (unit, split) = match splits {
-            None => (gi, None),
-            Some(splits) => (
-                uc(c, BinOp::Div, gi, splits),
-                Some(uc(c, BinOp::Rem, gi, splits)),
-            ),
-        };
-        let i = uc(c, BinOp::Rem, unit, lq);
-        let by_head = uc(c, BinOp::Div, unit, lq);
-        let (b, h, row) = if let Some((head_lane, _)) = lane_split {
-            let kv = uc(c, BinOp::Rem, by_head, hq / n_rep);
-            let b = uc(c, BinOp::Div, by_head, hq / n_rep);
-            let first_head = uc(c, BinOp::Mul, kv, n_rep);
-            let h = ubin(c, BinOp::Add, first_head, head_lane);
-            let by_batch = uc(c, BinOp::Mul, b, hq);
-            let bh = ubin(c, BinOp::Add, by_batch, h);
-            let by_head = uc(c, BinOp::Mul, bh, lq);
-            (b, h, ubin(c, BinOp::Add, by_head, i))
-        } else {
-            let h = uc(c, BinOp::Rem, by_head, hq);
-            (uc(c, BinOp::Div, by_head, hq), h, unit)
-        };
-        let kv_head = uc(c, BinOp::Div, h, n_rep);
-        let qbase = uc(c, BinOp::Mul, row, dk);
-        let kv_row = {
-            let by_batch = uc(c, BinOp::Mul, b, hkv);
-            ubin(c, BinOp::Add, by_batch, kv_head)
-        };
-        // A dense key's rows start at its `(batch, head)` plane; a paged key has no plane: its slot map starts
-        // at the batch row and the pool row of key `t` comes from the slot it names.
-        let rows = match read {
-            None => KeyRows::Dense {
-                k: uc(c, BinOp::Mul, kv_row, lk * head_dim),
-                shared: uc(c, BinOp::Mul, b, lk * shared_dim),
-                v: uc(c, BinOp::Mul, kv_row, lk * dv),
-            },
-            Some(read) => KeyRows::Paged {
-                read,
-                read_base: uc(c, BinOp::Mul, b, lk),
-            },
-        };
-        // Where this row's additive mask starts; the other masks have no tensor to index.
-        let maskbase = match mask_kind {
-            MaskKind::Broadcast | MaskKind::PerHead => {
-                let plane = match mask_kind {
-                    MaskKind::PerHead => {
-                        let by_batch = uc(c, BinOp::Mul, b, mask_heads);
-                        ubin(c, BinOp::Add, by_batch, h)
-                    }
-                    _ => uc(c, BinOp::Mul, b, mask_heads),
-                };
-                let plane_start = uc(c, BinOp::Mul, plane, lq * lk);
-                let row_start = uc(c, BinOp::Mul, i, lk);
-                Some(ubin(c, BinOp::Add, plane_start, row_start))
-            }
-            MaskKind::Causal { .. } | MaskKind::Blocks { .. } => None,
-        };
-        // The query's index among the `B * Lq` of the selection operands.
-        let qrow = {
-            let by_batch = uc(c, BinOp::Mul, b, lq);
-            ubin(c, BinOp::Add, by_batch, i)
-        };
-
-        // The keys this row visits: all `lk`, or the first `len[b]` clamped into `0..=lk`. A negative length
-        // is a zero bound (the signed compare comes before the unsigned cast), a length past `lk` is `lk`.
-        let key_end = match len {
-            None => cu(spec.walk_units()),
-            Some(len) => {
-                let raw = c.let_(Ty::I32, Rvalue::Use(copy(elem(len, b))));
-                let end = c.var(Ty::Usize, Rvalue::Use(cu(0)));
-                let non_negative = c.bin(
-                    Ty::Bool,
-                    BinOp::Ge,
-                    local_op(raw),
-                    Operand::Const(Constant::I32(0)),
-                );
-                c.if_then(non_negative, |c| {
-                    let widened = c.let_(
-                        Ty::Usize,
-                        Rvalue::Cast {
-                            to: Ty::Usize,
-                            operand: local_op(raw),
-                        },
-                    );
-                    c.assign(Place::local(end), Rvalue::Use(local_op(widened)));
-                });
-                let past_end = c.bin(Ty::Bool, BinOp::Gt, local_op(end), cu(lk));
-                c.if_then(past_end, |c| {
-                    c.assign(Place::local(end), Rvalue::Use(cu(lk)));
-                });
-                local_op(end)
-            }
-        };
-        // The range `[lo, hi)` of steps the row visits. A causal row walks only the keys it can see: it ends
-        // at its position and starts at its window's first key.
-        let (lo, hi) = match mask_kind {
-            MaskKind::Causal { window } => {
-                let raw = c.let_(Ty::I32, Rvalue::Use(copy(elem(mask, qrow))));
-                // The position as an index; a negative one (a padded query) is 0.
-                let position = c.var(Ty::Usize, Rvalue::Use(cu(0)));
-                let non_negative = c.bin(
-                    Ty::Bool,
-                    BinOp::Ge,
-                    local_op(raw),
-                    Operand::Const(Constant::I32(0)),
-                );
-                c.if_then(non_negative, |c| {
-                    let widened = c.let_(
-                        Ty::Usize,
-                        Rvalue::Cast {
-                            to: Ty::Usize,
-                            operand: local_op(raw),
-                        },
-                    );
-                    c.assign(Place::local(position), Rvalue::Use(local_op(widened)));
-                });
-                let visible_end = uc(c, BinOp::Add, position, 1);
-                let hi = c.var(Ty::Usize, Rvalue::Use(key_end));
-                let shorter = c.bin(Ty::Bool, BinOp::Lt, local_op(visible_end), local_op(hi));
-                c.if_then(shorter, |c| {
-                    c.assign(Place::local(hi), Rvalue::Use(local_op(visible_end)));
-                });
-                // The window's first key is `visible_end - window`, or 0.
-                let lo = c.var(Ty::Usize, Rvalue::Use(cu(0)));
-                if let Some(window) = window {
-                    let past_window = c.bin(Ty::Bool, BinOp::Gt, local_op(visible_end), cu(window));
-                    c.if_then(past_window, |c| {
-                        let window_start = uc(c, BinOp::Sub, visible_end, window);
-                        c.assign(Place::local(lo), Rvalue::Use(local_op(window_start)));
-                    });
-                }
-                (lo, hi)
-            }
-            MaskKind::Broadcast | MaskKind::PerHead | MaskKind::Blocks { .. } => (
-                c.var(Ty::Usize, Rvalue::Use(cu(0))),
-                c.var(Ty::Usize, Rvalue::Use(key_end)),
-            ),
-        };
-        // One workgroup's keys: the whole range from this lane's slice on, or its split's share of it. A
-        // split with no share (`active` shares cover the range) returns without a key, a partial or a barrier.
-        let (first_key, key_end, share) = match (grid, split) {
-            (Some(grid), Some(split)) => {
-                let (active, per) = split_shares(c, lo, hi, grid, slices);
-                let live = c.bin(Ty::Bool, BinOp::Lt, local_op(split), local_op(active));
-                let skipped = ubin(c, BinOp::Mul, split, per);
-                let begin = ubin(c, BinOp::Add, lo, skipped);
-                let share_end = ubin(c, BinOp::Add, begin, per);
-                let end = c.var(Ty::Usize, Rvalue::Use(local_op(hi)));
-                let shorter = c.bin(Ty::Bool, BinOp::Lt, local_op(share_end), local_op(end));
-                c.if_then(shorter, |c| {
-                    c.assign(Place::local(end), Rvalue::Use(local_op(share_end)));
-                });
-                let first = ubin(c, BinOp::Add, begin, slice);
-                (local_op(first), local_op(end), Some(Share { live, active }))
-            }
-            _ => {
-                let first = c.var(Ty::Usize, Rvalue::Use(local_op(slice)));
-                if let MaskKind::Causal { window: Some(_) } = mask_kind {
-                    // Move `first` up to the lane's first key at or after the window's start:
-                    // first + ceil((lo - first) / slices) * slices.
-                    let behind = c.bin(Ty::Bool, BinOp::Lt, local_op(first), local_op(lo));
-                    c.if_then(behind, |c| {
-                        let gap = ubin(c, BinOp::Sub, lo, first);
-                        let padded = uc(c, BinOp::Add, gap, slices - 1);
-                        let steps = uc(c, BinOp::Div, padded, slices);
-                        let jump = uc(c, BinOp::Mul, steps, slices);
-                        let moved = ubin(c, BinOp::Add, first, jump);
-                        c.assign(Place::local(first), Rvalue::Use(local_op(moved)));
-                    });
-                }
-                (local_op(first), local_op(hi), None)
-            }
-        };
-        let walk = |c: &mut Cfg| {
-            let own = OSlots::new(c, dv, lane);
-            // This lane's partial state: the running maximum and denominator in registers, `o` in LDS.
-            let m = c.var(Ty::F32, Rvalue::Use(f32c(f32::NEG_INFINITY)));
-            let l = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
-            // The sink is the row's initial state, held by exactly one lane of one workgroup of the row.
-            if let Some(sinks) = sinks {
-                let holds_sink = {
-                    let first_lane = c.bin(Ty::Bool, BinOp::Eq, local_op(slice), cu(0));
-                    match split {
-                        None => first_lane,
-                        Some(split) => {
-                            let first_split = c.bin(Ty::Bool, BinOp::Eq, local_op(split), cu(0));
-                            c.both(first_lane, first_split)
-                        }
-                    }
-                };
-                c.if_then(holds_sink, |c| {
-                    let logit = c.let_(Ty::F32, Rvalue::Use(copy(elem(sinks, h))));
-                    c.assign(Place::local(m), Rvalue::Use(local_op(logit)));
-                    c.assign(Place::local(l), Rvalue::Use(f32c(1.0)));
-                });
-            }
-            count(c, cu(0), dv, 1, |c, channel| {
-                let slot = own.at(c, channel);
-                lds_write(c, O_ARRAY, slot, f32c(0.0));
-            });
-            let visit = |c: &mut Cfg, t: poot_kernel_ir::Local| {
-                // dot = q[row] . k[t], over the key's own part and then its shared part
-                let dot = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
-                let accumulate = |c: &mut Cfg,
-                                  part: poot_kernel_ir::Local,
-                                  row: poot_kernel_ir::Local,
-                                  width: usize,
-                                  q_offset: usize| {
-                    count(c, cu(0), width, 1, |c, channel| {
-                        let qi = {
-                            let at = ubin(c, BinOp::Add, qbase, channel);
-                            uc(c, BinOp::Add, at, q_offset)
-                        };
-                        let ki = ubin(c, BinOp::Add, row, channel);
-                        let qv = c.let_(Ty::F32, Rvalue::Use(copy(elem(q, qi))));
-                        let kv_elem = c.emit(|e| kv.read(e, part, ki));
-                        let sum = add_product(c, qv, kv_elem, dot);
-                        c.assign(Place::local(dot), Rvalue::Use(local_op(sum)));
-                    });
-                };
-                // The row of the key and of the value in their operands: dense rows follow the plane, a paged
-                // key's operands share the pool row `slot * hkv + kv_head`.
-                let (key_row, value_row) = match rows {
-                    KeyRows::Dense { k, v, .. } => {
-                        let key = uc(c, BinOp::Mul, t, head_dim);
-                        let value = uc(c, BinOp::Mul, t, dv);
-                        (ubin(c, BinOp::Add, k, key), ubin(c, BinOp::Add, v, value))
-                    }
-                    KeyRows::Paged { read, read_base } => {
-                        let at = ubin(c, BinOp::Add, read_base, t);
-                        let word = c.let_(Ty::I32, Rvalue::Use(copy(elem(read, at))));
-                        let slot = c.let_(
-                            Ty::Usize,
-                            Rvalue::Cast {
-                                to: Ty::Usize,
-                                operand: local_op(word),
-                            },
-                        );
-                        let by_slot = uc(c, BinOp::Mul, slot, hkv);
-                        let pool_row = ubin(c, BinOp::Add, by_slot, kv_head);
-                        (
-                            uc(c, BinOp::Mul, pool_row, head_dim),
-                            uc(c, BinOp::Mul, pool_row, dv),
-                        )
-                    }
-                };
-                accumulate(c, k, key_row, head_dim, 0);
-                if let (Some(k_shared), KeyRows::Dense { shared, .. }) = (k_shared, rows) {
-                    let shared_row = {
-                        let by_key = uc(c, BinOp::Mul, t, shared_dim);
-                        ubin(c, BinOp::Add, shared, by_key)
-                    };
-                    accumulate(c, k_shared, shared_row, shared_dim, head_dim);
-                }
-
-                let s = score_of(c, score, dot);
-                // A block-selected or causal row visits only keys it can see, so there is no mask to add.
-                let s = match (mask_kind, maskbase) {
-                    (MaskKind::Broadcast | MaskKind::PerHead, Some(maskbase)) => {
-                        let mi = ubin(c, BinOp::Add, maskbase, t);
-                        let mask_value = c.let_(Ty::F32, Rvalue::Use(copy(elem(mask, mi))));
-                        fbin(c, BinOp::Add, s, mask_value)
-                    }
-                    _ => s,
-                };
-
-                // The online-softmax step. `m_new == -inf` means every position seen so far, this one
-                // included, is masked: the lane has contributed nothing, and `exp(-inf - -inf)` is NaN.
-                let m_new = fbin(c, BinOp::Max, m, s);
-                let corr = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
-                let weight = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
-                let seen = c.bin(
-                    Ty::Bool,
-                    BinOp::Ne,
-                    local_op(m_new),
-                    f32c(f32::NEG_INFINITY),
-                );
-                c.if_then(seen, |c| {
-                    let behind = fbin(c, BinOp::Sub, m, m_new);
-                    let rescale = exp(c, behind);
-                    c.assign(Place::local(corr), Rvalue::Use(local_op(rescale)));
-                    let below = fbin(c, BinOp::Sub, s, m_new);
-                    let own = exp(c, below);
-                    c.assign(Place::local(weight), Rvalue::Use(local_op(own)));
-                });
-                let decayed = fbin(c, BinOp::Mul, l, corr);
-                let l_next = fbin(c, BinOp::Add, decayed, weight);
-                c.assign(Place::local(l), Rvalue::Use(local_op(l_next)));
-
-                count(c, cu(0), dv, 1, |c, channel| {
-                    let slot = own.at(c, channel);
-                    let vi = ubin(c, BinOp::Add, value_row, channel);
-                    let held = lds_read(c, O_ARRAY, slot);
-                    let rescaled = fbin(c, BinOp::Mul, held, corr);
-                    let vv = c.emit(|e| kv.read(e, v, vi));
-                    let sum = add_product(c, weight, vv, rescaled);
-                    lds_write(c, O_ARRAY, slot, local_op(sum));
-                });
-                c.assign(Place::local(m), Rvalue::Use(local_op(m_new)));
-            };
-            // One step of a block-selected row: `step` consecutive keys of a block, the first of which `head` has
-            // checked. Their scores share each load of `q`, one running maximum and rescale cover all of them, and
-            // `o` is read and written once per step instead of once per key. A key past the query or the stored
-            // keys weighs zero and is read at position 0, so no address leaves the buffers.
-            let visit_block = |c: &mut Cfg, head: &Candidate, step: usize| {
-                let KeyRows::Dense {
-                    k: k_plane,
-                    v: v_plane,
-                    ..
-                } = rows
-                else {
-                    unreachable!("a block-selected key is dense")
-                };
-                let mut keys = Vec::with_capacity(step);
-                for j in 0..step {
-                    let (key, valid) = if j == 0 {
-                        (head.key, head.valid)
-                    } else {
-                        let key = uc(c, BinOp::Add, head.key, j);
-                        let causal =
-                            c.bin(Ty::Bool, BinOp::Le, local_op(key), local_op(head.position));
-                        let stored = c.bin(Ty::Bool, BinOp::Lt, local_op(key), cu(lk));
-                        let readable = c.both(causal, stored);
-                        (key, c.both(head.valid, readable))
-                    };
-                    let safe =
-                        crate::block_top_k::select(c, Ty::Usize, valid, local_op(key), cu(0));
-                    let k_row = {
-                        let at = uc(c, BinOp::Mul, safe, head_dim);
-                        ubin(c, BinOp::Add, k_plane, at)
-                    };
-                    let v_row = {
-                        let at = uc(c, BinOp::Mul, safe, dv);
-                        ubin(c, BinOp::Add, v_plane, at)
-                    };
-                    keys.push((k_row, v_row, valid));
-                }
-                let dots: Vec<_> = (0..step)
-                    .map(|_| c.var(Ty::F32, Rvalue::Use(f32c(0.0))))
-                    .collect();
-                count(c, cu(0), head_dim, 1, |c, channel| {
-                    let qi = ubin(c, BinOp::Add, qbase, channel);
-                    let qv = c.let_(Ty::F32, Rvalue::Use(copy(elem(q, qi))));
-                    for (&(k_row, _, _), &dot) in keys.iter().zip(&dots) {
-                        let ki = ubin(c, BinOp::Add, k_row, channel);
-                        let kv_elem = c.emit(|e| kv.read(e, k, ki));
-                        let sum = add_product(c, qv, kv_elem, dot);
-                        c.assign(Place::local(dot), Rvalue::Use(local_op(sum)));
-                    }
-                });
-                let scores: Vec<_> = keys
-                    .iter()
-                    .zip(&dots)
-                    .map(|(&(_, _, valid), &dot)| {
-                        let s = score_of(c, score, dot);
-                        crate::block_top_k::select(
-                            c,
-                            Ty::F32,
-                            valid,
-                            local_op(s),
-                            f32c(f32::NEG_INFINITY),
-                        )
-                    })
-                    .collect();
-                // The first key is read, so the step's maximum is finite.
-                let step_max = scores[1..]
-                    .iter()
-                    .fold(scores[0], |max, &s| fbin(c, BinOp::Max, max, s));
-                let m_new = fbin(c, BinOp::Max, m, step_max);
-                let behind = fbin(c, BinOp::Sub, m, m_new);
-                let corr = exp(c, behind);
-                let weights: Vec<_> = scores
-                    .iter()
-                    .map(|&s| {
-                        let below = fbin(c, BinOp::Sub, s, m_new);
-                        exp(c, below)
-                    })
-                    .collect();
-                let decayed = fbin(c, BinOp::Mul, l, corr);
-                let l_next = weights
-                    .iter()
-                    .fold(decayed, |sum, &w| fbin(c, BinOp::Add, sum, w));
-                c.assign(Place::local(l), Rvalue::Use(local_op(l_next)));
-                count(c, cu(0), dv, 1, |c, channel| {
-                    let slot = own.at(c, channel);
-                    let held = lds_read(c, O_ARRAY, slot);
-                    let rescaled = fbin(c, BinOp::Mul, held, corr);
-                    let sum = keys.iter().zip(&weights).fold(
-                        rescaled,
-                        |sum, (&(_, v_row, _), &weight)| {
-                            let vi = ubin(c, BinOp::Add, v_row, channel);
-                            let vv = c.emit(|e| kv.read(e, v, vi));
-                            add_product(c, weight, vv, sum)
-                        },
-                    );
-                    lds_write(c, O_ARRAY, slot, local_op(sum));
-                });
-                c.assign(Place::local(m), Rvalue::Use(local_op(m_new)));
-            };
-            match mask_kind {
-                MaskKind::Blocks { ratio, k, grouped } => {
-                    let ids = poot_kernel_ir::Local { index: 4 };
-                    let pos = poot_kernel_ir::Local { index: 5 };
-                    let step = block_step(ratio, grouped);
-                    count_to(c, first_key, key_end, slices, |c, unit| {
-                        let candidate = uc(c, BinOp::Mul, unit, step);
-                        let head = block_candidate(c, ids, pos, qrow, (k, ratio, lk), candidate);
-                        c.if_then(head.valid, |c| visit_block(c, &head, step));
-                    });
-                }
-                MaskKind::Broadcast | MaskKind::PerHead | MaskKind::Causal { .. } => {
-                    count_to(c, first_key, key_end, slices, visit);
-                }
-            }
-
-            // Publish this lane's `(m, l)`, then the one barrier: every lane reaches it exactly once.
-            lds_write(c, M_ARRAY, lane, local_op(m));
-            lds_write(c, L_ARRAY, lane, local_op(l));
-            c.barrier();
-
-            // The combine of this lane's head over its `slices` lanes. `big_m` is the maximum of their maxima; a
-            // lane whose maximum is `-inf` saw no unmasked key and weighs zero, so no `-inf - -inf` is formed.
-            let same_head = |c: &mut Cfg, other_slice: poot_kernel_ir::Local| match lane_split {
-                None => other_slice,
-                Some((head_lane, _)) => {
-                    let start = uc(c, BinOp::Mul, other_slice, group);
-                    ubin(c, BinOp::Add, start, head_lane)
-                }
-            };
-            let big_m = c.var(Ty::F32, Rvalue::Use(f32c(f32::NEG_INFINITY)));
-            count(c, cu(0), slices, 1, |c, other_slice| {
-                let other = same_head(c, other_slice);
-                let m_other = lds_read(c, M_ARRAY, other);
-                let next = fbin(c, BinOp::Max, big_m, m_other);
-                c.assign(Place::local(big_m), Rvalue::Use(local_op(next)));
-            });
-            let denominator = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
-            count(c, cu(0), slices, 1, |c, other_slice| {
-                let other = same_head(c, other_slice);
-                let w = lane_weight(c, other, big_m);
-                let l_other = lds_read(c, L_ARRAY, other);
-                let part = fbin(c, BinOp::Mul, l_other, w);
-                let next = fbin(c, BinOp::Add, denominator, part);
-                c.assign(Place::local(denominator), Rvalue::Use(local_op(next)));
-            });
-            // The streaming schedule writes the normalized row; a split writes its unnormalized state.
-            let out_base = match split {
-                None => uc(c, BinOp::Mul, row, dv),
-                Some(split) => {
-                    let partial = {
-                        let first = uc(
-                            c,
-                            BinOp::Mul,
-                            row,
-                            splits.expect("a split schedule has splits"),
-                        );
-                        ubin(c, BinOp::Add, first, split)
-                    };
-                    uc(c, BinOp::Mul, partial, dv + 2)
-                }
-            };
-            count(c, local_op(slice), dv, slices, |c, channel| {
-                let acc = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
-                count(c, cu(0), slices, 1, |c, other_slice| {
-                    let other = same_head(c, other_slice);
-                    let w = lane_weight(c, other, big_m);
-                    let slot = OSlots::new(c, dv, other).at(c, channel);
-                    let partial = lds_read(c, O_ARRAY, slot);
-                    let part = fbin(c, BinOp::Mul, partial, w);
-                    let next = fbin(c, BinOp::Add, acc, part);
-                    c.assign(Place::local(acc), Rvalue::Use(local_op(next)));
-                });
-                let result = match split {
-                    None => fbin(c, BinOp::Div, acc, denominator),
-                    Some(_) => acc,
-                };
-                let oi = ubin(c, BinOp::Add, out_base, channel);
-                c.assign(elem(out, oi), Rvalue::Use(local_op(result)));
-            });
-            if let (Some(split), Some(grid), Some(Share { active, .. })) = (split, grid, share) {
-                let first_lane = c.bin(Ty::Bool, BinOp::Eq, local_op(slice), cu(0));
-                c.if_then(first_lane, |c| {
-                    let m_at = uc(c, BinOp::Add, out_base, dv);
-                    c.assign(elem(out, m_at), Rvalue::Use(local_op(big_m)));
-                    let l_at = uc(c, BinOp::Add, out_base, dv + 1);
-                    c.assign(elem(out, l_at), Rvalue::Use(local_op(denominator)));
-                });
-                // Split 0 publishes how many splits the combine reads, in the row's word after the partials.
-                let first_split = c.bin(Ty::Bool, BinOp::Eq, local_op(split), cu(0));
-                let publishes = c.both(first_lane, first_split);
-                c.if_then(publishes, |c| {
-                    let count_at = uc(c, BinOp::Add, row, spec.rows() * grid.splits * (dv + 2));
-                    let published = c.let_(
-                        Ty::F32,
-                        Rvalue::Cast {
-                            to: Ty::F32,
-                            operand: local_op(active),
-                        },
-                    );
-                    c.assign(elem(out, count_at), Rvalue::Use(local_op(published)));
-                });
-            }
-        };
-        match share {
-            None => walk(c),
-            Some(Share { live, .. }) => c.if_then(live, walk),
-        }
-    });
-
-    let mut body = c.finish(name);
-    body.workgroup_size = [lanes as u32, 1, 1];
-    body.workgroup_locals = vec![f32_array(lanes * dv), f32_array(lanes), f32_array(lanes)];
-    Ok(body)
+    clustered::clustered_body(name, spec, rows, x_groups)
 }
 
 /// The combine stage of split-KV attention (see [`AttentionCombineSpec`]). The launch is one workgroup of
@@ -1768,28 +954,6 @@ fn split_weight(
     weight
 }
 
-/// `exp(m_other - big_m)`, or zero for a lane that saw no unmasked key.
-fn lane_weight(
-    c: &mut Cfg,
-    other: poot_kernel_ir::Local,
-    big_m: poot_kernel_ir::Local,
-) -> poot_kernel_ir::Local {
-    let weight = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
-    let m_other = lds_read(c, M_ARRAY, other);
-    let seen = c.bin(
-        Ty::Bool,
-        BinOp::Ne,
-        local_op(m_other),
-        f32c(f32::NEG_INFINITY),
-    );
-    c.if_then(seen, |c| {
-        let behind = fbin(c, BinOp::Sub, m_other, big_m);
-        let w = exp(c, behind);
-        c.assign(Place::local(weight), Rvalue::Use(local_op(w)));
-    });
-    weight
-}
-
 /// The score a raw dot product becomes: `dot * scale`, then the softcap `cap * tanh(. / cap)` when asked.
 /// The softcap multiplies by the reciprocal `1 / cap`, as `ops::softcap` does, so the bits agree.
 fn score_of(
@@ -1860,7 +1024,10 @@ mod tests {
             mask: MaskKind::Broadcast,
             bound: KeyBound::Static,
             sink: AttentionSink::Absent,
-            schedule: AttentionSchedule::Streaming { lanes: 4 },
+            schedule: AttentionSchedule::Streaming {
+                lanes: 32,
+                walk: KeyWalk { cluster: 4, run: 1 },
+            },
         }
     }
 
@@ -1869,7 +1036,14 @@ mod tests {
     /// A value width that differs from the key width is not one of them.
     #[test]
     fn a_spec_outside_the_generators_contract_is_a_typed_error() {
-        let wider_values = AttentionSpec { dv: 8, ..spec() };
+        let wider_values = AttentionSpec {
+            dv: 8,
+            schedule: AttentionSchedule::Streaming {
+                lanes: 32,
+                walk: KeyWalk { cluster: 8, run: 1 },
+            },
+            ..spec()
+        };
         assert!(
             attention_body(
                 "a",
@@ -1897,7 +1071,10 @@ mod tests {
         ));
         let no_lanes = AttentionSpec {
             kv: crate::KvLane::F32,
-            schedule: AttentionSchedule::Streaming { lanes: 0 },
+            schedule: AttentionSchedule::Streaming {
+                lanes: 0,
+                walk: KeyWalk { cluster: 4, run: 1 },
+            },
             ..spec()
         };
         assert!(matches!(
@@ -1950,6 +1127,87 @@ mod tests {
                 bound: 3,
                 ..
             })
+        ));
+    }
+
+    /// A clustered walk's geometry is checked: a cluster that is not a power of two or is wider than the 32 lanes a
+    /// butterfly stays inside, a workgroup that is not whole runs of 32 lanes, a run that does not divide the head
+    /// (or a split key's parts), and a cluster too narrow to cover a head are each a typed error.
+    #[test]
+    fn a_walk_outside_the_clusters_contract_is_a_typed_error() {
+        let walked = |lanes, cluster, run| AttentionSpec {
+            schedule: AttentionSchedule::Streaming {
+                lanes,
+                walk: KeyWalk { cluster, run },
+            },
+            ..spec()
+        };
+        let generate = |spec: &AttentionSpec| {
+            attention_body(
+                "a",
+                spec,
+                0..spec.workgroups(),
+                1,
+                RoundingConversions::NONE,
+            )
+        };
+        assert!(generate(&walked(32, 4, 1)).is_ok());
+        assert!(matches!(
+            generate(&walked(32, 3, 1)),
+            Err(KernelGenError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            generate(&walked(128, 64, 1)),
+            Err(KernelGenError::ExceedsBound {
+                what,
+                value: 64,
+                bound: 32,
+                ..
+            }) if what == "cluster"
+        ));
+        assert!(matches!(
+            generate(&walked(48, 4, 1)),
+            Err(KernelGenError::NotDivisible {
+                dim,
+                value: 48,
+                divisor: 32,
+                ..
+            }) if dim == "lanes"
+        ));
+        assert!(matches!(
+            generate(&walked(32, 4, 3)),
+            Err(KernelGenError::NotDivisible {
+                value: 4,
+                divisor: 3,
+                ..
+            })
+        ));
+        assert!(matches!(
+            generate(&walked(32, 2, 1)),
+            Err(KernelGenError::ExceedsBound {
+                value: 4,
+                bound: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            generate(&walked(32, 4, 0)),
+            Err(KernelGenError::BelowMinimum { .. })
+        ));
+        // A split key's run may not straddle its parts: head 6 + shared 2, run 4 divides the key (8) but not the first part.
+        let split = AttentionSpec {
+            dk: 8,
+            key: KeyLayout::Split { shared_dim: 2 },
+            ..walked(32, 4, 4)
+        };
+        assert!(matches!(
+            generate(&split),
+            Err(KernelGenError::NotDivisible {
+                dim,
+                value: 6,
+                divisor: 4,
+                ..
+            }) if dim == "dk - shared_dim"
         ));
     }
 }

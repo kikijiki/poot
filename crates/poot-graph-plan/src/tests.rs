@@ -3665,14 +3665,9 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
         "design bound, not swept: the widest row workgroup the portable FusedRow reduction runs; a wider row loops",
     ),
     prov(
-        "MAX_LANES",
-        64,
-        "design bound, not swept: more lanes only lengthen the serial per-lane combine",
-    ),
-    prov(
-        "SELECTED_SLICES",
-        2,
-        "measured (POOT-1338, RTX PRO 6000, one prefill chunk of 1024 queries, 2052 candidates, ms): 1 slice 54.4, 2 slices 46.8; 4 and more do not fit 48 KiB of workgroup memory at 12 head lanes of 256",
+        "VECTOR_LOAD_BYTES",
+        16,
+        "structural: the widest load one lane issues (a 128-bit vector load), which sets the channels a lane of a clustered key walk owns",
     ),
     prov(
         "MAX_ATTENTION_SPLITS",
@@ -3709,7 +3704,7 @@ const fn prov(name: &'static str, value: u64, source: &'static str) -> Provenanc
 /// `LAUNCH_PROVENANCE` with the same value and a stated source, and every entry names a `const` that exists.
 /// The test reads the file's own source, so a literal added without an entry cannot pass. It covers every
 /// numeric `const` item; the inline arithmetic that remains is structural, not a launch choice: `4 * (..)` and
-/// `2 * lanes` in `attention_lanes` (bytes per f32 and the online-softmax `m`, `l` scalars). The register-tiled lane figures live in `poot-target`'s own
+/// `(dv + 2)` in `attention_key_walk` (bytes per f32 and the online-softmax `m`, `l` scalars). The register-tiled lane figures live in `poot-target`'s own
 /// table. Mutation: add
 /// `const UNSOURCED_LAUNCH: usize = 7;` to `predicates.rs`; this goes red naming it.
 #[test]
@@ -4022,6 +4017,77 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
         copy_plan if is_plain(&copy_plan) => {}
         other => panic!("expected the unchanged materialize copy plan, got {other:?}"),
     }
+}
+
+/// The plan of the eqn that produces `id`, planned against `g`'s own `compute_views` on wgpu.
+fn view_plan_of(g: &Graph, id: ValueId) -> Plan {
+    let views = compute_views(g, Backend::SpirvVulkan);
+    let eqn = g.eqns().iter().find(|e| e.out == id).unwrap();
+    plan_eqn_views(
+        g,
+        eqn,
+        Backend::SpirvVulkan,
+        &views,
+        &default_caps_for(Backend::SpirvVulkan),
+        &crate::test_support::roomy_body_limits(),
+    )
+    .unwrap()
+}
+
+/// POOT-1564 SC-o: a slice of a wider row, reshaped to split its last axis (the GDN q/k/v split feeding its
+/// heads reshape), feeding a `Binary`, is two views and no dispatch: the reshape composes onto the slice's
+/// strides and offset. Mutation: make `is_movement_view_candidate` drop `Reshape` again: the slice plans a
+/// materializing dispatch and the first assertion goes red.
+#[test]
+fn slice_then_reshape_into_binary_plans_two_views() {
+    let bld = Builder::for_tests();
+    let row = bld
+        .constant("row", TensorType::f32(vec![1, 1, 12]))
+        .unwrap();
+    let slice = bld.slice(row, 2, 4, 10).unwrap();
+    let heads = bld.reshape(slice, vec![1, 1, 3, 2]).unwrap();
+    let y = bld.binary(GBinOp::Add, heads, heads).unwrap();
+    let g = bld.finish(y).unwrap();
+
+    assert!(
+        matches!(view_plan_of(&g, slice.id()), Plan::View { .. }),
+        "the slice under a composable reshape is a view"
+    );
+    match view_plan_of(&g, heads.id()) {
+        Plan::View {
+            src,
+            strides,
+            offset,
+        } => {
+            assert_eq!(src, slice.id());
+            // The split keeps the row-major strides inside the axis, and the slice's start offset.
+            assert_eq!((strides[2], strides[3], offset), (2, 1, 4));
+        }
+        other => panic!("expected the reshape to be a view, got {other:?}"),
+    }
+}
+
+/// POOT-1564 SC-p: a reshape that merges axes the slice left a stride gap between (the query/gate split of a
+/// `[hq, 2d]` row merged to `hq * d`) is not a view, so the slice under it keeps its materializing copy and
+/// the reshape stays a plain alias of it. Mutation: drop the chain check in `reshape_strides`: the merged
+/// view reads the gap and this row goes red.
+#[test]
+fn reshape_merging_across_a_stride_gap_keeps_the_slice_copy() {
+    let bld = Builder::for_tests();
+    let row = bld.constant("row", TensorType::f32(vec![1, 3, 4])).unwrap();
+    let query = bld.slice(row, 2, 0, 2).unwrap();
+    let merged = bld.reshape(query, vec![1, 6]).unwrap();
+    let y = bld.binary(GBinOp::Add, merged, merged).unwrap();
+    let g = bld.finish(y).unwrap();
+
+    assert!(
+        is_plain(&view_plan_of(&g, query.id())),
+        "the slice under an uncomposable reshape materializes"
+    );
+    assert!(
+        matches!(view_plan_of(&g, merged.id()), Plan::Alias(src) if src == query.id()),
+        "the reshape of the copy is an alias"
+    );
 }
 
 #[test]
@@ -4477,6 +4543,113 @@ fn view_chain_matches_oracle_fuzz() {
     }
 }
 
+/// POOT-1564 SC-n: a chain of Transpose, Slice, Broadcast and Reshape links feeding only a `Binary(Add)`
+/// promotes a reshape exactly when the view under it has a stride for the new shape, and every promoted link
+/// (reshapes included) reads what `poot_eval::apply_movement` folds over the chain, bit for bit. Where a
+/// reshape cannot compose, it and the movement under it materialize: no promoted link ever sits under a
+/// reshape that is not a view. The row counts both outcomes (a reshape over a view, and one that
+/// materialized with its input), so neither is vacuous. Mutation: drop the
+/// chain check in `reshape_strides`: a merge across a stride gap is promoted with wrong strides and the oracle
+/// comparison goes red.
+#[test]
+fn view_chain_with_reshape_matches_oracle_fuzz() {
+    let mut seed = 0x2468_ace0_1357_9bdfu64;
+    let (mut composed, mut materialized) = (0usize, 0usize);
+    for _ in 0..400 {
+        let bld = Builder::for_tests();
+        let mut shape: Vec<usize> = (0..3)
+            .map(|_| 2 + (xorshift(&mut seed) % 3) as usize)
+            .collect();
+        let a = bld.constant("a", TensorType::f32(shape.clone())).unwrap();
+        let mut cur = a;
+        let mut links: Vec<(ValueId, bool)> = Vec::new();
+        for _ in 0..(2 + xorshift(&mut seed) as usize % 3) {
+            let is_reshape = match xorshift(&mut seed) % 4 {
+                0 => {
+                    let rank = shape.len();
+                    let mut perm: Vec<usize> = (0..rank).collect();
+                    for i in (1..rank).rev() {
+                        perm.swap(i, xorshift(&mut seed) as usize % (i + 1));
+                    }
+                    cur = bld.transpose(cur, perm.clone()).unwrap();
+                    shape = perm.iter().map(|&p| shape[p]).collect();
+                    false
+                }
+                1 => {
+                    let axis = xorshift(&mut seed) as usize % shape.len();
+                    let start = xorshift(&mut seed) as usize % shape[axis];
+                    let end = start + 1 + xorshift(&mut seed) as usize % (shape[axis] - start);
+                    cur = bld.slice(cur, axis, start, end).unwrap();
+                    shape[axis] = end - start;
+                    false
+                }
+                2 => {
+                    let mut wider = vec![2 + (xorshift(&mut seed) % 3) as usize];
+                    wider.extend_from_slice(&shape);
+                    cur = bld.broadcast(cur, wider.clone()).unwrap();
+                    shape = wider;
+                    false
+                }
+                _ => {
+                    // Merge two neighbours, split an axis, or add a unit axis.
+                    let axis = xorshift(&mut seed) as usize % shape.len();
+                    match xorshift(&mut seed) % 3 {
+                        0 if shape.len() > 1 => {
+                            let axis = axis.min(shape.len() - 2);
+                            let merged = shape[axis] * shape[axis + 1];
+                            shape.splice(axis..axis + 2, [merged]);
+                        }
+                        1 if shape[axis].is_multiple_of(2) => {
+                            let half = shape[axis] / 2;
+                            shape.splice(axis..=axis, [2, half]);
+                        }
+                        _ => shape.insert(axis, 1),
+                    }
+                    cur = bld.reshape(cur, shape.clone()).unwrap();
+                    true
+                }
+            };
+            links.push((cur.id(), is_reshape));
+        }
+        let y = bld.binary(GBinOp::Add, cur, cur).unwrap();
+        let g = bld.finish(y).unwrap();
+        let views = compute_views(&g, Backend::SpirvVulkan);
+
+        let a_shape = g.aval(a.id()).shape.clone();
+        let a_data: Vec<f32> = (0..numel(&a_shape)).map(|i| i as f32 + 0.5).collect();
+        let mut oracle = poot_tensor::HostTensor::f32(a_shape, a_data.clone());
+        let mut intact = true;
+        for &(id, is_reshape) in &links {
+            let eqn = g.eqns().iter().find(|e| e.out == id).unwrap();
+            oracle = poot_eval::apply_movement(&eqn.op, &[oracle]).unwrap();
+            if let Some(layout) = views.get(&id).filter(|_| intact) {
+                assert_view_matches_oracle(
+                    &g.aval(id).shape,
+                    &layout.strides,
+                    layout.offset,
+                    &a_data,
+                    oracle.as_f32().unwrap(),
+                );
+            }
+            if is_reshape {
+                let input = value_ids(eqn)[0];
+                match (views.contains_key(&id), views.contains_key(&input)) {
+                    (true, true) => composed += 1,
+                    (false, true) => {
+                        panic!("a view under a reshape that is not a view: chain {links:?}")
+                    }
+                    (false, false) if links.iter().any(|&(l, _)| l == input) => materialized += 1,
+                    _ => {}
+                }
+            }
+            // Past the first link that is no view, layouts are relative to that link's own buffer.
+            intact &= views.contains_key(&id);
+        }
+    }
+    assert!(composed > 20, "composed reshapes: {composed}");
+    assert!(materialized > 20, "materialized reshapes: {materialized}");
+}
+
 /// The scatter's cost follows the source rows, not the pool (POOT-1148). At gemma4-dense's local-layer pool
 /// (`pool_slots = 1025, Hkv = 16, D = 256`, 4.2M elements, which the old pool-wide kernel had to chunk for the
 /// wgpu watchdog) a real prompt (`l = 49` rows) is one dispatch of `49 * Hkv * D` threads. A wide batched
@@ -4879,17 +5052,15 @@ fn every_attention_fixture_plans_the_generated_attention_family_on_every_target(
     }
 }
 
-/// The streaming schedule's lane count is the widest power of two whose partials fit the device's workgroup
-/// memory: `4 * (lanes * dv + 2 * lanes)` bytes. The same decode plans 64, 64, 32 and 16 lanes at value dim 64,
-/// 128, 256 and 512 on the Vulkan cap (65536 bytes, the adapter's own limit: wgpu no longer asks for the
-/// downlevel 16 KiB), the same as ROCm, and fewer on the PTX cap (49152 bytes). A fixture
-/// device whose workgroup memory cannot hold even one lane at `dv = 512` (2056 bytes) refuses with
-/// `AttentionLds { dv: 512, .. }`, one byte over the boundary plans a single lane, and the same graph plans
-/// on the real caps. Mutation: take the lane width from a constant 256 instead of `caps.lds_bytes`; the
-/// small-caps device plans and the refusal row goes red.
+/// The clustered attention's workgroup is the widest whole run of 32 lanes (at most 64) whose end combine fits the
+/// device's workgroup memory: `clusters * n_rep * (dv + 2)` words. The same decode plans 64 lanes at value dim 64,
+/// 128, 256 and 512 on every cap (the walk's cluster is at most 32 lanes, so a 64-lane workgroup is at most two clusters
+/// of a slab of at most 4 KiB). A fixture device whose workgroup memory cannot hold even one cluster at `dv = 512`
+/// (2056 bytes) refuses with `AttentionLds { dv: 512, .. }`, one byte over the boundary plans a single cluster of 32
+/// lanes, and the same graph plans on the real caps. Mutation: take the lane width from a constant instead of
+/// `caps.lds_bytes`; the small-caps device plans and the refusal row goes red.
 #[test]
-fn attention_lanes_follow_the_device_workgroup_memory() {
-    // (backend, dv) -> lanes, by hand from `4 * (lanes * dv + 2 * lanes) <= lds_bytes` and the 64 cap.
+fn the_attention_key_walk_fits_the_device_workgroup_memory() {
     let lanes = |backend: Backend, d: usize| {
         let fixture = AttentionFixture::decode("lanes", 1, 2, 1, 16, d);
         let (_, choice) = attention_planned(fixture, backend, &default_caps_for(backend))
@@ -4897,21 +5068,12 @@ fn attention_lanes_follow_the_device_workgroup_memory() {
         attention_spec(&choice).schedule.lanes()
     };
     let wgpu = Backend::SpirvVulkan;
-    assert_eq!(
-        [64, 128, 256, 512].map(|d| lanes(wgpu, d)),
-        [64, 64, 32, 16],
-        "65536 bytes of workgroup memory"
-    );
+    assert_eq!([64, 128, 256, 512].map(|d| lanes(wgpu, d)), [64; 4]);
     let rocm = Backend::AmdGcn(AmdArch::gfx1151());
-    assert_eq!(
-        [64, 128, 256, 512].map(|d| lanes(rocm, d)),
-        [64, 64, 32, 16],
-        "65536 bytes of workgroup memory"
-    );
+    assert_eq!([64, 128, 256, 512].map(|d| lanes(rocm, d)), [64; 4]);
     assert_eq!(
         [64, 128, 256, 512].map(|d| lanes(Backend::Nvptx, d)),
-        [64, 64, 32, 16],
-        "49152 bytes of workgroup memory"
+        [64; 4]
     );
 
     let fixture = AttentionFixture::decode("dv 512", 1, 2, 1, 16, 512);
@@ -4930,11 +5092,17 @@ fn attention_lanes_follow_the_device_workgroup_memory() {
             lds_bytes: 2055
         }
     );
-    let (_, one_lane) = attention_planned(fixture, wgpu, &with_lds(2056))
-        .expect("2056 bytes hold exactly one lane at dv 512");
+    let (_, one_cluster) = attention_planned(fixture, wgpu, &with_lds(2056))
+        .expect("2056 bytes hold exactly one cluster at dv 512");
     assert_eq!(
-        attention_spec(&one_lane).schedule,
-        kg::AttentionSchedule::Streaming { lanes: 1 }
+        attention_spec(&one_cluster).schedule,
+        kg::AttentionSchedule::Streaming {
+            lanes: 32,
+            walk: kg::KeyWalk {
+                cluster: 32,
+                run: 16
+            }
+        }
     );
     attention_planned(fixture, wgpu, &default_caps_for(wgpu))
         .expect("the same graph plans on the real caps");
@@ -4986,14 +5154,12 @@ fn selected_attention_planned(
     planned_with_choice_caps(&g, eqn, backend, caps)
 }
 
-/// POOT-1338: a prefill chunk of a block-selected attention serves the 12 query heads of a key/value head in one
-/// workgroup (the K/V rows load once for the group): the request is `grouped`, its lanes a multiple of 12 and
-/// its workgroups one per `(kv head, query)`. A decode row, whose two groups would leave the device idle, keeps a
-/// workgroup per head. A device whose workgroup memory cannot hold the 12 head lanes plans the chunk ungrouped
-/// (the schedule it ran before grouping existed), and refuses by name (`AttentionLds`) only when not even one
-/// head's lane fits. Mutation: make `groups_selected_heads` return `false`; the chunk rows go red.
+/// POOT-1338: a block-selected attention serves the 12 query heads of a key/value head in one workgroup, the chunk
+/// and the decode row alike (the K/V rows load once for the group): its workgroups are one per `(kv head, query)`.
+/// A device whose workgroup memory cannot hold one cluster's slab of the 12 heads refuses by name (`AttentionLds`).
+/// Mutation: make `AttentionSpec::heads_per_workgroup` return 1; the workgroup counts go red.
 #[test]
-fn a_selected_attention_chunk_groups_the_heads_of_a_key_value_head() {
+fn a_selected_attention_serves_the_heads_of_a_key_value_head_in_one_workgroup() {
     for backend in ATTENTION_TARGETS.map(|b| b()) {
         let caps = DeviceCaps {
             watchdog_budget: None,
@@ -5002,12 +5168,6 @@ fn a_selected_attention_chunk_groups_the_heads_of_a_key_value_head() {
         let (_, chunk) = selected_attention_planned(1024, backend, &caps)
             .unwrap_or_else(|e| panic!("{backend:?} chunk: {e:?}"));
         let spec = attention_spec(&chunk);
-        assert!(
-            matches!(spec.mask, kg::MaskKind::Blocks { grouped: true, .. }),
-            "{backend:?}: the chunk is grouped: {:?}",
-            spec.mask
-        );
-        assert_eq!(spec.schedule.lanes() % 12, 0, "{backend:?}: head lanes");
         assert_eq!(
             spec.workgroups(),
             2 * 1024,
@@ -5016,65 +5176,51 @@ fn a_selected_attention_chunk_groups_the_heads_of_a_key_value_head() {
 
         let (_, decode) = selected_attention_planned(1, backend, &caps)
             .unwrap_or_else(|e| panic!("{backend:?} decode: {e:?}"));
-        assert!(
-            matches!(
-                attention_spec(&decode).mask,
-                kg::MaskKind::Blocks { grouped: false, .. }
-            ),
-            "{backend:?}: decode keeps a workgroup per head"
+        assert_eq!(
+            attention_spec(&decode).row_groups(),
+            2,
+            "{backend:?}: one per kv head"
         );
     }
 
-    // 4 * (12 * 256 + 2 * 12) bytes: the partials of exactly the 12 head lanes.
+    // 4 * 12 * (256 + 2) bytes: the slab of one cluster of the 12 heads.
     let wgpu = Backend::SpirvVulkan;
     let with_lds = |lds_bytes: u32| DeviceCaps {
         lds_bytes,
         watchdog_budget: None,
         ..default_caps_for(wgpu)
     };
-    let (_, small) = selected_attention_planned(1024, wgpu, &with_lds(12383))
-        .expect("12383 bytes cannot hold 12 head lanes, so the chunk plans ungrouped");
-    let small = attention_spec(&small);
-    assert!(
-        matches!(small.mask, kg::MaskKind::Blocks { grouped: false, .. }),
-        "12383 bytes: ungrouped, got {:?}",
-        small.mask
-    );
-    assert_eq!(
-        small.workgroups(),
-        24 * 1024,
-        "a workgroup per head and query"
-    );
     let refusal = refusal_of(
-        selected_attention_planned(1024, wgpu, &with_lds(1023)).map(|(plan, _)| plan),
-        "not one head lane on 1023 bytes",
+        selected_attention_planned(1024, wgpu, &with_lds(12383)).map(|(plan, _)| plan),
+        "one cluster of 12 heads on 12383 bytes",
     );
     assert_eq!(
         refusal.missing,
         Capability::AttentionLds {
             dv: 256,
-            lds_bytes: 1023
+            lds_bytes: 12383
         }
     );
-    let (_, twelve) = selected_attention_planned(1024, wgpu, &with_lds(12384))
-        .expect("12384 bytes hold exactly the 12 head lanes");
-    let twelve = attention_spec(&twelve);
-    assert!(matches!(
-        twelve.mask,
-        kg::MaskKind::Blocks { grouped: true, .. }
-    ));
+    let (_, one_cluster) = selected_attention_planned(1024, wgpu, &with_lds(12384))
+        .expect("12384 bytes hold exactly one cluster of the 12 heads");
     assert_eq!(
-        twelve.schedule,
-        kg::AttentionSchedule::Streaming { lanes: 12 }
+        attention_spec(&one_cluster).schedule,
+        kg::AttentionSchedule::Streaming {
+            lanes: 32,
+            walk: kg::KeyWalk {
+                cluster: 32,
+                run: 8
+            }
+        }
     );
 }
 
-/// POOT-1338 x POOT-1313: a grouped chunk on a device with a display watchdog splits into runs of row groups
+/// POOT-1338 x POOT-1313: a selected chunk on a device with a display watchdog splits into runs of row groups
 /// (one per `(kv head, query)`, each costing its `n_rep` rows), not runs of rows: the run counts are in the
 /// workgroups the kernel launches. Mutation: drop the `heads_per_workgroup` factor from
 /// `attention_rows_per_dispatch`; the budget then admits all 2048 groups in one run and the chunk is not split.
 #[test]
-fn a_grouped_chunk_under_a_watchdog_splits_into_runs_of_row_groups() {
+fn a_selected_chunk_under_a_watchdog_splits_into_runs_of_row_groups() {
     let wgpu = Backend::SpirvVulkan;
     let caps = default_caps_for(wgpu);
     assert!(
@@ -5085,10 +5231,6 @@ fn a_grouped_chunk_under_a_watchdog_splits_into_runs_of_row_groups() {
     let KernelChoice::Generated(KernelRequest::AttentionRows(run)) = &first else {
         panic!("a chunk past the budget plans runs, got {first:?}");
     };
-    assert!(matches!(
-        run.spec.mask,
-        kg::MaskKind::Blocks { grouped: true, .. }
-    ));
     assert_eq!(run.spec.row_groups(), 2 * 1024);
     assert_eq!(run.first, 0);
     assert!(
@@ -5233,56 +5375,66 @@ fn the_tiled_schedule_is_chosen_only_within_the_devices_resources() {
 
 /// The plan records the implemented streaming schedule and the exact resources it needs, over a fixed bank:
 /// short and long prefill, low- and high-head decode, and a D = 256 softcapped prefill. Per row the request
-/// names `Streaming { lanes }`, the dispatch body states `lanes * (dv + 2) * 4` bytes of workgroup memory
-/// and a `[lanes, 1, 1]` workgroup.
+/// names `Streaming { lanes, walk }`, the dispatch body states `clusters * n_rep * (dv + 2) * 4` bytes of workgroup
+/// memory and a `[lanes, 1, 1]` workgroup.
 #[test]
 fn the_streaming_schedule_records_its_exact_resources() {
-    // (fixture, backend, lanes, workgroup-memory bytes), from the shapes by hand.
+    // (fixture, backend, lanes, walk, n_rep), from the shapes by hand: f32 keys are read 4 to a lane (16 bytes), a
+    // head too wide for one 32-lane cluster at that run takes a longer one, and a cluster is the power of two of lanes that
+    // covers the head. 64 lanes hold `64 / cluster` clusters.
     let wgpu = Backend::SpirvVulkan;
+    let walk = |cluster, run| kg::KeyWalk { cluster, run };
     let rows = [
         (
             AttentionFixture::prefill("short prefill", 8, 4, 16, 64),
             wgpu,
             64usize,
-            4 * (64 * 64 + 2 * 64),
+            walk(16, 4),
+            4usize,
         ),
         (
             // One key/value head of 32 rows gives the 40 compute units too few row groups to tile.
             AttentionFixture::prefill("one-group prefill", 8, 8, 32, 128),
             wgpu,
             64,
-            4 * (64 * 128 + 2 * 64),
+            walk(32, 4),
+            8,
         ),
         // 192 keys is under two 128-key chunks: the rows are few but a split has nothing to gain.
         (
             AttentionFixture::decode("low-head short-cache decode", 1, 2, 1, 192, 128),
             wgpu,
             64,
-            4 * (64 * 128 + 2 * 64),
+            walk(32, 4),
+            1,
         ),
         (
-            AttentionFixture::decode("high-head decode", 4, 32, 4, 2048, 128),
+            AttentionFixture::decode("high-head decode", 8, 32, 4, 2048, 128),
             Backend::AmdGcn(AmdArch::gfx1151()),
             64,
-            4 * (64 * 128 + 2 * 64),
+            walk(32, 4),
+            4,
         ),
         (
             AttentionFixture::prefill("softcap prefill D=256", 4, 2, 24, 256).softcapped(50.0),
             Backend::Nvptx,
-            32,
-            4 * (32 * 256 + 2 * 32),
+            64,
+            walk(32, 8),
+            2,
         ),
     ];
-    for (fixture, backend, lanes, lds_bytes) in rows {
+    for (fixture, backend, lanes, walk, n_rep) in rows {
         let caps = default_caps_for(backend);
         let (plan, choice) = attention_planned(fixture, backend, &caps)
             .unwrap_or_else(|e| panic!("{}: {e:?}", fixture.name));
         assert_eq!(
             attention_spec(&choice).schedule,
-            kg::AttentionSchedule::Streaming { lanes },
+            kg::AttentionSchedule::Streaming { lanes, walk },
             "{}",
             fixture.name
         );
+        let dv = attention_spec(&choice).dv;
+        let lds_bytes = 4 * (lanes / walk.cluster) * n_rep * (dv + 2);
         let dispatch = plan.single().expect("one dispatch");
         let used = kg::BodyUse::measure(dispatch.body()).expect("measurable workgroup memory");
         assert_eq!(used.lds_bytes, lds_bytes as u64, "{}: LDS", fixture.name);
@@ -5296,9 +5448,9 @@ fn the_streaming_schedule_records_its_exact_resources() {
 }
 
 /// POOT-1113: the split-KV plan records the exact resources of both its launches. A 2-row decode over 1024
-/// keys on the Vulkan caps plans 8 splits of 128 keys over 64 lanes: stage one is `rows * splits` workgroups of
-/// `lanes` threads with `lanes * (dv + 2) * 4` bytes of workgroup memory; the combine is one workgroup of
-/// `lanes` threads per row with no workgroup memory.
+/// keys on the Vulkan caps plans 8 splits of 128 keys over 64 lanes (two clusters of 32): stage one is `row groups *
+/// splits` workgroups of `lanes` threads with `clusters * n_rep * (dv + 2) * 4` bytes of workgroup memory; the
+/// combine is one workgroup of `lanes` threads per row with no workgroup memory.
 #[test]
 fn the_split_kv_plan_records_the_exact_resources_of_both_launches() {
     let backend = Backend::SpirvVulkan;
@@ -5306,12 +5458,17 @@ fn the_split_kv_plan_records_the_exact_resources_of_both_launches() {
     let fixture = AttentionFixture::decode("low-head long decode", 1, 2, 1, 1024, 128);
     let (plan, choice) = attention_planned(fixture, backend, &caps).expect("the decode plans");
     let (lanes, splits) = (64usize, 8usize);
+    let walk = kg::KeyWalk {
+        cluster: 32,
+        run: 4,
+    };
     assert_eq!(
         attention_spec(&choice).schedule,
         kg::AttentionSchedule::SplitKv {
             lanes,
             splits,
-            min_units: 128
+            min_units: 128,
+            walk
         }
     );
     let Plan::Dispatches(dispatches) = &plan else {
@@ -5321,7 +5478,7 @@ fn the_split_kv_plan_records_the_exact_resources_of_both_launches() {
     let used = |dispatch: &Dispatch| kg::BodyUse::measure(dispatch.body()).expect("measurable");
     assert_eq!(
         used(&dispatches[0]).lds_bytes,
-        (lanes * (128 + 2) * 4) as u64
+        (lanes / walk.cluster * (128 + 2) * 4) as u64
     );
     assert_eq!(used(&dispatches[0]).workgroup, [lanes as u32, 1, 1]);
     assert_eq!(used(&dispatches[1]).lds_bytes, 0);

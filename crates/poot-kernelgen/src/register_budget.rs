@@ -542,19 +542,15 @@ fn only_a_body_the_generator_unrolled_carries_the_no_unroll_metadata() {
     let nvptx = poot_codegen::emit_llvm_ir(&tiled_body, Target::Nvptx).unwrap();
     assert!(!nvptx.contains("llvm.loop"), "NVPTX takes no loop metadata");
 
-    let streaming = AttentionSpec {
-        lq: 1,
-        schedule: AttentionSchedule::Streaming { lanes: 64 },
-        ..tiled
+    // The split-KV combine is a loop nest the backend may unroll: no generator-unrolled loop in it. (The
+    // clustered streaming body would do too, but its subgroup shuffle has no lowering until POOT-1552.)
+    let combine = crate::AttentionCombineSpec {
+        rows: 1,
+        splits: 4,
+        dv: 16,
+        lanes: 32,
     };
-    let streaming_body = attention_body(
-        "streaming",
-        &streaming,
-        0..streaming.workgroups(),
-        1,
-        ROCM_ROUNDING,
-    )
-    .unwrap();
+    let streaming_body = crate::attention::attention_combine_body("combine", &combine, 1).unwrap();
     let ir = poot_codegen::emit_llvm_ir(&streaming_body, Target::AmdGcn(arch)).unwrap();
     assert!(
         !ir.contains("llvm.loop"),

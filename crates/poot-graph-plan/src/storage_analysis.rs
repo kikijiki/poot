@@ -946,6 +946,12 @@ mod kv_stride_tests {
             backend: Backend::AmdGcn(arch),
             caps: DeviceCaps {
                 dram_channels: poot_target::dram_channels::DramChannels::of_device_name("gfx1151"),
+                // gfx1151 runs wave32 (a live agent query says so; the preset leaves it unknown), which the
+                // clustered attention's butterfly needs.
+                subgroup: poot_target::Queried::Known(poot_target::SubgroupSupport::Present {
+                    min_size: 32,
+                    max_size: 32,
+                }),
                 ..DeviceCaps::rocm_default()
             },
         }

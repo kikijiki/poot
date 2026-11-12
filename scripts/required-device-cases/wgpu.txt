@@ -427,4 +427,5 @@ poot-wgpu-runtime::run_add	add_device_resident
 poot-wgpu-runtime::run_add	add_runs_on_gpu
 poot-wgpu-runtime::run_add	matmul_runs_on_gpu
 poot-wgpu-runtime::run_add	square_runs_on_gpu
+poot-wgpu-runtime::subgroup_shuffle	subgroup_shuffle_xor_matches_the_interpreter_on_wgpu
 poot-wgpu-runtime::vector_load	u32x4_vector_load_matches_scalar_loads_on_wgpu

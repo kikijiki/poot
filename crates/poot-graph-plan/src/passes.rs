@@ -43,6 +43,7 @@ mod range_check;
 mod routed_experts;
 mod selection;
 mod sharding;
+mod slice_concat;
 pub(crate) mod stage_split;
 mod widen;
 
@@ -121,6 +122,10 @@ pub use routed_experts::{RoutedExpertSite, routed_expert_sites};
 pub(crate) use selection::form_selection;
 pub(crate) use sharding::expand_ranks;
 pub use sharding::{ShardError, ShardRule, ShardedGraph, shard};
+#[cfg(any(test, feature = "test-support"))]
+pub use slice_concat::slice_of_concat;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use slice_concat::slice_of_concat;
 pub use stage_split::BoundaryDescriptor;
 pub use stage_split::StageSplitError;
 pub(crate) use stage_split::{CutSite, StageAssignment, split_stages};

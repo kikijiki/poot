@@ -41,7 +41,10 @@ fn attention_decode_body() -> poot_kernel_ir::Body {
         mask: kg::MaskKind::Broadcast,
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
-        schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
+        schedule: kg::AttentionSchedule::Streaming {
+            lanes: 32,
+            walk: kg::KeyWalk { cluster: 8, run: 1 },
+        },
         precision: poot_graph_ir::OperandPrecision::Exact,
     };
     let limits = kg::BodyLimits {

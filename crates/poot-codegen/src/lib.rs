@@ -103,6 +103,11 @@ pub struct Capability {
     /// lowering: at its calibrated 32-element run i32 index math measured slower (Q4_K 193-199 -> 173-177 GB/s,
     /// POOT-1390). SPIR-V and the AIE core index in 32 bits already, so nothing narrows there.
     pub narrow_index: bool,
+    /// [`poot_kernel_ir::Rvalue::SubgroupShuffleXor`] lowers: `shfl.sync.bfly` on NVPTX, `ds_bpermute` on AMDGPU
+    /// (wave32 and wave64) and `OpGroupNonUniformShuffle` on SPIR-V. The AIE core runs one scalar core and has no
+    /// subgroup to exchange within. Whether a *device* runs the shuffle is `DeviceCaps::subgroup`, which the planner
+    /// reads next to this flag.
+    pub subgroup_shuffle: bool,
 }
 
 /// The capability query for `target`. See [`Capability`]'s fields for what each one means and why it
@@ -113,21 +118,25 @@ pub fn capability(target: Target) -> Capability {
             strided_views: true,
             mixed_vector_reads: false,
             narrow_index: false,
+            subgroup_shuffle: true,
         },
         Target::AmdGcn(_) => Capability {
             strided_views: true,
             mixed_vector_reads: false,
             narrow_index: false,
+            subgroup_shuffle: true,
         },
         Target::Nvptx => Capability {
             strided_views: true,
             mixed_vector_reads: true,
             narrow_index: true,
+            subgroup_shuffle: true,
         },
         Target::AieCore => Capability {
             strided_views: false,
             mixed_vector_reads: false,
             narrow_index: false,
+            subgroup_shuffle: false,
         },
     }
 }

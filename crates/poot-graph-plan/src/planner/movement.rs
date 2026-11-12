@@ -166,7 +166,12 @@ pub(super) fn plan(
                 })?
             }
         }
-        OpKind::Reshape { .. } => Planned::alias(ids[0]),
+        // A reshape of a view is a view of the same buffer with the split or merged strides
+        // (`compute_views`); a reshape of a dense value is the buffer itself.
+        OpKind::Reshape { .. } => match view {
+            Some(layout) => Planned::view(ids[0], layout.clone()),
+            None => Planned::alias(ids[0]),
+        },
         // A collective is a cut point between stage programs (`compile_staged` places the transfer between
         // them), never an equation inside one: no stage program holds it, so planning it is a refusal, not
         // an identity that would silently drop the cross-device exchange.

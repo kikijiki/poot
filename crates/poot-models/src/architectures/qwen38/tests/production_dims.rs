@@ -62,7 +62,7 @@ fn target_of(backend: Backend) -> Target {
         caps: match backend {
             Backend::SpirvVulkan => poot_test_util::device_caps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
-            Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
+            Backend::AmdGcn(_) => poot_test_util::device_caps::default_caps_for(backend),
         },
     }
 }

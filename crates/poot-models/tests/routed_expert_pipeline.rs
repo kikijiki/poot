@@ -130,7 +130,9 @@ fn routed_expert_prefill_runs_the_full_pipeline_on_every_preset() {
             "ROCm",
             Target::Gpu {
                 backend: Backend::AmdGcn(AmdArch::gfx1151()),
-                caps: DeviceCaps::rocm_default(),
+                caps: poot_test_util::device_caps::default_caps_for(Backend::AmdGcn(
+                    AmdArch::gfx1151(),
+                )),
             },
         ),
         (
@@ -203,7 +205,7 @@ fn every_moe_family_prefill_has_routed_expert_sites_and_runs_every_pass_on_rocm(
     ];
     let rocm = Target::Gpu {
         backend: Backend::AmdGcn(AmdArch::gfx1151()),
-        caps: DeviceCaps::rocm_default(),
+        caps: poot_test_util::device_caps::default_caps_for(Backend::AmdGcn(AmdArch::gfx1151())),
     };
     let targets = TargetSet::single(DeviceId(0), rocm);
     let partition = Partition {
@@ -255,7 +257,9 @@ fn qwen3next_prefill_tiles_its_routers_and_runs_every_pass_on_every_preset() {
             "ROCm",
             Target::Gpu {
                 backend: Backend::AmdGcn(AmdArch::gfx1151()),
-                caps: DeviceCaps::rocm_default(),
+                caps: poot_test_util::device_caps::default_caps_for(Backend::AmdGcn(
+                    AmdArch::gfx1151(),
+                )),
             },
         ),
         (
@@ -336,7 +340,9 @@ fn routed_prefill_router_takes_the_tiled_schedule_on_every_preset() {
             "ROCm",
             Target::Gpu {
                 backend: Backend::AmdGcn(AmdArch::gfx1151()),
-                caps: DeviceCaps::rocm_default(),
+                caps: poot_test_util::device_caps::default_caps_for(Backend::AmdGcn(
+                    AmdArch::gfx1151(),
+                )),
             },
         ),
         (

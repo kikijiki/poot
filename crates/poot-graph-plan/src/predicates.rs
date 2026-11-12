@@ -138,14 +138,75 @@ fn reads_as_indexed_weight(eqn: &Eqn, value: ValueId) -> bool {
         && value_ids(eqn).iter().filter(|&&v| v == value).count() == 1
 }
 
-/// Is `op` one of the 3 movement ops promoted to a view (Transpose/Slice/Broadcast)? Reshape stays on
-/// the separate zero-cost `Plan::Alias` path. Used by [`compute_views`] for the candidate check and to let
-/// a promoted movement op count as a strided-capable consumer of another one it composes with.
+/// Is `op` one of the 4 movement ops promoted to a view (Transpose/Slice/Broadcast/Reshape)? Used by
+/// [`compute_views`] for the candidate check and to let a promoted movement op count as a strided-capable
+/// consumer of another one it composes with. A `Reshape` is a view only over a value that is itself a view
+/// (and only when the view's strides split, insert, remove or chain-merge axes, [`reshape_strides`]); over a
+/// dense value it stays the zero-cost `Plan::Alias`.
 fn is_movement_view_candidate(op: &OpKind) -> bool {
     matches!(
         op,
-        OpKind::Transpose { .. } | OpKind::Slice { .. } | OpKind::Broadcast { .. }
+        OpKind::Transpose { .. }
+            | OpKind::Slice { .. }
+            | OpKind::Broadcast { .. }
+            | OpKind::Reshape { .. }
     )
+}
+
+/// The element strides that read `in_shape` (laid out with `in_strides`) as `out_shape` without copying, or
+/// `None` when no single stride per output axis does: NumPy's no-copy reshape rule. Axes of extent 1 carry
+/// no stride, a run of input axes merges into one output axis only when each axis's stride is the next
+/// one's stride times its extent, and an input axis splits into output axes at the row-major strides within it.
+/// An input with a zero extent has no elements to address and is refused.
+fn reshape_strides(
+    in_shape: &[usize],
+    in_strides: &[usize],
+    out_shape: &[usize],
+) -> Option<Vec<usize>> {
+    if in_shape.contains(&0) || out_shape.contains(&0) {
+        return None;
+    }
+    // The input axes that matter: extent 1 axes are free to be dropped, whatever their stride.
+    let old: Vec<(usize, usize)> = in_shape
+        .iter()
+        .zip(in_strides)
+        .filter(|&(&extent, _)| extent != 1)
+        .map(|(&extent, &stride)| (extent, stride))
+        .collect();
+    let mut out = vec![0usize; out_shape.len()];
+    let (mut oi, mut oj) = (0usize, 0usize);
+    while oi < old.len() && oj < out_shape.len() {
+        // Grow the input group [oi, ni) and the output group [oj, nj) until they cover the same element count.
+        let (mut ni, mut nj) = (oi + 1, oj + 1);
+        let (mut old_prod, mut new_prod) = (old[oi].0, out_shape[oj]);
+        while old_prod != new_prod {
+            if old_prod < new_prod {
+                old_prod *= old.get(ni)?.0;
+                ni += 1;
+            } else {
+                new_prod *= out_shape.get(nj)?;
+                nj += 1;
+            }
+        }
+        // The input group must chain into one run: each stride is the next one's times the next one's extent.
+        if !(oi..ni - 1).all(|k| old[k].1 == old[k + 1].1 * old[k + 1].0) {
+            return None;
+        }
+        // The output axes of the group are the row-major split of the run, ending in the run's last stride.
+        let mut stride = old[ni - 1].1;
+        for k in (oj..nj).rev() {
+            out[k] = stride;
+            stride *= out_shape[k];
+        }
+        (oi, oj) = (ni, nj);
+    }
+    // Trailing output axes of extent 1 (the input is exhausted) carry no stride; any other leftover is a
+    // mismatched element count, which a validated Reshape never has.
+    if old[oi..].is_empty() && out_shape[oj..].iter().all(|&extent| extent == 1) {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Which values become a [`Plan::View`] (no dispatch) instead of a materialize copy, composing a whole
@@ -155,7 +216,7 @@ fn is_movement_view_candidate(op: &OpKind) -> bool {
 /// Two passes, since deciding promotion needs consumers (later in topological order) and composing a
 /// Layout needs the input's Layout (earlier):
 ///
-/// - Pass A walks `g.eqns` in reverse and decides the promoted set. A `Transpose`/`Slice`/`Broadcast`
+/// - Pass A walks `g.eqns` in reverse and decides the promoted set. A `Transpose`/`Slice`/`Broadcast`/`Reshape`
 ///   output (not pinned, F32, or BF16 read only as an indexed contraction's weight) is promoted when every
 ///   consumer is `is_strided_capable` or is itself a
 ///   movement-view candidate already promoted (consumers are visited first in reverse order).
@@ -164,6 +225,11 @@ fn is_movement_view_candidate(op: &OpKind) -> bool {
 ///   in terms of the original contiguous source, matching `poot_eval::apply_movement` over the whole
 ///   chain (see the `view_..._chain_matches_oracle_fuzz` test).
 ///
+/// A `Reshape` promotes only over a view whose strides it can keep ([`reshape_strides`]), and that depends on
+/// the input's composed Layout, which pass B alone knows. A reshape pass B cannot compose is barred and both
+/// passes run again without it, so the slice under it materializes as before. Barring only shrinks the promoted
+/// set, so the loop ends.
+///
 /// A value with no consumer is not promoted. A pinned value, a non-F32 dtype, or a non-strided-capable leaf
 /// consumer down the chain keeps the rest of the chain materialized. Unpromoted ops keep the
 /// metadata-launch index-remap copy.
@@ -171,26 +237,42 @@ fn is_movement_view_candidate(op: &OpKind) -> bool {
 /// Every pinned value ([`Graph::pinned_values`]: the output, each validation value, and both sides of each
 /// state pair) keeps its own materialized buffer, so a validation packet can copy it row-major from offset 0.
 pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId, Layout> {
-    let mut views: HashMap<ValueId, Layout> = HashMap::new();
     // A target that compiles no kernel bodies (a VPU) has no strided-view bodies to read a view through.
     let strided = poot_codegen::Target::try_from(target.into())
         .is_ok_and(|target| codegen_capability(target).strided_views);
     if !strided {
-        return views;
+        return HashMap::new();
     }
     let cons = consumers(g.into());
     let pinned: std::collections::HashSet<ValueId> = g.pinned_values().collect();
+    let mut barred: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
+    loop {
+        let promoted = promoted_movement(g, &cons, &pinned, &barred);
+        let (views, uncomposable) = compose_layouts(g, &promoted);
+        if uncomposable.is_empty() {
+            return views;
+        }
+        barred.extend(uncomposable);
+    }
+}
 
-    // Pass A (reverse topological order): decide the promoted set (no strides yet).
+/// Pass A of [`compute_views`] (reverse topological order): the promoted set, no strides yet. A value in
+/// `barred` is never promoted.
+fn promoted_movement(
+    g: &Graph,
+    cons: &HashMap<ValueId, Vec<usize>>,
+    pinned: &std::collections::HashSet<ValueId>,
+    barred: &std::collections::HashSet<ValueId>,
+) -> std::collections::HashSet<ValueId> {
     let mut promoted: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
     for eqn in g.eqns().iter().rev() {
         let out = eqn.out;
-        if pinned.contains(&out) || !is_movement_view_candidate(&eqn.op) {
+        if pinned.contains(&out) || barred.contains(&out) || !is_movement_view_candidate(&eqn.op) {
             continue;
         }
         // A strided view is read element by element, so any f32 reader that takes strides reads it. A BF16 view
         // is only ever the packed expert stack an indexed contraction reads in place; its other readers have no
-        // BF16 lane.
+        // BF16 lane, and a reshape of it is never one (the stack is transposed, not reshaped).
         //
         // An I32 view is read only by float pointwise regions (a region whose output is F32 reads an I32 leaf
         // through its layout like any other): a cast step or an exact step of the region consumes the word in
@@ -204,11 +286,13 @@ pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId,
                         && g.aval(g.eqns()[i].out).dtype == DType::F32
                 })
             }),
-            DType::BF16 => cons.get(&out).is_some_and(|users| {
-                users
-                    .iter()
-                    .all(|&i| reads_as_indexed_weight(&g.eqns()[i], out))
-            }),
+            DType::BF16 if !matches!(eqn.op, OpKind::Reshape { .. }) => {
+                cons.get(&out).is_some_and(|users| {
+                    users
+                        .iter()
+                        .all(|&i| reads_as_indexed_weight(&g.eqns()[i], out))
+                })
+            }
             _ => false,
         };
         if !admitted {
@@ -225,8 +309,18 @@ pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId,
             promoted.insert(out);
         }
     }
+    promoted
+}
 
-    // Pass B (forward topological order): compose each promoted value's Layout from its input's Layout.
+/// Pass B of [`compute_views`] (forward topological order): each promoted value's Layout composed from its
+/// input's, and the promoted reshapes whose input Layout has no stride for the new shape. A promoted `Reshape`
+/// over a value that is no view has no Layout of its own: it stays a `Plan::Alias`.
+fn compose_layouts(
+    g: &Graph,
+    promoted: &std::collections::HashSet<ValueId>,
+) -> (HashMap<ValueId, Layout>, Vec<ValueId>) {
+    let mut views: HashMap<ValueId, Layout> = HashMap::new();
+    let mut uncomposable = Vec::new();
     for eqn in g.eqns() {
         let out = eqn.out;
         if !promoted.contains(&out) {
@@ -234,10 +328,11 @@ pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId,
         }
         let ids = value_ids(eqn);
         let in_shape = g.aval(ids[0]).shape.clone();
-        let in_layout = views
-            .get(&ids[0])
-            .cloned()
-            .unwrap_or_else(|| Layout::contiguous(&in_shape));
+        let in_layout = match (views.get(&ids[0]), &eqn.op) {
+            (Some(layout), _) => layout.clone(),
+            (None, OpKind::Reshape { .. }) => continue,
+            (None, _) => Layout::contiguous(&in_shape),
+        };
         let (strides, offset) = match &eqn.op {
             // Transpose permutes the view's strides; the base offset does not move.
             OpKind::Transpose { perm } => (
@@ -256,13 +351,23 @@ pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId,
             }
             // `view_eff_strides`: 0 on a size-1 logical dim, else the view's own stride, right-aligned.
             OpKind::Broadcast { shape: s } => kg::view_eff_strides(s, &in_shape, &in_layout),
+            // Reshape keeps the offset; its strides are the no-copy split or merge of the input's.
+            OpKind::Reshape { shape } => {
+                match reshape_strides(&in_shape, &in_layout.strides, shape) {
+                    Some(strides) => (strides, in_layout.offset),
+                    None => {
+                        uncomposable.push(out);
+                        continue;
+                    }
+                }
+            }
             _ => unreachable!(
-                "promoted only ever contains Transpose/Slice/Broadcast outputs (is_movement_view_candidate)"
+                "promoted only ever contains Transpose/Slice/Broadcast/Reshape outputs (is_movement_view_candidate)"
             ),
         };
         views.insert(out, Layout { strides, offset });
     }
-    views
+    (views, uncomposable)
 }
 
 /// Workgroup width (lanes per output column) for the LDS decode attention GEMV (`kernelgen::attn_scores_v_gemv_lds`),
@@ -457,94 +562,51 @@ pub(crate) fn scatter_update_plan(
     Planned::split(chunks)
 }
 
-/// The most lanes the streaming attention schedule uses ([`attention_lanes`]).
-const MAX_LANES: usize = 64;
+/// The lanes of a clustered attention workgroup, widest first: whole 32-lane runs (the walk's butterfly stays inside
+/// one), and no more than a decode row's clusters can use.
+const ATTENTION_LANES: [usize; 2] = [64, 32];
+/// The bytes one lane reads of a key or value row in one load.
+const VECTOR_LOAD_BYTES: usize = 16;
 
-/// The lane count of the streaming attention schedule: the widest power of two, at most 64, whose
-/// partials fit the device. Each lane stages one online-softmax triple `(m, l, o[dv])` in workgroup memory,
-/// so `lanes` lanes need `4 * (lanes * dv + 2 * lanes)` bytes of `caps.lds_bytes`, and `lanes` may not
-/// exceed the workgroup limits. More than 64 lanes only lengthen the serial per-lane combine. `None` when
-/// not even one lane fits.
-pub(crate) fn attention_lanes(dv: usize, caps: &DeviceCaps) -> Option<usize> {
-    let lanes_limit = (caps.max_workgroup_size[0] as usize)
-        .min(caps.max_workgroup_invocations as usize)
-        .min(MAX_LANES);
-    let lds_bytes = caps.lds_bytes as usize;
-    std::iter::successors(Some(MAX_LANES), |lanes| (*lanes > 1).then_some(lanes / 2))
-        .find(|&lanes| lanes <= lanes_limit && 4 * (lanes * dv + 2 * lanes) <= lds_bytes)
-}
-
-/// Whether a block-selected attention serves the `n_rep` query heads of a key/value head in one workgroup
-/// (`rows` is `batch * hq * lq`). Grouping loads each selected key and value row once for the group, not once
-/// per head, which is what a prefill chunk's rows spend their time on (Native Sparse Attention's
-/// group-centric loading, arXiv 2502.11089 section 3.4); it divides the workgroups by `n_rep`, so it is kept
-/// for the shapes that still fill the device afterwards, [`poot_target::calibration::GemmLaunch::fill_workgroups_per_unit`] groups per
-/// compute unit. A few-row decode keeps a workgroup per head, whose parallelism it needs more than the shared loads.
-fn groups_selected_heads(rows: usize, n_rep: usize, caps: &DeviceCaps) -> bool {
-    // An unknown device cannot show the groups still fill it: keep a workgroup per head.
-    caps.compute_units.known().is_some_and(|units| {
-        n_rep > 1
-            && rows / n_rep >= units as usize * caps.gemm_launch().fill_workgroups_per_unit as usize
-    })
-}
-
-/// How a block-selected attention schedules its workgroups: whether one serves the `n_rep` heads of a key/value
-/// head, and the lanes it runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedSchedule {
-    pub(crate) grouped: bool,
-    pub(crate) lanes: usize,
-}
-
-/// The schedule of a block-selected attention over `rows` (`batch * hq * lq`), or `None` when the device's
-/// workgroup memory holds not even one lane of a head.
+/// The clustered key walk of an attention ([`poot_kernelgen::KeyWalk`]) and the lanes of the workgroup that runs
+/// it, or `None` when no whole run of 32 lanes holds the end combine of the device's workgroup memory.
 ///
-/// Grouping is chosen when the rows keep the device full ([`groups_selected_heads`]) and the device's
-/// workgroup memory holds the `n_rep` head lanes' partials ([`selected_attention_lanes`]). A device that
-/// cannot hold them plans the ungrouped schedule, a workgroup per head with the lanes a dense row gets: that
-/// is the schedule the device ran before grouping existed, so the capability limit costs the shared key loads and nothing
-/// else. The request records the choice (`MaskKind::Blocks { grouped }`), so it is visible in the plan.
-pub(crate) fn selected_attention_schedule(
-    rows: usize,
+/// A lane's run is the widest power-of-two count of `kv_bytes`-wide elements that one 16-byte load covers
+/// and that divides both head widths and a split key's parts (`shared_dim`, `0` for a dense key), grown only
+/// while the cluster, at most 32 lanes, could not cover the wider head otherwise. The cluster is the power of two
+/// of lanes that covers the wider head with that run. The end combine of the clusters keeps `clusters * n_rep *
+/// (dv + 2)` words in workgroup memory, and `lanes` may not exceed the workgroup limits.
+pub(crate) fn attention_key_walk(
+    (dk, dv, shared_dim): (usize, usize, usize),
     n_rep: usize,
-    dv: usize,
+    kv_bytes: usize,
     caps: &DeviceCaps,
-) -> Option<SelectedSchedule> {
-    let grouped = groups_selected_heads(rows, n_rep, caps)
-        .then(|| selected_attention_lanes(n_rep, dv, caps))
-        .flatten();
-    match grouped {
-        Some(lanes) => Some(SelectedSchedule {
-            grouped: true,
-            lanes,
-        }),
-        None => attention_lanes(dv, caps).map(|lanes| SelectedSchedule {
-            grouped: false,
-            lanes,
-        }),
+) -> Option<(usize, poot_kernelgen::KeyWalk)> {
+    let widths = [dk, dv, dk - shared_dim];
+    let mut run = (VECTOR_LOAD_BYTES / kv_bytes).next_power_of_two();
+    while run > 1 && !widths.iter().all(|width| width.is_multiple_of(run)) {
+        run /= 2;
     }
-}
-
-/// The key-walking slices of the block-selected attention schedule ([`selected_attention_lanes`]).
-const SELECTED_SLICES: usize = 2;
-
-/// The lane count of the block-selected attention schedule: `n_rep` head lanes (the query heads of one
-/// key/value head, which read the same selected keys) for each of the widest [`SELECTED_SLICES`]-or-fewer
-/// power-of-two number of slices whose partials fit the device (`4 * (lanes * dv + 2 * lanes)` bytes of
-/// `caps.lds_bytes`, `lanes` within the workgroup limits). `None` when the head lanes of one slice do not fit.
-pub(crate) fn selected_attention_lanes(
-    n_rep: usize,
-    dv: usize,
-    caps: &DeviceCaps,
-) -> Option<usize> {
+    // A head too wide for one 32-lane cluster at this run takes a longer run.
+    let cluster_cap = poot_kernel_ir::COLLECTIVE_LANES as usize;
+    while dk.max(dv).div_ceil(run) > cluster_cap {
+        run *= 2;
+        if !widths.iter().all(|width| width.is_multiple_of(run)) {
+            return None;
+        }
+    }
+    let cluster = dk.max(dv).div_ceil(run).next_power_of_two();
     let lanes_limit =
         (caps.max_workgroup_size[0] as usize).min(caps.max_workgroup_invocations as usize);
     let lds_bytes = caps.lds_bytes as usize;
-    std::iter::successors(Some(SELECTED_SLICES), |slices| {
-        (*slices > 1).then_some(slices / 2)
-    })
-    .map(|slices| n_rep * slices)
-    .find(|&lanes| lanes <= lanes_limit && 4 * (lanes * dv + 2 * lanes) <= lds_bytes)
+    ATTENTION_LANES
+        .into_iter()
+        .find(|&lanes| {
+            lanes <= lanes_limit
+                && lanes >= cluster
+                && 4 * (lanes / cluster) * n_rep * (dv + 2) <= lds_bytes
+        })
+        .map(|lanes| (lanes, poot_kernelgen::KeyWalk { cluster, run }))
 }
 
 /// The most key chunks one decode row is split into: past this the combine stage's per-row reduction costs
@@ -592,10 +654,12 @@ pub(crate) fn attention_splits(
     if splits < 2 || rows >= compute_units {
         return None;
     }
+    let walk = spec.schedule.walk()?;
     let schedule = poot_kernelgen::AttentionSchedule::SplitKv {
         lanes: spec.schedule.lanes(),
         splits,
-        min_units: MIN_KEYS_PER_SPLIT.div_ceil(spec.keys_per_unit()),
+        min_units: MIN_KEYS_PER_SPLIT,
+        walk,
     };
     let split = poot_kernelgen::AttentionSpec {
         schedule,
@@ -1302,4 +1366,69 @@ const FUSED_ROW_MAX_WIDTH: usize = 128;
 /// it bakes alongside it.
 pub(crate) fn row_parallel_width(n_cols: usize) -> usize {
     n_cols.clamp(1, FUSED_ROW_MAX_WIDTH)
+}
+
+#[cfg(test)]
+mod reshape_stride_tests {
+    use super::reshape_strides;
+
+    /// The element offset `reshape_strides` addresses for row-major flat index `flat` of `shape`.
+    fn offset(shape: &[usize], strides: &[usize], mut flat: usize) -> usize {
+        let mut at = 0;
+        for (&extent, &stride) in shape.iter().zip(strides).rev() {
+            at += flat % extent * stride;
+            flat /= extent;
+        }
+        at
+    }
+
+    /// POOT-1564 SC-l: every stride vector `reshape_strides` returns reads, for each flat index of the new
+    /// shape, the element the old strided view holds at that flat index (NumPy's no-copy contract). Mutation:
+    /// split an axis with its input stride instead of the row-major split inside it
+    /// (`stride *= out_shape[k]` becomes `stride`): the split rows are off.
+    #[test]
+    fn a_composed_reshape_reads_the_element_the_view_holds_at_each_flat_index() {
+        // (input shape, input strides, output shape): a slice of a wider row, a transpose, a broadcast
+        // (stride 0), unit axes in both, a merge over a chain, and a split.
+        let cases: &[(&[usize], &[usize], &[usize])] = &[
+            (&[1, 1, 6], &[6144, 6144, 1], &[1, 1, 3, 2]),
+            (&[2, 6], &[12, 1], &[2, 3, 2]),
+            (&[2, 3, 4], &[12, 4, 1], &[6, 4]),
+            (&[2, 3, 4], &[12, 4, 1], &[24]),
+            (&[4, 3], &[1, 4], &[4, 3, 1]),
+            (&[4, 3], &[1, 4], &[1, 4, 3]),
+            (&[3, 1, 4], &[4, 99, 1], &[3, 4]),
+            (&[5, 4], &[0, 1], &[5, 2, 2]),
+            (&[2, 3], &[0, 0], &[6]),
+            (&[1], &[7], &[1, 1]),
+            (&[6, 4], &[8, 1], &[2, 3, 4]),
+        ];
+        for &(in_shape, in_strides, out_shape) in cases {
+            let strides = reshape_strides(in_shape, in_strides, out_shape).unwrap_or_else(|| {
+                panic!("{in_shape:?} {in_strides:?} -> {out_shape:?} has a stride per output axis")
+            });
+            let count: usize = in_shape.iter().product();
+            for flat in 0..count {
+                assert_eq!(
+                    offset(out_shape, &strides, flat),
+                    offset(in_shape, in_strides, flat),
+                    "{in_shape:?} {in_strides:?} -> {out_shape:?} at flat index {flat}"
+                );
+            }
+        }
+    }
+
+    /// POOT-1564 SC-m: a merge of axes whose strides do not chain has no single stride, so the reshape is
+    /// refused and the slice under it materializes: the query/gate split of a `[hq, 2d]` row, merged to
+    /// `hq * d`, and a transposed pair merged. Mutation: drop the chain check in `reshape_strides` (the `all`
+    /// over `old[k].1 == old[k + 1].1 * old[k + 1].0`): these return a stride and the row goes red.
+    #[test]
+    fn a_merge_across_a_stride_gap_has_no_stride() {
+        // `[hq = 3, d = 2]` read at stride `(2d, 1) = (4, 1)`: the gap of `d` between rows is not `d`.
+        assert_eq!(reshape_strides(&[3, 2], &[4, 1], &[6]), None);
+        // A transposed `[3, 4]` (strides 1, 3) merged into 12 elements.
+        assert_eq!(reshape_strides(&[4, 3], &[1, 4], &[12]), None);
+        // A broadcast row (stride 0) merged with a dense axis.
+        assert_eq!(reshape_strides(&[2, 3], &[0, 1], &[6]), None);
+    }
 }

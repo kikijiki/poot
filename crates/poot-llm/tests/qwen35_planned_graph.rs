@@ -488,3 +488,58 @@ fn a_cap_below_one_projection_row_is_a_typed_refusal_naming_the_constant() {
         }
     }
 }
+
+/// POOT-1564 SC-i: the planned decode graph dispatches few slices and no transpose of a constant, on every
+/// backend with strided views. The slices left are the ones that must exist: each GDN layer's new conv window
+/// (a pinned state commit) and each attention layer's query/gate split (a merge of axes across a stride gap),
+/// at most 85 per step at 48 GDN and 16 attention layers (from 421; the design's bound is 90). The q/k/v
+/// splits, the conv taps and the conv-kernel transposes are views. Mutation: make `Reshape` non-composable
+/// again (drop it from `is_movement_view_candidate`): the slice dispatches return to 27 on this fixture and
+/// the conv-kernel transposes dispatch.
+#[test]
+fn qwen35_decode_plans_few_slices() {
+    let (model, _) = qwen35();
+    let graph = decode_graph(&*model);
+    for backend in backends() {
+        let program = compile(&graph, &target(backend), &options()).unwrap();
+        let planned = program.graph();
+        let count = |wanted: fn(&OpKind) -> bool| {
+            planned.eqns().iter().filter(|eqn| wanted(&eqn.op)).count()
+        };
+        let gdn_layers = count(|op| matches!(op, OpKind::Concat { .. }));
+        let attention_layers = count(|op| matches!(op, OpKind::Attention(_)));
+        assert!(
+            gdn_layers > 1 && attention_layers > 0,
+            "the fixture holds a hybrid stack"
+        );
+        let dispatched = |wanted: fn(&OpKind) -> bool| {
+            planned
+                .eqns()
+                .iter()
+                .zip(program.plans())
+                .filter(|(eqn, plan)| {
+                    wanted(&eqn.op) && matches!(plan, poot_graph_plan::Plan::Dispatches(_))
+                })
+                .count()
+        };
+        let slices = dispatched(|op| matches!(op, OpKind::Slice { .. }));
+        assert!(
+            slices <= gdn_layers + 2 * attention_layers,
+            "{backend:?}: {slices} slice dispatches for {gdn_layers} GDN and {attention_layers} attention layers"
+        );
+        let constant_transposes = planned
+            .eqns()
+            .iter()
+            .zip(program.plans())
+            .filter(|(eqn, plan)| {
+                matches!(eqn.op, OpKind::Transpose { .. })
+                    && matches!(plan, poot_graph_plan::Plan::Dispatches(_))
+                    && matches!(&eqn.inputs[0], Operand::Value(v) if planned.consts().contains(v))
+            })
+            .count();
+        assert_eq!(
+            constant_transposes, 0,
+            "{backend:?}: a constant is transposed by a dispatch"
+        );
+    }
+}

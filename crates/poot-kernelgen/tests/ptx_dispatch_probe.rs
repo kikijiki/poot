@@ -197,7 +197,13 @@ fn attention_spec(
         mask,
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
-        schedule: kg::AttentionSchedule::Streaming { lanes },
+        schedule: kg::AttentionSchedule::Streaming {
+            lanes,
+            walk: kg::KeyWalk {
+                cluster: d.next_power_of_two().min(32),
+                run: d.div_ceil(d.next_power_of_two().min(32)),
+            },
+        },
         precision: poot_graph_ir::OperandPrecision::Exact,
     }
 }
@@ -220,7 +226,7 @@ fn attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx() {
     let (hq, n_rep, cap, d) = (2usize, 1usize, 2usize, 4usize);
     let spec = attention_spec(
         (1, hq, n_rep, 1, cap, d),
-        4,
+        32,
         kg::MaskKind::Broadcast,
         kg::ScoreTransform::Scale {
             scale_bits: 0.5f32.to_bits(),
@@ -284,7 +290,7 @@ fn attention_fixture_bank_matches_cpu_on_ptx() {
             "decode_d512",
             attention_spec(
                 (1, 2, 1, 1, 96, 512),
-                16,
+                32,
                 kg::MaskKind::Broadcast,
                 scale(512),
             ),
@@ -397,7 +403,13 @@ fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
         mask: kg::MaskKind::Broadcast,
         bound: kg::KeyBound::Live,
         sink: kg::AttentionSink::Absent,
-        schedule: kg::AttentionSchedule::Streaming { lanes: 8 },
+        schedule: kg::AttentionSchedule::Streaming {
+            lanes: 32,
+            walk: kg::KeyWalk {
+                cluster: 32,
+                run: 8,
+            },
+        },
         precision: poot_graph_ir::OperandPrecision::Exact,
     };
     let len = [37i32, 100, -1, 1000];
