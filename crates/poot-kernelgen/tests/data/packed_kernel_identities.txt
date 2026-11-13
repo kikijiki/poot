@@ -51,36 +51,36 @@ Q4_1 | register_tiled_narrow_f16 | cfac458ed408f5d4
 Q4_1 | fragment_tiled_split_bf16 | 47b62395fee326f9
 Q4_1 | run_sharing | FactorRun { factor_run: 32 } 5 bits
 Q5_0 | row_gather | 1478c70f0f1e233c
-Q5_0 | gemv0 | 10d53a577a67e159
-Q5_0 | gemv1 | 097009b08a99207e
-Q5_0 | gemv2 | 5c36498413bea50a
-Q5_0 | gemv3 | fb664b994ba672fc
-Q5_0 | gemv0_indexed | 3872613ed9a2f173
-Q5_0 | gemv1_indexed | bf9c2650786f04e0
-Q5_0 | gemv_vec4 | 05bfbbca84b81a8d
-Q5_0 | register_tiled | cf909c77fab35b3d
-Q5_0 | register_tiled_indexed | 119f81fe61843d2b
-Q5_0 | register_tiled_narrow_f16 | c67079fea6ba352c
-Q5_0 | fragment_tiled_split_bf16 | 1ff69f3f97474653
+Q5_0 | gemv0 | ac128ab98dab6e26
+Q5_0 | gemv1 | c46654e9d5701d8d
+Q5_0 | gemv2 | 8811186c06898545
+Q5_0 | gemv3 | a14856daace3e805
+Q5_0 | gemv0_indexed | 88c8ad33ae6588be
+Q5_0 | gemv1_indexed | ce1d7ec9545f937f
+Q5_0 | gemv_vec4 | 903ca57cc9d7a036
+Q5_0 | register_tiled | 7080087e4966d3d1
+Q5_0 | register_tiled_indexed | aa0c3b7800b20ea9
+Q5_0 | register_tiled_narrow_f16 | 4eae6380ad8ad40b
+Q5_0 | fragment_tiled_split_bf16 | df2d2896ac7eb7f2
 Q5_0 | run_sharing | FactorRun { factor_run: 32 } 6 bits
 Q5_1 | row_gather | 6e501e8151f2e97e
-Q5_1 | gemv0 | 5dcd34e092901ffa
-Q5_1 | gemv1 | 5cff487720d638fb
-Q5_1 | gemv2 | fcf4c6ab213356f4
-Q5_1 | gemv3 | 35c21ce64ca6c7ee
-Q5_1 | gemv0_indexed | 00c2d8c5cd89628e
-Q5_1 | gemv1_indexed | c7e7200c0396c851
-Q5_1 | gemv_vec4 | c4828d810ba32cc3
-Q5_1 | register_tiled | 492330eb86f4921b
-Q5_1 | register_tiled_indexed | 10bc3109fd6fbb49
-Q5_1 | register_tiled_narrow_f16 | ea419b694420df95
-Q5_1 | fragment_tiled_split_bf16 | cf65a587fa42a248
+Q5_1 | gemv0 | 02e4063dbbec778d
+Q5_1 | gemv1 | 42b3bf04633cfed1
+Q5_1 | gemv2 | 698026aa19901340
+Q5_1 | gemv3 | 10f6b8ab80a37ac8
+Q5_1 | gemv0_indexed | dee7b23be763b808
+Q5_1 | gemv1_indexed | 7afcc585edd180e6
+Q5_1 | gemv_vec4 | e0c02160e0273d64
+Q5_1 | register_tiled | d4f93f20929357e5
+Q5_1 | register_tiled_indexed | a7a61bce8d89adf0
+Q5_1 | register_tiled_narrow_f16 | ecb7f079c7b60ee5
+Q5_1 | fragment_tiled_split_bf16 | ea9634a87fc68c54
 Q5_1 | run_sharing | FactorRun { factor_run: 32 } 6 bits
 Q8_0 | row_gather | b15e4ec9b9b4d20e
 Q8_0 | gemv0 | 75b8d0417683cb6a
 Q8_0 | gemv1 | de408d515a47db33
 Q8_0 | gemv2 | 1289e4868d479e12
-Q8_0 | gemv3 | c05a16ae0bf6a9b7
+Q8_0 | gemv3 | a446cf3dbb4fefc9
 Q8_0 | gemv0_indexed | 0eb9b447ee55269c
 Q8_0 | gemv1_indexed | 1d19f5f17ca8478a
 Q8_0 | gemv_vec4 | 41c6a5a2c6a6fa8a
@@ -103,23 +103,23 @@ Q2_K | register_tiled_narrow_f16 | 98110c3f4c86a157
 Q2_K | fragment_tiled_split_bf16 | 0711fef6437b73c5
 Q2_K | run_sharing | FactorRun { factor_run: 16 } 3 bits
 Q3_K | row_gather | cc0873fc39b49604
-Q3_K | gemv0 | 3cf9842199c25740
-Q3_K | gemv1 | 8e9fa36f2e2f3f43
-Q3_K | gemv2 | 4bf730754b37bd0d
-Q3_K | gemv3 | 19c00a6f79163182
-Q3_K | gemv0_indexed | eaef710c6805f18f
-Q3_K | gemv1_indexed | 8f2f2c6ba1a2298f
-Q3_K | gemv_vec4 | 780ce278a82bc83f
-Q3_K | register_tiled | d189f8e7976a857d
-Q3_K | register_tiled_indexed | dd8987b3506dc5b2
-Q3_K | register_tiled_narrow_f16 | 361c6dd074bd9f5d
-Q3_K | fragment_tiled_split_bf16 | 361e5360d6f5a792
+Q3_K | gemv0 | 24bea9c4aa187137
+Q3_K | gemv1 | 99cb1a978a488929
+Q3_K | gemv2 | 83c211babf3c1d20
+Q3_K | gemv3 | 05e41dd0bc682b6d
+Q3_K | gemv0_indexed | 1972c1a56a734bd1
+Q3_K | gemv1_indexed | 2d3147c444f2fc1f
+Q3_K | gemv_vec4 | 83b14e7da02b8f27
+Q3_K | register_tiled | 065db2a7cc1d2daf
+Q3_K | register_tiled_indexed | 34d0efb2fcef46ca
+Q3_K | register_tiled_narrow_f16 | 7bb1b885bcb5c1dd
+Q3_K | fragment_tiled_split_bf16 | 174dcce7e581d3e4
 Q3_K | run_sharing | FactorRun { factor_run: 16 } 4 bits
 Q4_K | row_gather | 84ade43dcf82a29e
 Q4_K | gemv0 | bf8d65d62ef3e879
 Q4_K | gemv1 | 2b46ad6fd9d4bb26
 Q4_K | gemv2 | 7780f7979382a2ea
-Q4_K | gemv3 | ef517f46df37b7b5
+Q4_K | gemv3 | 00be384c98c86987
 Q4_K | gemv0_indexed | e1f1551f4588e46c
 Q4_K | gemv1_indexed | f9da74716bb92b8a
 Q4_K | gemv_vec4 | 2d5886094fb95a5b
@@ -129,56 +129,69 @@ Q4_K | register_tiled_narrow_f16 | 2b596384d700b5c3
 Q4_K | fragment_tiled_split_bf16 | daa39c2921996e33
 Q4_K | run_sharing | FactorRun { factor_run: 32 } 5 bits
 Q5_K | row_gather | a45892204c7dd3dd
-Q5_K | gemv0 | be3eab1f312b24d1
-Q5_K | gemv1 | 4d3343bffe42ab56
-Q5_K | gemv2 | b4eb9d67a97d852a
-Q5_K | gemv3 | 117df3c39973661b
-Q5_K | gemv0_indexed | d9aa9230eca2d6e3
-Q5_K | gemv1_indexed | e18ef9fc078e3625
-Q5_K | gemv_vec4 | dcddb99b5d089ee4
-Q5_K | register_tiled | a1d6654f6a47fcba
-Q5_K | register_tiled_indexed | e89f3fb013971132
-Q5_K | register_tiled_narrow_f16 | d261506af3fec0d9
-Q5_K | fragment_tiled_split_bf16 | 87a838c55acd59d4
+Q5_K | gemv0 | 7eabb54f7a6b0bac
+Q5_K | gemv1 | 739eda24e713be16
+Q5_K | gemv2 | ba9c526d6a066178
+Q5_K | gemv3 | 369caf0ebf1776db
+Q5_K | gemv0_indexed | 9334ac872fda1dc0
+Q5_K | gemv1_indexed | 06304f842f8e7953
+Q5_K | gemv_vec4 | 8007c6c3647412fe
+Q5_K | register_tiled | 83c276cefd8c3188
+Q5_K | register_tiled_indexed | a8c8cc67db9f6b20
+Q5_K | register_tiled_narrow_f16 | 4f514cd5b5073272
+Q5_K | fragment_tiled_split_bf16 | ae3aa328963b0e24
 Q5_K | run_sharing | FactorRun { factor_run: 32 } 6 bits
 Q6_K | row_gather | b183feff087d9694
-Q6_K | gemv0 | 137bc89c4d934917
-Q6_K | gemv1 | a6bf8bdd7187a8b6
-Q6_K | gemv2 | 24fd1f7f5c7a2eed
-Q6_K | gemv3 | 419f1bedf07812ae
-Q6_K | gemv0_indexed | 964b55888491690f
-Q6_K | gemv1_indexed | 53051d031d9d34dc
-Q6_K | gemv_vec4 | f9694e1868dff27e
-Q6_K | register_tiled | e9e6a2cebf51c11b
-Q6_K | register_tiled_indexed | d8af609a5e9f759c
-Q6_K | register_tiled_narrow_f16 | 7e982db05de2c35d
-Q6_K | fragment_tiled_split_bf16 | 2491a75ab8b10c51
+Q6_K | gemv0 | 6091b6eb1a734c53
+Q6_K | gemv1 | 26c2b0f7f4f016aa
+Q6_K | gemv2 | cb7d99d715227761
+Q6_K | gemv3 | a804195a7abec025
+Q6_K | gemv0_indexed | 8e06d3185f2bef88
+Q6_K | gemv1_indexed | 3ba9fdbfc332e9d4
+Q6_K | gemv_vec4 | e411425dee9eff8d
+Q6_K | register_tiled | e6ceda1c371b2c50
+Q6_K | register_tiled_indexed | be2c9d5e955fac72
+Q6_K | register_tiled_narrow_f16 | 525e9b6470de5d69
+Q6_K | fragment_tiled_split_bf16 | af2c44642555f465
 Q6_K | run_sharing | FactorRun { factor_run: 16 } 7 bits
+Iq2_Xxs | row_gather | 78aca2ed88e7cb87
+Iq2_Xxs | gemv0 | 1c665a90dd760765
+Iq2_Xxs | gemv1 | d8ebbaee04bd18b1
+Iq2_Xxs | gemv2 | d956b866e52558e1
+Iq2_Xxs | gemv3 | 27794eb08a5776fa
+Iq2_Xxs | gemv0_indexed | e0e74bea025473eb
+Iq2_Xxs | gemv1_indexed | 75e785bbe0b17685
+Iq2_Xxs | gemv_vec4 | be16937ca5354919
+Iq2_Xxs | register_tiled | e4351dc5abe7fd08
+Iq2_Xxs | register_tiled_indexed | 253ea95f8e88639f
+Iq2_Xxs | register_tiled_narrow_f16 | 86398e86c096d019
+Iq2_Xxs | fragment_tiled_split_bf16 | bf85856f159be649
+Iq2_Xxs | run_sharing | FactorRun { factor_run: 32 } 3 bits
 Iq2_Xs | row_gather | 1f1a4371aaf83eba
-Iq2_Xs | gemv0 | df0e0573d9d32f3d
-Iq2_Xs | gemv1 | 3db214bcdb256578
-Iq2_Xs | gemv2 | 1cb542e78a69a1ae
-Iq2_Xs | gemv3 | 7033b8dbdfdde2fa
-Iq2_Xs | gemv0_indexed | 82af38a59bda85b0
-Iq2_Xs | gemv1_indexed | 607ee2221adef644
-Iq2_Xs | gemv_vec4 | 641e4df601f06871
-Iq2_Xs | register_tiled | 29c1ccb9a07ccf2a
-Iq2_Xs | register_tiled_indexed | 2857fcda590ceb32
-Iq2_Xs | register_tiled_narrow_f16 | 54dc98638dcea052
-Iq2_Xs | fragment_tiled_split_bf16 | fd35555b1effc709
+Iq2_Xs | gemv0 | 9d00530eedd3a0ce
+Iq2_Xs | gemv1 | 4a75496b9647cfc2
+Iq2_Xs | gemv2 | 70e347d93c204d2e
+Iq2_Xs | gemv3 | 3aebef626995469e
+Iq2_Xs | gemv0_indexed | 64cad140dead923e
+Iq2_Xs | gemv1_indexed | 2e54d6341e23ff3c
+Iq2_Xs | gemv_vec4 | d35268610efd1160
+Iq2_Xs | register_tiled | d1145a84e13979cf
+Iq2_Xs | register_tiled_indexed | e4bb7db65b97adaf
+Iq2_Xs | register_tiled_narrow_f16 | 76538eef69afe0a2
+Iq2_Xs | fragment_tiled_split_bf16 | f78fac79eef01447
 Iq2_Xs | run_sharing | FactorRun { factor_run: 16 } 3 bits
 Iq3_Xxs | row_gather | 9fc9d715c85f0bf4
-Iq3_Xxs | gemv0 | 4f2f39ed232fd60f
-Iq3_Xxs | gemv1 | a1313484315c8d14
-Iq3_Xxs | gemv2 | f966caf72596f12d
-Iq3_Xxs | gemv3 | fc588d0ebd0c56a4
-Iq3_Xxs | gemv0_indexed | bc2af801963a716d
-Iq3_Xxs | gemv1_indexed | d28457a09d448ac4
-Iq3_Xxs | gemv_vec4 | d6b52a379d0e27ec
-Iq3_Xxs | register_tiled | e56af5ad362784d8
-Iq3_Xxs | register_tiled_indexed | 15789200d36aadc7
-Iq3_Xxs | register_tiled_narrow_f16 | 6f6301c1ce9e1b5b
-Iq3_Xxs | fragment_tiled_split_bf16 | 65a1925c8e3c1733
+Iq3_Xxs | gemv0 | 5b3712f0ddc24eff
+Iq3_Xxs | gemv1 | 8e6f1eb31d3e677b
+Iq3_Xxs | gemv2 | 0eae46e3deda0901
+Iq3_Xxs | gemv3 | 9a1864005022f256
+Iq3_Xxs | gemv0_indexed | 55c56fc0df677aad
+Iq3_Xxs | gemv1_indexed | 29e8279bbb052374
+Iq3_Xxs | gemv_vec4 | 552b9fea170cae0c
+Iq3_Xxs | register_tiled | 8f5e120504245d57
+Iq3_Xxs | register_tiled_indexed | ad0f3e9f6b7d6c60
+Iq3_Xxs | register_tiled_narrow_f16 | 2db736fe92bbc88b
+Iq3_Xxs | fragment_tiled_split_bf16 | 6ddedef982558cad
 Iq3_Xxs | run_sharing | FactorRun { factor_run: 32 } 4 bits
 Iq4_Nl | row_gather | c76dc043544e1b16
 Iq4_Nl | gemv0 | b6345b4ff1b5414e
@@ -194,18 +207,31 @@ Iq4_Nl | register_tiled_narrow_f16 | c28e97f16ac24f2e
 Iq4_Nl | fragment_tiled_split_bf16 | 90c39af9180632a1
 Iq4_Nl | run_sharing | FactorRun { factor_run: 32 } 5 bits
 Iq3_S | row_gather | 052f4e2e8bbb170a
-Iq3_S | gemv0 | c454c08e80adc2ea
-Iq3_S | gemv1 | 8ef3d454b9024e0d
-Iq3_S | gemv2 | d8c3f2a65e521aa5
-Iq3_S | gemv3 | fd4a40abb726e3b2
-Iq3_S | gemv0_indexed | fb6acdfb1dba326a
-Iq3_S | gemv1_indexed | b8364120aaa774c2
-Iq3_S | gemv_vec4 | 9b6ab118969d98dc
-Iq3_S | register_tiled | 2e5a1e36d5015ab3
-Iq3_S | register_tiled_indexed | fb1ad99fad8f8ed6
-Iq3_S | register_tiled_narrow_f16 | 366bd4807e234fca
-Iq3_S | fragment_tiled_split_bf16 | 33a4de284d044edd
+Iq3_S | gemv0 | 33eaaed82a62d2b1
+Iq3_S | gemv1 | fc12b528f99d24ca
+Iq3_S | gemv2 | c1b676bac19641f7
+Iq3_S | gemv3 | 0ebd8ea548de94b6
+Iq3_S | gemv0_indexed | bc3556968c215770
+Iq3_S | gemv1_indexed | 4c9094fbe52c02d3
+Iq3_S | gemv_vec4 | 2b2f0b1831a7ed7c
+Iq3_S | register_tiled | 485b0819e7d9dc9a
+Iq3_S | register_tiled_indexed | 2afe704dd95e80b7
+Iq3_S | register_tiled_narrow_f16 | bdc2d8212e1765c8
+Iq3_S | fragment_tiled_split_bf16 | b757075d650f24e1
 Iq3_S | run_sharing | FactorRun { factor_run: 32 } 4 bits
+Iq2_S | row_gather | 24143ffb11eb1079
+Iq2_S | gemv0 | deaeb44880214fac
+Iq2_S | gemv1 | 4429efe866e94aa0
+Iq2_S | gemv2 | 0cb14eb8500362ee
+Iq2_S | gemv3 | 5de7bc0a6dd07831
+Iq2_S | gemv0_indexed | 4213132cddf084ec
+Iq2_S | gemv1_indexed | 8ec0312aca8d75d5
+Iq2_S | gemv_vec4 | 7b935ff4572483c2
+Iq2_S | register_tiled | 9e14553381331b53
+Iq2_S | register_tiled_indexed | f859e9b0ab02bf52
+Iq2_S | register_tiled_narrow_f16 | c47da0efad3db79a
+Iq2_S | fragment_tiled_split_bf16 | 440dc7d2d1d5e563
+Iq2_S | run_sharing | FactorRun { factor_run: 16 } 3 bits
 Iq4_Xs | row_gather | e90f7e4a37a311a1
 Iq4_Xs | gemv0 | 500222c5119ae209
 Iq4_Xs | gemv1 | ffdd33b625aae57c
@@ -232,6 +258,19 @@ Bf16 | register_tiled_indexed | 112e94a0ecd671ca
 Bf16 | register_tiled_narrow_f16 | 4ae85a8dfd2c5c0b
 Bf16 | fragment_tiled_split_bf16 | 9da91ad471a6a3ab
 Bf16 | run_sharing | FactorRun { factor_run: 1 } 16 bits
+Tq2_0 | row_gather | 991dbeb6d9a77e18
+Tq2_0 | gemv0 | 773ae53233627241
+Tq2_0 | gemv1 | 66439ef17f210071
+Tq2_0 | gemv2 | f6e5ccfc74fc55c2
+Tq2_0 | gemv3 | ae2a9aa55559a2d0
+Tq2_0 | gemv0_indexed | 6d0a47017244aa8d
+Tq2_0 | gemv1_indexed | bb0f767ef033f684
+Tq2_0 | gemv_vec4 | 451b7cd88ace5b2d
+Tq2_0 | register_tiled | 4fb5ffde94e7e828
+Tq2_0 | register_tiled_indexed | 4cec856a4c9a3adf
+Tq2_0 | register_tiled_narrow_f16 | 8145e7af9d425005
+Tq2_0 | fragment_tiled_split_bf16 | 60dc1a597e798812
+Tq2_0 | run_sharing | FactorRun { factor_run: 256 } 3 bits
 Mxfp4 | row_gather | 46982c7ead7c75d7
 Mxfp4 | gemv0 | 6c2b22b5f0ba4d69
 Mxfp4 | gemv1 | dec119ab7720d469
@@ -242,108 +281,108 @@ Mxfp4 | gemv1_indexed | be620d8149a119c1
 Mxfp4 | gemv_vec4 | a87d3e22f3474748
 Mxfp4 | register_tiled | 6cd5c1ce6a25ffbe
 Mxfp4 | register_tiled_indexed | 8150c3292877743c
-Mxfp4 | register_tiled_narrow_f16 | 9d91c1a22d55addb
+Mxfp4 | register_tiled_narrow_f16 | 170364ea4efdcf58
 Mxfp4 | fragment_tiled_split_bf16 | e09d1ed5462218e5
 Mxfp4 | run_sharing | FactorRun { factor_run: 32 } 5 bits
 E4m3PerChannel { scale: F32 } | row_gather | refused: packed_kernel: E4m3PerChannel { scale: F32 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
-E4m3PerChannel { scale: F32 } | gemv0 | eba82dbadfb8f941
-E4m3PerChannel { scale: F32 } | gemv1 | afb0477048c10a19
-E4m3PerChannel { scale: F32 } | gemv2 | abe2baa18747b8c9
-E4m3PerChannel { scale: F32 } | gemv3 | 52f5410904f8ac88
-E4m3PerChannel { scale: F32 } | gemv0_indexed | 9bdcbc0ea516ea6a
-E4m3PerChannel { scale: F32 } | gemv1_indexed | cc5c3fae50616797
-E4m3PerChannel { scale: F32 } | gemv_vec4 | 969546f5a3172b29
+E4m3PerChannel { scale: F32 } | gemv0 | 8f0bb3033ae6f1cf
+E4m3PerChannel { scale: F32 } | gemv1 | cfc216c465f773fc
+E4m3PerChannel { scale: F32 } | gemv2 | ac1cdcb453d571ea
+E4m3PerChannel { scale: F32 } | gemv3 | be3c8707c239318a
+E4m3PerChannel { scale: F32 } | gemv0_indexed | 2a1251290d6818b1
+E4m3PerChannel { scale: F32 } | gemv1_indexed | d02af0f85c137405
+E4m3PerChannel { scale: F32 } | gemv_vec4 | 29135e911990020c
 E4m3PerChannel { scale: F32 } | register_tiled | 58c090a42aaf4164
 E4m3PerChannel { scale: F32 } | register_tiled_indexed | ce9a6ae94426f693
-E4m3PerChannel { scale: F32 } | register_tiled_narrow_f16 | d1a4342118191a9a
+E4m3PerChannel { scale: F32 } | register_tiled_narrow_f16 | 889cd0171fa05cba
 E4m3PerChannel { scale: F32 } | fragment_tiled_split_bf16 | 4cf44189cb97aa96
-E4m3PerChannel { scale: F32 } | run_sharing | Elementwise 8 bits
+E4m3PerChannel { scale: F32 } | run_sharing | WholeRow 8 bits
 E4m3PerChannel { scale: Bf16 } | row_gather | refused: packed_kernel: E4m3PerChannel { scale: Bf16 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
-E4m3PerChannel { scale: Bf16 } | gemv0 | b8c27a3fd548e076
-E4m3PerChannel { scale: Bf16 } | gemv1 | 6420a9e208f7f057
-E4m3PerChannel { scale: Bf16 } | gemv2 | 3ba72db3235dfd5b
-E4m3PerChannel { scale: Bf16 } | gemv3 | 9859eaa1876ea6fd
-E4m3PerChannel { scale: Bf16 } | gemv0_indexed | edf9cda8dfb13e80
-E4m3PerChannel { scale: Bf16 } | gemv1_indexed | ecf61b7e91c1f84c
-E4m3PerChannel { scale: Bf16 } | gemv_vec4 | f2de3af70dd4c489
+E4m3PerChannel { scale: Bf16 } | gemv0 | c136a1f96c86038a
+E4m3PerChannel { scale: Bf16 } | gemv1 | 9eaad26b6efe0077
+E4m3PerChannel { scale: Bf16 } | gemv2 | ad617c62dbb36369
+E4m3PerChannel { scale: Bf16 } | gemv3 | 38a49bfd94866b00
+E4m3PerChannel { scale: Bf16 } | gemv0_indexed | 2b08ddacab77ecc3
+E4m3PerChannel { scale: Bf16 } | gemv1_indexed | 861643ae0805381b
+E4m3PerChannel { scale: Bf16 } | gemv_vec4 | e9122faa900ca730
 E4m3PerChannel { scale: Bf16 } | register_tiled | bd7dcf116e21010c
 E4m3PerChannel { scale: Bf16 } | register_tiled_indexed | d303a7b247ed4187
-E4m3PerChannel { scale: Bf16 } | register_tiled_narrow_f16 | 2ad398464fcfe176
+E4m3PerChannel { scale: Bf16 } | register_tiled_narrow_f16 | 80e4fbeaac352738
 E4m3PerChannel { scale: Bf16 } | fragment_tiled_split_bf16 | b1e42d71c2a2008c
-E4m3PerChannel { scale: Bf16 } | run_sharing | Elementwise 8 bits
+E4m3PerChannel { scale: Bf16 } | run_sharing | WholeRow 8 bits
 E4m3PerChannel { scale: E8m0 } | row_gather | refused: packed_kernel: E4m3PerChannel { scale: E8m0 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
-E4m3PerChannel { scale: E8m0 } | gemv0 | baf46d452869aaf0
-E4m3PerChannel { scale: E8m0 } | gemv1 | 36e1832972f5e5d1
-E4m3PerChannel { scale: E8m0 } | gemv2 | c057c5a672ea57db
-E4m3PerChannel { scale: E8m0 } | gemv3 | 46032601a7969537
-E4m3PerChannel { scale: E8m0 } | gemv0_indexed | 10b62f3a0ddf7dee
-E4m3PerChannel { scale: E8m0 } | gemv1_indexed | 84a0ab314eec015f
-E4m3PerChannel { scale: E8m0 } | gemv_vec4 | 2b75a8dfa3a7202d
+E4m3PerChannel { scale: E8m0 } | gemv0 | afc4c6628f4952f8
+E4m3PerChannel { scale: E8m0 } | gemv1 | e36deaa9fa7ad786
+E4m3PerChannel { scale: E8m0 } | gemv2 | 11d464ce9473c389
+E4m3PerChannel { scale: E8m0 } | gemv3 | 336f4b5634eef473
+E4m3PerChannel { scale: E8m0 } | gemv0_indexed | 5388ce255073c995
+E4m3PerChannel { scale: E8m0 } | gemv1_indexed | dd4f89dabe6fd48c
+E4m3PerChannel { scale: E8m0 } | gemv_vec4 | 360f5eb6dd6051fc
 E4m3PerChannel { scale: E8m0 } | register_tiled | 3d3d31f6662ad018
 E4m3PerChannel { scale: E8m0 } | register_tiled_indexed | 137a0fb538d3d960
-E4m3PerChannel { scale: E8m0 } | register_tiled_narrow_f16 | 0bc6eedbe4b2ba91
+E4m3PerChannel { scale: E8m0 } | register_tiled_narrow_f16 | 345fae6bddfca07d
 E4m3PerChannel { scale: E8m0 } | fragment_tiled_split_bf16 | 2c715bc93123a77b
-E4m3PerChannel { scale: E8m0 } | run_sharing | Elementwise 8 bits
+E4m3PerChannel { scale: E8m0 } | run_sharing | WholeRow 8 bits
 E4m3Block128 { scale: F32 } | row_gather | refused: packed_kernel: E4m3Block128 { scale: F32 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
-E4m3Block128 { scale: F32 } | gemv0 | 6e3f3b1e56f80bc9
-E4m3Block128 { scale: F32 } | gemv1 | a9bad1ab67e783c2
-E4m3Block128 { scale: F32 } | gemv2 | 20c2bb03eef95d19
-E4m3Block128 { scale: F32 } | gemv3 | 664101b29d2f3079
-E4m3Block128 { scale: F32 } | gemv0_indexed | 99d9e12fd5c1653d
-E4m3Block128 { scale: F32 } | gemv1_indexed | 4d30cb7925120244
-E4m3Block128 { scale: F32 } | gemv_vec4 | 7f9ab3efc96f1e51
+E4m3Block128 { scale: F32 } | gemv0 | d3ae98bd177cf1cc
+E4m3Block128 { scale: F32 } | gemv1 | d928ee7d495adadd
+E4m3Block128 { scale: F32 } | gemv2 | da54866478255075
+E4m3Block128 { scale: F32 } | gemv3 | 8effd53043a3f9e2
+E4m3Block128 { scale: F32 } | gemv0_indexed | 852912bf6672fa15
+E4m3Block128 { scale: F32 } | gemv1_indexed | f86dfbe2dbe5fe37
+E4m3Block128 { scale: F32 } | gemv_vec4 | 0290afc1bda5f1d5
 E4m3Block128 { scale: F32 } | register_tiled | b2960cbedcced976
 E4m3Block128 { scale: F32 } | register_tiled_indexed | 16183520c269bb1e
-E4m3Block128 { scale: F32 } | register_tiled_narrow_f16 | c050018fe94e1b2b
+E4m3Block128 { scale: F32 } | register_tiled_narrow_f16 | 76c1d889dec794bd
 E4m3Block128 { scale: F32 } | fragment_tiled_split_bf16 | a32533193890d452
-E4m3Block128 { scale: F32 } | run_sharing | Elementwise 8 bits
+E4m3Block128 { scale: F32 } | run_sharing | FactorRun { factor_run: 128 } 8 bits
 E4m3Block128 { scale: Bf16 } | row_gather | refused: packed_kernel: E4m3Block128 { scale: Bf16 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
-E4m3Block128 { scale: Bf16 } | gemv0 | 836463eecfe0f4ce
-E4m3Block128 { scale: Bf16 } | gemv1 | 73d61aa2bc6df885
-E4m3Block128 { scale: Bf16 } | gemv2 | 658b5f8ff846736d
-E4m3Block128 { scale: Bf16 } | gemv3 | 122f76406979c9f2
-E4m3Block128 { scale: Bf16 } | gemv0_indexed | 5ee82b7d486a915b
-E4m3Block128 { scale: Bf16 } | gemv1_indexed | 6fbc9dea59da0cc5
-E4m3Block128 { scale: Bf16 } | gemv_vec4 | 9653c3713ca01112
+E4m3Block128 { scale: Bf16 } | gemv0 | 3bc6808378f64628
+E4m3Block128 { scale: Bf16 } | gemv1 | b1b9b38a092f92ac
+E4m3Block128 { scale: Bf16 } | gemv2 | 7e12f3642401aca7
+E4m3Block128 { scale: Bf16 } | gemv3 | c8e1817b4831a359
+E4m3Block128 { scale: Bf16 } | gemv0_indexed | 8f2bacb9879f3019
+E4m3Block128 { scale: Bf16 } | gemv1_indexed | 43f8e83683ea57b0
+E4m3Block128 { scale: Bf16 } | gemv_vec4 | 8c2a1125d905b27f
 E4m3Block128 { scale: Bf16 } | register_tiled | b5a9145650ae5a52
 E4m3Block128 { scale: Bf16 } | register_tiled_indexed | 941a9b6d45186e03
-E4m3Block128 { scale: Bf16 } | register_tiled_narrow_f16 | 0f7cbb2558fe0ebd
+E4m3Block128 { scale: Bf16 } | register_tiled_narrow_f16 | cb0da60bcaf7f91a
 E4m3Block128 { scale: Bf16 } | fragment_tiled_split_bf16 | 4f138baa25bc5025
-E4m3Block128 { scale: Bf16 } | run_sharing | Elementwise 8 bits
+E4m3Block128 { scale: Bf16 } | run_sharing | FactorRun { factor_run: 128 } 8 bits
 E4m3Block128 { scale: E8m0 } | row_gather | refused: packed_kernel: E4m3Block128 { scale: E8m0 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
-E4m3Block128 { scale: E8m0 } | gemv0 | e1e1519f087316b5
-E4m3Block128 { scale: E8m0 } | gemv1 | 5640e2552ef7baa8
-E4m3Block128 { scale: E8m0 } | gemv2 | 241a67732a87af4a
-E4m3Block128 { scale: E8m0 } | gemv3 | b57923446945f1ce
-E4m3Block128 { scale: E8m0 } | gemv0_indexed | 7b76d04ec93928f2
-E4m3Block128 { scale: E8m0 } | gemv1_indexed | 884c64e40131124d
-E4m3Block128 { scale: E8m0 } | gemv_vec4 | 288594ed3a9be7df
+E4m3Block128 { scale: E8m0 } | gemv0 | 12e50f03bff85b98
+E4m3Block128 { scale: E8m0 } | gemv1 | d75888348a4d2eee
+E4m3Block128 { scale: E8m0 } | gemv2 | d3fae62c369247a5
+E4m3Block128 { scale: E8m0 } | gemv3 | 03ebfa783303c7d0
+E4m3Block128 { scale: E8m0 } | gemv0_indexed | 97679fa8f9517f8e
+E4m3Block128 { scale: E8m0 } | gemv1_indexed | 1b73e97bc07bb723
+E4m3Block128 { scale: E8m0 } | gemv_vec4 | 2e4accf2d0756a2b
 E4m3Block128 { scale: E8m0 } | register_tiled | c6c88b66ae9cf1d2
 E4m3Block128 { scale: E8m0 } | register_tiled_indexed | 7cacedd51eb5a2d2
-E4m3Block128 { scale: E8m0 } | register_tiled_narrow_f16 | e6b1e0ddf210edb6
+E4m3Block128 { scale: E8m0 } | register_tiled_narrow_f16 | b5294c30b0fbc2ac
 E4m3Block128 { scale: E8m0 } | fragment_tiled_split_bf16 | b74453e4c04b58c6
-E4m3Block128 { scale: E8m0 } | run_sharing | Elementwise 8 bits
+E4m3Block128 { scale: E8m0 } | run_sharing | FactorRun { factor_run: 128 } 8 bits
 E2m1Row32 | row_gather | refused: packed_kernel: E2m1Row32: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
-E2m1Row32 | gemv0 | d84c6c14f12c588a
-E2m1Row32 | gemv1 | d08ce8de93a89b67
-E2m1Row32 | gemv2 | ff38520cbd7d4033
-E2m1Row32 | gemv3 | 19ffd157ea332d18
-E2m1Row32 | gemv0_indexed | ec1f1015f9168feb
-E2m1Row32 | gemv1_indexed | b96427548dbd0038
-E2m1Row32 | gemv_vec4 | 5fdf9c8339967473
+E2m1Row32 | gemv0 | 8d5cf3fb999cfd4c
+E2m1Row32 | gemv1 | 8f2296b151ed263e
+E2m1Row32 | gemv2 | 64cffe503ed19e58
+E2m1Row32 | gemv3 | a845c1e25395e78e
+E2m1Row32 | gemv0_indexed | 15d2070051884c2d
+E2m1Row32 | gemv1_indexed | cd9501aa783db1e4
+E2m1Row32 | gemv_vec4 | a898196049878bc9
 E2m1Row32 | register_tiled | 5dcf0d86106b539c
 E2m1Row32 | register_tiled_indexed | d465950127596207
-E2m1Row32 | register_tiled_narrow_f16 | 4fa72b20d57d2bd8
+E2m1Row32 | register_tiled_narrow_f16 | 71487a5a2a3d3bf4
 E2m1Row32 | fragment_tiled_split_bf16 | 3ff3fb0a5a890763
 E2m1Row32 | run_sharing | Elementwise 4 bits
 Gptq { groups: Contiguous { size: 128 } } | row_gather | refused: packed_kernel: Gptq { groups: Contiguous { size: 128 } }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
-Gptq { groups: Contiguous { size: 128 } } | gemv0 | 152e202dcd30b8dc
-Gptq { groups: Contiguous { size: 128 } } | gemv1 | 504c5b3b4a5cad2b
-Gptq { groups: Contiguous { size: 128 } } | gemv2 | c30cbb210ba1531b
-Gptq { groups: Contiguous { size: 128 } } | gemv3 | 14076e79b6e760a6
-Gptq { groups: Contiguous { size: 128 } } | gemv0_indexed | f7d61cb5474300a9
-Gptq { groups: Contiguous { size: 128 } } | gemv1_indexed | 38830d4229517716
-Gptq { groups: Contiguous { size: 128 } } | gemv_vec4 | ae99c9427732a3c4
+Gptq { groups: Contiguous { size: 128 } } | gemv0 | 3a1bdf828c02d5e4
+Gptq { groups: Contiguous { size: 128 } } | gemv1 | 1c4a11405ca95dca
+Gptq { groups: Contiguous { size: 128 } } | gemv2 | ce6bd1b2624a5459
+Gptq { groups: Contiguous { size: 128 } } | gemv3 | 4d17faa4aa4d3450
+Gptq { groups: Contiguous { size: 128 } } | gemv0_indexed | 4151ae52168d2ffc
+Gptq { groups: Contiguous { size: 128 } } | gemv1_indexed | b4749f2c10b2e133
+Gptq { groups: Contiguous { size: 128 } } | gemv_vec4 | e4533909c3e11ff3
 Gptq { groups: Contiguous { size: 128 } } | register_tiled | 50f49618363bcb8e
 Gptq { groups: Contiguous { size: 128 } } | register_tiled_indexed | fb528661f20380ba
 Gptq { groups: Contiguous { size: 128 } } | register_tiled_narrow_f16 | 387a3fa02fefd7b8
@@ -363,13 +402,13 @@ Gptq { groups: Indexed { groups: 32 } } | register_tiled_narrow_f16 | ed529dd135
 Gptq { groups: Indexed { groups: 32 } } | fragment_tiled_split_bf16 | bfaaeae0923ba658
 Gptq { groups: Indexed { groups: 32 } } | run_sharing | Elementwise 4 bits
 Awq { group_size: 128 } | row_gather | refused: packed_kernel: Awq { group_size: 128 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
-Awq { group_size: 128 } | gemv0 | f121aed6878ca6e7
-Awq { group_size: 128 } | gemv1 | 9421f37b89b7c146
-Awq { group_size: 128 } | gemv2 | be6d91f51e698cd2
-Awq { group_size: 128 } | gemv3 | 876f1edecdfa8609
-Awq { group_size: 128 } | gemv0_indexed | 392ca8fedf3360c6
-Awq { group_size: 128 } | gemv1_indexed | 6442b87d5cccbc42
-Awq { group_size: 128 } | gemv_vec4 | 0cdc08fcd245c5bd
+Awq { group_size: 128 } | gemv0 | e9b7720a9c5a1011
+Awq { group_size: 128 } | gemv1 | 8bb7222ecf03a698
+Awq { group_size: 128 } | gemv2 | ace6414ca0459a05
+Awq { group_size: 128 } | gemv3 | 8226f9ab209c985a
+Awq { group_size: 128 } | gemv0_indexed | 0af2f88e7a077b9b
+Awq { group_size: 128 } | gemv1_indexed | 523077eed507e141
+Awq { group_size: 128 } | gemv_vec4 | 58da6e70cdf9a524
 Awq { group_size: 128 } | register_tiled | 95014c9572b711d5
 Awq { group_size: 128 } | register_tiled_indexed | 2f85c209868d93b9
 Awq { group_size: 128 } | register_tiled_narrow_f16 | d57d9b3c3e284d91

@@ -63,7 +63,14 @@ fn vulkan() -> Target {
 fn rocm_without_units() -> Target {
     Target::Gpu {
         backend: Backend::AmdGcn(AmdArch::gfx1151()),
-        caps: DeviceCaps::rocm_default(),
+        caps: DeviceCaps {
+            // The wavefront is the device's, and the clustered attention walk needs it reported.
+            subgroup: Queried::Known(poot_target::SubgroupSupport::Present {
+                min_size: 32,
+                max_size: 32,
+            }),
+            ..DeviceCaps::rocm_default()
+        },
     }
 }
 

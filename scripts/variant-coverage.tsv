@@ -31,6 +31,9 @@ Capability	LiteralFirstOperand	covered	crates/poot-graph-plan/src/tests.rs	plann
 Capability	IndexOperand	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	a_negative_literal_update_index_is_an_index_operand_refusal
 Capability	NonLastAxisReduce	covered	crates/poot-npu/src/xdna_lowering/tests.rs	plan_eqn_refuses_for_aie_what_has_no_serialized_schedule
 Capability	AttentionLds	covered	crates/poot-graph-plan/src/planner/choice.rs	a_device_too_small_for_the_request_compiles_to_a_typed_refusal
+Capability	SubgroupShuffle	covered	crates/poot-graph-plan/tests/attention_split.rs	the_key_walk_follows_the_caps
+Capability	AttentionRegisters	covered	crates/poot-graph-plan/tests/attention_split.rs	the_key_walk_follows_the_caps
+Capability	AttentionHeadWidth	covered	crates/poot-graph-plan/tests/attention_split.rs	the_key_walk_follows_the_caps
 Capability	ScanLds	covered	crates/poot-models/tests/scan_contract.rs	a_state_column_that_cannot_fit_is_refused_before_dispatch
 Capability	BlockTopKWorkgroup	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	a_device_below_the_block_top_k_workgroup_is_refused_with_both_numbers
 Capability	RankExtent	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	a_device_below_the_stable_rank_workgroup_memory_is_refused_with_the_extent
@@ -82,6 +85,7 @@ LoadError	InvalidGgufAlignment	covered	crates/poot-load/src/gguf/format.rs	align
 LoadError	UnsafeShardName	covered	crates/poot-load/src/safetensors.rs	shard_names_must_be_plain_file_names
 LoadError	UnsupportedQuantConfig	covered	crates/poot-load/tests/refusal_coverage.rs	a_gptq_checkpoint_format_other_than_gptq_is_an_unsupported_quant_config
 LoadError	UnsupportedLoraConfig	covered	crates/poot-load/src/lora.rs	per_module_patterns_are_refused
+LoadError	ActivationGgufType	covered	crates/poot-load/src/gguf.rs	read_gguf_refuses_the_activation_formats_by_name
 LoadError	UnsupportedGgufType	covered	crates/poot-load/src/gguf.rs	read_gguf_refuses_a_scheme_with_no_packed_path_by_name
 LoadError	UnsupportedGgufTensorRank	covered	crates/poot-load/tests/hostile_inputs.rs	a_quantized_tensor_of_another_rank_is_refused
 LoadError	GgufTensorTruncated	covered	crates/poot-load/src/gguf.rs	truncated_tensor_data_is_a_typed_error

@@ -13,15 +13,17 @@ mod lattice;
 
 use poot_kernel_ir::{ConstantTableDecl, Local};
 use poot_quant::families::lattice::Lattice;
-use poot_quant::format::{Field, OperandRole, ValueMap};
+use poot_quant::format::{Field, FieldEncoding, OperandRole, ValueMap};
+use poot_target::RoundingConversions;
 
+use super::float_decode::FloatDecode;
 use crate::emit::Emit;
 
 /// The value family a descriptor selects.
 #[derive(Clone, Copy)]
 pub(super) enum Family {
     Integer,
-    Float,
+    Float(FloatDecode),
     Lattice(&'static Lattice),
 }
 
@@ -42,11 +44,36 @@ pub(super) struct Position {
 }
 
 impl Family {
-    pub(super) fn of(value: ValueMap) -> Self {
-        match value {
+    /// The family `value` selects over the `Codes` field `codes`; `None` for a float family whose codes are not
+    /// float-encoded.
+    pub(super) fn of(value: ValueMap, codes: &Field) -> Option<Self> {
+        Some(match value {
             ValueMap::Integer => Self::Integer,
-            ValueMap::Float => Self::Float,
+            ValueMap::Float => {
+                let FieldEncoding::Float(format) = codes.encoding else {
+                    return None;
+                };
+                Self::Float(FloatDecode::exact(format))
+            }
             ValueMap::Lattice(lattice) => Self::Lattice(lattice),
+        })
+    }
+
+    /// The family decoding through what the device keeps ([`FloatDecode::shifted_on`]), for a decode whose
+    /// value meets a scale ([`Self::fold_scale`] is then owed on it).
+    pub(super) fn decoding_on(self, conversions: RoundingConversions) -> Self {
+        match self {
+            Self::Float(decode) => Self::Float(decode.shifted_on(conversions)),
+            other => other,
+        }
+    }
+
+    /// `scale` with what the family's value owes it: the power of two of a shifted float decode, nothing for
+    /// any other.
+    pub(super) fn fold_scale(&self, e: &mut Emit, scale: Local) -> Local {
+        match self {
+            Self::Float(decode) => decode.fold_scale(e, scale),
+            Self::Integer | Self::Lattice(_) => scale,
         }
     }
 
@@ -55,7 +82,7 @@ impl Family {
     /// reads them in; nothing for a family whose value is computed from the code.
     pub(super) fn tables(&self) -> Vec<ConstantTableDecl> {
         match self {
-            Self::Integer | Self::Float => Vec::new(),
+            Self::Integer | Self::Float(_) => Vec::new(),
             Self::Lattice(lattice) => lattice::tables(lattice),
         }
     }
@@ -64,7 +91,7 @@ impl Family {
     /// their bits.
     pub(super) fn operands(&self) -> &'static [OperandRole] {
         match self {
-            Self::Integer | Self::Float => &[],
+            Self::Integer | Self::Float(_) => &[],
             Self::Lattice(lattice) => lattice::operands(lattice),
         }
     }
@@ -80,7 +107,7 @@ impl Family {
     ) -> Local {
         match self {
             Self::Integer => integer::emit_value(e, codes),
-            Self::Float => float::emit_value(e, codes),
+            Self::Float(decode) => float::emit_value(e, *decode, codes),
             Self::Lattice(lattice) => lattice::emit_value(e, lattice, codes.bits, extras, at),
         }
     }

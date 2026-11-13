@@ -167,13 +167,34 @@ pub enum Capability {
         /// The reduced axis.
         axis: usize,
     },
-    /// The attention kernel keeps one lane's running state (`dv` output channels and two scalars) in
-    /// workgroup memory, and not even one lane's fits the device's `lds_bytes`.
+    /// The clustered attention walk's end combine keeps one cluster's running state (`n_rep` heads of `dv` output
+    /// channels and two scalars each) in workgroup memory, and not even one cluster's fits the device's
+    /// `lds_bytes`.
     AttentionLds {
-        /// Output channels of one lane's running state.
+        /// Output channels of one head's running state.
         dv: usize,
         /// The device's workgroup memory, in bytes.
         lds_bytes: u32,
+    },
+    /// The clustered attention walk reduces a key's dot product with subgroup shuffles, and the device reports no
+    /// subgroup of at least 32 lanes that runs them, or its code generator has no shuffle lowering.
+    SubgroupShuffle,
+    /// The clustered attention walk holds `needed` registers per lane across its key loop (the heads' query, output
+    /// and softmax state, and the key and value runs), and even a full 32-lane cluster exceeds the `budget` the
+    /// device's register file allows.
+    AttentionRegisters {
+        /// Registers a lane needs at the widest cluster.
+        needed: u32,
+        /// Registers a lane may hold across the loop.
+        budget: u32,
+    },
+    /// No whole-lane run of a clustered attention key walk covers a head of `dk` key and `dv` value channels in at
+    /// most 32 lanes: the head widths share no power-of-two run wide enough.
+    AttentionHeadWidth {
+        /// Key channels.
+        dk: usize,
+        /// Value channels.
+        dv: usize,
     },
     /// The scan kernel keeps one state column (`rows` floats) per lane in workgroup memory, and not even one
     /// lane's fits the device's `lds_bytes`.
@@ -576,8 +597,19 @@ impl fmt::Display for Capability {
             }
             Capability::AttentionLds { dv, lds_bytes } => write!(
                 f,
-                "the attention kernel needs {} bytes of workgroup memory for one lane at value dim {dv}, the device has {lds_bytes}",
+                "the attention kernel needs workgroup memory for one cluster's end combine (at least {} bytes for one head at value dim {dv}), the device has {lds_bytes}",
                 4 * (dv + 2)
+            ),
+            Capability::SubgroupShuffle => f.write_str(
+                "the attention kernel reduces with subgroup shuffles, and the device reports no subgroup of 32 or more lanes that runs them",
+            ),
+            Capability::AttentionRegisters { needed, budget } => write!(
+                f,
+                "the attention kernel holds {needed} registers per lane across its key loop, the device's register file allows {budget}"
+            ),
+            Capability::AttentionHeadWidth { dk, dv } => write!(
+                f,
+                "no run of the attention key walk covers key dim {dk} and value dim {dv} in at most 32 lanes"
             ),
             Capability::ScanLds { rows, lds_bytes } => write!(
                 f,

@@ -1,7 +1,7 @@
 //! Packed-linear payloads decode through the one scalar decoder.
 
 use super::*;
-use crate::format::ScaleEncoding;
+use crate::format::{FloatFormat, ScaleEncoding};
 use crate::test_support::formats::GGUF_FORMATS;
 
 fn owner(bytes: &[u8]) -> StoredBytes {
@@ -533,4 +533,43 @@ fn a_deferred_payload_refuses_a_bad_row_when_it_is_decoded() {
         PackedPayload::try_new(weight, [(SourceRole::Blocks, owner(&eager))]),
         Err(PackedWeightError::NonFiniteField { .. })
     ));
+}
+
+/// A [`HalfEmbedding`] is exact: the binary16 a shift of the code builds, widened, times the rescale is the
+/// scalar decoder's value, for every admitted code of every format that embeds and for both signs of zero.
+/// Mutation: build the shift one position short (`10 - mantissa_bits + 1`) and every nonzero code is off.
+#[test]
+fn a_half_embedding_is_the_scalar_decode_up_to_its_rescale() {
+    use crate::scalar::{f16_to_f32, float_to_f32};
+    let mut embedded = 0;
+    for format in [
+        FloatFormat::F32,
+        FloatFormat::F16,
+        FloatFormat::Bf16,
+        FloatFormat::E4m3Fn,
+        FloatFormat::E2m1,
+        FloatFormat::E8m0,
+    ] {
+        let Some(embedding) = format.half_embedding() else {
+            continue;
+        };
+        embedded += 1;
+        assert_eq!(embedding.width, format.bits(), "{format:?}");
+        for code in 0..1u32 << embedding.width {
+            if format.non_finite().is_some_and(|n| n.matches(code)) {
+                continue;
+            }
+            let sign = (code >> (embedding.width - 1)) & 1;
+            let magnitude = code & ((1 << (embedding.width - 1)) - 1);
+            let half = ((sign << 15) | (magnitude << (10 - embedding.mantissa_bits))) as u16;
+            let got = f16_to_f32(half) * embedding.rescale();
+            let want = float_to_f32(format, code);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{format:?} code {code:#04x}: {got} vs {want}"
+            );
+        }
+    }
+    assert_eq!(embedded, 2, "E4M3FN and E2M1 embed in binary16");
 }

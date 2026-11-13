@@ -172,6 +172,9 @@ pub enum WeightFormat {
     Iq4_Nl,
     /// GGUF `IQ4_XS` (ggml type 23): 256-value super-blocks of 4-bit codebook codes with 6-bit sub-block scales.
     Iq4_Xs,
+    /// GGUF `IQ2_XXS` (ggml type 16): 256-value super-blocks of 8-bit lattice points over eight values
+    /// each, with the 7-bit sign patterns and a 4-bit half-step scale packed per 32 values.
+    Iq2_Xxs,
     /// GGUF `IQ2_XS` (ggml type 17): 256-value super-blocks of 9-bit lattice points over eight values
     /// each, 7-bit sign patterns and 4-bit half-step sub-block scales.
     Iq2_Xs,
@@ -182,6 +185,13 @@ pub enum WeightFormat {
     /// each (eight low bits and one high bit stored apart), 8-bit sign patterns and 4-bit odd-integer
     /// scales.
     Iq3_S,
+    /// GGUF `IQ2_S` (ggml type 22): 256-value super-blocks of 10-bit lattice points over eight values
+    /// each (eight low bits and two high bits stored apart), 8-bit sign patterns and 4-bit half-step
+    /// sub-block scales.
+    Iq2_S,
+    /// GGUF `TQ2_0` (ggml type 35): 256-value ternary blocks of 2-bit codes and one f16 scale,
+    /// `y = (q - 1) * d`.
+    Tq2_0,
     /// GGUF MXFP4 (ggml type 39): 32-value blocks, element `j` in the low nibble of byte `j` and
     /// element `j + 16` in its high nibble.
     Mxfp4,
@@ -364,6 +374,48 @@ impl FloatFormat {
             Self::E2m1 => return None,
         };
         Some(NonFinite { mask, pattern })
+    }
+
+    /// How this format embeds in IEEE binary16 by a shift, or `None` when its exponent or mantissa does
+    /// not fit binary16's (`F32`, `Bf16`, `E8m0`) or it is binary16 itself.
+    pub const fn half_embedding(self) -> Option<HalfEmbedding> {
+        match self {
+            Self::E4m3Fn => Some(HalfEmbedding {
+                width: 8,
+                mantissa_bits: 3,
+                bias: 7,
+            }),
+            Self::E2m1 => Some(HalfEmbedding {
+                width: 4,
+                mantissa_bits: 1,
+                bias: 1,
+            }),
+            Self::F32 | Self::F16 | Self::Bf16 | Self::E8m0 => None,
+        }
+    }
+}
+
+/// How a sign-magnitude float with at most binary16's exponent and mantissa bits embeds in binary16 by a
+/// shift. The magnitude bits (exponent then mantissa) move up to binary16's mantissa position and the sign
+/// to binary16's sign bit. The exponent field keeps its meaning at binary16's bias of 15, so the binary16
+/// that results has the format's value times `2^(bias - 15)`, for normals and subnormals alike (a
+/// subnormal's `2^(1 - bias) * m` is that format's own `2^(1 - 15) * m` shifted by the same power of two).
+/// The exact value is the binary16's times [`Self::rescale`], a power of two a block's scale can absorb.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HalfEmbedding {
+    /// The stored width in bits: sign, exponent, mantissa.
+    pub width: u32,
+    /// The stored mantissa bits.
+    pub mantissa_bits: u32,
+    /// The stored exponent bias.
+    pub bias: u32,
+}
+
+impl HalfEmbedding {
+    /// The power of two, `2^(15 - bias)`, by which the shifted binary16's value is multiplied to give the
+    /// stored value.
+    pub const fn rescale(self) -> f32 {
+        f32::from_bits((127 + 15 - self.bias) << 23)
     }
 }
 
@@ -678,9 +730,12 @@ impl WeightFormat {
             Self::Q6_K => blocks::Q6_K,
             Self::Iq4_Nl => blocks::IQ4_NL,
             Self::Iq4_Xs => blocks::IQ4_XS,
+            Self::Iq2_Xxs => blocks::IQ2_XXS,
             Self::Iq2_Xs => blocks::IQ2_XS,
             Self::Iq3_Xxs => blocks::IQ3_XXS,
             Self::Iq3_S => blocks::IQ3_S,
+            Self::Iq2_S => blocks::IQ2_S,
+            Self::Tq2_0 => blocks::TQ2_0,
             Self::Mxfp4 => blocks::MXFP4,
             Self::E4m3PerChannel { scale } => planar::e4m3_per_channel(scale),
             Self::E4m3Block128 { scale } => planar::e4m3_block128(scale),

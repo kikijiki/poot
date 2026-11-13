@@ -48,6 +48,11 @@ pub(crate) struct SelectedRow {
 }
 
 impl SelectedRow {
+    /// The bit offset of the selected expert's slab in source `index`.
+    pub(crate) fn slab_bit(&self, index: usize) -> Local {
+        self.slab_bits[index]
+    }
+
     /// Source `index` (a buffer of `words`) read relative to the selected expert's slab.
     pub(crate) fn source(&self, index: usize, words: Local) -> Source {
         Source {
@@ -114,11 +119,12 @@ pub(super) fn indexed_register_tiled(
     launch: TiledLaunch,
     epilogue: Option<&Epilogue>,
     read: ProductRead,
+    conversions: poot_target::RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     let decode = match descriptor.storage {
-        Storage::Planar(_) => Decode::Planar(PlanarPlan::of(&descriptor)?),
-        _ => Decode::Block(DecodePlan::of(&descriptor)?),
+        Storage::Planar(_) => Decode::Planar(PlanarPlan::of(&descriptor)?.on(conversions)),
+        _ => Decode::Block(DecodePlan::of(&descriptor)?.on(conversions)),
     };
     let sources = match &decode {
         Decode::Block(_) => 1,
@@ -205,6 +211,42 @@ pub fn packed_run_held_registers(
     format: poot_quant::format::WeightFormat,
     run: usize,
 ) -> Result<u32, KernelGenError> {
+    let stub = emit_stub_run(format, run, false)?;
+    Ok(crate::contraction::held_registers(
+        stub.statements,
+        &stub.locals,
+    ))
+}
+
+/// The 32-bit registers the loads of one run of `run` aligned values of a `format` expert row carry to its decode
+/// (POOT-1560): what [`DecodePlan::emit_run_load`] or [`PlanarPlan::emit_run_load`] returns, which a Gemv trip keeps
+/// live from its issue until its decode and a deeper pipeline multiplies by its depth. A run that reads each
+/// element where it decodes it carries only the factors it shares.
+pub(crate) fn packed_run_carried_registers(
+    format: poot_quant::format::WeightFormat,
+    run: usize,
+) -> Result<u32, KernelGenError> {
+    let stub = emit_stub_run(format, run, true)?;
+    Ok(crate::contraction::register_words_of(
+        &stub.carried,
+        &stub.locals,
+    ))
+}
+
+/// One run emitted alone ([`emit_stub_run`]): its statements, the locals they declare and the locals its loads return.
+struct StubRun {
+    statements: Vec<poot_kernel_ir::Statement>,
+    locals: Vec<poot_kernel_ir::LocalDecl>,
+    carried: Vec<Local>,
+}
+
+/// One run of `format` emitted alone over stub parameters: its statements, the locals they declare and, when
+/// `loads_only`, the locals the run's loads return (otherwise the whole run is emitted and none are).
+fn emit_stub_run(
+    format: poot_quant::format::WeightFormat,
+    run: usize,
+    loads_only: bool,
+) -> Result<StubRun, KernelGenError> {
     let descriptor = format.descriptor();
     let decode = match descriptor.storage {
         Storage::Planar(_) => Decode::Planar(PlanarPlan::of(&descriptor)?),
@@ -221,13 +263,18 @@ pub fn packed_run_held_registers(
     let [row, k0, k, weight_rows] = [(); 4].map(|()| al.add(Ty::Usize, false));
     let mut e = Emit::new(&mut al);
     let words = |index: usize| local(1 + index as u32);
+    let mut carried = Vec::new();
     match &decode {
         Decode::Block(plan) => {
             let source = Source {
                 words: words(0),
                 slab_bit: Some(slabs[0]),
             };
-            plan.emit_run(&mut e, source, row, k0, run, k);
+            if loads_only {
+                carried = plan.emit_run_load(&mut e, source, row, k0, run, k);
+            } else {
+                plan.emit_run(&mut e, source, row, k0, run, k);
+            }
         }
         Decode::Planar(plan) => {
             let sources: Vec<Source> = slabs
@@ -238,11 +285,19 @@ pub fn packed_run_held_registers(
                     slab_bit: Some(slab),
                 })
                 .collect();
-            plan.emit_run(&mut e, &sources, row, k0, run, k, weight_rows);
+            if loads_only {
+                carried = plan.emit_run_load(&mut e, &sources, row, k0, run, k, weight_rows);
+            } else {
+                plan.emit_run(&mut e, &sources, row, k0, run, k, weight_rows);
+            }
         }
     }
     let statements = e.take();
-    Ok(crate::contraction::held_registers(statements, &al.locals))
+    Ok(StubRun {
+        statements,
+        locals: al.locals,
+        carried,
+    })
 }
 
 #[cfg(test)]

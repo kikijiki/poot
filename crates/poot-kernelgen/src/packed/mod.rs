@@ -18,6 +18,7 @@ mod source;
 #[cfg(test)]
 mod identity_tests;
 
+pub(crate) use indexed::packed_run_carried_registers;
 pub use indexed::packed_run_held_registers;
 pub(crate) use kernel::packed_contraction;
 pub use kernel::{
@@ -129,6 +130,470 @@ mod float_decode_tests {
     }
 }
 
+#[cfg(test)]
+mod float_shift_tests {
+    //! POOT-1561 SC-f and SC-g (D3 of the POOT-1550 design): the shifted float decode and the planar run's shared
+    //! scale, through the production run paths ([`DecodePlan::emit_run`], [`PlanarPlan::emit_run`] and the planar
+    //! Gemv body), in the KIR interpreter.
+
+    use poot_kernel_ir::interp::{Buffer, run};
+    use poot_kernel_ir::test_support::workgroups_covering;
+    use poot_kernel_ir::{
+        BasicBlock, Body, Local, Operand, Place, Rvalue, Statement, Terminator, Ty,
+    };
+    use poot_quant::format::{
+        FieldEncoding, OperandRole, PlanarRole, ScaleEncoding, Storage, ValueMap, WeightFormat,
+    };
+    use poot_quant::{PackedWeight, SourceRole};
+    use poot_target::RoundingConversions;
+
+    use super::decode_plan::DecodePlan;
+    use super::fixtures::{self, GEMV_SCHEDULES};
+    use super::planar::PlanarPlan;
+    use super::planar_fixtures::{self, every_planar_format, pack_words};
+    use super::source::Source;
+    use crate::contraction::Schedule;
+    use crate::emit::{Emit, copy, cu};
+    use crate::helpers::{Alloc, elem, ld, local, slice_dtype, slice_f32};
+
+    /// The body that stores the values `run` emits for the run at `(row 0, k0)` of a weight row of `k_total` values
+    /// (`out_total` is one row) to `out[0..]`; `sources` word slices precede `out`.
+    fn probe(
+        sources: usize,
+        (k0, k_total): (usize, usize),
+        run: impl FnOnce(&mut Emit, &[Local], [Local; 4]) -> Vec<Local>,
+    ) -> Body {
+        let mut params = vec![ld(Ty::Unit, false)];
+        params.extend((0..sources).map(|_| ld(slice_dtype(Ty::U32, false), false)));
+        params.push(ld(slice_f32(true), true));
+        let mut al = Alloc::new(params);
+        let words: Vec<Local> = (0..sources as u32).map(|index| local(1 + index)).collect();
+        let out = local(1 + sources as u32);
+        let mut emit = Emit::new(&mut al);
+        let [row, k0, k, out_total] =
+            [0, k0, k_total, 1].map(|value| emit.let_(Ty::Usize, Rvalue::Use(cu(value))));
+        let values = run(&mut emit, &words, [row, k0, k, out_total]);
+        for (j, value) in values.iter().enumerate() {
+            let at = emit.let_(Ty::Usize, Rvalue::Use(cu(j)));
+            emit.assign(elem(out, at), Rvalue::Use(copy(*value)));
+        }
+        let block = BasicBlock {
+            statements: emit.take(),
+            terminator: Terminator::Return,
+        };
+        Body::new("shift_probe", 1 + sources as u32, al.locals, vec![block])
+    }
+
+    fn execute(body: &Body, sources: &[Vec<u32>], count: usize) -> Vec<f32> {
+        let mut buffers: Vec<Buffer> = sources
+            .iter()
+            .map(|words| Buffer::from_u32s(words))
+            .collect();
+        buffers.push(Buffer::from_f32s(&vec![0.0; count]));
+        run(body, workgroups_covering(body, 1), &mut buffers).expect("the probe runs");
+        buffers.pop().unwrap().to_f32s().unwrap()
+    }
+
+    fn has_half_conversion(body: &Body) -> bool {
+        body.blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .any(|statement| matches!(statement, Statement::Assign(_, Rvalue::FromLowBits { .. })))
+    }
+
+    /// One weight row of `k` values of the planar `format`: every admitted code of the float codes (in order, then
+    /// cycling), and `scale` (one element's bytes) in every element of the scale plane.
+    fn planar_row(
+        format: WeightFormat,
+        k: usize,
+        scale: &[u8],
+    ) -> (Vec<(SourceRole, Vec<u8>)>, Vec<f32>) {
+        let shape = [1, k];
+        let weight = PackedWeight::try_new(format, shape).unwrap();
+        let descriptor = format.descriptor();
+        let sources: Vec<(SourceRole, Vec<u8>)> = weight
+            .sources()
+            .into_iter()
+            .map(|role| {
+                let SourceRole::Planar(operand_role) = role else {
+                    unreachable!("a planar source")
+                };
+                let len = descriptor
+                    .planar_operand_bytes(shape, operand_role)
+                    .unwrap();
+                let bytes = match operand_role {
+                    PlanarRole::Codes => {
+                        let operand = descriptor.planar_operand(operand_role).unwrap();
+                        let FieldEncoding::Float(float) = operand.encoding else {
+                            unreachable!("a float planar format has float codes")
+                        };
+                        let admitted: Vec<u8> = (0..=255u32)
+                            .filter(|&code| {
+                                float.bits() < 8
+                                    || !float.non_finite().is_some_and(|n| n.matches(code))
+                            })
+                            .map(|code| code as u8)
+                            .collect();
+                        (0..len).map(|i| admitted[i % admitted.len()]).collect()
+                    }
+                    PlanarRole::Scale => scale.iter().copied().cycle().take(len).collect(),
+                    other => unreachable!("{other:?} is not an operand of a float planar format"),
+                };
+                (role, bytes)
+            })
+            .collect();
+        let refs: Vec<(PlanarRole, &[u8])> = sources
+            .iter()
+            .map(|(role, bytes)| {
+                let SourceRole::Planar(operand_role) = role else {
+                    unreachable!()
+                };
+                (*operand_role, bytes.as_slice())
+            })
+            .collect();
+        let expected = (0..k)
+            .map(|kk| {
+                descriptor
+                    .decode_planar_value(shape, &refs, [0, kk])
+                    .unwrap()
+            })
+            .collect();
+        (sources, expected)
+    }
+
+    /// A shifted run decodes exactly what the scalar decoder does: every admitted code of every float format that
+    /// embeds in binary16 (E4M3FN and E2M1), under a spread of scales, through a block run (`DecodePlan`) and a
+    /// planar run (`PlanarPlan`, as a sliced four-code run and as sixteen codes one by one), equals `float_to_f32 *
+    /// scale` bit for bit. The scales reach the largest power of two the fold keeps finite (2^119 for E4M3FN, 2^113 for
+    /// E2M1), a binary32 subnormal, zero and a negative scale. The shifted body must really convert through binary16 and
+    /// the exact one must not, so a decode that quietly stays exact does not pass.
+    /// Mutation: fold `2^(bias - 14)` (`HalfEmbedding::rescale` one power of two short); every value is off by 2x.
+    #[test]
+    fn float_shift_decode_matches_scalar_on_the_admitted_domain() {
+        let f32_scales: Vec<[u8; 4]> = [
+            1.0f32,
+            -0.0173,
+            3.4e-5,
+            f32::from_bits(1 << 8),
+            f32::from_bits((127 + 119) << 23),
+            0.0,
+            448.0,
+        ]
+        .map(f32::to_le_bytes)
+        .to_vec();
+        let e8m0_scales: Vec<[u8; 1]> = [0x00u8, 0x01, 0x7f, 0x8e, 0xf0].map(|b| [b]).to_vec();
+        let planar: Vec<(WeightFormat, Vec<Vec<u8>>)> = vec![
+            (
+                WeightFormat::E4m3PerChannel {
+                    scale: ScaleEncoding::F32,
+                },
+                f32_scales.iter().map(|s| s.to_vec()).collect(),
+            ),
+            (
+                WeightFormat::E4m3Block128 {
+                    scale: ScaleEncoding::F32,
+                },
+                f32_scales.iter().map(|s| s.to_vec()).collect(),
+            ),
+            (
+                WeightFormat::E2m1Row32,
+                e8m0_scales.iter().map(|s| s.to_vec()).collect(),
+            ),
+        ];
+        let k = 512;
+        let mut compared = 0usize;
+        for (format, scales) in planar {
+            let plan = PlanarPlan::of(&format.descriptor()).unwrap();
+            for scale in scales {
+                let (sources, expected) = planar_row(format, k, &scale);
+                let words = pack_words(&sources);
+                for count in [4, 16] {
+                    let body_of = |plan: &PlanarPlan, k0: usize| {
+                        probe(
+                            plan.source_count(),
+                            (k0, k),
+                            |e, words, [row, k0, k, out_total]| {
+                                let src: Vec<Source> =
+                                    words.iter().copied().map(Source::plain).collect();
+                                plan.emit_run(e, &src, row, k0, count, k, out_total)
+                            },
+                        )
+                    };
+                    let shifted = PlanarPlan::of(&format.descriptor())
+                        .unwrap()
+                        .on(RoundingConversions::F16);
+                    assert!(
+                        has_half_conversion(&body_of(&shifted, 0)),
+                        "{format:?}: the shifted decode converts through binary16"
+                    );
+                    assert!(
+                        !has_half_conversion(&body_of(&plan, 0)),
+                        "{format:?}: the exact decode does not"
+                    );
+                    for k0 in (0..k).step_by(count) {
+                        let got = execute(&body_of(&shifted, k0), &words, count);
+                        for (j, value) in got.iter().enumerate() {
+                            assert_eq!(
+                                value.to_bits(),
+                                expected[k0 + j].to_bits(),
+                                "{format:?} scale {scale:?} count {count} k {}: got {value} want {}",
+                                k0 + j,
+                                expected[k0 + j]
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for format in poot_quant::test_support::formats::GGUF_FORMATS {
+            let descriptor = format.descriptor();
+            let Storage::Blocks(layout) = descriptor.storage else {
+                continue;
+            };
+            let codes = layout.field(OperandRole::Codes).unwrap().field;
+            let embeds =
+                matches!(codes.encoding, FieldEncoding::Float(f) if f.half_embedding().is_some());
+            if descriptor.value != ValueMap::Float || !embeds {
+                continue;
+            }
+            for seed in 0..3u64 {
+                let (k, mut bytes, _) = fixtures::fixture(format, 1, 16, seed);
+                for block in bytes.chunks_mut(layout.bytes) {
+                    // The fold needs `scale * 2^14` finite: an E8M0 scale up to 2^113.
+                    let bit = layout.field(OperandRole::Scale).unwrap().field.pieces[0]
+                        .layout
+                        .bit(0);
+                    block[(bit / 8) as usize] = block[(bit / 8) as usize].min(0xf0);
+                }
+                let mut expected = vec![0.0f32; k];
+                poot_quant::plan::decode_blocks(format, &bytes, &mut expected).unwrap();
+                let words = vec![fixtures::pack_words(&bytes)];
+                for count in [4, 16] {
+                    let plan = DecodePlan::of(&descriptor)
+                        .unwrap()
+                        .on(RoundingConversions::F16);
+                    for k0 in (0..k).step_by(count) {
+                        let body = probe(1, (k0, k), |e, words, [row, k0, k, _]| {
+                            plan.emit_run(e, Source::plain(words[0]), row, k0, count, k)
+                        });
+                        assert!(has_half_conversion(&body), "{format:?}");
+                        let got = execute(&body, &words, count);
+                        for (j, value) in got.iter().enumerate() {
+                            assert_eq!(
+                                value.to_bits(),
+                                expected[k0 + j].to_bits(),
+                                "{format:?} seed {seed} count {count} k {}",
+                                k0 + j
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 20_000, "{compared} values compared");
+    }
+
+    /// The loads from `source` a Gemv body issues: scalar and vector reads of that parameter.
+    fn reads_of(body: &Body, source: Local) -> usize {
+        body.blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .filter(|statement| {
+                matches!(
+                    statement,
+                    Statement::Assign(_, Rvalue::Use(Operand::Copy(Place { local, .. })))
+                        | Statement::Assign(_, Rvalue::VectorLoad { place: Place { local, .. }, .. })
+                        if *local == source
+                )
+            })
+            .count()
+    }
+
+    fn planar_gemv(format: WeightFormat, unroll: u32, conversions: RoundingConversions) -> Body {
+        super::kernel::packed_contraction(
+            "planar_gemv",
+            format,
+            Schedule::Gemv {
+                width: 32,
+                cols: 1,
+                unroll,
+                activation: crate::GemvActivation::Scalar,
+                rows: crate::GemvRows::ONE,
+                depth: crate::LoadDepth::ONE,
+            },
+            &[512, 4],
+            None,
+            crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
+            conversions,
+        )
+        .unwrap()
+    }
+
+    /// POOT-1561 SC-g: a planar run inside one scale group reads the group's scale once, not once per element. The
+    /// scale-plane loads of an FP8 block-128 or AWQ Gemv body (the unrolled run plus its one-element tail) do not
+    /// grow with the run: a run of 8 issues as many as a run of 1. Act-order GPTQ names a group per element, so its
+    /// run still decodes each element's own scale and its loads grow with the run.
+    /// Mutation: decode each element's factors in `contraction_gemv_planar` again (`emit_factors` per `j`, the
+    /// pre-D3 loop); an FP8 block-128 Gemv issues 4 scale loads at run 1 and 18 at run 8, and the row is red.
+    #[test]
+    fn a_planar_run_decodes_its_scale_once() {
+        let scale_reads = |format: WeightFormat, unroll: u32| {
+            let descriptor = format.descriptor();
+            let Storage::Planar(layout) = descriptor.storage else {
+                unreachable!("planar")
+            };
+            let scale = layout
+                .operands
+                .iter()
+                .position(|operand| operand.role == PlanarRole::Scale)
+                .expect("a Scale operand");
+            // Params: the unit, the activation, then one word slice per source in `PackedWeight::sources()` order.
+            let source = local(2 + scale as u32);
+            reads_of(
+                &planar_gemv(format, unroll, RoundingConversions::NONE),
+                source,
+            )
+        };
+        for format in [
+            WeightFormat::E4m3Block128 {
+                scale: ScaleEncoding::F32,
+            },
+            planar_fixtures::awq(),
+        ] {
+            let per_run: Vec<usize> = [1, 8].map(|unroll| scale_reads(format, unroll)).to_vec();
+            assert!(per_run[0] > 0, "{format:?}: the body reads its scale plane");
+            assert_eq!(
+                per_run[0], per_run[1],
+                "{format:?}: a run of 8 reads the scale plane as often as a run of 1 (loads at runs 1 and 8)"
+            );
+        }
+        let act_order = planar_fixtures::gptq_indexed(2);
+        assert!(
+            scale_reads(act_order, 8) > scale_reads(act_order, 1),
+            "act-order GPTQ decodes each element's own scale"
+        );
+    }
+
+    /// The output of the planar Gemv of `schedule` over the shared fixture of `out_rows` weight rows at `K = k`.
+    fn planar_gemv_output(
+        format: WeightFormat,
+        schedule: Schedule,
+        k: usize,
+        out_rows: usize,
+        conversions: RoundingConversions,
+    ) -> Vec<f32> {
+        let (sources, _) = planar_fixtures::fixture(format, out_rows, k, 11);
+        let words = pack_words(&sources);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let activation: Vec<f32> = (0..k)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state % 2000) as f32 - 1000.0) / 500.0
+            })
+            .collect();
+        let body = super::kernel::packed_contraction(
+            &format!("pin_{}", planar_fixtures::format_tag(format)),
+            format,
+            schedule,
+            &[k as u32, out_rows as u32],
+            None,
+            crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
+            conversions,
+        )
+        .unwrap();
+        let metadata = [k as u32, out_rows as u32, 1, 0, 0];
+        let mut buffers: Vec<Buffer> = vec![Buffer::from_f32s(&activation)];
+        buffers.extend(words.iter().map(|words| Buffer::from_u32s(words)));
+        buffers.push(Buffer::from_u32s(&metadata));
+        buffers.push(Buffer::from_f32s(&vec![0.0; out_rows]));
+        let workgroups = workgroups_covering(&body, schedule.grid_threads(1, 1, out_rows));
+        run(&body, workgroups, &mut buffers).expect("the planar Gemv runs");
+        buffers.pop().unwrap().to_f32s().unwrap()
+    }
+
+    /// The f32 bits of the planar Gemv over the shared fixture, per format, schedule and `K`, digested.
+    fn planar_gemv_digests(conversions: RoundingConversions) -> Vec<String> {
+        let mut current = Vec::new();
+        for format in every_planar_format() {
+            for k in [17, 64] {
+                for (index, schedule) in GEMV_SCHEDULES.into_iter().enumerate() {
+                    let got = planar_gemv_output(format, schedule, k, 11, conversions);
+                    let text: String = got.iter().map(|v| format!("{:08x}", v.to_bits())).collect();
+                    current.push(format!(
+                        "{format:?} | gemv{index} k={k} | {:016x}",
+                        super::identity_tests::digest(&text)
+                    ));
+                }
+            }
+        }
+        current
+    }
+
+    /// POOT-1560 SC-e over the planar bodies (shared scale, sliced field, per-element codes): `rows` and `depth` change
+    /// no bit of a row's sum, at `K` 17 (a ragged tail) and 64, over 12 weight rows (a multiple of every row count).
+    /// Mutation: in `gemv_body` run the products of rows after the first in reverse order of the run (the `MUTATION`
+    /// line); every row count above one goes red for the planar formats too.
+    #[test]
+    fn rows_and_depth_do_not_change_a_planar_rows_sum() {
+        for format in every_planar_format() {
+            for k in [17, 64] {
+                for launch in [GEMV_SCHEDULES[1], GEMV_SCHEDULES[3]] {
+                    let want = planar_gemv_output(format, launch, k, 12, RoundingConversions::NONE);
+                    for rows in 1..=4 {
+                        for depth in 1..=3 {
+                            let schedule = fixtures::with_rows_and_depth(launch, rows, depth);
+                            let got = planar_gemv_output(
+                                format,
+                                schedule,
+                                k,
+                                12,
+                                RoundingConversions::NONE,
+                            );
+                            assert_eq!(
+                                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                "{format:?} {launch:?} k={k} rows={rows} depth={depth}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// POOT-1561 SC-g, the output side: sharing a planar run's scale changes no bit of the Gemv's output. The f32
+    /// bits of every planar format under every `GEMV_SCHEDULES` entry at `K` 17 and 64 are the ones recorded from the
+    /// per-element-factor body before this change.
+    /// Mutation: take the scale of `k0 + 1` for the run's shared factors; an FP8 or AWQ row changes.
+    #[test]
+    fn a_planar_gemv_is_bit_identical_after_sharing_its_scale() {
+        let recorded = include_str!("../../tests/data/packed_planar_gemv_output_bits.txt");
+        let current = planar_gemv_digests(RoundingConversions::NONE);
+        let expected: Vec<&str> = recorded.lines().collect();
+        let changed: Vec<String> = current
+            .iter()
+            .zip(&expected)
+            .filter(|(now, was)| now.as_str() != **was)
+            .map(|(now, was)| format!("recorded {was}\n     now {now}"))
+            .collect();
+        assert!(
+            changed.is_empty() && current.len() == expected.len(),
+            "{} of {} planar Gemv outputs changed ({} recorded):\n{}\n--- full table ---\n{}",
+            changed.len(),
+            current.len(),
+            expected.len(),
+            changed.join("\n"),
+            current.join("\n")
+        );
+    }
+}
+
 /// Shared fixtures for every packed-kernel device/interpreter test below: the seven block-32
 /// formats, a deterministic admitted-domain byte generator, and the D9 word transport. One
 /// implementation so every op's test compares against the identical oracle input shape.
@@ -152,12 +617,24 @@ mod fixtures {
                 cols,
                 unroll,
                 activation,
+                rows,
+                depth,
             } => {
                 let read = match activation {
                     crate::GemvActivation::Scalar => "",
                     crate::GemvActivation::Vec4 => "v4",
                 };
-                format!("gemv{width}c{cols}u{unroll}{read}")
+                let rows = if rows.get() > 1 {
+                    format!("r{rows:?}")
+                } else {
+                    String::new()
+                };
+                let depth = if depth.get() > 1 {
+                    format!("d{depth:?}")
+                } else {
+                    String::new()
+                };
+                format!("gemv{width}c{cols}u{unroll}{read}{rows}{depth}")
             }
             Schedule::RegisterTiled {
                 lanes: TileSize(lanes),
@@ -211,26 +688,69 @@ mod fixtures {
             cols: 1,
             unroll: 1,
             activation: crate::GemvActivation::Scalar,
+            rows: crate::GemvRows::ONE,
+            depth: crate::LoadDepth::ONE,
         },
         Schedule::Gemv {
             width: 32,
             cols: 4,
             unroll: 4,
             activation: crate::GemvActivation::Scalar,
+            rows: crate::GemvRows::ONE,
+            depth: crate::LoadDepth::ONE,
         },
         Schedule::Gemv {
             width: 64,
             cols: 8,
             unroll: 3,
             activation: crate::GemvActivation::Scalar,
+            rows: crate::GemvRows::ONE,
+            depth: crate::LoadDepth::ONE,
         },
         Schedule::Gemv {
             width: 32,
             cols: 2,
             unroll: 32,
             activation: crate::GemvActivation::Scalar,
+            rows: crate::GemvRows::ONE,
+            depth: crate::LoadDepth::ONE,
         },
     ];
+
+    /// `schedule`, a Gemv, with `rows` adjacent output columns per lane and `depth` trips of loads in flight.
+    pub(super) fn with_rows_and_depth(schedule: Schedule, rows: u32, depth: u32) -> Schedule {
+        let Schedule::Gemv {
+            width,
+            cols,
+            unroll,
+            activation,
+            ..
+        } = schedule
+        else {
+            panic!("{schedule:?} is not a Gemv");
+        };
+        Schedule::Gemv {
+            width,
+            cols,
+            unroll,
+            activation,
+            rows: crate::GemvRows::new(rows).unwrap(),
+            depth: crate::LoadDepth::new(depth).unwrap(),
+        }
+    }
+
+    /// The geometries a device row runs a Gemv at beyond one row and one trip: two rows, two trips in flight, and the
+    /// deepest of both. The formats are a block-32 one and a K-quant with sub-block factors and a lattice, so the
+    /// rotated state carries windows, factors and a constant table.
+    pub(super) const DEVICE_ROWS_AND_DEPTH: [(u32, u32); 3] = [(2, 1), (1, 3), (4, 3)];
+    pub(super) fn device_rows_and_depth_formats() -> Vec<WeightFormat> {
+        vec![
+            block32()[0],
+            kquant()[0],
+            kquant()[kquant().len() - 1],
+            lattice()[0],
+        ]
+    }
 
     /// The block formats of 32 values (`Q4_0` to `Q8_0`, `IQ4_NL`, MXFP4), from the shared format list.
     pub(super) fn block32() -> Vec<WeightFormat> {
@@ -1176,8 +1696,9 @@ mod contraction_tests {
     use poot_kernel_ir::test_support::workgroups_covering;
 
     use super::fixtures::{
-        GEMV_SCHEDULES, assert_close, block32, contraction_fixture, kquant, pack_words,
-        register_tiled, schedule_tag,
+        DEVICE_ROWS_AND_DEPTH, GEMV_SCHEDULES, assert_close, block32, contraction_fixture,
+        device_rows_and_depth_formats, kquant, pack_words, register_tiled, schedule_tag,
+        with_rows_and_depth,
     };
     use super::kernel::packed_contraction;
     use crate::contraction::{RegisterTiling, Schedule};
@@ -1435,6 +1956,8 @@ mod contraction_tests {
                     cols,
                     unroll,
                     activation: crate::GemvActivation::Vec4,
+                    rows: crate::GemvRows::ONE,
+                    depth: crate::LoadDepth::ONE,
                 };
                 for (blocks, out_per_block) in [(1, 11), (2, 5)] {
                     let what = format!("{format:?} {scalar:?} blocks={blocks}");
@@ -1457,6 +1980,8 @@ mod contraction_tests {
             cols: 4,
             unroll: 6,
             activation: crate::GemvActivation::Vec4,
+            rows: crate::GemvRows::ONE,
+            depth: crate::LoadDepth::ONE,
         };
         let refused = packed_contraction(
             "contraction_vec4_unroll6",
@@ -1540,6 +2065,73 @@ mod contraction_tests {
             changed.join("\n"),
             current.join("\n")
         );
+    }
+
+    /// POOT-1560 SC-e: a lane that accumulates `rows` adjacent output columns and keeps `depth` trips of loads in flight
+    /// computes every column's sum bit for bit as it does at one row and one trip, at the same lanes per column and
+    /// run, over every block format and three launches (a run that ends on a block, one that straddles several
+    /// trips of a K-quant row, one of 3 values that no block divides), over two blocks of 12 outputs. 12 is a multiple of
+    /// every row count, and 24 columns over groups of up to 4 columns of 4 rows leave the last workgroup's tail past the
+    /// output.
+    /// Mutation: in `gemv_body` run the products of rows after the first in reverse order of the run (the
+    /// `MUTATION` line); every row count above one goes red, rows = 1 stays green.
+    #[test]
+    fn rows_and_depth_do_not_change_a_rows_sum() {
+        let launches = [
+            GEMV_SCHEDULES[1],
+            with_rows_and_depth(GEMV_SCHEDULES[2], 1, 1),
+            Schedule::Gemv {
+                width: 16,
+                cols: 2,
+                unroll: 8,
+                activation: crate::GemvActivation::Scalar,
+                rows: crate::GemvRows::ONE,
+                depth: crate::LoadDepth::ONE,
+            },
+        ];
+        for format in block32().into_iter().chain(kquant()) {
+            for launch in launches {
+                for (blocks, out_per_block) in [(2, 12)] {
+                    let (want, _) = interpret(format, launch, blocks, 1, out_per_block);
+                    for rows in 1..=4 {
+                        for depth in 1..=3 {
+                            let schedule = with_rows_and_depth(launch, rows, depth);
+                            let (got, _) = interpret(format, schedule, blocks, 1, out_per_block);
+                            assert_eq!(
+                                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                "{format:?} {launch:?} blocks={blocks} rows={rows} depth={depth}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A launch whose lane rows straddle two blocks (`out_per_block` not a multiple of `rows`) would meet one
+    /// activation row with weight rows of another; the body computes NaN for every output instead of a sum over the
+    /// wrong activation, and the same launch at one row, or at a count that divides `out_per_block`, is finite.
+    /// Mutation: drop the poison term from the published partials in `gemv_body`; the straddling launch is finite and
+    /// the row goes red.
+    #[test]
+    fn a_launch_whose_rows_straddle_a_block_computes_nan() {
+        let format = block32()[0];
+        let launch = GEMV_SCHEDULES[1];
+        let (blocks, out_per_block) = (2, 6);
+        for (rows, poisoned) in [(1, false), (2, false), (3, false), (4, true)] {
+            let (got, _) = interpret(
+                format,
+                with_rows_and_depth(launch, rows, 1),
+                blocks,
+                1,
+                out_per_block,
+            );
+            assert!(
+                got.iter().all(|v| v.is_nan() == poisoned),
+                "rows={rows}: {got:?}"
+            );
+        }
     }
 
     /// The weight reads of one run of 16 elements of `format` (`DecodePlan::emit_run`, the statements a Gemv trip
@@ -2043,6 +2635,30 @@ mod contraction_tests {
         }
     }
 
+    /// POOT-1560 (device tier 2): a Gemv whose lanes accumulate several rows and keep several trips of loads in flight
+    /// is within tier-2 tolerance of the reference on the local wgpu (SPIR-V/RADV) device, over two blocks of 12
+    /// outputs (a multiple of every row count). The interpreter pins these bit for bit against one row and one trip
+    /// (`rows_and_depth_do_not_change_a_rows_sum`).
+    #[test]
+    fn a_gemv_with_rows_and_depth_matches_reference_on_wgpu() {
+        let ctx = match poot_wgpu_runtime::Context::new() {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
+                return;
+            }
+        };
+        for format in device_rows_and_depth_formats() {
+            for (rows, depth) in DEVICE_ROWS_AND_DEPTH {
+                let schedule = with_rows_and_depth(GEMV_SCHEDULES[1], rows, depth);
+                run_wgpu_case(&ctx, format, schedule, 2, 1, 12);
+            }
+        }
+    }
+
     #[test]
     fn contraction_gemv_matches_reference_blocks_1_and_2_on_wgpu_kquant() {
         let ctx = match poot_wgpu_runtime::Context::new() {
@@ -2451,8 +3067,9 @@ mod rocm_tests {
     use poot_target::ElementKind;
 
     use super::fixtures::{
-        GEMV_SCHEDULES, GatherCase, assert_close, block32, contraction_fixture, fixture, kquant,
-        kquant_gather_cases, pack_words, register_tiled, schedule_tag,
+        DEVICE_ROWS_AND_DEPTH, GEMV_SCHEDULES, GatherCase, assert_close, block32,
+        contraction_fixture, device_rows_and_depth_formats, fixture, kquant, kquant_gather_cases,
+        pack_words, register_tiled, schedule_tag, with_rows_and_depth,
     };
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
     use crate::contraction::Schedule;
@@ -2813,6 +3430,21 @@ mod rocm_tests {
         }
     }
 
+    /// POOT-1560 (device tier 2): the ROCm counterpart of
+    /// `contraction_tests::a_gemv_with_rows_and_depth_matches_reference_on_wgpu`.
+    #[test]
+    fn a_gemv_with_rows_and_depth_matches_reference_on_rocm() {
+        let Some(ctx) = open_or_skip("a_gemv_with_rows_and_depth_matches_reference_on_rocm") else {
+            return;
+        };
+        for format in device_rows_and_depth_formats() {
+            for (rows, depth) in DEVICE_ROWS_AND_DEPTH {
+                let schedule = with_rows_and_depth(GEMV_SCHEDULES[1], rows, depth);
+                run_contraction_case(&ctx, format, schedule, 2, 1, 12);
+            }
+        }
+    }
+
     #[test]
     fn row_gather_matches_decode_blocks_rows_on_rocm_kquant() {
         let Some(ctx) = open_or_skip("row_gather_matches_decode_blocks_rows_on_rocm_kquant") else {
@@ -2905,7 +3537,11 @@ mod rocm_tests {
     }
 
     /// SC-002 (card 542c, device tier 2): `Contraction` (Gemv, RegisterTiled) for every planar format is
-    /// within tier-2 tolerance of the reference on real ROCm/HSA hardware.
+    /// within tier-2 tolerance of the reference on real ROCm/HSA hardware. Each is built twice, as a device that
+    /// does not keep the binary16 conversion decodes it and as the ROCm caps' `RoundingConversions::F16` does
+    /// (POOT-1561: a float code shifts into binary16 and its scale takes the power of two), and the two outputs are
+    /// equal bit for bit.
+    /// Mutation: fold `2^(bias - 14)` (`HalfEmbedding::rescale`); the E4M3 and E2M1 rows differ between the builds.
     #[test]
     fn contraction_matches_reference_for_every_planar_format_on_rocm() {
         let Some(ctx) =
@@ -2944,36 +3580,48 @@ mod rocm_tests {
                     })
                     .collect();
 
-                let name = format!(
-                    "contraction_planar_rocm_{}_{}",
-                    super::planar_fixtures::format_tag(format),
-                    schedule_tag(schedule)
-                );
-                let body = packed_contraction(
-                    &name,
-                    format,
-                    schedule,
-                    &[k as u32, out_rows as u32],
-                    None,
-                    crate::PackedRows::Blocks,
-                    poot_graph_ir::OperandPrecision::Exact,
-                    poot_target::RoundingConversions::NONE,
-                )
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-                let metadata = [k as u32, out_rows as u32, m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
-                let out_len = m * out_rows;
-                let grid = (schedule.grid_threads(1, m, out_rows) as u32, 1, 1);
-                let block = (body.workgroup_size[0], 1, 1);
-                let mut args: Vec<Arg<'_>> = vec![Arg::F32(&activation)];
-                args.extend(word_bufs.iter().map(|w| Arg::U32(w)));
-                args.push(Arg::U32(&metadata));
-                args.push(Arg::Out(out_len));
-                let got = dispatch_and_download(&ctx, &name, &body, &args, grid, block);
-                assert_close(
-                    format,
-                    &format!("planar Contraction {schedule:?} (ROCm)"),
-                    &got,
-                    &expected,
+                let mut outputs: Vec<Vec<f32>> = Vec::new();
+                for (conversions, tag) in [
+                    (poot_target::RoundingConversions::NONE, "exact"),
+                    (poot_target::RoundingConversions::F16, "f16"),
+                ] {
+                    let name = format!(
+                        "contraction_planar_rocm_{}_{}_{tag}",
+                        super::planar_fixtures::format_tag(format),
+                        schedule_tag(schedule)
+                    );
+                    let body = packed_contraction(
+                        &name,
+                        format,
+                        schedule,
+                        &[k as u32, out_rows as u32],
+                        None,
+                        crate::PackedRows::Blocks,
+                        poot_graph_ir::OperandPrecision::Exact,
+                        conversions,
+                    )
+                    .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
+                    let metadata = [k as u32, out_rows as u32, m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
+                    let out_len = m * out_rows;
+                    let grid = (schedule.grid_threads(1, m, out_rows) as u32, 1, 1);
+                    let block = (body.workgroup_size[0], 1, 1);
+                    let mut args: Vec<Arg<'_>> = vec![Arg::F32(&activation)];
+                    args.extend(word_bufs.iter().map(|w| Arg::U32(w)));
+                    args.push(Arg::U32(&metadata));
+                    args.push(Arg::Out(out_len));
+                    let got = dispatch_and_download(&ctx, &name, &body, &args, grid, block);
+                    assert_close(
+                        format,
+                        &format!("planar Contraction {schedule:?} {tag} (ROCm)"),
+                        &got,
+                        &expected,
+                    );
+                    outputs.push(got);
+                }
+                assert_eq!(
+                    outputs[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    outputs[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{format:?} {schedule:?}: the decode that keeps the f16 conversion (the shift into binary16 for a float code) is the exact decode, bit for bit"
                 );
             }
         }
@@ -3143,8 +3791,9 @@ mod ptx_tests {
     use poot_ptx_runtime::{PtxBuffer, PtxContext};
 
     use super::fixtures::{
-        GEMV_SCHEDULES, GatherCase, assert_close, block32, contraction_fixture, fixture, kquant,
-        kquant_gather_cases, pack_words, register_tiled, schedule_tag,
+        DEVICE_ROWS_AND_DEPTH, GEMV_SCHEDULES, GatherCase, assert_close, block32,
+        contraction_fixture, device_rows_and_depth_formats, fixture, kquant, kquant_gather_cases,
+        pack_words, register_tiled, schedule_tag, with_rows_and_depth,
     };
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
     use crate::contraction::Schedule;
@@ -3313,6 +3962,21 @@ mod ptx_tests {
             for schedule in GEMV_SCHEDULES {
                 run_contraction_case(&ctx, format, schedule, 1, 1, 11);
                 run_contraction_case(&ctx, format, schedule, 2, 1, 5);
+            }
+        }
+    }
+
+    /// POOT-1560 (device tier 2): the PTX counterpart of
+    /// `contraction_tests::a_gemv_with_rows_and_depth_matches_reference_on_wgpu`.
+    #[test]
+    fn a_gemv_with_rows_and_depth_matches_reference_on_ptx() {
+        let Some(ctx) = open_or_skip("a_gemv_with_rows_and_depth_matches_reference_on_ptx") else {
+            return;
+        };
+        for format in device_rows_and_depth_formats() {
+            for (rows, depth) in DEVICE_ROWS_AND_DEPTH {
+                let schedule = with_rows_and_depth(GEMV_SCHEDULES[1], rows, depth);
+                run_contraction_case(&ctx, format, schedule, 2, 1, 12);
             }
         }
     }

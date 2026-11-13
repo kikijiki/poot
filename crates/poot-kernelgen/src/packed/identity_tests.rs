@@ -21,6 +21,41 @@
 //! are bit-identical: `every_format_gemv_is_bit_identical_after_static_alignment` pins the interpreter output of
 //! every block format under every Gemv schedule from the body before this change. To re-record, run the test and
 //! copy its `full table`.
+//!
+//! Extended for POOT-1540 (`Iq2_Xxs`, `Iq2_S`, `Tq2_0`): 39 rows inserted in list order and none changed, so every
+//! earlier format emits the same kernel. The new formats are a descriptor and a table; no emitter changed.
+//!
+//! Re-recorded a third time for POOT-1561 (float shift decode, planar run sharing): 77 of 377 rows changed.
+//! The Gemv bodies of nine planar formats (`gemv0` to `gemv3`, `gemv0_indexed`, `gemv1_indexed`, `gemv_vec4` of the
+//! six E4M3 formats, E2M1 row-32, contiguous GPTQ and AWQ; 63 rows) decode their scale once per run
+//! (`PlanarPlan::emit_run`) where they decoded each element's own; act-order GPTQ names a group per element and its
+//! bodies are unchanged. The `register_tiled_narrow_f16` rows of the eight formats with a float code and a scale
+//! (the six E4M3 formats, E2M1 row-32, MXFP4) are the one row built on a device that keeps the binary16 conversion
+//! (`RoundingConversions::F16`), so they decode through a shift into binary16 and fold the power of two into the
+//! scale; every other row is built without the conversion and decodes exactly as before. The six `run_sharing` rows
+//! of the E4M3 formats are text: their codes are one to an element, so they report their scale group (`FactorRun` for
+//! block 128, `WholeRow` for a per-channel scale) where they said `Elementwise`; the packed-code planar formats (E2M1,
+//! GPTQ, AWQ) still address each element's code through its own chain and say `Elementwise`. The numerics are
+//! bit-identical: `a_planar_gemv_is_bit_identical_after_sharing_its_scale` pins the interpreter output of every
+//! planar format under every Gemv schedule from the per-element body, and
+//! `float_shift_decode_matches_scalar_on_the_admitted_domain` pins the shifted decode to the scalar decoder. To
+//! re-record, run the test and copy its `full table`.
+//!
+//! Re-recorded a fourth time for POOT-1560 (rows and depth in `Schedule::Gemv`): a run read is two phases, its loads
+//! (`DecodePlan::emit_run_load`: the block address, the factors and every field's windows) then its decode
+//! (`emit_run_decode`: the cuts out of those windows and the value formula), so a Gemv trip can issue the next trip's
+//! loads before this trip's decode. A format whose run reads more than one field or more than one stretch of
+//! windows now issues all its window loads before the first cut where it cut each field as it read it: 113 of 416
+//! rows changed. They are every row of Iq2_Xs, Iq2_Xxs, Iq2_S, Iq3_S, Iq3_Xxs, Q3_K, Q5_0, Q5_1, Q5_K and Q6_K under `gemv0` to
+//! `gemv3`, `gemv0_indexed`, `gemv1_indexed`, `gemv_vec4`, `register_tiled`, `register_tiled_indexed`,
+//! `register_tiled_narrow_f16` and `fragment_tiled_split_bf16` (110), and Q4_K, Q8_0 and Tq2_0 under `gemv3` (3, the
+//! 32-value run that reads two stretches). Every other row (the Gemv, tiled and fragment bodies of F32, F16, Bf16 and
+//! the other block formats, `row_gather` and the planar formats, whose run loads (the scale it shares, the field of codes
+//! it slices) now sit in `PlanarPlan::emit_run_load` in the order they were emitted) is the text it was: `gemv_body` at rows = 1 and
+//! depth = 1 emits the nest it always did. The numerics are bit-identical:
+//! `every_format_gemv_is_bit_identical_after_static_alignment` pins the interpreter output of every block format
+//! under every Gemv schedule, unchanged, and `rows_and_depth_do_not_change_a_rows_sum` pins every other geometry to
+//! it. To re-record, run the test and copy its `full table`.
 
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
 use poot_quant::format::WeightFormat;
@@ -121,6 +156,8 @@ fn rows() -> Vec<String> {
                     cols: 2,
                     unroll: 4,
                     activation: crate::GemvActivation::Vec4,
+                    rows: crate::GemvRows::ONE,
+                    depth: crate::LoadDepth::ONE,
                 },
                 PackedRows::Blocks,
                 exact,

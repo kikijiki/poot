@@ -24,9 +24,10 @@ Accepted formats, all kept packed at load time:
 - F32, F16 and BF16;
 - legacy quants `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`;
 - K-quants `Q2_K` through `Q6_K`;
-- `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, and MXFP4.
+- `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, and MXFP4;
+- the ternary `TQ2_0`.
 
-`Q8_K` and the other IQ1 and IQ2 grid formats are refused by name.
+`Q8_1` and `Q8_K` are activation formats with no weight decode in ggml, and no model file carries them; they are refused by name with that reason. The IQ1 formats and TQ1_0 are refused by tensor name and type.
 
 Real-checkpoint receipts: `Q8_0` and `Q4_K_M` library decode on wgpu, ROCm and PTX. Raw Vulkan has a receipt for a bf16 safetensors decode and none for a GGUF quant. Receipts do not establish every family/format combination.
 

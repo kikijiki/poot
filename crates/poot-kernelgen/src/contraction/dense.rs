@@ -6,7 +6,7 @@ use poot_target::{BufferStorage, RoundingConversions};
 
 use super::Schedule;
 use super::epilogue::{BoundEpilogue, Epilogue};
-use super::gemv::{GemvLaunch, gemv_body};
+use super::gemv::{GemvLaunch, Phased, RunAt, gemv_body};
 use super::tiled::{TiledBody, TiledExtents, TiledLaunch, TiledWeight, tiled_body};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, copy};
@@ -79,10 +79,12 @@ pub(crate) fn dense_contraction(
             cols,
             unroll,
             activation,
+            rows,
+            depth,
         } => dense_gemv(
             name,
             lane,
-            GemvLaunch::new(width, cols, unroll, activation)?,
+            GemvLaunch::new(width, cols, unroll, activation, rows, depth)?,
             k,
             epilogue,
             conversions,
@@ -230,13 +232,23 @@ fn dense_gemv(
     let (metadata, out) = (local(3 + leaf_count as u32), local(4 + leaf_count as u32));
     let per_word = lane.per_word();
     let rows_aligned = k.is_multiple_of(per_word);
-    // `gemv_body`'s shared run-read signature: only the planar packed front end reads `out_total`.
-    let read_run =
-        |e: &mut Emit, row: Local, k0: Local, count: usize, k: Local, _out_total: Local| {
-            let first = row_run_start(e, row, k0, k);
-            let word_aligned = rows_aligned && count.is_multiple_of(per_word);
-            lane.emit_run(e, conversions, weight, first, count, word_aligned)
-        };
+    let word_aligned = |count: usize| rows_aligned && count.is_multiple_of(per_word);
+    let read = Phased {
+        load: |e: &mut Emit, at: RunAt| {
+            let first = row_run_start(e, at.row, at.k0, at.k);
+            lane.emit_run_load(e, weight, first, at.count, word_aligned(at.count))
+        },
+        decode: |e: &mut Emit, at: RunAt, loaded: &[Local]| {
+            lane.emit_run_decode(
+                e,
+                conversions,
+                weight,
+                at.count,
+                word_aligned(at.count),
+                loaded,
+            )
+        },
+    };
     let epilogue = epilogue.map(|epilogue| BoundEpilogue {
         epilogue,
         leaves: &leaves,
@@ -250,7 +262,7 @@ fn dense_gemv(
         launch,
         conversions,
         epilogue,
-        read_run,
+        read,
     ))
 }
 

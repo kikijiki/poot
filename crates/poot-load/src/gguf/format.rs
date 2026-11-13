@@ -468,11 +468,11 @@ fn parse_header(bytes: &[u8], in_set: bool) -> Result<ParsedHeader, LoadError> {
 /// Every ggml tensor type id a GGUF file can name (0..=39, ggml.h's `ggml_type`), mapped to the
 /// [`WeightFormat`] poot reads it as, or `None` when poot has no packed or dense representation for
 /// it: a ggml id ggml itself no longer assigns (a removed legacy variant, e.g. `Q4_2`), or a real
-/// ggml scheme with no packed path in `poot-quant` (`Q8_1`, `Q8_K`, the IQ2_XXS/IQ2_S/IQ1 grid formats,
-/// `TQ1_0`/`TQ2_0`, or a plain integer/`F64` tensor type). A quantized tensor of a `None` type is
-/// refused by name at load ([`crate::LoadError::UnsupportedGgufType`]), never loaded dense silently
-/// (ADR-0103 decision 2). Pinned by a literal table (card 543 SC-004): every entry is written out, not
-/// derived, so it can be checked against `ggml.h` line by line.
+/// ggml scheme with no packed path in `poot-quant` (the activation formats `Q8_1` and `Q8_K`, the IQ1
+/// grid formats, `TQ1_0`, or a plain integer/`F64` tensor type). A quantized tensor of a `None` type is
+/// refused by name at load ([`refusal_of`]), never loaded dense silently (ADR-0103 decision 2). Pinned
+/// by a literal table (card 543 SC-004): every entry is written out, not derived, so it can be checked
+/// against `ggml.h` line by line.
 pub fn weight_format_of(ggml_type: u32) -> Option<WeightFormat> {
     const TABLE: [Option<WeightFormat>; 40] = [
         Some(WeightFormat::F32),     // 0 GGML_TYPE_F32
@@ -484,20 +484,20 @@ pub fn weight_format_of(ggml_type: u32) -> Option<WeightFormat> {
         Some(WeightFormat::Q5_0),    // 6 GGML_TYPE_Q5_0
         Some(WeightFormat::Q5_1),    // 7 GGML_TYPE_Q5_1
         Some(WeightFormat::Q8_0),    // 8 GGML_TYPE_Q8_0
-        None,                        // 9 GGML_TYPE_Q8_1 (no packed path)
+        None,                        // 9 GGML_TYPE_Q8_1 (activation format)
         Some(WeightFormat::Q2_K),    // 10 GGML_TYPE_Q2_K
         Some(WeightFormat::Q3_K),    // 11 GGML_TYPE_Q3_K
         Some(WeightFormat::Q4_K),    // 12 GGML_TYPE_Q4_K
         Some(WeightFormat::Q5_K),    // 13 GGML_TYPE_Q5_K
         Some(WeightFormat::Q6_K),    // 14 GGML_TYPE_Q6_K
-        None,                        // 15 GGML_TYPE_Q8_K (no packed path)
-        None,                        // 16 GGML_TYPE_IQ2_XXS (no packed path)
+        None,                        // 15 GGML_TYPE_Q8_K (activation format)
+        Some(WeightFormat::Iq2_Xxs), // 16 GGML_TYPE_IQ2_XXS
         Some(WeightFormat::Iq2_Xs),  // 17 GGML_TYPE_IQ2_XS
         Some(WeightFormat::Iq3_Xxs), // 18 GGML_TYPE_IQ3_XXS
         None,                        // 19 GGML_TYPE_IQ1_S (no packed path)
         Some(WeightFormat::Iq4_Nl),  // 20 GGML_TYPE_IQ4_NL
         Some(WeightFormat::Iq3_S),   // 21 GGML_TYPE_IQ3_S
-        None,                        // 22 GGML_TYPE_IQ2_S (no packed path)
+        Some(WeightFormat::Iq2_S),   // 22 GGML_TYPE_IQ2_S
         Some(WeightFormat::Iq4_Xs),  // 23 GGML_TYPE_IQ4_XS
         None,                        // 24 GGML_TYPE_I8 (not a weight format)
         None,                        // 25 GGML_TYPE_I16 (not a weight format)
@@ -510,13 +510,39 @@ pub fn weight_format_of(ggml_type: u32) -> Option<WeightFormat> {
         None,                        // 32 GGML_TYPE_Q4_0_4_8 (removed)
         None,                        // 33 GGML_TYPE_Q4_0_8_8 (removed)
         None,                        // 34 GGML_TYPE_TQ1_0 (no packed path)
-        None,                        // 35 GGML_TYPE_TQ2_0 (no packed path)
+        Some(WeightFormat::Tq2_0),   // 35 GGML_TYPE_TQ2_0
         None,                        // 36 GGML_TYPE_IQ4_NL_4_4 (removed)
         None,                        // 37 GGML_TYPE_IQ4_NL_4_8 (removed)
         None,                        // 38 GGML_TYPE_IQ4_NL_8_8 (removed)
         Some(WeightFormat::Mxfp4),   // 39 GGML_TYPE_MXFP4
     ];
     TABLE.get(ggml_type as usize).copied().flatten()
+}
+
+/// ggml's `GGML_TYPE_Q8_1`: the activation-side block type of the integer dot products.
+const GGML_TYPE_Q8_1: u32 = 9;
+/// ggml's `GGML_TYPE_Q8_K`: the activation-side block type of the K-quant dot products.
+const GGML_TYPE_Q8_K: u32 = 15;
+
+/// The refusal for a tensor whose ggml type [`weight_format_of`] does not read. `Q8_1` and `Q8_K` are
+/// ggml's activation formats: `type_traits` has no `to_float` for either, `llama-quantize` cannot write
+/// them and no model file carries them, so there is no weight decode to prove against and the refusal
+/// says so; every other unread type is [`LoadError::UnsupportedGgufType`].
+pub(crate) fn refusal_of(tensor: &str, ggml_type: u32) -> LoadError {
+    let tensor = tensor.to_owned();
+    match ggml_type {
+        GGML_TYPE_Q8_1 => LoadError::ActivationGgufType {
+            tensor,
+            ggml_type,
+            name: "Q8_1",
+        },
+        GGML_TYPE_Q8_K => LoadError::ActivationGgufType {
+            tensor,
+            ggml_type,
+            name: "Q8_K",
+        },
+        _ => LoadError::UnsupportedGgufType { tensor, ggml_type },
+    }
 }
 
 /// A GGUF checkpoint's header and tensor directory, with no tensor data read (dquant.md 8.1): the

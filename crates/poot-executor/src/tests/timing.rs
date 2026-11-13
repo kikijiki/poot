@@ -723,3 +723,109 @@ fn sc003_one_kind_name_spans_two_kernel_keys_through_a_real_engine_step() {
         Some(1)
     );
 }
+
+/// Two entries of one program over an I32 `[2, 1]` token slot, `next = tok + 1` exported as the picked token (one
+/// `binary` dispatch each), the second fed the first's pick.
+fn chain_fixture(
+    engine: &mut Engine<FakeDevice>,
+) -> (crate::ExecutableId, [crate::EntryId; 2], crate::ChainFeed) {
+    use poot_graph_ir::{Outputs, Scalar, Slot};
+    use poot_tensor::DType;
+
+    let b = Builder::for_tests();
+    let tok = b
+        .slot_named(Slot::Token, "tok", TensorType::new(vec![2, 1], DType::I32))
+        .unwrap();
+    let next = b.binary_scalar(BinOp::Add, tok, Scalar::I32(1)).unwrap();
+    let picked = poot_graph_ir::BoundaryId(next.id());
+    let graph = b
+        .finish(Outputs::new(next).with_export(picked, next))
+        .unwrap();
+    let program = staged(&graph, engine.device().target());
+    let weights = Arc::new(WeightStore::builder().build());
+    let map = Arc::new(poot_weights::WeightMap::default());
+    let exe = engine.load_weights(weights, map).unwrap();
+    let entries = [
+        engine.add_entry(exe, &program).unwrap(),
+        engine.add_entry(exe, &program).unwrap(),
+    ];
+    let feed = crate::ChainFeed {
+        picked,
+        slot: poot_graph_ir::SlotKey::new(Slot::Token, Some("tok")),
+    };
+    (exe, entries, feed)
+}
+
+/// A chain reports the whole chain's device time once, but each entry's profile row must carry its own dispatches:
+/// the device numbers its dispatches across the chain (the copy that feeds step 1 takes no index), so the second
+/// entry's dispatch is chain index 1 and its label is the second entry's own first step. Before this the second
+/// entry looked chain index 1 up among its own steps (no such step: `unknown`) and read chain index 0 as its own, and
+/// the chain's cumulative device sum counted every dispatch once per entry (the POOT-1568 drift class, in the engine).
+///
+/// Mutation: pass the chain's `time` whole to every entry in `step_chain` (drop the per-entry window); the second
+/// entry's `binary` row reads 10 us (chain index 0) with an `unknown` row beside it, and the summed device time is
+/// 60 us instead of 30 us.
+#[test]
+fn a_chain_labels_each_entrys_dispatches_with_its_own_steps() {
+    let (mut engine, control) = new_engine(TimingOptions::Detailed(DetailedTiming::every_step(
+        4, 64, 4,
+    )));
+    let (exe, entries, feed) = chain_fixture(&mut engine);
+    control.set_device_time(measured(
+        Duration::from_micros(30),
+        Duration::from_micros(35),
+        vec![
+            DispatchDeviceTime {
+                index: 0,
+                duration: Duration::from_micros(10),
+            },
+            DispatchDeviceTime {
+                index: 1,
+                duration: Duration::from_micros(20),
+            },
+        ],
+    ));
+    let tokens: Vec<u8> = [4i32, 9].iter().flat_map(|t| t.to_le_bytes()).collect();
+    let mut first = StepInputs::new();
+    first.push(
+        feed.slot.clone(),
+        &[2, 1],
+        poot_tensor::HostView::new(poot_tensor::DType::I32, 2, &tokens).unwrap(),
+    );
+    let second = StepInputs::new();
+    let steps = [
+        crate::ChainStep {
+            entry: entries[0],
+            inputs: &first,
+        },
+        crate::ChainStep {
+            entry: entries[1],
+            inputs: &second,
+        },
+    ];
+    let mark = engine.stats().timing.mark();
+    engine.step_chain(exe, &steps, &feed, &mut NoSync).unwrap();
+    let stats = engine.stats();
+
+    let window = |entries: &[u64]| poot_profile::Report::window(&stats.timing, &mark, entries);
+    for (entry, expected) in [(entries[0], 10), (entries[1], 20)] {
+        let report = window(&[entry.raw()]);
+        let rows: Vec<_> = report
+            .buckets
+            .iter()
+            .map(|(kind, bucket)| (*kind, bucket.dispatch_count, bucket.device))
+            .collect();
+        assert_eq!(
+            rows,
+            [("binary", 1, Some(Duration::from_micros(expected)))],
+            "entry {entry:?} carries exactly its own dispatch"
+        );
+    }
+    assert_eq!(
+        window(&[entries[0].raw(), entries[1].raw()])
+            .device
+            .sum_of_dispatch_durations,
+        Some(Duration::from_micros(30)),
+        "the chain's dispatches are counted once across its entries"
+    );
+}

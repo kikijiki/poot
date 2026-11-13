@@ -16,6 +16,8 @@ fn gemv() -> kg::Schedule {
         cols: 16,
         unroll: 8,
         activation: kg::GemvActivation::Scalar,
+        rows: poot_kernelgen::GemvRows::ONE,
+        depth: poot_kernelgen::LoadDepth::ONE,
     }
 }
 

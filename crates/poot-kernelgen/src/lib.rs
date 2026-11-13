@@ -63,8 +63,8 @@ pub use stable_rank::{STABLE_RANK_MAX_LANES, StableRankSpec};
 pub use contraction::{CostFit, fit_cost_ratios};
 pub use contraction::{
     CostTerms, DenseTiledWeight, Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep, Feasibility,
-    GemvActivation, GemvShape, RegisterTiling, RunLength, Schedule, Selection, SpillCheck,
-    StagedWeight, TileSize, TiledRows, TiledShape, probe_body,
+    GemvActivation, GemvRows, GemvShape, LoadDepth, RegisterTiling, RunLength, Schedule, Selection,
+    SpillCheck, StagedWeight, TileSize, TiledRows, TiledShape, probe_body,
 };
 pub use fused::{
     FusedInput, FusedKernel, FusedScalarOp, FusedStep, LaneId, LeafId, LeafTy, RowKernel, RowOp,

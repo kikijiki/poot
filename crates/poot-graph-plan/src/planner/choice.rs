@@ -706,6 +706,8 @@ mod tests {
                         cols: 1,
                         unroll: 1,
                         activation: GemvActivation::Scalar,
+                        rows: poot_kernelgen::GemvRows::ONE,
+                        depth: poot_kernelgen::LoadDepth::ONE,
                     },
                     layout: WeightLayout::Nk,
                     weight: poot_target::BufferStorage::f32(),
@@ -896,6 +898,8 @@ mod tests {
             cols,
             unroll: 8,
             activation: poot_kernelgen::GemvActivation::Scalar,
+            rows: poot_kernelgen::GemvRows::ONE,
+            depth: poot_kernelgen::LoadDepth::ONE,
         };
         let cast = |numel: usize| KernelRequest::Cast(CastSpec::F32ToBf16 { numel });
         let rope = |rot: usize| {

@@ -1,10 +1,10 @@
 //! The generated attention kernel on ROCm, one fixture per phase, each through the one contract path
 //! (`compile`, `load_weights`, `add_entry`, `step`) against the CPU oracle's evaluation of the same graph.
 //!
-//! Every fixture has more keys than one pass of the planned kernel covers (a key per lane, or a staged key
+//! Every fixture has more keys than one pass of the planned kernel covers (a key per cluster, or a staged key
 //! block for the tiled schedule), so the running maximum, denominator and output are rescaled between passes:
 //! a kernel that skipped the running-sum rescale passes only a fixture one pass covers. Decode is D = 512 (the
-//! head width that fixes the lane count lowest, 16 lanes on this device) over 96 keys with a per-batch-row
+//! widest head: its cluster is a full 32 lanes, four clusters in the 128-lane workgroup) over 96 keys with a per-batch-row
 //! visible length; prefill is a softcapped D = 128 over 80 rows, each row attending its causal prefix.
 //!
 //! Mutation (guards `poot-kernelgen`'s `attention.rs`, applied once, observed red, restored): drop the
@@ -99,7 +99,7 @@ fn check(name: &str, case: &Case) {
 
 /// `graph` through the contract on ROCm against the oracle, its operands `ids` bound to `consts` and its slot
 /// inputs `slots` (a value and the tensor its step binds), with `lk` keys that must exceed one pass of the
-/// planned attention kernel (a key per lane, or a staged key block for the tiled schedule).
+/// planned attention kernel (a key per cluster, or a staged key block for the tiled schedule).
 fn check_operands(
     name: &str,
     graph: &Graph,
@@ -126,10 +126,11 @@ fn check_operands(
     };
     let spec = spec.clone();
     let lanes = spec.schedule.lanes();
-    // One pass of the walk covers a key per lane (streaming, split) or a staged key block (tiled).
+    // One pass of the walk covers a key per cluster (streaming, split) or a staged key block (tiled).
     let pass = match spec.schedule {
         kg::AttentionSchedule::Tiled { bc, .. } => bc,
-        _ => lanes,
+        kg::AttentionSchedule::Streaming { lanes, walk }
+        | kg::AttentionSchedule::SplitKv { lanes, walk, .. } => lanes / walk.cluster,
     };
     assert!(
         lk > pass,
@@ -202,7 +203,7 @@ fn softcapped_prefill_over_many_key_tiles_matches_the_oracle_on_rocm() {
 }
 
 /// Prefill into a cache (`1 < Lq < Lk`): three new rows against an 80-slot cache whose first 70 slots hold
-/// the prefix (80 keys over 64 lanes), so each lane may walk two keys and the mask row stride is `Lk`, not
+/// the prefix (80 keys over the walk's clusters), so each cluster may walk several keys and the mask row stride is `Lk`, not
 /// `Lq`.
 #[test]
 fn prefill_into_a_cache_matches_the_oracle_on_rocm() {

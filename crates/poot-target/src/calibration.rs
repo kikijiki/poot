@@ -23,6 +23,12 @@ pub const REGISTER_LANE_EDGE_WIDE: u32 = 16;
 /// POOT-1398. [`PerfCalibration::PORTABLE`]'s figure.
 pub const PORTABLE_PACKED_GEMV_RUN: u32 = 8;
 
+/// The fewest steps of a clustered attention walk a split-KV share takes, on a device nobody measured: a share of
+/// fewer steps spends more on the second launch's combine than the extra workgroup hides. The prior of the POOT-1549
+/// design's roofline model (`receipts/1549-design/model.txt`); a pod sweep of {2, 4, 8} replaces it per device.
+/// [`PerfCalibration::PORTABLE`]'s figure, and every measured entry's until its device is swept.
+pub const PORTABLE_ATTENTION_SPLIT_MIN_STEPS: u32 = 4;
+
 /// The packed decode Gemv's longest lane run on Strix Halo (gfx1151, through HSA or RADV), measured (POOT-1390):
 /// a 32-element run (one Q4_K/Q5_K sub-block) amortises the block addressing and the factor decode over
 /// four times the weights of the portable run and keeps the body within the register file on both
@@ -188,6 +194,9 @@ pub struct PerfCalibration {
     /// The longest run of contiguous K elements a packed decode Gemv lane decodes per trip: the register and issue
     /// budget of the device's compiler. The planner runs the format's factor run up to this cap.
     pub packed_gemv_max_run: u32,
+    /// The fewest steps of a clustered attention walk a split-KV share takes: the floor of a share is `clusters`
+    /// times this many keys. A ranking figure: a smaller floor splits a short cache into more workgroups.
+    pub attention_split_min_steps: u32,
 }
 
 impl PerfCalibration {
@@ -200,6 +209,7 @@ impl PerfCalibration {
         cost: PORTABLE_COST_RATIOS,
         attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
         packed_gemv_max_run: PORTABLE_PACKED_GEMV_RUN,
+        attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
 
     /// Strix Halo (gfx1151) through HSA (ROCm): the device the Gemv figures were measured on, with the cost ratios
@@ -211,6 +221,7 @@ impl PerfCalibration {
         cost: STRIX_HALO_HSA_COST_RATIOS,
         attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
         packed_gemv_max_run: STRIX_HALO_PACKED_GEMV_RUN,
+        attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
 
     /// Strix Halo (gfx1151) behind RADV (wgpu, raw Vulkan): the same silicon and Gemv figures, but the cost ratios
@@ -222,6 +233,7 @@ impl PerfCalibration {
         cost: Self::PORTABLE.cost,
         attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
         packed_gemv_max_run: STRIX_HALO_PACKED_GEMV_RUN,
+        attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
 
     /// The RTX PRO 6000 Blackwell Server (compute capability 12.0). Measured for the packed Gemv run (POOT-1405), the
@@ -242,6 +254,7 @@ impl PerfCalibration {
         },
         attention_key_blocks: Self::PORTABLE.attention_key_blocks,
         packed_gemv_max_run: SM_120_PACKED_GEMV_RUN,
+        attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
 }
 
@@ -663,6 +676,11 @@ mod tests {
             source: "POOT-1402: the narrower block the staged tile falls back to when LDS holds no 32-key one",
         },
         Provenance {
+            name: "PORTABLE_ATTENTION_SPLIT_MIN_STEPS",
+            value: 4.0,
+            source: "prior, not yet swept: the POOT-1549 design's roofline model (receipts/1549-design/model.txt section 5) puts a clustered walk step at 200 + 2 n_rep (e_k + e_v) cycles against the combine's 4.1 us fixed launch term, so a share under 4 steps costs more in the combine than the extra workgroup hides. The W7 pod sweep {2, 4, 8} at ISL 128 and 2048 replaces it per device",
+        },
+        Provenance {
             name: "GFX11_MATRIX_FMA_RATE",
             value: 4.0,
             source: "measured gfx1151 peaks, 40-45 TFLOP/s matrix against 10.8 TFLOP/s FMA (receipts/1429-narrow-operands/design.md section 1.1)",
@@ -798,8 +816,13 @@ mod tests {
                 cost: _,
                 attention_key_blocks,
                 packed_gemv_max_run,
+                attention_split_min_steps,
             } = entry;
             assert_provenance(row, packed_gemv_max_run);
+            assert_provenance(
+                "PORTABLE_ATTENTION_SPLIT_MIN_STEPS",
+                attention_split_min_steps,
+            );
             // Every measured entry spells the Strix Halo figures (SM_120 borrows the dense columns from `PORTABLE`,
             // which are the same values): one row each, checked against whichever entry carries it.
             assert_provenance("STRIX_HALO_DENSE_GEMV_COLS_WIDE", dense_gemv_cols.wide);
@@ -890,6 +913,7 @@ mod tests {
             "SM80_MATRIX_FMA_RATE",
             "SM90_MATRIX_FMA_RATE",
             "GEFORCE_MATRIX_FMA_RATE",
+            "PORTABLE_ATTENTION_SPLIT_MIN_STEPS",
             "PORTABLE_PACKED_GEMV_RUN",
             "STRIX_HALO_PACKED_GEMV_RUN",
             "SM_120_PACKED_GEMV_RUN",

@@ -453,9 +453,12 @@ macro_rules! with_plan {
             WeightFormat::Q5_K => arm!(blocks::Q5_K, blocks::QK_K),
             WeightFormat::Q6_K => arm!(blocks::Q6_K, blocks::QK_K),
             WeightFormat::Iq4_Xs => arm!(blocks::IQ4_XS, blocks::QK_K),
+            WeightFormat::Iq2_Xxs => arm!(blocks::IQ2_XXS, blocks::QK_K),
             WeightFormat::Iq2_Xs => arm!(blocks::IQ2_XS, blocks::QK_K),
             WeightFormat::Iq3_Xxs => arm!(blocks::IQ3_XXS, blocks::QK_K),
             WeightFormat::Iq3_S => arm!(blocks::IQ3_S, blocks::QK_K),
+            WeightFormat::Iq2_S => arm!(blocks::IQ2_S, blocks::QK_K),
+            WeightFormat::Tq2_0 => arm!(blocks::TQ2_0, blocks::QK_K),
             WeightFormat::F32 | WeightFormat::F16 | WeightFormat::Bf16 => $otherwise,
             WeightFormat::E4m3PerChannel { .. }
             | WeightFormat::E4m3Block128 { .. }

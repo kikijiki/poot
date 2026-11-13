@@ -54,6 +54,35 @@ pub enum DeviceTime {
     Measured(MeasuredDeviceTime),
 }
 
+impl DeviceTime {
+    /// The part of a chain's device time that belongs to `count` dispatches starting at chain index `first`: those
+    /// dispatches re-indexed from 0, and their summed duration. A step's dispatches are numbered across every entry it
+    /// replays (the copies that feed one entry from the next take no index), so each entry's profile row needs its own
+    /// window or it reads the dispatches of the entries before it. The span of one entry inside a chain is not
+    /// measured, so it is absent rather than the chain's.
+    pub(crate) fn window(&self, first: usize, count: usize) -> DeviceTime {
+        let DeviceTime::Measured(measured) = self else {
+            return DeviceTime::Unknown;
+        };
+        let dispatches: Vec<DispatchDeviceTime> = measured
+            .dispatches
+            .iter()
+            .filter(|d| (first..first + count).contains(&d.index))
+            .map(|d| DispatchDeviceTime {
+                index: d.index - first,
+                duration: d.duration,
+            })
+            .collect();
+        DeviceTime::Measured(MeasuredDeviceTime {
+            // A device that listed no dispatches cannot be split: its entry has no sum, not a zero.
+            sum_of_dispatch_durations: (!measured.dispatches.is_empty())
+                .then(|| dispatches.iter().map(|d| d.duration).sum()),
+            device_span: None,
+            dispatches,
+        })
+    }
+}
+
 /// The kernel a device with no native buffer copy copies state with, compiled by the engine for the device's
 /// target: one thread per `u32` word of the buffer (the planner's `copy_words` kernel,
 /// [`ImportedKernel::CopyWords`]), so it moves any storage byte for byte whatever its element kind. The

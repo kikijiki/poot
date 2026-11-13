@@ -99,13 +99,8 @@ pub(super) fn plan(
         KeyLayout::Split { shared_dim } => *shared_dim,
         KeyLayout::Single | KeyLayout::Paged => 0,
     };
-    let (lanes, walk) = attention_key_walk((dk, dv, shared_dim), *n_rep, kv.bytes(), caps)
-        .ok_or_else(|| {
-            site.refuse(Capability::AttentionLds {
-                dv,
-                lds_bytes: caps.lds_bytes,
-            })
-        })?;
+    let (lanes, walk) = attention_key_walk((dk, dv, shared_dim), *n_rep, kv.bytes(), backend, caps)
+        .map_err(|missing| site.refuse(missing))?;
     let streaming = AttentionSpec {
         kv,
         batch,
@@ -193,15 +188,14 @@ fn plan_selected(
         &[operand_types[1].dtype, operand_types[2].dtype],
         caps,
     )?;
-    let (lanes, walk) =
-        attention_key_walk((layout.dk, layout.dv, 0), attrs.n_rep, kv.bytes(), caps).ok_or_else(
-            || {
-                site.refuse(Capability::AttentionLds {
-                    dv: layout.dv,
-                    lds_bytes: caps.lds_bytes,
-                })
-            },
-        )?;
+    let (lanes, walk) = attention_key_walk(
+        (layout.dk, layout.dv, 0),
+        attrs.n_rep,
+        kv.bytes(),
+        backend,
+        caps,
+    )
+    .map_err(|missing| site.refuse(missing))?;
     let spec = AttentionSpec {
         kv,
         batch: layout.batch,

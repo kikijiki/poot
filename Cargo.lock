@@ -1872,6 +1872,7 @@ dependencies = [
  "poot-graph-ir",
  "poot-graph-plan",
  "poot-kernelgen",
+ "poot-profile",
  "poot-quant",
  "poot-runtime-common",
  "poot-target",

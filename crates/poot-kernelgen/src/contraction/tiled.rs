@@ -1254,6 +1254,15 @@ pub(crate) fn held_registers(statements: Vec<Statement>, locals: &[LocalDecl]) -
         .sum()
 }
 
+/// The 32-bit registers the distinct `locals` of `declared` occupy.
+pub(crate) fn register_words_of(locals: &[Local], declared: &[LocalDecl]) -> u32 {
+    let distinct: std::collections::HashSet<Local> = locals.iter().copied().collect();
+    distinct
+        .into_iter()
+        .map(|l| register_words(&declared[l.index as usize].ty))
+        .sum()
+}
+
 /// The 32-bit registers a value of `ty` occupies: one for a scalar of at most 32 bits (a 16-bit value takes a whole
 /// register), two for a 64-bit one, a vector's lanes packed, nothing for a type no register holds.
 fn register_words(ty: &Ty) -> u32 {

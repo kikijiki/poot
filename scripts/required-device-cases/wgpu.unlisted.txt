@@ -86,6 +86,7 @@ poot-executor	lanes::tests::an_e4m3_table_pads_each_row_to_a_whole_word	executor
 poot-executor	lanes::tests::dense_e4m3_storage_has_no_encoding	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	lanes::tests::encoding_of_agrees_with_encode_stored_for_every_dtype_and_lane	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	lanes::tests::every_encoding_lands_the_oracle_bytes_in_chunks_of_any_size	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	tests::timing::a_chain_labels_each_entrys_dispatches_with_its_own_steps	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	tests::timing::absent_consumer_never_blocks_execution	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	tests::timing::sample_every_skips_detail_on_the_declared_ratio_of_steps	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	tests::timing::sc001_host_partition_sums_to_wall_without_device_subtraction	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified

@@ -33,6 +33,7 @@ pub mod attention;
 pub mod bf16_cast;
 pub mod block_top_k;
 pub mod capture;
+pub mod commit_labels;
 pub mod copy_probe;
 pub mod coresident;
 pub mod device_sampling;

@@ -415,11 +415,15 @@ fn packed_gemv_launch(
 /// ([`PackedRunSharing::FactorRun`]) runs the longest divisor of the factor run within `max_run`: a longer run
 /// amortises the shared decode over more weights (gfx1151 at 17408 x 5120: Q4_K 101-110 -> 171-195 GB/s from run 8 to
 /// its factor run 32), and a run that does not divide the factor run decodes every element's factors, a cliff
-/// this never plans (Q6_K at run 32: 60 GB/s against 190 at its factor run 16).
+/// this never plans (Q6_K at run 32: 60 GB/s against 190 at its factor run 16). A planar format whose codes are
+/// one to an element shares its scale the same way (an FP8 block-128 weight at 17408 x 5120 on gfx1151: 211 GB/s at
+/// run 8, 223 at 16 and 224 at 32, POOT-1561), and a per-channel scale ([`PackedRunSharing::WholeRow`]) takes the
+/// device's longest run.
 ///
 /// A decode that addresses each element on its own ([`PackedRunSharing::Elementwise`]) gains nothing from a
 /// longer run, which only spreads a lane's loads (GPTQ group 128 on gfx1151: 110-129 GB/s at run 8, 59 at 32;
-/// GPTQ act-order 29-32 at run 8, 17 at run 1), so it runs the portable run within `max_run`.
+/// GPTQ act-order 29-32 at run 8, 17 at run 1; with the group's scale decoded once per run, still 111 GB/s at run 8,
+/// 60 at 16 and 51 at 32 at 17408 x 5120, POOT-1561), so it runs the portable run within `max_run`.
 fn gemv_run(sharing: PackedRunSharing, max_run: u32) -> u32 {
     let max_run = max_run.max(1);
     match sharing {
@@ -427,6 +431,7 @@ fn gemv_run(sharing: PackedRunSharing, max_run: u32) -> u32 {
             .rev()
             .find(|&run| factor_run.is_multiple_of(run as usize))
             .unwrap_or(1),
+        PackedRunSharing::WholeRow => max_run,
         PackedRunSharing::Elementwise => max_run.min(PORTABLE_PACKED_GEMV_RUN),
     }
 }
@@ -755,6 +760,8 @@ mod tests {
                 cols,
                 unroll: 32,
                 activation: poot_kernelgen::GemvActivation::Scalar,
+                rows: poot_kernelgen::GemvRows::ONE,
+                depth: poot_kernelgen::LoadDepth::ONE,
             };
             let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
                 PackedContraction {
@@ -908,6 +915,10 @@ mod tests {
                             "{what}: run {run} is shorter than the factor run {factor_run} allows"
                         );
                     }
+                    PackedRunSharing::WholeRow => assert_eq!(
+                        run, cap,
+                        "{what}: a per-channel scale shares any run, so the device's longest runs"
+                    ),
                     PackedRunSharing::Elementwise => assert_eq!(
                         run,
                         cap.min(8),
@@ -930,7 +941,13 @@ mod tests {
                 WeightFormat::E4m3PerChannel {
                     scale: ScaleEncoding::Bf16,
                 },
-                8,
+                32,
+            ),
+            (
+                WeightFormat::E4m3Block128 {
+                    scale: ScaleEncoding::Bf16,
+                },
+                32,
             ),
             (
                 WeightFormat::Gptq {

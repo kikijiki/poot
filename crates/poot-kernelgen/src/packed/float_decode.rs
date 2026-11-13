@@ -10,10 +10,112 @@
 //! a wasted branch, or worse a wrong reconstruction, for a byte that can never arrive - the bug this
 //! design replaces, `dequant_mxfp4.rs`'s ggml half-scale E8M0 form).
 
-use poot_kernel_ir::{BinOp, Local, Rvalue, Ty};
-use poot_quant::format::FloatFormat;
+use poot_kernel_ir::{BinOp, Constant, Local, Operand, Rvalue, Ty};
+use poot_quant::format::{FloatFormat, HalfEmbedding};
+use poot_target::{FragmentDtype, RoundingConversions};
 
 use crate::emit::{Emit, bin, c32, copy, select_u32};
+
+/// How a float code becomes the f32 a packed body multiplies by its scale.
+///
+/// [`Self::exact`] decodes the code to its own value ([`emit_float_decode`]). [`Self::shifted_on`] is the
+/// cheaper decode of a format that embeds in binary16 ([`HalfEmbedding`]) on a device that keeps the binary16
+/// conversion ([`RoundingConversions`], POOT-1458): the code is shifted into binary16 bits and widened by the
+/// device, a handful of integer ops and one conversion in place of the exact decode's subnormal select. The
+/// widened value is the code's times `2^(bias - 15)`, so the block scale takes the inverse power of two once
+/// per run ([`Self::fold_scale`]). The product `scale' * value` is the exact product of `scale * 2^(15 - bias)`
+/// and the binary16, which is the real number `scale * decode(code)`, so it rounds to the same f32 whenever
+/// `scale'` is finite (`|scale| < 2^(128 - 15 + bias)`: 2^120 for E4M3FN, 2^114 for E2M1, far above any
+/// scale a weight carries). A decode with no scale to absorb the power of two stays exact.
+#[derive(Clone, Copy)]
+pub(crate) struct FloatDecode {
+    format: FloatFormat,
+    shift: Option<HalfEmbedding>,
+}
+
+impl FloatDecode {
+    pub(crate) fn exact(format: FloatFormat) -> Self {
+        Self {
+            format,
+            shift: None,
+        }
+    }
+
+    /// The shifted decode of `self`'s format when the device keeps the binary16 conversion and the format
+    /// embeds in binary16, else `self`. Only for a decode whose value meets a scale ([`Self::fold_scale`]).
+    pub(crate) fn shifted_on(self, conversions: RoundingConversions) -> Self {
+        Self {
+            shift: conversions
+                .keeps(FragmentDtype::F16)
+                .then(|| self.format.half_embedding())
+                .flatten(),
+            ..self
+        }
+    }
+
+    /// The f32 of the code `bits`: its value, or its value times `2^(bias - 15)` for a shifted decode.
+    pub(crate) fn emit(self, e: &mut Emit, bits: Local) -> Local {
+        match self.shift {
+            None => emit_float_decode(e, self.format, bits),
+            Some(embedding) => emit_half_shift(e, embedding, bits),
+        }
+    }
+
+    /// `scale` with the power of two a shifted decode owes it, or `scale` itself for an exact decode.
+    pub(crate) fn fold_scale(self, e: &mut Emit, scale: Local) -> Local {
+        match self.shift {
+            None => scale,
+            Some(embedding) => bin(
+                e,
+                Ty::F32,
+                BinOp::Mul,
+                copy(scale),
+                Operand::Const(Constant::F32(embedding.rescale())),
+            ),
+        }
+    }
+}
+
+/// The binary16 `embedding` builds from `bits` by a shift, widened to f32: the sign bit to bit 15 and the
+/// magnitude bits up to binary16's mantissa position, `FromLowBits` and one widening `Cast`.
+fn emit_half_shift(e: &mut Emit, embedding: HalfEmbedding, bits: Local) -> Local {
+    let sign_bit = embedding.width - 1;
+    let sign = {
+        let masked = bin(e, Ty::U32, BinOp::BitAnd, copy(bits), c32(1 << sign_bit));
+        bin(e, Ty::U32, BinOp::Shl, copy(masked), c32(15 - sign_bit))
+    };
+    let magnitude = {
+        let masked = bin(
+            e,
+            Ty::U32,
+            BinOp::BitAnd,
+            copy(bits),
+            c32((1 << sign_bit) - 1),
+        );
+        bin(
+            e,
+            Ty::U32,
+            BinOp::Shl,
+            copy(masked),
+            c32(10 - embedding.mantissa_bits),
+        )
+    };
+    let half_bits = bin(e, Ty::U32, BinOp::BitOr, copy(sign), copy(magnitude));
+    let half = e.let_(
+        Ty::F16,
+        Rvalue::FromLowBits {
+            to: Ty::F16,
+            operand: copy(half_bits),
+        },
+    );
+    e.let_(
+        Ty::F32,
+        Rvalue::Cast {
+            to: Ty::F32,
+            operand: copy(half),
+        },
+    )
+}
 
 pub(crate) fn emit_float_decode(e: &mut Emit, format: FloatFormat, bits: Local) -> Local {
     match format {

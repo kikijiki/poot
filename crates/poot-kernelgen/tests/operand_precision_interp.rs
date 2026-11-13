@@ -445,6 +445,8 @@ fn the_scalar_contraction_bodies_equal_the_exact_host_product() {
             cols: 2,
             unroll: 2,
             activation: kg::GemvActivation::Scalar,
+            rows: poot_kernelgen::GemvRows::ONE,
+            depth: poot_kernelgen::LoadDepth::ONE,
         };
         let request = kg::KernelRequest::Contraction(kg::ContractionSpec::DenseGemv {
             weight: BufferStorage::f32(),
@@ -544,6 +546,8 @@ fn an_indexed_gemv_refuses_a_narrowed_precision() {
                     cols: 2,
                     unroll: 2,
                     activation: kg::GemvActivation::Scalar,
+                    rows: poot_kernelgen::GemvRows::ONE,
+                    depth: poot_kernelgen::LoadDepth::ONE,
                 },
                 layout: kg::WeightLayout::Nk,
                 weight: BufferStorage::f32(),

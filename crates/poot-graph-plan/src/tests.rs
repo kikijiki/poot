@@ -3670,16 +3670,6 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
         "structural: the widest load one lane issues (a 128-bit vector load), which sets the channels a lane of a clustered key walk owns",
     ),
     prov(
-        "MAX_ATTENTION_SPLITS",
-        16,
-        "design bound, not swept: past it the combine stage's per-row reduction costs more than the extra workgroups hide (Flash-Decoding occupancy rule)",
-    ),
-    prov(
-        "MIN_KEYS_PER_SPLIT",
-        128,
-        "design bound, not swept: a shorter share leaves a workgroup's lanes idle and the launch is the combine's overhead",
-    ),
-    prov(
         "TILED_MAX_ROWS",
         128,
         "design bound, not swept: past 128 rows the query tile alone (128 x d words) exceeds a 64 KiB workgroup memory at d 128",
@@ -5052,12 +5042,12 @@ fn every_attention_fixture_plans_the_generated_attention_family_on_every_target(
     }
 }
 
-/// The clustered attention's workgroup is the widest whole run of 32 lanes (at most 64) whose end combine fits the
-/// device's workgroup memory: `clusters * n_rep * (dv + 2)` words. The same decode plans 64 lanes at value dim 64,
-/// 128, 256 and 512 on every cap (the walk's cluster is at most 32 lanes, so a 64-lane workgroup is at most two clusters
-/// of a slab of at most 4 KiB). A fixture device whose workgroup memory cannot hold even one cluster at `dv = 512`
-/// (2056 bytes) refuses with `AttentionLds { dv: 512, .. }`, one byte over the boundary plans a single cluster of 32
-/// lanes, and the same graph plans on the real caps. Mutation: take the lane width from a constant instead of
+/// The clustered attention's workgroup is the lanes that saturate a compute unit with two resident workgroups (128), in
+/// whole subgroups, halved while its end combine (`clusters * n_rep * (dv + 2)` words) exceeds the device's workgroup
+/// memory. The same decode plans 128 lanes at value dim 64, 128, 256 and 512 on every cap. A fixture device whose
+/// workgroup memory cannot hold the end combine of the narrowest workgroup, one 64-lane subgroup of the wgpu fixture
+/// (two clusters of 32 at `dv = 512`, 4112 bytes), refuses with `AttentionLds { dv: 512, .. }`, one byte over the
+/// boundary plans those 64 lanes, and the same graph plans on the real caps. Mutation: take the lane width from a constant instead of
 /// `caps.lds_bytes`; the small-caps device plans and the refusal row goes red.
 #[test]
 fn the_attention_key_walk_fits_the_device_workgroup_memory() {
@@ -5068,12 +5058,12 @@ fn the_attention_key_walk_fits_the_device_workgroup_memory() {
         attention_spec(&choice).schedule.lanes()
     };
     let wgpu = Backend::SpirvVulkan;
-    assert_eq!([64, 128, 256, 512].map(|d| lanes(wgpu, d)), [64; 4]);
+    assert_eq!([64, 128, 256, 512].map(|d| lanes(wgpu, d)), [128; 4]);
     let rocm = Backend::AmdGcn(AmdArch::gfx1151());
-    assert_eq!([64, 128, 256, 512].map(|d| lanes(rocm, d)), [64; 4]);
+    assert_eq!([64, 128, 256, 512].map(|d| lanes(rocm, d)), [128; 4]);
     assert_eq!(
         [64, 128, 256, 512].map(|d| lanes(Backend::Nvptx, d)),
-        [64; 4]
+        [128; 4]
     );
 
     let fixture = AttentionFixture::decode("dv 512", 1, 2, 1, 16, 512);
@@ -5082,27 +5072,26 @@ fn the_attention_key_walk_fits_the_device_workgroup_memory() {
         ..default_caps_for(wgpu)
     };
     let refusal = refusal_of(
-        attention_planned(fixture, wgpu, &with_lds(2055)).map(|(plan, _)| plan),
-        "dv 512 on 2055 bytes of workgroup memory",
+        attention_planned(fixture, wgpu, &with_lds(4111)).map(|(plan, _)| plan),
+        "dv 512 on 4111 bytes of workgroup memory",
     );
     assert_eq!(
         refusal.missing,
         Capability::AttentionLds {
             dv: 512,
-            lds_bytes: 2055
+            lds_bytes: 4111
         }
     );
-    let (_, one_cluster) = attention_planned(fixture, wgpu, &with_lds(2056))
-        .expect("2056 bytes hold exactly one cluster at dv 512");
+    let (_, one_cluster) = attention_planned(fixture, wgpu, &with_lds(4112))
+        .expect("4112 bytes hold exactly two clusters at dv 512");
+    let schedule = attention_spec(&one_cluster).schedule;
+    assert_eq!(schedule.lanes(), 64);
     assert_eq!(
-        attention_spec(&one_cluster).schedule,
-        kg::AttentionSchedule::Streaming {
-            lanes: 32,
-            walk: kg::KeyWalk {
-                cluster: 32,
-                run: 16
-            }
-        }
+        schedule.walk(),
+        Some(kg::KeyWalk {
+            cluster: 32,
+            run: 16
+        })
     );
     attention_planned(fixture, wgpu, &default_caps_for(wgpu))
         .expect("the same graph plans on the real caps");
@@ -5156,7 +5145,8 @@ fn selected_attention_planned(
 
 /// POOT-1338: a block-selected attention serves the 12 query heads of a key/value head in one workgroup, the chunk
 /// and the decode row alike (the K/V rows load once for the group): its workgroups are one per `(kv head, query)`.
-/// A device whose workgroup memory cannot hold one cluster's slab of the 12 heads refuses by name (`AttentionLds`).
+/// A device whose workgroup memory cannot hold the end combine of the narrowest workgroup (two clusters' slabs of the
+/// 12 heads) refuses by name (`AttentionLds`).
 /// Mutation: make `AttentionSpec::heads_per_workgroup` return 1; the workgroup counts go red.
 #[test]
 fn a_selected_attention_serves_the_heads_of_a_key_value_head_in_one_workgroup() {
@@ -5183,7 +5173,7 @@ fn a_selected_attention_serves_the_heads_of_a_key_value_head_in_one_workgroup() 
         );
     }
 
-    // 4 * 12 * (256 + 2) bytes: the slab of one cluster of the 12 heads.
+    // 2 * 4 * 12 * (256 + 2) bytes: the slabs of the two clusters of a 64-lane workgroup (the wgpu fixture's subgroup).
     let wgpu = Backend::SpirvVulkan;
     let with_lds = |lds_bytes: u32| DeviceCaps {
         lds_bytes,
@@ -5191,22 +5181,22 @@ fn a_selected_attention_serves_the_heads_of_a_key_value_head_in_one_workgroup() 
         ..default_caps_for(wgpu)
     };
     let refusal = refusal_of(
-        selected_attention_planned(1024, wgpu, &with_lds(12383)).map(|(plan, _)| plan),
-        "one cluster of 12 heads on 12383 bytes",
+        selected_attention_planned(1024, wgpu, &with_lds(24767)).map(|(plan, _)| plan),
+        "two clusters of 12 heads on 24767 bytes",
     );
     assert_eq!(
         refusal.missing,
         Capability::AttentionLds {
             dv: 256,
-            lds_bytes: 12383
+            lds_bytes: 24767
         }
     );
-    let (_, one_cluster) = selected_attention_planned(1024, wgpu, &with_lds(12384))
-        .expect("12384 bytes hold exactly one cluster of the 12 heads");
+    let (_, one_cluster) = selected_attention_planned(1024, wgpu, &with_lds(24768))
+        .expect("24768 bytes hold exactly two clusters of the 12 heads");
     assert_eq!(
         attention_spec(&one_cluster).schedule,
         kg::AttentionSchedule::Streaming {
-            lanes: 32,
+            lanes: 64,
             walk: kg::KeyWalk {
                 cluster: 32,
                 run: 8
@@ -5381,14 +5371,14 @@ fn the_tiled_schedule_is_chosen_only_within_the_devices_resources() {
 fn the_streaming_schedule_records_its_exact_resources() {
     // (fixture, backend, lanes, walk, n_rep), from the shapes by hand: f32 keys are read 4 to a lane (16 bytes), a
     // head too wide for one 32-lane cluster at that run takes a longer one, and a cluster is the power of two of lanes that
-    // covers the head. 64 lanes hold `64 / cluster` clusters.
+    // covers the head. 128 lanes (two resident workgroups saturate a compute unit) hold `128 / cluster` clusters.
     let wgpu = Backend::SpirvVulkan;
     let walk = |cluster, run| kg::KeyWalk { cluster, run };
     let rows = [
         (
             AttentionFixture::prefill("short prefill", 8, 4, 16, 64),
             wgpu,
-            64usize,
+            128usize,
             walk(16, 4),
             4usize,
         ),
@@ -5396,29 +5386,30 @@ fn the_streaming_schedule_records_its_exact_resources() {
             // One key/value head of 32 rows gives the 40 compute units too few row groups to tile.
             AttentionFixture::prefill("one-group prefill", 8, 8, 32, 128),
             wgpu,
-            64,
+            128,
             walk(32, 4),
             8,
         ),
-        // 192 keys is under two 128-key chunks: the rows are few but a split has nothing to gain.
+        // 24 keys is under two shares of 16 (4 steps of the 4 clusters): the rows are few but a split has nothing to
+        // gain.
         (
-            AttentionFixture::decode("low-head short-cache decode", 1, 2, 1, 192, 128),
+            AttentionFixture::decode("low-head short-cache decode", 1, 2, 1, 24, 128),
             wgpu,
-            64,
+            128,
             walk(32, 4),
             1,
         ),
         (
             AttentionFixture::decode("high-head decode", 8, 32, 4, 2048, 128),
             Backend::AmdGcn(AmdArch::gfx1151()),
-            64,
+            128,
             walk(32, 4),
             4,
         ),
         (
             AttentionFixture::prefill("softcap prefill D=256", 4, 2, 24, 256).softcapped(50.0),
             Backend::Nvptx,
-            64,
+            128,
             walk(32, 8),
             2,
         ),
@@ -5448,7 +5439,8 @@ fn the_streaming_schedule_records_its_exact_resources() {
 }
 
 /// POOT-1113: the split-KV plan records the exact resources of both its launches. A 2-row decode over 1024
-/// keys on the Vulkan caps plans 8 splits of 128 keys over 64 lanes (two clusters of 32): stage one is `row groups *
+/// keys on the Vulkan caps plans 40 splits (the 40 compute units at two workgroups each over 2 row groups, no fixed
+/// cap) of at least 16 keys (4 steps of the 4 clusters) over 128 lanes: stage one is `row groups *
 /// splits` workgroups of `lanes` threads with `clusters * n_rep * (dv + 2) * 4` bytes of workgroup memory; the
 /// combine is one workgroup of `lanes` threads per row with no workgroup memory.
 #[test]
@@ -5457,7 +5449,7 @@ fn the_split_kv_plan_records_the_exact_resources_of_both_launches() {
     let caps = default_caps_for(backend);
     let fixture = AttentionFixture::decode("low-head long decode", 1, 2, 1, 1024, 128);
     let (plan, choice) = attention_planned(fixture, backend, &caps).expect("the decode plans");
-    let (lanes, splits) = (64usize, 8usize);
+    let (lanes, splits) = (128usize, 40usize);
     let walk = kg::KeyWalk {
         cluster: 32,
         run: 4,
@@ -5467,7 +5459,7 @@ fn the_split_kv_plan_records_the_exact_resources_of_both_launches() {
         kg::AttentionSchedule::SplitKv {
             lanes,
             splits,
-            min_units: 128,
+            min_units: 16,
             walk
         }
     );
@@ -5801,6 +5793,7 @@ fn an_m1_dense_bf16_contraction_plans_the_generated_gemv_on_every_backend() {
             cols,
             unroll,
             activation,
+            ..
         } = schedule
         else {
             panic!("{backend:?}: the Gemv schedule, got {schedule:?}");
@@ -6465,6 +6458,8 @@ fn dense_bf16_decode_gemv_selection_rows() {
             cols: launch.cols,
             unroll,
             activation,
+            rows: poot_kernelgen::GemvRows::ONE,
+            depth: poot_kernelgen::LoadDepth::ONE,
         };
         assert_eq!(launch.schedule(backend, k), schedule, "{backend:?}");
 

@@ -23,7 +23,7 @@ use poot_target::{BufferStorage, RoundingConversions};
 
 use super::Schedule;
 use super::epilogue::{BoundEpilogue, Epilogue};
-use super::gemv::{GemvLaunch, gemv_body};
+use super::gemv::{GemvLaunch, RunAt, Undivided, gemv_body};
 use super::tiled::{
     ExpertStep, GroupedRows, TiledBody, TiledExtents, TiledLaunch, TiledWeight, tiled_body,
 };
@@ -176,11 +176,13 @@ pub(crate) fn indexed_contraction(
             cols,
             unroll,
             activation,
+            rows,
+            depth,
         } => {
             require_exact(precision, "indexed_contraction")?;
             indexed_gemv(
                 name,
-                GemvLaunch::new(width, cols, unroll, activation)?,
+                GemvLaunch::new(width, cols, unroll, activation, rows, depth)?,
                 layout,
                 lane,
                 epilogue,
@@ -232,28 +234,31 @@ fn indexed_gemv(
     let (activation, weight, ids) = (local(1), local(2), local(3));
     let leaves: Vec<Local> = (0..leaf_count).map(|j| local(4 + j as u32)).collect();
     let (metadata, out) = (local(4 + leaf_count as u32), local(5 + leaf_count as u32));
-    let read_run =
-        |e: &mut Emit, row: Local, k0: Local, count: usize, k: Local, _out_total: Local| {
-            let n = emit_read_meta(e, metadata, META_N);
-            let experts = emit_read_meta(e, metadata, META_EXPERTS);
-            let m = bin(e, Ty::Usize, BinOp::Div, copy(row), copy(n));
-            let col = bin(e, Ty::Usize, BinOp::Rem, copy(row), copy(n));
-            let stride = bin(e, Ty::Usize, BinOp::Mul, copy(k), copy(n));
-            let slab = emit_row_slab(e, ids, m, experts, stride);
-            (0..count)
-                .map(|j| {
-                    let k_at = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
-                    let in_slab = emit_in_slab(e, layout, (k_at, col), (k, n));
-                    let at = bin(e, Ty::Usize, BinOp::Add, copy(slab.base), copy(in_slab));
-                    let value = lane.emit_elem(e, conversions, weight, at);
-                    if j == 0 {
-                        bin(e, Ty::F32, BinOp::Add, copy(value), copy(slab.poison))
-                    } else {
-                        value
-                    }
-                })
-                .collect()
-        };
+    // Each element's address names its row's expert slab, so the run is read where it is decoded.
+    let read = Undivided(|e: &mut Emit, at: RunAt| {
+        let RunAt {
+            row, k0, count, k, ..
+        } = at;
+        let n = emit_read_meta(e, metadata, META_N);
+        let experts = emit_read_meta(e, metadata, META_EXPERTS);
+        let m = bin(e, Ty::Usize, BinOp::Div, copy(row), copy(n));
+        let col = bin(e, Ty::Usize, BinOp::Rem, copy(row), copy(n));
+        let stride = bin(e, Ty::Usize, BinOp::Mul, copy(k), copy(n));
+        let slab = emit_row_slab(e, ids, m, experts, stride);
+        (0..count)
+            .map(|j| {
+                let k_at = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
+                let in_slab = emit_in_slab(e, layout, (k_at, col), (k, n));
+                let elem_at = bin(e, Ty::Usize, BinOp::Add, copy(slab.base), copy(in_slab));
+                let value = lane.emit_elem(e, conversions, weight, elem_at);
+                if j == 0 {
+                    bin(e, Ty::F32, BinOp::Add, copy(value), copy(slab.poison))
+                } else {
+                    value
+                }
+            })
+            .collect()
+    });
     let epilogue = epilogue.map(|epilogue| BoundEpilogue {
         epilogue,
         leaves: &leaves,
@@ -267,7 +272,7 @@ fn indexed_gemv(
         launch,
         conversions,
         epilogue,
-        read_run,
+        read,
     ))
 }
 

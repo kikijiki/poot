@@ -13,7 +13,7 @@ use std::num::NonZeroUsize;
 use crate::format::{GroupMap, ScaleEncoding, Storage, WeightFormat};
 
 /// Every format a GGUF file stores and poot reads, in ggml type order (`ggml.h` `ggml_type`).
-pub const GGUF_FORMATS: [WeightFormat; 19] = [
+pub const GGUF_FORMATS: [WeightFormat; 22] = [
     WeightFormat::F32,
     WeightFormat::F16,
     WeightFormat::Q4_0,
@@ -26,12 +26,15 @@ pub const GGUF_FORMATS: [WeightFormat; 19] = [
     WeightFormat::Q4_K,
     WeightFormat::Q5_K,
     WeightFormat::Q6_K,
+    WeightFormat::Iq2_Xxs,
     WeightFormat::Iq2_Xs,
     WeightFormat::Iq3_Xxs,
     WeightFormat::Iq4_Nl,
     WeightFormat::Iq3_S,
+    WeightFormat::Iq2_S,
     WeightFormat::Iq4_Xs,
     WeightFormat::Bf16,
+    WeightFormat::Tq2_0,
     WeightFormat::Mxfp4,
 ];
 
@@ -123,15 +126,18 @@ mod tests {
             WeightFormat::Q6_K => 12,
             WeightFormat::Iq4_Nl => 13,
             WeightFormat::Iq4_Xs => 14,
-            WeightFormat::Iq2_Xs => 15,
-            WeightFormat::Iq3_Xxs => 16,
-            WeightFormat::Iq3_S => 17,
-            WeightFormat::Mxfp4 => 18,
-            WeightFormat::E4m3PerChannel { .. } => 19,
-            WeightFormat::E4m3Block128 { .. } => 20,
-            WeightFormat::E2m1Row32 => 21,
-            WeightFormat::Gptq { .. } => 22,
-            WeightFormat::Awq { .. } => 23,
+            WeightFormat::Iq2_Xxs => 15,
+            WeightFormat::Iq2_Xs => 16,
+            WeightFormat::Iq3_Xxs => 17,
+            WeightFormat::Iq3_S => 18,
+            WeightFormat::Iq2_S => 19,
+            WeightFormat::Tq2_0 => 20,
+            WeightFormat::Mxfp4 => 21,
+            WeightFormat::E4m3PerChannel { .. } => 22,
+            WeightFormat::E4m3Block128 { .. } => 23,
+            WeightFormat::E2m1Row32 => 24,
+            WeightFormat::Gptq { .. } => 25,
+            WeightFormat::Awq { .. } => 26,
         }
     }
 
@@ -147,7 +153,7 @@ mod tests {
             all.iter().map(|&format| variant_position(format)).collect();
         assert_eq!(
             positions,
-            (0..24).collect::<BTreeSet<usize>>(),
+            (0..27).collect::<BTreeSet<usize>>(),
             "a variant is missing from GGUF_FORMATS and SAFETENSORS_FORMATS"
         );
         for (index, format) in all.iter().enumerate() {

@@ -888,6 +888,8 @@ fn indexed_gemv_selects_expert_in_kernel() {
         cols: 2,
         unroll: 2,
         activation: poot_kernelgen::GemvActivation::Scalar,
+        rows: poot_kernelgen::GemvRows::ONE,
+        depth: poot_kernelgen::LoadDepth::ONE,
     };
     let kernel = indexed_kernel(gemv, (1, k, n, e), "igemv");
     for expert in 0..e {
@@ -940,6 +942,8 @@ fn indexed_bodies_compile_to_valid_spirv_and_nvptx() {
         cols: 4,
         unroll: 4,
         activation: poot_kernelgen::GemvActivation::Scalar,
+        rows: poot_kernelgen::GemvRows::ONE,
+        depth: poot_kernelgen::LoadDepth::ONE,
     };
     let request = |schedule, epilogue| {
         KernelRequest::Contraction(ContractionSpec::Indexed(IndexedContraction {
@@ -2077,6 +2081,8 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
                     cols: 2,
                     unroll: 2,
                     activation: poot_kernelgen::GemvActivation::Scalar,
+                    rows: poot_kernelgen::GemvRows::ONE,
+                    depth: poot_kernelgen::LoadDepth::ONE,
                 },
                 k: 8,
                 n: 5,

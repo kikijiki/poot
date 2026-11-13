@@ -16,8 +16,8 @@ use super::source::Source;
 use crate::KernelGenError;
 use crate::PackedRows;
 use crate::contraction::{
-    BoundEpilogue, Epilogue, GemvLaunch, Schedule, TiledBody, TiledExtents, TiledLaunch,
-    TiledWeight, gemv_body, tiled_body,
+    BoundEpilogue, Epilogue, GemvLaunch, Phased, RunAt, Schedule, TiledBody, TiledExtents,
+    TiledLaunch, TiledWeight, gemv_body, tiled_body,
 };
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, WeightLayout, elem, guard, ld, local, slice_dtype, slice_f32};
@@ -56,16 +56,21 @@ pub fn packed_kernel(name: &str, spec: PackedKernelSpec) -> Result<Body, KernelG
 /// decode: the fact the planner sizes the run from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackedRunSharing {
-    /// The decode addresses the run's block once, decodes its factors (scale, sub-scale, min, sub-min) once and
-    /// reads its codes through shared 32-bit windows, when `count` divides `factor_run` (the aligned elements
-    /// whose factor bits are all the same); a run that does not divide it decodes every element's factors.
-    /// Block storage.
+    /// The decode decodes the run's factors (scale, sub-scale, min, sub-min) once when `count` divides
+    /// `factor_run` (the aligned elements whose factor bits are all the same); a run that does not divide it
+    /// decodes every element's factors. Block storage also addresses the run's block once and reads its codes
+    /// through shared 32-bit windows; planar storage with one code per stored element reads them contiguously, and
+    /// takes `factor_run` from its scale group (an FP8 block).
     FactorRun {
         /// The length of the aligned runs that share one set of factors.
         factor_run: usize,
     },
-    /// The decode addresses every element's codes through its own chain (a float run of at most 32 code bits
-    /// is one read), so a run shares at most its scale. Planar storage.
+    /// Every element of a weight row shares its factors (a per-channel scale) and its codes are read
+    /// contiguously, so any run decodes its factors once. Planar storage.
+    WholeRow,
+    /// The decode addresses every element's codes through its own chain (a planar code packed into words, or a
+    /// group named per element), so a run shares at most its scale (a group the run lies in decodes it once). Planar
+    /// storage.
     Elementwise,
 }
 
@@ -74,10 +79,7 @@ pub enum PackedRunSharing {
 pub fn packed_run_sharing(format: WeightFormat) -> Result<PackedRunSharing, KernelGenError> {
     let descriptor = format.descriptor();
     Ok(match descriptor.storage {
-        Storage::Planar(_) => {
-            PlanarPlan::of(&descriptor)?;
-            PackedRunSharing::Elementwise
-        }
+        Storage::Planar(_) => PlanarPlan::of(&descriptor)?.run_sharing(),
         Storage::Blocks(_) => PackedRunSharing::FactorRun {
             factor_run: DecodePlan::of(&descriptor)?.factor_run(),
         },
@@ -129,12 +131,14 @@ pub(crate) fn packed_contraction(
             cols,
             unroll,
             activation,
+            rows: lane_rows,
+            depth,
         } => {
             require_exact(precision, GENERATOR)?;
             contraction_gemv(
                 name,
                 format,
-                GemvLaunch::new(width, cols, unroll, activation)?,
+                GemvLaunch::new(width, cols, unroll, activation, lane_rows, depth)?,
                 epilogue,
                 rows,
                 conversions,
@@ -154,6 +158,7 @@ pub(crate) fn packed_contraction(
                 )?,
                 epilogue,
                 read,
+                conversions,
             )
         }
         Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } if epilogue.is_some() => {
@@ -173,6 +178,7 @@ pub(crate) fn packed_contraction(
                     TiledExtents::of_meta(GENERATOR, meta)?,
                 )?,
                 read,
+                conversions,
             )
         }
     }
@@ -300,7 +306,7 @@ fn contraction_gemv(
     if let Storage::Planar(_) = descriptor.storage {
         return contraction_gemv_planar(name, format, launch, epilogue, rows, conversions);
     }
-    let plan = DecodePlan::of(&descriptor)?;
+    let plan = DecodePlan::of(&descriptor)?.on(conversions);
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let lanes = match epilogue {
         Some(epilogue) => epilogue.lanes("packed_contraction")?,
@@ -331,20 +337,45 @@ fn contraction_gemv(
         ids: local(2),
         metadata,
     });
-    let decode_run = |e: &mut Emit, row: Local, k0: Local, count: usize, k: Local, _: Local| {
-        let (row, src, poison) = match selection {
+    // An indexed run first selects its row's expert slab (the id read, carried with the run's state), then loads and
+    // decodes against the slab; a plain run is the weight's own.
+    let read = Phased {
+        load: |e: &mut Emit, at: RunAt| match selection {
             Some(selection) => {
-                let selected = selection.select(e, row, 1);
-                (
-                    selected.weight_row,
+                let selected = selection.select(e, at.row, 1);
+                let mut loaded = vec![selected.weight_row, selected.poison, selected.slab_bit(0)];
+                loaded.extend(plan.emit_run_load(
+                    e,
                     selected.source(0, words),
-                    Some(selected.poison),
-                )
+                    selected.weight_row,
+                    at.k0,
+                    at.count,
+                    at.k,
+                ));
+                loaded
             }
-            None => (row, Source::plain(words), None),
-        };
-        let decoded = plan.emit_run(e, src, row, k0, count, k);
-        poisoned(e, decoded, poison)
+            None => plan.emit_run_load(e, Source::plain(words), at.row, at.k0, at.count, at.k),
+        },
+        decode: |e: &mut Emit, at: RunAt, loaded: &[Local]| match selection {
+            Some(_) => {
+                let (row, poison, slab_bit) = (loaded[0], loaded[1], loaded[2]);
+                let src = Source {
+                    words,
+                    slab_bit: Some(slab_bit),
+                };
+                let decoded =
+                    plan.emit_run_decode(e, src, (row, at.k0), at.count, at.k, &loaded[3..]);
+                poisoned(e, decoded, Some(poison))
+            }
+            None => plan.emit_run_decode(
+                e,
+                Source::plain(words),
+                (at.row, at.k0),
+                at.count,
+                at.k,
+                loaded,
+            ),
+        },
     };
     let mut body = gemv_body(
         name,
@@ -358,7 +389,7 @@ fn contraction_gemv(
             leaves: &leaves,
             lanes: &lanes,
         }),
-        decode_run,
+        read,
     );
     body.constant_tables = plan.constant_tables();
     Ok(body)
@@ -388,7 +419,7 @@ fn contraction_gemv_planar(
     conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
-    let plan = PlanarPlan::of(&descriptor)?;
+    let plan = PlanarPlan::of(&descriptor)?.on(conversions);
     let n = plan.source_count();
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let lanes = match epilogue {
@@ -420,39 +451,70 @@ fn contraction_gemv_planar(
         ids: local(2),
         metadata,
     });
-    let decode_run =
-        |e: &mut Emit, row: Local, k0: Local, count: usize, k: Local, out_total: Local| {
-            let (row, out_total, sources, poison) = match selection {
-                Some(selection) => {
-                    let selected = selection.select(e, row, n);
-                    let sources: Vec<Source> = words
-                        .iter()
-                        .enumerate()
-                        .map(|(index, &words)| selected.source(index, words))
-                        .collect();
-                    (
-                        selected.weight_row,
-                        selected.out_rows,
-                        sources,
-                        Some(selected.poison),
-                    )
-                }
-                None => (
+    // An indexed run first selects its row's expert slab (the id read and one slab offset per source, carried with the
+    // run's state), then loads and decodes against the slabs; a plain run is the weight's own. The run's own loads
+    // (`PlanarPlan::emit_run_load`: the scale it shares and the field of codes it slices) are what a deeper pipeline
+    // issues ahead; a run that reads per element carries nothing and decodes where it is used.
+    let plain: Vec<Source> = words.iter().copied().map(Source::plain).collect();
+    let read = Phased {
+        load: |e: &mut Emit, at: RunAt| match selection {
+            Some(selection) => {
+                let selected = selection.select(e, at.row, n);
+                let sources: Vec<Source> = words
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &words)| selected.source(index, words))
+                    .collect();
+                let mut loaded = vec![selected.weight_row, selected.out_rows, selected.poison];
+                loaded.extend((0..n).map(|index| selected.slab_bit(index)));
+                loaded.extend(plan.emit_run_load(
+                    e,
+                    &sources,
+                    selected.weight_row,
+                    at.k0,
+                    at.count,
+                    at.k,
+                    selected.out_rows,
+                ));
+                loaded
+            }
+            None => plan.emit_run_load(e, &plain, at.row, at.k0, at.count, at.k, at.out_total),
+        },
+        decode: |e: &mut Emit, at: RunAt, loaded: &[Local]| match selection {
+            Some(_) => {
+                let (row, out_rows, poison) = (loaded[0], loaded[1], loaded[2]);
+                let sources: Vec<Source> = words
+                    .iter()
+                    .zip(&loaded[3..3 + n])
+                    .map(|(&words, &slab_bit)| Source {
+                        words,
+                        slab_bit: Some(slab_bit),
+                    })
+                    .collect();
+                let decoded = plan.emit_run_decode(
+                    e,
+                    &sources,
                     row,
-                    out_total,
-                    words.iter().copied().map(Source::plain).collect(),
-                    None,
-                ),
-            };
-            let decoded: Vec<Local> = (0..count)
-                .map(|j| {
-                    let k_index = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
-                    let factors = plan.emit_factors(e, &sources, row, k_index, k, out_total);
-                    plan.emit_value(e, &sources, row, k_index, k, out_total, &factors)
-                })
-                .collect();
-            poisoned(e, decoded, poison)
-        };
+                    at.k0,
+                    at.count,
+                    at.k,
+                    out_rows,
+                    &loaded[3 + n..],
+                );
+                poisoned(e, decoded, Some(poison))
+            }
+            None => plan.emit_run_decode(
+                e,
+                &plain,
+                at.row,
+                at.k0,
+                at.count,
+                at.k,
+                at.out_total,
+                loaded,
+            ),
+        },
+    };
     Ok(gemv_body(
         name,
         al,
@@ -465,7 +527,7 @@ fn contraction_gemv_planar(
             leaves: &leaves,
             lanes: &lanes,
         }),
-        decode_run,
+        read,
     ))
 }
 
@@ -482,14 +544,15 @@ fn contraction_register_tiled(
     format: WeightFormat,
     launch: TiledLaunch,
     read: ProductRead,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     let (source_count, block_plan, planar_plan) = match descriptor.storage {
         Storage::Planar(_) => {
-            let plan = PlanarPlan::of(&descriptor)?;
+            let plan = PlanarPlan::of(&descriptor)?.on(conversions);
             (plan.source_count(), None, Some(plan))
         }
-        _ => (1, Some(DecodePlan::of(&descriptor)?), None),
+        _ => (1, Some(DecodePlan::of(&descriptor)?.on(conversions)), None),
     };
     let mut params = vec![ld(Ty::Unit, false), ld(slice_f32(false), false)];
     for _ in 0..source_count {

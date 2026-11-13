@@ -119,7 +119,9 @@ A one-layer dense decoder whose projections are stored in each format (a random 
 | FP8 E4M3, 128x128 block F32 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | FP8 E4M3, per-channel BF16 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | FP8 E4M3, per-channel F32 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF IQ2_S | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GGUF IQ2_XS | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF IQ2_XXS | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GGUF IQ3_S | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GGUF IQ3_XXS | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GGUF IQ4_NL | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
@@ -135,6 +137,7 @@ A one-layer dense decoder whose projections are stored in each format (a random 
 | GGUF Q5_K | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GGUF Q6_K | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GGUF Q8_0 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF TQ2_0 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GPTQ int4 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GPTQ int4, act-order | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 
@@ -249,5 +252,5 @@ The tables above say which graphs plan. These are the checkpoints and configs a 
 
 A quantized tensor whose ggml type has no packed format is refused at load, by tensor name and type. It is never loaded as dense weights silently.
 
-- Refused types: Q8_1, Q8_K, IQ2_XXS, IQ2_S, IQ1_S, IQ1_M, TQ1_0 and TQ2_0.
+- Refused types: Q8_1, Q8_K, IQ1_S, IQ1_M and TQ1_0.
 - This holds for Qwen3.8-Flash-Next and every other GGUF family.

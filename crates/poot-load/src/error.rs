@@ -97,6 +97,19 @@ pub enum LoadError {
         /// The ggml type id the file declares.
         ggml_type: u32,
     },
+    /// A GGUF tensor of an activation-side ggml type (`Q8_1`, `Q8_K`): ggml has no weight decode for it and
+    /// no model file carries it.
+    #[error(
+        "gguf tensor {tensor:?}: ggml type {ggml_type} ({name}) is an activation format, no weight decode in ggml"
+    )]
+    ActivationGgufType {
+        /// The GGUF tensor name.
+        tensor: String,
+        /// The ggml type id the file declares.
+        ggml_type: u32,
+        /// ggml's name of the type.
+        name: &'static str,
+    },
     /// [`crate::gguf::read_gguf`] found a quantized tensor of a rank it has no owner shape for
     /// (2 for a plain weight, 3 for stacked experts).
     #[error("gguf tensor {tensor:?}: unsupported rank {rank} for a quantized tensor")]

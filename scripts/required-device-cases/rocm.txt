@@ -275,6 +275,7 @@ poot-rocm-device::cross_backend	unary_log_rocm_matches_cpu
 poot-rocm-device::cross_backend	unary_sqrt_rocm_matches_cpu
 poot-rocm-device::cross_backend	unary_tanh_rocm_matches_cpu
 poot-rocm-device::device_timing	plain_rocm_device_reports_unknown_device_time
+poot-rocm-device::device_timing	rocm_dispatch_times_keep_their_plan_labels_across_a_stage_commit
 poot-rocm-device::device_timing	timed_rocm_device_reads_a_nonzero_device_time_for_a_known_kernel
 poot-rocm-device::device_timing	timing_does_not_change_the_rocm_scan_result
 poot-rocm-device::float_ne	float_ne_is_ieee_on_nan_on_rocm

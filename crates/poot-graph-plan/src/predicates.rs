@@ -15,11 +15,11 @@ use std::collections::HashMap;
 use poot_graph_ir::op::{ContractionHead, OpKind};
 use poot_graph_ir::{Eqn, Graph, Operand, TensorType, ValueId, ValueMeta, ValueTable};
 use poot_kernelgen as kg;
-use poot_target::{Backend, DeviceCaps, TargetId};
+use poot_target::{Backend, DeviceCaps, Queried, SubgroupSupport, TargetId};
 
-use crate::PlanError;
 use crate::planner::PlannedDispatch;
 use crate::{Binding, Sink, Source};
+use crate::{Capability, PlanError};
 use poot_kernelgen::KernelRequest;
 
 /// The codegen capability query for the target (card 522, R468-014). `Backend`'s `AmdGcn` payload already
@@ -439,6 +439,8 @@ impl GemvLaunch {
             cols: self.cols,
             unroll: self.unroll,
             activation: gemv_activation(backend, k, self.unroll),
+            rows: poot_kernelgen::GemvRows::ONE,
+            depth: poot_kernelgen::LoadDepth::ONE,
         }
     }
 }
@@ -562,59 +564,91 @@ pub(crate) fn scatter_update_plan(
     Planned::split(chunks)
 }
 
-/// The lanes of a clustered attention workgroup, widest first: whole 32-lane runs (the walk's butterfly stays inside
-/// one), and no more than a decode row's clusters can use.
-const ATTENTION_LANES: [usize; 2] = [64, 32];
 /// The bytes one lane reads of a key or value row in one load.
 const VECTOR_LOAD_BYTES: usize = 16;
 
 /// The clustered key walk of an attention ([`poot_kernelgen::KeyWalk`]) and the lanes of the workgroup that runs
-/// it, or `None` when no whole run of 32 lanes holds the end combine of the device's workgroup memory.
+/// it, or the capability the device lacks.
 ///
 /// A lane's run is the widest power-of-two count of `kv_bytes`-wide elements that one 16-byte load covers
-/// and that divides both head widths and a split key's parts (`shared_dim`, `0` for a dense key), grown only
-/// while the cluster, at most 32 lanes, could not cover the wider head otherwise. The cluster is the power of two
-/// of lanes that covers the wider head with that run. The end combine of the clusters keeps `clusters * n_rep *
-/// (dv + 2)` words in workgroup memory, and `lanes` may not exceed the workgroup limits.
+/// and that divides both head widths and a split key's parts (`shared_dim`, `0` for a dense key). The cluster is the
+/// power of two of lanes that covers the wider head with that run; a head too wide for 32 lanes at the load's run
+/// takes a longer one. The `n_rep` heads' query, output and softmax state and the key and value runs live in
+/// registers across the key loop: while they exceed the lane's held share of the register file, the cluster doubles
+/// and the run halves, until the cluster is a full 32 lanes; a state that exceeds the lane's whole file is refused
+/// ([`Capability::AttentionRegisters`]). The workgroup is the lanes that saturate a compute unit
+/// at [`DeviceCaps::gemm_launch`]'s residency (two workgroups resident), in whole subgroups, halved while the end
+/// combine of the clusters (`clusters * n_rep * (dv + 2)` words) exceeds the device's workgroup memory.
 pub(crate) fn attention_key_walk(
     (dk, dv, shared_dim): (usize, usize, usize),
     n_rep: usize,
     kv_bytes: usize,
+    backend: Backend,
     caps: &DeviceCaps,
-) -> Option<(usize, poot_kernelgen::KeyWalk)> {
+) -> Result<(usize, kg::KeyWalk), Capability> {
+    let collective_lanes = poot_kernel_ir::COLLECTIVE_LANES;
+    let Queried::Known(SubgroupSupport::Present { min_size, max_size }) = caps.subgroup else {
+        return Err(Capability::SubgroupShuffle);
+    };
+    if min_size < collective_lanes || !codegen_capability(backend.into()).subgroup_shuffle {
+        return Err(Capability::SubgroupShuffle);
+    }
+    let launch = caps.gemm_launch();
+    let lanes_limit = caps.max_workgroup_size[0].min(caps.max_workgroup_invocations);
+    let saturating = launch.saturating_lanes / launch.fill_workgroups_per_unit;
+    let lanes = saturating.min(lanes_limit) / max_size * max_size;
+    if lanes == 0 {
+        return Err(Capability::SubgroupShuffle);
+    }
+
     let widths = [dk, dv, dk - shared_dim];
     let mut run = (VECTOR_LOAD_BYTES / kv_bytes).next_power_of_two();
     while run > 1 && !widths.iter().all(|width| width.is_multiple_of(run)) {
         run /= 2;
     }
-    // A head too wide for one 32-lane cluster at this run takes a longer run.
-    let cluster_cap = poot_kernel_ir::COLLECTIVE_LANES as usize;
+    let cluster_cap = collective_lanes as usize;
     while dk.max(dv).div_ceil(run) > cluster_cap {
         run *= 2;
         if !widths.iter().all(|width| width.is_multiple_of(run)) {
-            return None;
+            return Err(Capability::AttentionHeadWidth { dk, dv });
         }
     }
-    let cluster = dk.max(dv).div_ceil(run).next_power_of_two();
-    let lanes_limit =
-        (caps.max_workgroup_size[0] as usize).min(caps.max_workgroup_invocations as usize);
-    let lds_bytes = caps.lds_bytes as usize;
-    ATTENTION_LANES
-        .into_iter()
-        .find(|&lanes| {
-            lanes <= lanes_limit
-                && lanes >= cluster
-                && 4 * (lanes / cluster) * n_rep * (dv + 2) <= lds_bytes
-        })
-        .map(|lanes| (lanes, poot_kernelgen::KeyWalk { cluster, run }))
-}
+    let mut cluster = dk.max(dv).div_ceil(run).next_power_of_two();
+    let registers = |run: usize| {
+        let run_words = (run * kv_bytes).div_ceil(4);
+        n_rep * (2 * run) + 2 * n_rep + 2 * run_words
+    };
+    // The held share leaves the other half of the lane's file to the step's temporaries; a wider cluster spreads
+    // the state over more lanes. A cluster at 32 lanes that still exceeds the share keeps it (the compiler's spill
+    // is slow, not wrong, as for the accumulators) until the state cannot fit the lane's whole file.
+    let held = launch.register_budget.loop_registers(lanes) as usize;
+    while registers(run) > held && cluster < cluster_cap && run > 1 {
+        cluster *= 2;
+        run /= 2;
+    }
+    let file = launch.register_budget.lane_registers(lanes) as usize;
+    if registers(run) > file {
+        return Err(Capability::AttentionRegisters {
+            needed: registers(run) as u32,
+            budget: file as u32,
+        });
+    }
 
-/// The most key chunks one decode row is split into: past this the combine stage's per-row reduction costs
-/// more than the extra workgroups hide.
-const MAX_ATTENTION_SPLITS: usize = 16;
-/// The fewest keys a split walks. A shorter share leaves a workgroup's lanes mostly idle and the launch
-/// is the combine's overhead alone.
-const MIN_KEYS_PER_SPLIT: usize = 128;
+    let lds_bytes = caps.lds_bytes as usize;
+    let combine_bytes = |lanes: usize| 4 * (lanes / cluster) * n_rep * (dv + 2);
+    let subgroup = max_size as usize;
+    let mut lanes = lanes as usize;
+    while combine_bytes(lanes) > lds_bytes {
+        if !(lanes / 2).is_multiple_of(subgroup) || lanes / 2 < subgroup {
+            return Err(Capability::AttentionLds {
+                dv,
+                lds_bytes: caps.lds_bytes,
+            });
+        }
+        lanes /= 2;
+    }
+    Ok((lanes, kg::KeyWalk { cluster, run }))
+}
 
 /// The split-KV schedule of a decode attention (`Lq == 1`), or `None` for the streaming schedule.
 ///
@@ -631,8 +665,10 @@ const MIN_KEYS_PER_SPLIT: usize = 128;
 /// ([`poot_kernelgen::AttentionSchedule::SplitKv`]), and the workgroups past the row's shares return.
 ///
 /// Streaming is kept when any of these holds, so a request never needs a capability the device lacks:
-/// the rows already fill the device, the cache is too short for two chunks of [`MIN_KEYS_PER_SPLIT`], the
-/// partial-state scratch exceeds `caps.max_buffer_bytes`, or the launch's 2-D fold would pass `max_grid`.
+/// the row groups (one per key/value head) already fill the device, the cache is too short for two shares of
+/// `clusters * attention_split_min_steps` keys
+/// ([`poot_target::calibration::PerfCalibration::attention_split_min_steps`]), the partial-state scratch exceeds
+/// `caps.max_buffer_bytes`, or the launch's 2-D fold would pass `max_grid`.
 /// `spec` is the streaming-schedule request being considered.
 pub(crate) fn attention_splits(
     spec: &poot_kernelgen::AttentionSpec,
@@ -648,17 +684,18 @@ pub(crate) fn attention_splits(
     // waits on its K/V loads.
     let fill = caps.gemm_launch().fill_workgroups_per_unit as usize;
     let wanted = (compute_units * fill).div_ceil(rows);
-    let splits = wanted
-        .min(MAX_ATTENTION_SPLITS)
-        .min(spec.candidates() / MIN_KEYS_PER_SPLIT);
+    let walk = spec.schedule.walk()?;
+    // A share is whole steps of the walk, `clusters` keys each, and at least `attention_split_min_steps` of them.
+    let clusters = spec.schedule.lanes() / walk.cluster;
+    let min_units = clusters * caps.perf_calibration.figures().attention_split_min_steps as usize;
+    let splits = wanted.min(spec.candidates() / min_units);
     if splits < 2 || rows >= compute_units {
         return None;
     }
-    let walk = spec.schedule.walk()?;
     let schedule = poot_kernelgen::AttentionSchedule::SplitKv {
         lanes: spec.schedule.lanes(),
         splits,
-        min_units: MIN_KEYS_PER_SPLIT,
+        min_units,
         walk,
     };
     let split = poot_kernelgen::AttentionSpec {

@@ -55,6 +55,8 @@ poot-kernelgen	helpers::stride_tests::row_major_strides_contiguous	kernelgen uni
 poot-kernelgen	helpers::stride_tests::view_eff_strides_contiguous_matches_broadcast_eff_strides	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	helpers::stride_tests::view_eff_strides_transposed_layout_is_not_row_major	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_gemv_refuses_a_narrowed_precision	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::a_gemv_with_rows_and_depth_matches_reference_on_wgpu	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::a_launch_whose_rows_straddle_a_block_computes_nan	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_narrowed_packed_contraction_rounds_the_decoded_weight_and_the_activation	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_tiled_packed_contraction_refuses_an_epilogue_by_name	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_two_byte_aligned_run_reads_its_span_plus_one_word	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -75,6 +77,7 @@ poot-kernelgen	packed::contraction_tests::contraction_tiled_matches_reference_al
 poot-kernelgen	packed::contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged_on_wgpu	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::every_format_gemv_is_bit_identical_after_static_alignment	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::rows_and_depth_do_not_change_a_rows_sum	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::decode_plan::tests::a_count_that_does_not_factor_over_the_digits_has_no_constant_offsets	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::decode_plan::tests::a_run_moves_the_bit_offset_by_constants_over_the_digits	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::decode_plan::tests::a_run_of_field_bits_equals_the_scalar_read_of_each_element	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -84,6 +87,10 @@ poot-kernelgen	packed::float_decode_tests::e4m3fn_matches_scalar_on_the_admitted
 poot-kernelgen	packed::float_decode_tests::e8m0_matches_scalar_on_the_admitted_domain	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::float_decode_tests::f16_matches_scalar_on_the_admitted_domain	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::float_decode_tests::f32_is_an_identity_bitcast	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::float_shift_tests::a_planar_gemv_is_bit_identical_after_sharing_its_scale	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::float_shift_tests::a_planar_run_decodes_its_scale_once	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::float_shift_tests::float_shift_decode_matches_scalar_on_the_admitted_domain	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::float_shift_tests::rows_and_depth_do_not_change_a_planar_rows_sum	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::indexed::tests::a_folded_tiled_grid_equals_the_unfolded_one	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::indexed::tests::a_tile_whose_rows_skip_an_expert_reads_each_rows_own_slab	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::indexed::tests::an_invalid_expert_id_makes_only_its_row_nan	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -96,6 +103,7 @@ poot-kernelgen	packed::planar_contraction_tests::contraction_gemv_matches_refere
 poot-kernelgen	packed::planar_contraction_tests::contraction_tiled_matches_reference_at_the_planned_geometries	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::planar_contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged_for_every_planar_format	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::planar_contraction_tests::contraction_tiled_matches_reference_for_every_planar_format	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::rocm_tests::a_gemv_with_rows_and_depth_matches_reference_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::rocm_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::rocm_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_rocm_kquant	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::rocm_tests::contraction_matches_reference_for_every_planar_format_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -236,12 +244,14 @@ poot-kernelgen::fused_row_interp	fused_row_reads_a_packed_bf16_leaf_as_its_widen
 poot-kernelgen::gemv_index_width	a_narrowed_body_runs_32_bit_index_math_on_nvptx	kernelgen `gemv_index_width` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::gemv_index_width	amdgpu_refuses_a_narrowed_body_by_name	kernelgen `gemv_index_width` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::gemv_index_width	the_gemv_states_its_index_bound_only_where_it_forms_every_index_itself	kernelgen `gemv_index_width` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::gemv_rows_depth	dense_rows_and_depth_do_not_change_a_rows_sum	kernelgen `gemv_rows_depth` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::gemv_vector_activation	a_dense_vector_activation_read_matches_the_scalar_read_bit_for_bit	kernelgen `gemv_vector_activation` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::gemv_vector_activation	nvptx_lowers_the_vector_activation_read_to_v4_loads	kernelgen `gemv_vector_activation` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::index_cast_interp	a_cast_step_converts_an_i32_leaf_to_the_nearest_f32	kernelgen `index_cast_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::index_cast_interp	an_exact_i32_chain_then_a_cast_then_float_arithmetic_is_one_region	kernelgen `index_cast_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::indexed_interp	an_f16_packed_indexed_weight_is_refused_by_name	kernelgen `indexed_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::indexed_interp	an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read	kernelgen `indexed_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::indexed_interp	indexed_gemv_rows_and_depth_do_not_change_a_sum	kernelgen `indexed_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::kernelgen_error_families	a_two_byte_float_is_only_ever_a_select_branch	kernelgen `kernelgen_error_families` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::kernelgen_error_families	concat_family_rejects_zero_inputs	kernelgen `kernelgen_error_families` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::kernelgen_error_families	float_region_rejects_a_cast_of_a_float_operand_and_mixed_arithmetic	kernelgen `kernelgen_error_families` test binary (emit, interpreter or dispatch rows); the lane runs the package whole

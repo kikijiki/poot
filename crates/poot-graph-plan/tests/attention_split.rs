@@ -11,6 +11,7 @@ use poot_graph_plan::{
 };
 use poot_kernelgen::{AttentionSchedule, AttentionSpec, KernelRequest};
 use poot_target::{AmdArch, Backend, DeviceCaps};
+use poot_tensor::DType;
 use poot_test_util::device_caps::default_caps_for;
 
 const OPTIONS: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
@@ -189,9 +190,10 @@ fn a_live_decode_over_a_declared_position_slot_plans_the_split_schedule() {
 
 /// The capacity bounds the grid and the planner states the floor the live range is partitioned against
 /// (POOT-1400). A 16-head decode on a 64-compute-unit device (an RTX A5000) over a 8320-key cache plans a grid of
-/// 8 splits with shares of at least the planner's 128 keys; over a 256-key cache the grid is 2. The shares are
-/// the kernel's to cut from the live length, so the planned floor is 128 steps in both, not the capacity's chunk,
-/// and the scratch holds the grid's partials plus one published count per row.
+/// 8 splits (the device's resident workgroups over the row groups) with shares of at least 16 keys (4 steps of the 4
+/// clusters); over a 48-key cache the grid is 3. The shares are the kernel's to cut from the live length, so the
+/// planned floor is 16 keys in both, not the capacity's chunk, and the scratch holds the grid's partials plus one
+/// published count per row.
 ///
 /// Mutation: in `attention_splits`, state the floor as the cache capacity (`min_units: spec.lk`); the floor
 /// assertion goes red.
@@ -202,7 +204,7 @@ fn the_split_grid_follows_the_capacity_and_the_floor_does_not() {
         compute_units: poot_target::Queried::Known(64),
         ..default_caps_for(backend)
     };
-    for (capacity, grid) in [(8320, 8), (256, 2)] {
+    for (capacity, grid) in [(8320, 8), (48, 3)] {
         let program = compiled(&decode_chain(1, 16, capacity, 128), &target(backend, caps));
         let [(_, _, plan, spec)] = attentions(&program)[..] else {
             panic!("capacity {capacity}: one attention");
@@ -213,7 +215,7 @@ fn the_split_grid_follows_the_capacity_and_the_floor_does_not() {
         else {
             panic!("capacity {capacity}: a 16-row decode on 64 compute units splits: {spec:?}");
         };
-        assert_eq!((splits, min_units), (grid, 128), "capacity {capacity}");
+        assert_eq!((splits, min_units), (grid, 16), "capacity {capacity}");
         let [decl] = plan.scratch() else {
             panic!("capacity {capacity}: one scratch: {:?}", plan.scratch());
         };
@@ -225,7 +227,7 @@ fn the_split_grid_follows_the_capacity_and_the_floor_does_not() {
     }
 }
 
-/// The rows already fill the device, or the cache is too short for two chunks: the streaming schedule, one
+/// The rows already fill the device, or the cache is too short for two shares: the streaming schedule, one
 /// launch, no scratch. A decode with `hq >= compute_units` gains nothing from splitting.
 #[test]
 fn a_decode_that_fills_the_device_or_has_a_short_cache_keeps_the_streaming_schedule() {
@@ -240,8 +242,8 @@ fn a_decode_that_fills_the_device_or_has_a_short_cache_keeps_the_streaming_sched
         for (graph, why) in [
             (decode_chain(1, units, 1024, 64), "one row per compute unit"),
             (
-                decode_chain(1, 2, 192, 64),
-                "192 keys: under two 128-key chunks",
+                decode_chain(1, 2, 24, 64),
+                "24 keys: under two 16-key shares",
             ),
         ] {
             let program = compiled(&graph, &target);
@@ -388,8 +390,8 @@ fn a_buffer_limit_below_the_scratch_falls_back_to_streaming() {
 }
 
 /// Every dispatch of the split plan stays inside the device's grid even where the cap forces the 2-D fold:
-/// a device whose X grid is 4 workgroups plans the partials stage's 16 `(row, split)` workgroups as a
-/// 4 x 4 grid and the combine's 2 rows as 2 x 1, each within `max_grid`.
+/// a device whose X grid is 4 workgroups plans the partials stage's 64 `(row, split)` workgroups as a
+/// 4 x 16 grid and the combine's 2 rows as 2 x 1, each within `max_grid`.
 ///
 /// Mutation: fold against `u32::MAX` instead of `caps.max_grid[0]` in `request.rs`'s `fold_within_grid`;
 /// the partials launch is then 16 workgroups wide and the assertion names axis 0.
@@ -397,7 +399,7 @@ fn a_buffer_limit_below_the_scratch_falls_back_to_streaming() {
 fn every_split_dispatch_stays_within_max_grid() {
     let graph = decode_chain(1, 2, 1024, 64);
     let caps = DeviceCaps {
-        max_grid: [4, 8, 65_535],
+        max_grid: [4, 16, 65_535],
         ..default_caps_for(Backend::SpirvVulkan)
     };
     let max_grid = caps.max_grid;
@@ -455,5 +457,169 @@ fn a_device_with_unknown_compute_units_keeps_the_streaming_schedule() {
             "{name}: {spec:?}"
         );
         assert_eq!((plan.len(), plan.scratch().len()), (1, 0), "{name}");
+    }
+}
+
+/// One `Attention` equation staged directly (so a planner refusal is `compile`'s typed error, not a fusion pass
+/// reverting to the decomposition) over `hq` query heads of width `d` and `hkv` key/value heads of a `cap`-key cache
+/// of `kv` values. The keys and values are activation inputs, so a device whose buffer limit is below the cache still
+/// plans it.
+fn staged_gqa_decode(hq: usize, hkv: usize, cap: usize, d: usize, kv: DType) -> Graph {
+    let b = Builder::for_tests();
+    let q = b
+        .slot_named(Slot::Activation, "q", TensorType::f32(vec![1, hq, 1, d]))
+        .unwrap();
+    let k = b
+        .slot_named(
+            Slot::Activation,
+            "k",
+            TensorType::new(vec![1, hkv, cap, d], kv),
+        )
+        .unwrap();
+    let v = b
+        .slot_named(
+            Slot::Activation,
+            "v",
+            TensorType::new(vec![1, hkv, cap, d], kv),
+        )
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
+    let mut plan = b.append_plan(0).unwrap();
+    let out = plan
+        .equation(
+            OpKind::Attention(AttentionAttrs::new(hq / hkv, 0.125, None)),
+            [q, k, v, mask]
+                .map(|operand| poot_graph_ir::Operand::Value(operand.id()))
+                .to_vec(),
+        )
+        .expect("stage the decode attention");
+    plan.declare_result(out).expect("declare the result");
+    let mut prepared = b.preflight_append(plan).expect("preflight");
+    let committed = b.commit_append(&mut prepared).expect("commit");
+    b.finish(committed).unwrap()
+}
+
+/// The capability `graph` is refused for on `target`, or the one attention's schedule when it compiles.
+fn walk_of(
+    graph: &Graph,
+    target: &Target,
+) -> Result<AttentionSchedule, poot_graph_plan::Capability> {
+    match compile(graph, target, &OPTIONS) {
+        Err(CompileError::Plan(error)) => match *error {
+            PlanError::Refused(refusal) => Err(refusal.missing),
+            other => panic!("expected a typed refusal or a program, got {other:?}"),
+        },
+        Err(other) => panic!("expected a typed refusal or a program, got {other:?}"),
+        Ok(program) => {
+            let found = attentions(&program);
+            let [(_, _, _, spec)] = found[..] else {
+                panic!("one attention, found {}", found.len());
+            };
+            Ok(spec.schedule)
+        }
+    }
+}
+
+/// POOT-1555 row 11: the key walk follows the caps. An f16 `dk = 128` decode of four heads per key/value head on a
+/// `{32, 64}` subgroup plans 16 lanes per cluster over 8-element runs and 128 lanes; the same shape over f32 keys
+/// reads 4-element runs and takes 32; a register file whose held share is under the walk's 80 registers widens the
+/// f16 cluster to 32 (4-element runs); a state past the lane's whole file, or a device with no subgroup shuffle, or a
+/// head width no 32-lane run covers, is a typed refusal out of `compile`.
+///
+/// Mutation: size the run from 4 bytes instead of `kv_bytes` in `attention_key_walk`; the f16 row reads 4-element
+/// runs and goes red.
+#[test]
+fn the_key_walk_follows_the_caps() {
+    use poot_graph_plan::Capability;
+    use poot_target::{Queried, RegisterFile, SubgroupSupport};
+    let wgpu = Backend::SpirvVulkan;
+    let caps = default_caps_for(wgpu);
+    let walk = |graph: &Graph, caps: &DeviceCaps| {
+        walk_of(graph, &target(wgpu, *caps))
+            .map(|schedule| (schedule.lanes(), schedule.walk().expect("a clustered walk")))
+    };
+    let f16 = staged_gqa_decode(8, 2, 1024, 128, DType::F16);
+    let f32_kv = staged_gqa_decode(8, 2, 1024, 128, DType::F32);
+    let key_walk = |cluster, run| poot_kernelgen::KeyWalk { cluster, run };
+
+    assert_eq!(walk(&f16, &caps), Ok((128, key_walk(16, 8))));
+    assert_eq!(walk(&f32_kv, &caps), Ok((128, key_walk(32, 4))));
+
+    // 64 registers per lane hold 32 across the loop: the f16 walk needs 80 at 16 lanes and 44 at 32.
+    let small_file = DeviceCaps {
+        register_file: Queried::Known(RegisterFile {
+            per_lane: 64,
+            per_workgroup: 65_536,
+        }),
+        ..caps
+    };
+    assert_eq!(walk(&f16, &small_file), Ok((128, key_walk(32, 4))));
+
+    // 32 heads of each key/value head hold 584 registers at the widest cluster, past a 256-register lane.
+    let heavy = staged_gqa_decode(64, 2, 1024, 256, DType::F16);
+    assert_eq!(
+        walk(&heavy, &caps),
+        Err(Capability::AttentionRegisters {
+            needed: 584,
+            budget: 256
+        })
+    );
+
+    // No head width of 1000 divides into a power-of-two run wide enough for 32 lanes.
+    let odd = staged_gqa_decode(2, 2, 1024, 1000, DType::F32);
+    assert_eq!(
+        walk(&odd, &caps),
+        Err(Capability::AttentionHeadWidth { dk: 1000, dv: 1000 })
+    );
+
+    let unknown = DeviceCaps {
+        subgroup: Queried::Unknown,
+        ..caps
+    };
+    let narrow = DeviceCaps {
+        subgroup: Queried::Known(SubgroupSupport::Present {
+            min_size: 16,
+            max_size: 16,
+        }),
+        ..caps
+    };
+    let absent = DeviceCaps {
+        subgroup: Queried::Known(SubgroupSupport::Absent),
+        ..caps
+    };
+    for (name, caps) in [
+        ("unknown", unknown),
+        ("16 lanes", narrow),
+        ("absent", absent),
+    ] {
+        assert_eq!(
+            walk(&f16, &caps),
+            Err(Capability::SubgroupShuffle),
+            "{name} subgroup"
+        );
+    }
+}
+
+/// POOT-1555 row 12: the split ceiling follows the compute units over the key/value-head row groups, with no fixed
+/// cap. A qwen3-4b-like decode (32 query heads over 8 key/value heads of 128, f16 cache of 8320 keys) plans
+/// `ceil(units * 2 / 8)` splits: 47 on 188 compute units, 10 on 40.
+///
+/// Mutation: reinstate `.min(16)` on the ceiling in `attention_splits`; the 188-unit row plans 16 and goes red.
+#[test]
+fn the_split_ceiling_follows_the_compute_units_over_the_kv_head_rows() {
+    let backend = Backend::Nvptx;
+    let graph = staged_gqa_decode(32, 8, 8320, 128, DType::F16);
+    for (units, expected) in [(188, 47), (40, 10)] {
+        let caps = DeviceCaps {
+            compute_units: poot_target::Queried::Known(units),
+            ..default_caps_for(backend)
+        };
+        let Ok(AttentionSchedule::SplitKv { splits, .. }) = walk_of(&graph, &target(backend, caps))
+        else {
+            panic!("{units} compute units: the 8 row groups split");
+        };
+        assert_eq!(splits, expected, "{units} compute units");
     }
 }

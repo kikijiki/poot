@@ -18,13 +18,25 @@ use poot_quant::format::{
 };
 
 use super::decode_plan::Factors;
-use super::float_decode::emit_float_decode;
+use super::float_decode::{FloatDecode, emit_float_decode};
+use super::kernel::PackedRunSharing;
 use super::source::Source;
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu};
+use poot_target::RoundingConversions;
 
 fn reject(format: WeightFormat, reason: &'static str) -> KernelGenError {
     KernelGenError::UnsupportedDescriptor { format, reason }
+}
+
+/// The `K` length over which a planar scale is one value.
+enum ScaleRun {
+    /// The whole row (or there is no scale).
+    Whole,
+    /// Aligned runs of this many values.
+    Values(usize),
+    /// Every `K` index names its own (act-order groups).
+    PerElement,
 }
 
 pub(crate) struct PlanarPlan {
@@ -32,6 +44,8 @@ pub(crate) struct PlanarPlan {
     /// Operands in `PackedWeight::sources()` order: one kernel parameter per entry.
     operands: Vec<PlanarOperand>,
     value: ValueMap,
+    /// How the `Codes` of a `ValueMap::Float` format decode; `None` for any other value map.
+    float: Option<FloatDecode>,
     codes: usize,
     scale: Option<usize>,
     zero: Option<usize>,
@@ -58,15 +72,36 @@ impl PlanarPlan {
         let group_index = operands
             .iter()
             .position(|operand| operand.role == PlanarRole::GroupIndex);
+        let float = match (descriptor.value, operands[codes].encoding) {
+            (ValueMap::Float, FieldEncoding::Float(format)) => Some(FloatDecode::exact(format)),
+            (ValueMap::Float, _) => {
+                return Err(reject(
+                    format,
+                    "a float value map over a Codes operand that is not float-encoded",
+                ));
+            }
+            _ => None,
+        };
         Ok(Self {
             format,
             operands,
             value: descriptor.value,
+            float,
             codes,
             scale,
             zero,
             group_index,
         })
+    }
+
+    /// This plan decoding its values through what the device keeps ([`FloatDecode::shifted_on`]): a float code
+    /// that meets a scale takes the cheaper decode, and [`Self::emit_factors`] folds the power of two it leaves
+    /// into the scale, once per factor run.
+    pub(crate) fn on(mut self, conversions: RoundingConversions) -> Self {
+        if self.scale.is_some() {
+            self.float = self.float.map(|decode| decode.shifted_on(conversions));
+        }
+        self
     }
 
     /// One kernel word-slice parameter per entry, in `PackedWeight::sources()` order.
@@ -98,6 +133,9 @@ impl PlanarPlan {
             unreachable!("format tests: a Scale operand is always Float-encoded")
         };
         let scale = emit_float_decode(e, format, bits);
+        let scale = self
+            .float
+            .map_or(scale, |decode| decode.fold_scale(e, scale));
         Factors {
             scale: Some(scale),
             min: None,
@@ -124,12 +162,10 @@ impl PlanarPlan {
         let code_bits =
             self.emit_operand_bits(e, src, self.codes, &codes_operand, o, k, k_total, out_total);
         let value = match self.value {
-            ValueMap::Float => {
-                let FieldEncoding::Float(format) = codes_operand.encoding else {
-                    unreachable!("format tests: a Float value map has a Float-encoded Codes field")
-                };
-                emit_float_decode(e, format, code_bits)
-            }
+            ValueMap::Float => self
+                .float
+                .expect("a Float value map has a float decode")
+                .emit(e, code_bits),
             ValueMap::Integer => {
                 let code_int = emit_encoded_integer(e, codes_operand.encoding, code_bits);
                 let zero_int = match self.zero {
@@ -181,7 +217,8 @@ impl PlanarPlan {
     /// the run shares what its elements share. A scale its elements cannot straddle (a `K` extent that `count`
     /// divides) is decoded once. A `Float` format whose codes are one unpacked stored element per `K` index
     /// reads the whole run as one `count * bits` field (at most 32 bits) and slices it, so the address chain and
-    /// the word loads are emitted once per run instead of once per element.
+    /// the word loads are emitted once per run instead of once per element. It is [`Self::emit_run_load`] then
+    /// [`Self::emit_run_decode`].
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn emit_run(
         &self,
@@ -193,24 +230,74 @@ impl PlanarPlan {
         k_total: Local,
         out_total: Local,
     ) -> Vec<Local> {
-        let shared = self
-            .run_shares_factors(count)
-            .then(|| self.emit_factors(e, src, o, k0, k_total, out_total));
+        let loaded = self.emit_run_load(e, src, o, k0, count, k_total, out_total);
+        self.emit_run_decode(e, src, o, k0, count, k_total, out_total, &loaded)
+    }
+
+    /// The width in bits of the one field a run of `count` reads whole, or `None` when the run reads each element's
+    /// codes through its own address chain: a `Float` format whose codes are one unpacked stored element per `K`
+    /// index, at most 32 bits for the run.
+    fn run_field_bits(&self, count: usize) -> Option<u32> {
         let codes = self.operands[self.codes];
-        let FieldEncoding::Float(format) = codes.encoding else {
-            return self.emit_run_elements(e, src, o, k0, count, k_total, out_total, shared);
-        };
         let field_bits = codes.bits * count as u32;
-        let sliced = self.value == ValueMap::Float
-            && codes.packing.is_none()
+        let sliced = codes.packing.is_none()
             && codes.major == Major::OutMajor
             && codes.grid[1] == Extent::Values(1)
             && field_bits <= 32;
-        if count == 1 || !sliced {
-            return self.emit_run_elements(e, src, o, k0, count, k_total, out_total, shared);
+        (self.float.is_some() && count > 1 && sliced).then_some(field_bits)
+    }
+
+    /// What a run reads from memory ahead of its decode: the scale the run shares (decoded, when its elements cannot
+    /// straddle a scale group) then the one field of codes ([`Self::run_field_bits`]). A run that has neither loads
+    /// nothing here and reads per element in [`Self::emit_run_decode`], so a software pipeline over it is a no-op.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn emit_run_load(
+        &self,
+        e: &mut Emit,
+        src: &[Source],
+        o: Local,
+        k0: Local,
+        count: usize,
+        k_total: Local,
+        out_total: Local,
+    ) -> Vec<Local> {
+        let mut loaded = Vec::new();
+        if self.run_shares_factors(count) {
+            let factors = self.emit_factors(e, src, o, k0, k_total, out_total);
+            loaded.extend(factors.scale);
         }
-        let bit = self.emit_operand_bit(e, src, &codes, o, k0, k_total, out_total);
-        let field = src[self.codes].read_bits(e, bit, field_bits);
+        if let Some(field_bits) = self.run_field_bits(count) {
+            let codes = self.operands[self.codes];
+            let bit = self.emit_operand_bit(e, src, &codes, o, k0, k_total, out_total);
+            loaded.push(src[self.codes].read_bits(e, bit, field_bits));
+        }
+        loaded
+    }
+
+    /// The values of the run whose loads are `loaded` ([`Self::emit_run_load`]).
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn emit_run_decode(
+        &self,
+        e: &mut Emit,
+        src: &[Source],
+        o: Local,
+        k0: Local,
+        count: usize,
+        k_total: Local,
+        out_total: Local,
+        loaded: &[Local],
+    ) -> Vec<Local> {
+        let shared = self.run_shares_factors(count).then(|| Factors {
+            scale: self.scale.map(|_| loaded[0]),
+            min: None,
+        });
+        let Some(field_bits) = self.run_field_bits(count) else {
+            return self.emit_run_elements(e, src, o, k0, count, k_total, out_total, shared);
+        };
+        let codes = self.operands[self.codes];
+        let decode = self.float.expect("a field run has a float decode");
+        let field = *loaded.last().expect("a field run loaded its field");
+        debug_assert!(field_bits <= 32);
         let mask = (1u32 << codes.bits) - 1;
         (0..count)
             .map(|j| {
@@ -225,7 +312,7 @@ impl PlanarPlan {
                     ),
                 };
                 let code = bin(e, Ty::U32, BinOp::BitAnd, copy(shifted), c32(mask));
-                let value = emit_float_decode(e, format, code);
+                let value = decode.emit(e, code);
                 let own;
                 let factors = match &shared {
                     Some(factors) => factors,
@@ -276,15 +363,40 @@ impl PlanarPlan {
             .collect()
     }
 
+    /// What a Gemv lane run shares of this format's decode ([`PackedRunSharing`]). Codes stored one to an
+    /// element read contiguously, so a run shares its scale group like a block format does. Codes packed into words
+    /// (GPTQ, AWQ) are addressed one element at a time whatever the scale does: a run decodes its scale once
+    /// ([`Self::emit_run`]) and still pays an address chain per element, which is why a longer run only spreads the
+    /// loads (gfx1151, 17408 x 5120, GPTQ group 128: 111 GB/s at run 8, 60 at 16, 51 at 32).
+    pub(crate) fn run_sharing(&self) -> PackedRunSharing {
+        if self.operands[self.codes].packing.is_some() {
+            return PackedRunSharing::Elementwise;
+        }
+        match self.scale_run() {
+            ScaleRun::Whole => PackedRunSharing::WholeRow,
+            ScaleRun::Values(factor_run) => PackedRunSharing::FactorRun { factor_run },
+            ScaleRun::PerElement => PackedRunSharing::Elementwise,
+        }
+    }
+
+    /// The `K` length over which the scale is one value.
+    fn scale_run(&self) -> ScaleRun {
+        match self.scale.map(|position| self.operands[position].grid[1]) {
+            None | Some(Extent::Whole) => ScaleRun::Whole,
+            Some(Extent::Values(values)) => ScaleRun::Values(values),
+            Some(Extent::Group) => self
+                .group_size()
+                .map_or(ScaleRun::PerElement, ScaleRun::Values),
+        }
+    }
+
     /// Whether every element of a run of `count` (starting at a multiple of `count`) has the same factors: the
     /// scale's `K` extent is a multiple of `count`, or whole, or there is no scale.
     fn run_shares_factors(&self, count: usize) -> bool {
-        match self.scale.map(|position| self.operands[position].grid[1]) {
-            None | Some(Extent::Whole) => true,
-            Some(Extent::Values(values)) => values.is_multiple_of(count),
-            Some(Extent::Group) => self
-                .group_size()
-                .is_some_and(|size| size.is_multiple_of(count)),
+        match self.scale_run() {
+            ScaleRun::Whole => true,
+            ScaleRun::Values(values) => values.is_multiple_of(count),
+            ScaleRun::PerElement => false,
         }
     }
 

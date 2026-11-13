@@ -1,4 +1,5 @@
-//! The K-quants: 256-value super-blocks of integer codes with packed sub-block scales and mins.
+//! The K-quants: 256-value super-blocks of integer codes with packed sub-block scales and mins, and
+//! `TQ2_0`, the 256-value ternary block of one scale.
 
 use super::{HALF, QK_K, UNSIGNED, WHOLE_QK_K, blocks, digit, piece};
 use crate::format::{FieldEncoding, FormatDescriptor, MinSign, ValueMap, WeightFormat};
@@ -221,6 +222,28 @@ pub(crate) const Q6_K: FormatDescriptor = FormatDescriptor {
                         2
                     ),
                 ]
+            ),
+        ],
+    ),
+    value: ValueMap::Integer,
+    min_sign: None,
+};
+
+/// `TQ2_0` (ggml type 35): `[qs u8[64]][d f16]`, 66 bytes per 256. Element `i = n*128 + l*32 + m` is bits
+/// `2l` of `qs[n*32 + m]`. `y = (q - 1) * d`, so a code is one of -1, 0, 1 (and 2, which ggml's quantizer
+/// never writes but its dequantizer reads).
+pub(crate) const TQ2_0: FormatDescriptor = FormatDescriptor {
+    format: WeightFormat::Tq2_0,
+    storage: blocks(
+        QK_K,
+        66,
+        &[
+            field!(Scale, "d", HALF, [piece(512, WHOLE_QK_K, 16)]),
+            field!(
+                Codes,
+                "qs",
+                FieldEncoding::Unsigned { offset: -1 },
+                [piece(0, &[digit(2, 256), digit(4, 2), digit(32, 8)], 2)]
             ),
         ],
     ),

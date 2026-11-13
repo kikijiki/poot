@@ -52,7 +52,11 @@ fn weights() -> Vec<f32> {
 
 /// `weights()` in the order `layout` stores each expert slab.
 fn stored(layout: kg::WeightLayout) -> Vec<f32> {
-    let w = weights();
+    arranged(layout, weights())
+}
+
+/// The logical weights `w`, a flat `[E, K, N]` stack, in the order `layout` stores each expert slab.
+fn arranged(layout: kg::WeightLayout, w: Vec<f32>) -> Vec<f32> {
     match layout {
         kg::WeightLayout::Kn => w,
         kg::WeightLayout::Nk => (0..EXPERTS * K * N)
@@ -68,7 +72,11 @@ fn stored(layout: kg::WeightLayout) -> Vec<f32> {
 /// The weight buffer in `storage`: f32 words, or BF16 packed two per `u32` word (element `i` in word `i / 2` at bit
 /// `(i % 2) * 16`), the bytes a BF16 checkpoint uploads.
 fn weight_buffer(storage: BufferStorage, layout: kg::WeightLayout) -> Buffer {
-    let values = stored(layout);
+    stored_buffer(storage, stored(layout))
+}
+
+/// The weight buffer holding `values`, already in a layout's stored order, in `storage`.
+fn stored_buffer(storage: BufferStorage, values: Vec<f32>) -> Buffer {
     if storage == BufferStorage::f32() {
         return Buffer::from_f32s(&values);
     }
@@ -119,6 +127,21 @@ fn run_indexed(
     layout: kg::WeightLayout,
     weight: BufferStorage,
 ) -> Vec<f32> {
+    run_indexed_over(
+        schedule,
+        (m, x_groups),
+        (layout, weight),
+        (fill(1, m * K), weight_buffer(weight, layout)),
+    )
+}
+
+/// [`run_indexed`] over the given activation rows and weight buffer.
+fn run_indexed_over(
+    schedule: kg::Schedule,
+    (m, x_groups): (usize, Option<u32>),
+    (layout, weight): (kg::WeightLayout, BufferStorage),
+    (activation, weights): (Vec<f32>, Buffer),
+) -> Vec<f32> {
     let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
@@ -158,8 +181,8 @@ fn run_indexed(
     let generated = kg::generate(&request, &caps, &limits).unwrap();
     let wg = generated.body.workgroup_size[0];
     let mut buffers = [
-        Buffer::from_f32s(&fill(1, m * K)),
-        weight_buffer(weight, layout),
+        Buffer::from_f32s(&activation),
+        weights,
         Buffer::from_i32s(&experts),
         Buffer::from_u32s(generated.launch.meta.as_ref().unwrap()),
         Buffer::from_f32s(&vec![f32::MIN; m * N]),
@@ -213,6 +236,8 @@ fn an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read() {
         cols: 2,
         unroll: 2,
         activation: poot_kernelgen::GemvActivation::Scalar,
+        rows: poot_kernelgen::GemvRows::ONE,
+        depth: poot_kernelgen::LoadDepth::ONE,
     };
     for weight in [BufferStorage::f32(), BufferStorage::bf16_packed()] {
         for layout in [kg::WeightLayout::Kn, kg::WeightLayout::Nk] {
@@ -274,6 +299,8 @@ fn an_f16_packed_indexed_weight_is_refused_by_name() {
                 cols: 2,
                 unroll: 2,
                 activation: poot_kernelgen::GemvActivation::Scalar,
+                rows: poot_kernelgen::GemvRows::ONE,
+                depth: poot_kernelgen::LoadDepth::ONE,
             },
             layout: kg::WeightLayout::Kn,
             weight: BufferStorage::f16_packed(),
@@ -293,4 +320,67 @@ fn an_f16_packed_indexed_weight_is_refused_by_name() {
     )
     .expect_err("an F16 indexed weight has no body");
     assert!(error.to_string().contains("an indexed weight"), "{error}");
+}
+
+/// POOT-1560 SC-e on the indexed Gemv: a lane that accumulates `rows` adjacent output columns of one row's expert
+/// slab (N = 9, so 3 divides it) and keeps `depth` trips of loads in flight computes every output, the NaN rows of
+/// the refused ids included, bit for bit as at one row and one trip, over both expert layouts and both weight storages.
+/// The inputs have full mantissas (the BF16 weights ones a BF16 holds), so a sum in another order changes bits; the
+/// fixture of the invalid-id row sums exactly in any order and would not show it.
+/// Mutation: in `gemv_body` run the products of rows after the first in reverse order of the run (the `MUTATION`
+/// line); every row count above one goes red.
+#[test]
+fn indexed_gemv_rows_and_depth_do_not_change_a_sum() {
+    // Two lanes per column read 2 values each: a lane sums three runs of two products in sequence (K = 10), so the
+    // order of its products is visible in the bits.
+    let gemv = |rows, depth| kg::Schedule::Gemv {
+        width: 4,
+        cols: 2,
+        unroll: 2,
+        activation: poot_kernelgen::GemvActivation::Scalar,
+        rows: poot_kernelgen::GemvRows::new(rows).unwrap(),
+        depth: poot_kernelgen::LoadDepth::new(depth).unwrap(),
+    };
+    let hard = |seed: u64, count: usize, bf16: bool| -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let value = ((state >> 40) as f32 / (1u64 << 24) as f32) * 0.8 - 0.4;
+                if bf16 {
+                    f32::from_bits(value.to_bits() & 0xffff_0000)
+                } else {
+                    value
+                }
+            })
+            .collect()
+    };
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    let m = 14;
+    for weight in [BufferStorage::f32(), BufferStorage::bf16_packed()] {
+        for layout in [kg::WeightLayout::Kn, kg::WeightLayout::Nk] {
+            let bf16 = weight == BufferStorage::bf16_packed();
+            let run = |schedule| {
+                run_indexed_over(
+                    schedule,
+                    (m, None),
+                    (layout, weight),
+                    (
+                        hard(3, m * K, false),
+                        stored_buffer(weight, arranged(layout, hard(5, EXPERTS * K * N, bf16))),
+                    ),
+                )
+            };
+            let want = bits(run(gemv(1, 1)));
+            for (rows, depth) in [(3, 1), (1, 2), (3, 2), (1, 3), (3, 3)] {
+                assert_eq!(
+                    bits(run(gemv(rows, depth))),
+                    want,
+                    "{weight:?} {layout:?} rows={rows} depth={depth}"
+                );
+            }
+        }
+    }
 }

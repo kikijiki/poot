@@ -3,7 +3,8 @@
 //! known kernel (the delta-rule scan); the plain `RocmDevice::new` reports the typed `Unknown`, and
 //! timing leaves the step's result unchanged.
 
-use poot_executor::{Device, DeviceTime, Engine};
+use poot_executor::{DetailedTiming, Device, DeviceTime, Engine, TimingOptions};
+use poot_executor_parity::commit_labels::run_dispatch_labels_survive_the_stage_commit;
 use poot_executor_parity::scan::{device_time_of_step, timed_step};
 use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_rocm_device::device::RocmDevice;
@@ -83,4 +84,21 @@ fn timing_does_not_change_the_rocm_scan_result() {
     let (_, without) = timed_step(&mut Engine::new(plain), plain_target, &scan());
     assert!(matches!(time, DeviceTime::Measured(_)));
     assert_eq!(with_timing, without);
+}
+
+/// POOT-1571: a step whose recording holds a state commit between two stages' dispatches times each dispatch under
+/// its own plan label: the device gives no copy a dispatch index, so no row of the step reads `unknown`.
+/// Mutation: in `RocmDevice::copy` set `is_copy: false`; the commit copies take dispatch indices and the trailing rows read `unknown`.
+#[test]
+fn rocm_dispatch_times_keep_their_plan_labels_across_a_stage_commit() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new_with_device_timing())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::with_timing(
+        device,
+        TimingOptions::Detailed(DetailedTiming::every_step(16, 64, 4)),
+    );
+    run_dispatch_labels_survive_the_stage_commit(&mut engine, target).unwrap();
 }

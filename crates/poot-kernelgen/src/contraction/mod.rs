@@ -26,7 +26,7 @@ pub(crate) use epilogue::{BoundEpilogue, emit_epilogue};
 pub use epilogue::{Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep};
 #[cfg(any(test, feature = "test-support"))]
 pub use fit::{CostFit, fit_cost_ratios};
-pub(crate) use gemv::{GemvLaunch, gemv_body};
+pub(crate) use gemv::{GemvLaunch, Phased, RunAt, gemv_body};
 pub(crate) use indexed::{
     META_EXPERTS, META_N, META_PACKED_SLAB_WORDS, RowExpert, emit_poison, emit_row_expert,
     indexed_contraction,
@@ -34,7 +34,8 @@ pub(crate) use indexed::{
 pub use probe::{Feasibility, SpillCheck, probe_body};
 
 pub(crate) use tiled::{
-    GroupedRows, TiledBody, TiledExtents, TiledLaunch, TiledWeight, held_registers, tiled_body,
+    GroupedRows, TiledBody, TiledExtents, TiledLaunch, TiledWeight, held_registers,
+    register_words_of, tiled_body,
 };
 
 use poot_graph_ir::FragmentDtype;
@@ -67,22 +68,128 @@ impl GemvActivation {
     pub const VEC4_LANES: usize = 4;
 }
 
+/// The adjacent output rows one [`Schedule::Gemv`] lane accumulates over the same `K` runs (POOT-1550 D2), built
+/// only by [`GemvRows::new`]. A lane reads one activation run per trip and one weight run per row, so the activation
+/// loads per weight byte divide by the rows. Each row's sum is the sum it has at one row per lane: same runs, same
+/// order, so the output bits do not depend on this count.
+///
+/// More than one row needs every lane's rows to meet one activation row: the rows of a lane lie in one block of
+/// `out_per_block` outputs, so `out_per_block` is a multiple of the rows. The planner chooses only such counts; a
+/// launch whose metadata says otherwise computes NaN rather than a sum over the wrong activation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GemvRows(u32);
+
+impl GemvRows {
+    /// One row per lane: the loop nest without row sharing.
+    pub const ONE: Self = Self(1);
+    /// The most rows one lane accumulates: each is a run of loaded weight values and an accumulator in registers.
+    pub const MAX: u32 = 4;
+
+    /// `rows` per lane: refused outside `1 ..= MAX`.
+    pub fn new(rows: u32) -> Result<Self, KernelGenError> {
+        const GENERATOR: &str = "contraction_gemv";
+        if rows == 0 {
+            return Err(KernelGenError::BelowMinimum {
+                generator: GENERATOR,
+                what: "rows".to_string(),
+                value: 0,
+                min: 1,
+            });
+        }
+        if rows > Self::MAX {
+            return Err(KernelGenError::ExceedsBound {
+                generator: GENERATOR,
+                what: "rows".to_string(),
+                value: rows as usize,
+                bound: Self::MAX as usize,
+            });
+        }
+        Ok(Self(rows))
+    }
+
+    /// The rows per lane, at least 1.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The bare count, so a schedule's `Debug` (part of the planner's kernel key) reads `rows: 2`.
+impl std::fmt::Debug for GemvRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The trips of weight loads one [`Schedule::Gemv`] lane keeps in flight (POOT-1550 D2), built only by
+/// [`LoadDepth::new`]. At depth `d` the loads of the next `d - 1` trips are issued before the current trip's decode,
+/// rotating through `d` sets of registers, so the lane has `d` runs of weight bytes outstanding where a trip of the
+/// loop nest has one. The decode and the sums keep their order: the output bits do not depend on the depth. A front
+/// end whose run cannot issue its loads apart from its decode (a per-element address, a planar scale) carries
+/// nothing across trips, so its depth changes no body.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LoadDepth(u32);
+
+impl LoadDepth {
+    /// One trip: a trip loads, decodes and sums before the next loads.
+    pub const ONE: Self = Self(1);
+    /// The deepest pipeline: each extra trip holds a set of loaded registers across the loop.
+    pub const MAX: u32 = 3;
+
+    /// A pipeline of `depth` trips: refused outside `1 ..= MAX`.
+    pub fn new(depth: u32) -> Result<Self, KernelGenError> {
+        const GENERATOR: &str = "contraction_gemv";
+        if depth == 0 {
+            return Err(KernelGenError::BelowMinimum {
+                generator: GENERATOR,
+                what: "depth".to_string(),
+                value: 0,
+                min: 1,
+            });
+        }
+        if depth > Self::MAX {
+            return Err(KernelGenError::ExceedsBound {
+                generator: GENERATOR,
+                what: "depth".to_string(),
+                value: depth as usize,
+                bound: Self::MAX as usize,
+            });
+        }
+        Ok(Self(depth))
+    }
+
+    /// The trips in flight, at least 1.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The bare count, so a schedule's `Debug` (part of the planner's kernel key) reads `depth: 2`.
+impl std::fmt::Debug for LoadDepth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// The contraction's loop structure, chosen by the planner from shapes, never from the format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Schedule {
-    /// `M == 1`: one workgroup of `width` lanes owns `cols` adjacent output columns (weight rows),
-    /// `width / cols` lanes per column; each lane reads `unroll` contiguous `K` elements per trip,
-    /// and one LDS tree folds each column's lanes. `cols` is the launch-grid knob the
-    /// planner picks per shape; `width` must be a multiple of `cols`.
+    /// `M == 1`: one workgroup of `width` lanes owns `cols * rows` adjacent output columns (weight rows), `rows`
+    /// to each of `cols` column groups, `width / cols` lanes per group; each lane reads `unroll` contiguous `K`
+    /// elements of each of its `rows` rows per trip, and one LDS tree per row folds each group's lanes. `cols` is
+    /// the launch-grid knob the planner picks per shape; `width` must be a multiple of `cols`.
     Gemv {
         /// Lanes in the workgroup; a multiple of `cols`.
         width: u32,
-        /// Adjacent output columns the workgroup owns.
+        /// Column groups the workgroup owns.
         cols: u32,
         /// Contiguous `K` elements each lane reads per trip.
         unroll: u32,
         /// How a full run reads its activation values.
         activation: GemvActivation,
+        /// Adjacent output columns each lane accumulates, sharing one activation read.
+        rows: GemvRows,
+        /// Trips of weight loads each lane keeps in flight.
+        depth: LoadDepth,
     },
     /// `M > 1`, every contraction (block-diagonal, or indexed with each row reading its own expert's weight):
     /// LDS-staged tiles with a register tile per lane. A workgroup
@@ -187,7 +294,9 @@ impl Schedule {
         let rows = blocks * m_per_block;
         let outputs = rows * out_per_block;
         match self {
-            Schedule::Gemv { width, cols, .. } => outputs.div_ceil(cols as usize) * width as usize,
+            Schedule::Gemv {
+                width, cols, rows, ..
+            } => outputs.div_ceil((cols * rows.get()) as usize) * width as usize,
             Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
                 let tiling = RegisterTiling::of(self).expect("a tiled schedule has a tiling");
                 let (tile_rows, tile_cols) = tiling.output_tile();
@@ -197,6 +306,55 @@ impl Schedule {
                     * tiling.workgroup_lanes()
             }
         }
+    }
+
+    /// The 32-bit registers one lane of a [`Schedule::Gemv`] holds at once across its `K` loop over `weight`, or `None`
+    /// for a tiled schedule or a weight whose run the decode emitter cannot state (POOT-1560). Per row: its
+    /// accumulator, the run in flight ([`StagedWeight::in_flight_run`])
+    /// and the `depth - 1` runs a pipeline carries ahead of it ([`StagedWeight::carried_run`]: what their loads
+    /// return); and, while a trip multiplies, the
+    /// `unroll` decoded values of each row and the `unroll` activation values they meet. The rest of the decode's
+    /// temporaries are what [`poot_target::RegisterBudget::loop_registers`] leaves the other half of the lane for.
+    /// Evidence: `register_budget`'s Gemv sweep compiles every geometry this admits for gfx1151.
+    pub(crate) fn gemv_loop_registers(self, weight: StagedWeight) -> Option<u32> {
+        let Schedule::Gemv {
+            unroll,
+            rows,
+            depth,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let carried = weight.carried_run(unroll as usize)?;
+        let in_flight = weight.in_flight_run(unroll as usize)?;
+        Some(rows.get() * (1 + unroll + (depth.get() - 1) * carried + in_flight) + unroll)
+    }
+
+    /// Refuses a [`Schedule::Gemv`] whose lane would hold more than `caps` budgets for a loop
+    /// ([`poot_target::RegisterBudget::loop_registers`] of its workgroup): rows and depth multiply the registers a
+    /// lane keeps in flight, and a plan over the budget spills. Any other schedule, and a weight whose run the decode
+    /// emitter cannot state (which its own generator refuses by name), passes.
+    pub(crate) fn require_gemv_registers(
+        self,
+        weight: StagedWeight,
+        caps: &poot_target::DeviceCaps,
+        generator: &'static str,
+    ) -> Result<(), KernelGenError> {
+        let (Some(held), Schedule::Gemv { width, .. }) = (self.gemv_loop_registers(weight), self)
+        else {
+            return Ok(());
+        };
+        let budget = caps.gemm_launch().register_budget.loop_registers(width);
+        if held > budget {
+            return Err(KernelGenError::ExceedsBound {
+                generator,
+                what: "registers a Gemv lane holds across its K loop".to_string(),
+                value: held as usize,
+                bound: budget as usize,
+            });
+        }
+        Ok(())
     }
 
     /// The `(rows, columns)` of the output tile one workgroup of a tiled schedule computes, or `None` for the Gemv.
@@ -262,17 +420,60 @@ impl StagedWeight {
         }
     }
 
-    /// The 32-bit registers one staged run of `run` weight values holds in a tiled round: a dense run its loaded
-    /// bits; a packed run the reads its decode issues ahead of the round's multiply
-    /// ([`crate::packed_run_held_registers`]) and the `run` f32 values the decode then computes from them, which
-    /// stay live until the round's staged write. `None` for a format the decode emitter cannot state.
-    pub fn run_registers(self, run: usize) -> Option<u32> {
+    /// The 32-bit registers one run of `run` weight values holds once loaded, before it is decoded: a dense run its
+    /// bits; a packed run the reads its decode issues ahead of a multiply ([`crate::packed_run_held_registers`]).
+    /// `None` for a format the decode emitter cannot state.
+    fn held_run(self, run: usize) -> Option<u32> {
         match self {
             Self::Dense { bits } => Some((run as u32 * bits).div_ceil(32)),
-            Self::Packed(format) => crate::packed_run_held_registers(format, run)
-                .ok()
-                .map(|held| held + run as u32),
+            Self::Packed(format) => crate::packed_run_held_registers(format, run).ok(),
         }
+    }
+
+    /// The 32-bit registers one run of `run` weight values has loaded while a Gemv trip decodes it: a dense run its
+    /// bits; a packed run the reads its decode issues ahead of the multiply ([`Self::held_run`]), except that a planar
+    /// run whose codes are one stored element per `K` index ([`crate::PackedRunSharing::FactorRun`] or `WholeRow`: FP8)
+    /// counts one register per element beside what its loads carry, where `held_run` counts the word pair its
+    /// reads of an element's code address (gfx1151: 124 to 125 VGPRs at run 32, `held_run` 66 of them per row). `None`
+    /// for a format the decode emitter cannot state.
+    fn in_flight_run(self, run: usize) -> Option<u32> {
+        let held = self.held_run(run)?;
+        match self {
+            Self::Packed(format)
+                if matches!(
+                    format.descriptor().storage,
+                    poot_quant::format::Storage::Planar(_)
+                ) && !matches!(
+                    crate::packed_run_sharing(format),
+                    Ok(crate::PackedRunSharing::Elementwise) | Err(_)
+                ) =>
+            {
+                Some(held.min(run as u32 + self.carried_run(run)?))
+            }
+            _ => Some(held),
+        }
+    }
+
+    /// The 32-bit registers one run of `run` weight values carries from its loads to its decode in a Gemv trip, which a
+    /// pipeline of depth `d` keeps `d` of: a dense run its bits; a packed run what its loads return
+    /// ([`crate::packed_run_carried_registers`]). `None` for a format the decode emitter cannot state.
+    fn carried_run(self, run: usize) -> Option<u32> {
+        match self {
+            Self::Dense { bits } => Some((run as u32 * bits).div_ceil(32)),
+            Self::Packed(format) => crate::packed::packed_run_carried_registers(format, run).ok(),
+        }
+    }
+
+    /// The 32-bit registers one staged run of `run` weight values holds in a tiled round: a dense run its loaded
+    /// bits; a packed run the reads its decode issues ahead of the round's multiply ([`Self::held_run`]) and the
+    /// `run` f32 values the decode then computes from them, which stay live until the round's staged write. `None`
+    /// for a format the decode emitter cannot state.
+    pub fn run_registers(self, run: usize) -> Option<u32> {
+        let held = self.held_run(run)?;
+        Some(match self {
+            Self::Dense { .. } => held,
+            Self::Packed(_) => held + run as u32,
+        })
     }
 }
 

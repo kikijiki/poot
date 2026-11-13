@@ -25,7 +25,7 @@ use crate::attention::{
 };
 use crate::block_top_k::{BlockTopKSpec, block_top_k_body};
 use crate::contraction::{
-    DenseTiledWeight, Epilogue, GemvActivation, Schedule, TiledExtents, TiledRead,
+    DenseTiledWeight, Epilogue, GemvActivation, Schedule, StagedWeight, TiledExtents, TiledRead,
     dense_contraction, dense_tiled_contraction, indexed_contraction,
 };
 use crate::data_movement::{
@@ -409,7 +409,8 @@ impl KernelRequest {
     }
 }
 
-/// The schedule as a display label: a GEMV's width, columns, unroll and activation read, or a tiled form's tiling.
+/// The schedule as a display label: a GEMV's width, columns, unroll, activation read and (above one) rows and depth, or
+/// a tiled form's tiling.
 fn schedule_label(schedule: &Schedule) -> String {
     match schedule {
         Schedule::Gemv {
@@ -417,12 +418,25 @@ fn schedule_label(schedule: &Schedule) -> String {
             cols,
             unroll,
             activation,
+            rows,
+            depth,
         } => {
             let read = match activation {
                 GemvActivation::Scalar => "",
                 GemvActivation::Vec4 => "v4",
             };
-            format!("w{width}c{cols}u{unroll}{read}")
+            // The default geometry keeps the label it always had: rows and depth name themselves above one.
+            let rows = if rows.get() > 1 {
+                format!("r{rows:?}")
+            } else {
+                String::new()
+            };
+            let depth = if depth.get() > 1 {
+                format!("d{depth:?}")
+            } else {
+                String::new()
+            };
+            format!("w{width}c{cols}u{unroll}{read}{rows}{depth}")
         }
         Schedule::RegisterTiled {
             lanes,
@@ -601,12 +615,19 @@ pub enum ContractionSpec {
     /// field and a `[K, N]` Gemv cannot be written down.
     ///
     /// ```
-    /// use poot_kernelgen::{ContractionSpec, GemvActivation, Schedule};
+    /// use poot_kernelgen::{ContractionSpec, GemvActivation, GemvRows, LoadDepth, Schedule};
     /// use poot_target::BufferStorage;
     ///
     /// let _gemv_over_n_by_k = ContractionSpec::DenseGemv {
     ///     weight: BufferStorage::f32(),
-    ///     schedule: Schedule::Gemv { width: 256, cols: 4, unroll: 4, activation: GemvActivation::Scalar },
+    ///     schedule: Schedule::Gemv {
+    ///         width: 256,
+    ///         cols: 4,
+    ///         unroll: 4,
+    ///         activation: GemvActivation::Scalar,
+    ///         rows: GemvRows::ONE,
+    ///         depth: LoadDepth::ONE,
+    ///     },
     ///     k: 896,
     ///     n: 4864,
     ///     epilogue: None,
@@ -614,13 +635,22 @@ pub enum ContractionSpec {
     /// ```
     ///
     /// ```compile_fail,E0559
-    /// use poot_kernelgen::{ContractionSpec, GemvActivation, Schedule, WeightLayout};
+    /// use poot_kernelgen::{
+    ///     ContractionSpec, GemvActivation, GemvRows, LoadDepth, Schedule, WeightLayout,
+    /// };
     /// use poot_target::BufferStorage;
     ///
     /// let _gemv_over_k_by_n = ContractionSpec::DenseGemv {
     ///     weight: BufferStorage::f32(),
     ///     layout: WeightLayout::Kn,
-    ///     schedule: Schedule::Gemv { width: 256, cols: 4, unroll: 4, activation: GemvActivation::Scalar },
+    ///     schedule: Schedule::Gemv {
+    ///         width: 256,
+    ///         cols: 4,
+    ///         unroll: 4,
+    ///         activation: GemvActivation::Scalar,
+    ///         rows: GemvRows::ONE,
+    ///         depth: LoadDepth::ONE,
+    ///     },
     ///     k: 896,
     ///     n: 4864,
     ///     epilogue: None,
@@ -1122,6 +1152,13 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             n,
             epilogue,
         } => {
+            schedule.require_gemv_registers(
+                StagedWeight::Dense {
+                    bits: crate::dense_value_bits(*weight),
+                },
+                caps,
+                ENTRY,
+            )?;
             let body = dense_contraction(
                 ENTRY,
                 *weight,
@@ -1148,6 +1185,11 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             meta,
             precision,
         }) => {
+            schedule.require_gemv_registers(
+                StagedWeight::Packed(*format),
+                caps,
+                "packed_contraction",
+            )?;
             let body = packed_contraction(
                 "packed_contraction",
                 *format,
@@ -1215,22 +1257,31 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             grid,
             meta,
             precision,
-        }) => with(
-            indexed_contraction(
+        }) => {
+            schedule.require_gemv_registers(
+                StagedWeight::Dense {
+                    bits: crate::dense_value_bits(*weight),
+                },
+                caps,
                 ENTRY,
-                *schedule,
-                *layout,
-                *weight,
-                meta,
-                epilogue.as_ref(),
-                *precision,
-                caps.rounding_conversions,
-            )?,
-            Launch {
-                grid: *grid,
-                meta: Some(meta.clone()),
-            },
-        ),
+            )?;
+            with(
+                indexed_contraction(
+                    ENTRY,
+                    *schedule,
+                    *layout,
+                    *weight,
+                    meta,
+                    epilogue.as_ref(),
+                    *precision,
+                    caps.rounding_conversions,
+                )?,
+                Launch {
+                    grid: *grid,
+                    meta: Some(meta.clone()),
+                },
+            )
+        }
     }
 }
 
@@ -1875,6 +1926,8 @@ mod tests {
                         cols: 4,
                         unroll: 4,
                         activation: crate::GemvActivation::Scalar,
+                        rows: crate::GemvRows::ONE,
+                        depth: crate::LoadDepth::ONE,
                     },
                     k: 896,
                     n: 4864,
@@ -1916,6 +1969,8 @@ mod tests {
                         cols: 2,
                         unroll: 1,
                         activation: crate::GemvActivation::Scalar,
+                        rows: crate::GemvRows::ONE,
+                        depth: crate::LoadDepth::ONE,
                     },
                     epilogue: None,
                     grid: [64, 1, 1],
@@ -2130,6 +2185,8 @@ mod tests {
                             cols: 2,
                             unroll: 2,
                             activation: crate::GemvActivation::Scalar,
+                            rows: crate::GemvRows::ONE,
+                            depth: crate::LoadDepth::ONE,
                         },
                         k,
                         n,
@@ -2276,6 +2333,8 @@ mod tests {
                             cols: 2,
                             unroll: 2,
                             activation: crate::GemvActivation::Scalar,
+                            rows: crate::GemvRows::ONE,
+                            depth: crate::LoadDepth::ONE,
                         },
                         k,
                         n,
@@ -2339,6 +2398,8 @@ mod tests {
                     cols: 2,
                     unroll: 2,
                     activation: crate::GemvActivation::Scalar,
+                    rows: crate::GemvRows::ONE,
+                    depth: crate::LoadDepth::ONE,
                 },
                 k: 8,
                 n: 4,
@@ -2419,6 +2480,8 @@ mod tests {
                             cols,
                             unroll,
                             activation: crate::GemvActivation::Scalar,
+                            rows: crate::GemvRows::ONE,
+                            depth: crate::LoadDepth::ONE,
                         },
                         k,
                         n,

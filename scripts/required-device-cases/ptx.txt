@@ -22,6 +22,7 @@
 # captured replay bit-identical to the recording pass. The two-device row is in ptx-2gpu.txt.
 poot-kernelgen	packed::planar_ptx_tests::contraction_gemv_matches_reference_for_every_planar_format_on_ptx
 poot-kernelgen	packed::planar_ptx_tests::contraction_tiled_matches_reference_for_every_planar_format_on_ptx
+poot-kernelgen	packed::ptx_tests::a_gemv_with_rows_and_depth_matches_reference_on_ptx
 poot-kernelgen	packed::ptx_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_ptx
 poot-kernelgen	packed::ptx_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_ptx_kquant
 poot-kernelgen	packed::ptx_tests::contraction_tiled_matches_reference_aligned_and_ragged_on_ptx
@@ -241,6 +242,7 @@ poot-ptx-device::cross_backend	unary_tanh_ptx_matches_cpu
 poot-ptx-device::device_caps_planning	a_live_ptx_device_reports_its_workgroup_subgroup_and_matrix_caps
 poot-ptx-device::device_caps_planning	the_ptx_device_reports_live_free_memory_within_its_open_time_ceiling
 poot-ptx-device::device_timing	plain_ptx_device_reports_unknown_device_time
+poot-ptx-device::device_timing	ptx_dispatch_times_keep_their_plan_labels_across_a_stage_commit
 poot-ptx-device::device_timing	timed_ptx_device_reads_a_nonzero_device_time_for_a_known_kernel
 poot-ptx-device::device_timing	timed_ptx_device_reads_each_dispatch_of_a_captured_step
 poot-ptx-device::feedback_end_to_end	the_engine_plans_the_expert_projection_with_the_drivers_verdicts_on_ptx

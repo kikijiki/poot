@@ -4,7 +4,8 @@
 
 use std::num::NonZeroUsize;
 
-use poot_executor::{Device, DeviceTime, Engine};
+use poot_executor::{DetailedTiming, Device, DeviceTime, Engine, TimingOptions};
+use poot_executor_parity::commit_labels::run_dispatch_labels_survive_the_stage_commit;
 use poot_executor_parity::scan::device_time_of_step;
 use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_runtime_common::DeviceBackend;
@@ -61,4 +62,28 @@ fn counters_only_wgpu_device_reports_unknown_device_time() {
         device_time_of_step(&mut engine, target, &scan()),
         DeviceTime::Unknown
     );
+}
+
+/// POOT-1571: a step whose recording holds a state commit between two stages' dispatches times each dispatch under
+/// its own plan label: the device gives no copy a dispatch index, so no row of the step reads `unknown`.
+/// Mutation: in `Context::copy_words_into` advance `next_dispatch_index`; the commit takes a dispatch index, the second
+/// stage's labels shift and the trailing rows read `unknown` (observed: red).
+#[test]
+fn wgpu_dispatch_times_keep_their_plan_labels_across_a_stage_commit() {
+    let Some(device) = open_or_skip(
+        DeviceBackend::Wgpu,
+        WgpuDevice::new_with_device_timing(NonZeroUsize::new(64).unwrap()),
+    ) else {
+        return;
+    };
+    if !device.has_device_timestamps() {
+        poot_runtime_common::device_skip::skip_unsupported(DeviceBackend::Wgpu, "TIMESTAMP_QUERY");
+        return;
+    }
+    let target = device.target();
+    let mut engine = Engine::with_timing(
+        device,
+        TimingOptions::Detailed(DetailedTiming::every_step(16, 64, 4)),
+    );
+    run_dispatch_labels_survive_the_stage_commit(&mut engine, target).unwrap();
 }

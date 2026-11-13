@@ -564,14 +564,33 @@ impl WeightLane {
         count: usize,
         word_aligned: bool,
     ) -> Vec<Local> {
+        let loaded = self.emit_run_load(e, weight, first, count, word_aligned);
+        self.emit_run_decode(e, conversions, weight, count, word_aligned, &loaded)
+    }
+
+    /// The loads of [`Self::emit_run`]'s run, apart from its decode: the f32 elements of an f32 lane, the words of
+    /// a word-aligned packed run. A packed run that is not word-aligned reads each element through
+    /// [`Self::emit_elem`], whose load and decode share one address, so it loads nothing here and returns the
+    /// run's `first` element for [`Self::emit_run_decode`].
+    pub(crate) fn emit_run_load(
+        self,
+        e: &mut Emit,
+        weight: Local,
+        first: Local,
+        count: usize,
+        word_aligned: bool,
+    ) -> Vec<Local> {
         let per_word = self.per_word();
-        if per_word == 1 || !word_aligned {
+        if per_word == 1 {
             return (0..count)
                 .map(|j| {
                     let idx = emit::bin(e, Ty::Usize, BinOp::Add, emit::copy(first), emit::cu(j));
-                    self.emit_elem(e, conversions, weight, idx)
+                    e.let_(Ty::F32, Rvalue::Use(copy(elem(weight, idx))))
                 })
                 .collect();
+        }
+        if !word_aligned {
+            return vec![first];
         }
         debug_assert!(count.is_multiple_of(per_word), "an aligned run of {count}");
         let first_word = emit::bin(
@@ -582,7 +601,7 @@ impl WeightLane {
             emit::cu(per_word),
         );
         (0..count / per_word)
-            .flat_map(|w| {
+            .map(|w| {
                 let idx = emit::bin(
                     e,
                     Ty::Usize,
@@ -590,7 +609,37 @@ impl WeightLane {
                     emit::copy(first_word),
                     emit::cu(w),
                 );
-                let word = e.let_(Ty::U32, Rvalue::Use(copy(elem(weight, idx))));
+                e.let_(Ty::U32, Rvalue::Use(copy(elem(weight, idx))))
+            })
+            .collect()
+    }
+
+    /// The `count` f32 values of the run [`Self::emit_run_load`] loaded as `loaded`: both halves of each word, or
+    /// the elements of an unaligned run.
+    pub(crate) fn emit_run_decode(
+        self,
+        e: &mut Emit,
+        conversions: RoundingConversions,
+        weight: Local,
+        count: usize,
+        word_aligned: bool,
+        loaded: &[Local],
+    ) -> Vec<Local> {
+        if self.per_word() == 1 {
+            return loaded.to_vec();
+        }
+        if !word_aligned {
+            let first = loaded[0];
+            return (0..count)
+                .map(|j| {
+                    let idx = emit::bin(e, Ty::Usize, BinOp::Add, emit::copy(first), emit::cu(j));
+                    self.emit_elem(e, conversions, weight, idx)
+                })
+                .collect();
+        }
+        loaded
+            .iter()
+            .flat_map(|&word| {
                 let low = emit::bin(
                     e,
                     Ty::U32,

@@ -1109,3 +1109,137 @@ fn the_planned_packed_expert_tilings_spill_no_register() {
         }
     }
 }
+
+/// POOT-1560: a decode Gemv at each `rows` and `depth` the generator admits on gfx1151 spills no register, and one it
+/// does not admit is refused by the request (`ExceedsBound`) before any body exists. The bound is
+/// [`crate::Schedule::gemv_loop_registers`] against the lane's `loop_registers` budget. The sweep covers every block
+/// format (2- to 8-bit codes, with and without sub-block factors and lattices) at runs of 8, 16 and, where the
+/// format shares its factors across 32 values, 32 (the runs the planner plans, `gemv_run`), and every planar format
+/// (FP8, FP4, GPTQ, AWQ) at the same runs, and a dense bf16 weight at
+/// runs of 4 and 8, over 256 lanes. It prints the compiler's count beside the model's so the bound can be read against
+/// the hardware. Mutation: make `require_gemv_registers` return `Ok(())`; the geometries the bound refuses are
+/// generated and the refusal assertion goes red.
+#[test]
+fn the_gemv_geometries_within_the_register_budget_spill_no_register() {
+    use crate::{
+        ContractionSpec, GemvActivation, KernelRequest, PackedContraction, PackedRows,
+        PackedRunSharing, StagedWeight,
+    };
+    use poot_quant::test_support::formats::{GGUF_FORMATS, SAFETENSORS_FORMATS};
+
+    let caps = gfx1151_caps();
+    let budget = caps.gemm_launch().register_budget.loop_registers(256);
+    let limits = crate::BodyLimits {
+        max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
+    };
+    let (k, n) = (4096u32, 4096u32);
+    let mut sweep: Vec<(String, StagedWeight, KernelRequest)> = Vec::new();
+    let geometry = |unroll: u32, rows: u32, depth: u32| crate::Schedule::Gemv {
+        width: 256,
+        cols: 4,
+        unroll,
+        activation: GemvActivation::Vec4,
+        rows: crate::GemvRows::new(rows).unwrap(),
+        depth: crate::LoadDepth::new(depth).unwrap(),
+    };
+    // Every block-storage GGUF format and every planar one: the codes and factors the planner decodes in a run.
+    for format in GGUF_FORMATS
+        .into_iter()
+        .chain(SAFETENSORS_FORMATS)
+        .filter(|format| {
+            matches!(
+                format.descriptor().storage,
+                poot_quant::format::Storage::Blocks(_) | poot_quant::format::Storage::Planar(_)
+            )
+        })
+    {
+        let wide = match crate::packed_run_sharing(format).unwrap() {
+            PackedRunSharing::FactorRun { factor_run } => factor_run.is_multiple_of(32),
+            PackedRunSharing::WholeRow => true,
+            PackedRunSharing::Elementwise => false,
+        };
+        for unroll in [8u32, 16, 32].into_iter().filter(|&run| run < 32 || wide) {
+            for (rows, depth) in (1..=4u32).flat_map(|rows| (1..=3u32).map(move |d| (rows, d))) {
+                let schedule = geometry(unroll, rows, depth);
+                sweep.push((
+                    format!("{format:?}_u{unroll}_r{rows}_d{depth}"),
+                    StagedWeight::Packed(format),
+                    KernelRequest::Contraction(ContractionSpec::Packed(PackedContraction {
+                        format,
+                        rows: PackedRows::Blocks,
+                        schedule,
+                        epilogue: None,
+                        grid: [schedule.grid_threads(1, 1, n as usize) as u32, 1, 1],
+                        meta: vec![k, n],
+                        precision: poot_graph_ir::OperandPrecision::Exact,
+                    })),
+                ));
+            }
+        }
+    }
+    for unroll in [4u32, 8] {
+        for (rows, depth) in (1..=4u32).flat_map(|rows| (1..=3u32).map(move |d| (rows, d))) {
+            sweep.push((
+                format!("bf16_u{unroll}_r{rows}_d{depth}"),
+                StagedWeight::Dense { bits: 16 },
+                KernelRequest::Contraction(ContractionSpec::DenseGemv {
+                    weight: BufferStorage::bf16_packed(),
+                    schedule: geometry(unroll, rows, depth),
+                    k: k as usize,
+                    n: n as usize,
+                    epilogue: None,
+                }),
+            ));
+        }
+    }
+    let (mut admitted, mut refused) = (0, 0);
+    for (label, weight, request) in sweep {
+        let KernelRequest::Contraction(
+            ContractionSpec::Packed(PackedContraction { schedule, .. })
+            | ContractionSpec::DenseGemv { schedule, .. },
+        ) = &request
+        else {
+            unreachable!("the sweep builds Gemv requests")
+        };
+        let held = schedule.gemv_loop_registers(weight).unwrap();
+        let name: String = format!("budget_gemv_{label}")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        match crate::generate(&request, &caps, &limits) {
+            Err(crate::KernelGenError::ExceedsBound { value, bound, .. }) => {
+                assert!(
+                    held > budget && value == held as usize && bound == budget as usize,
+                    "{name}: refused at {value} of {bound}, the model says {held} of {budget}"
+                );
+                refused += 1;
+            }
+            Err(error) => panic!("{name}: {error}"),
+            Ok(generated) => {
+                assert!(held <= budget, "{name}: {held} of {budget} was admitted");
+                let mut body = generated.body;
+                body.name = name.clone();
+                let Some((vgprs, spilled)) = compiled_registers(&body) else {
+                    return;
+                };
+                eprintln!("{name}: model {held} of {budget}, {vgprs} VGPRs, {spilled} spilled");
+                assert_eq!(
+                    spilled, 0,
+                    "{name}: model {held} of {budget} registers, compiled to {vgprs} VGPRs, {spilled} spilled"
+                );
+                admitted += 1;
+            }
+        }
+    }
+    assert!(
+        admitted >= 200 && refused >= 20,
+        "the bound admits {admitted} and refuses {refused} geometries"
+    );
+}

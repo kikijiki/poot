@@ -21,6 +21,8 @@ fn schedule(activation: kg::GemvActivation) -> kg::Schedule {
         cols: 4,
         unroll: 8,
         activation,
+        rows: kg::GemvRows::ONE,
+        depth: kg::LoadDepth::ONE,
     }
 }
 

@@ -118,11 +118,8 @@ pub fn gguf_plan(index: &GgufIndex, names: &dyn TensorNameMap) -> Result<LoadPla
         };
         // ggml `ne` is fastest-varying first; the logical row-major shape is the reverse.
         let shape: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
-        let format =
-            weight_format_of(info.ggml_type).ok_or_else(|| LoadError::UnsupportedGgufType {
-                tensor: name.clone(),
-                ggml_type: info.ggml_type,
-            })?;
+        let format = weight_format_of(info.ggml_type)
+            .ok_or_else(|| format::refusal_of(name, info.ggml_type))?;
         let descriptor = format.descriptor();
         if !descriptor.has_scale() {
             let dtype = dense_stored_dtype(format);
@@ -967,7 +964,7 @@ mod tests {
     /// mapping id 7 (Q5_1) to `Some(WeightFormat::Q5_0)` in the `weight_format_of` table makes this
     /// row's `assert_eq!` fail (`Some(Q5_0) != Some(Q5_1)`) - the acceptance mutation the card names
     /// ("map Q5_1 to Q5_0") shows up here, not in `read_gguf_refuses_...` (that row is about an id
-    /// with no packed path at all, e.g. Q8_1).
+    /// with no packed path at all, e.g. IQ1_S).
     #[test]
     fn weight_format_of_matches_the_pinned_ggml_type_table() {
         let mapped: &[(u32, WeightFormat)] = &[
@@ -983,19 +980,22 @@ mod tests {
             (12, WeightFormat::Q4_K),
             (13, WeightFormat::Q5_K),
             (14, WeightFormat::Q6_K),
-            (20, WeightFormat::Iq4_Nl),
+            (16, WeightFormat::Iq2_Xxs),
             (17, WeightFormat::Iq2_Xs),
             (18, WeightFormat::Iq3_Xxs),
+            (20, WeightFormat::Iq4_Nl),
             (21, WeightFormat::Iq3_S),
+            (22, WeightFormat::Iq2_S),
             (23, WeightFormat::Iq4_Xs),
             (30, WeightFormat::Bf16),
+            (35, WeightFormat::Tq2_0),
             (39, WeightFormat::Mxfp4),
         ];
         for &(id, format) in mapped {
             assert_eq!(weight_format_of(id), Some(format), "ggml type {id}");
         }
         let unmapped: &[u32] = &[
-            4, 5, 9, 15, 16, 19, 22, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38,
+            4, 5, 9, 15, 19, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 36, 37, 38,
         ];
         for &id in unmapped {
             assert_eq!(weight_format_of(id), None, "ggml type {id}");
@@ -1112,25 +1112,69 @@ mod tests {
         assert_eq!(store.total_stored_bytes(), data.len());
     }
 
-    /// Card 543 SC-003/SC-004 (refusal): a scheme with no packed path (`Q8_1`, ggml id 9) is refused
+    /// Card 543 SC-003/SC-004 (refusal): a scheme with no packed path (`IQ1_S`, ggml id 19) is refused
     /// by name, naming the tensor - never loaded dense silently.
     #[test]
     fn read_gguf_refuses_a_scheme_with_no_packed_path_by_name() {
-        const GGML_Q8_1: u32 = 9;
+        const GGML_IQ1_S: u32 = 19;
         let bytes = write_gguf(
             &[],
-            &[("blk.0.attn_v.weight", vec![32], GGML_Q8_1, vec![0u8; 34])],
+            &[("blk.0.attn_v.weight", vec![256], GGML_IQ1_S, vec![0u8; 50])],
         );
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let error = read_gguf(&index, &IdentityNames).expect_err("must refuse Q8_1");
+        let error = read_gguf(&index, &IdentityNames).expect_err("must refuse IQ1_S");
         match error {
             LoadError::UnsupportedGgufType { tensor, ggml_type } => {
                 assert_eq!(tensor, "blk.0.attn_v.weight");
-                assert_eq!(ggml_type, GGML_Q8_1);
+                assert_eq!(ggml_type, GGML_IQ1_S);
             }
             other => panic!("expected UnsupportedGgufType, got {other:?}"),
+        }
+    }
+
+    /// POOT-1540 SC-5: `Q8_1` (9) and `Q8_K` (15) are ggml's activation formats and are refused by name with
+    /// that reason, a different variant from a scheme that merely has no packed path. Mutation: map id 9 to
+    /// a format in `weight_format_of`; the load goes past the type check and the row fails with `expected
+    /// ActivationGgufType, got UnsupportedGgufTensorRank` (a 1-D tensor has no owner shape); the pinned-table
+    /// row fails too.
+    #[test]
+    fn read_gguf_refuses_the_activation_formats_by_name() {
+        for (ggml_type, name, bytes_per_block, values) in
+            [(9u32, "Q8_1", 36usize, 32u64), (15, "Q8_K", 292, 256)]
+        {
+            let bytes = write_gguf(
+                &[],
+                &[(
+                    "blk.0.attn_v.weight",
+                    vec![values],
+                    ggml_type,
+                    vec![0u8; bytes_per_block],
+                )],
+            );
+            let fixture = TempGguf::write(&bytes);
+            let file = fixture.map();
+            let index = GgufIndex::parse(&file).expect("parse index");
+            let error =
+                read_gguf(&index, &IdentityNames).expect_err(&format!("must refuse {name}"));
+            match &error {
+                LoadError::ActivationGgufType {
+                    tensor,
+                    ggml_type: refused,
+                    name: refused_name,
+                } => {
+                    assert_eq!(tensor, "blk.0.attn_v.weight");
+                    assert_eq!((*refused, *refused_name), (ggml_type, name));
+                }
+                other => panic!("expected ActivationGgufType, got {other:?}"),
+            }
+            assert!(
+                error
+                    .to_string()
+                    .contains("activation format, no weight decode in ggml"),
+                "{error}"
+            );
         }
     }
 
@@ -1144,10 +1188,10 @@ mod tests {
                 None
             }
         }
-        const GGML_Q8_1: u32 = 9; // no packed path; would refuse if not skipped first
+        const GGML_Q8_1: u32 = 9; // refused if not skipped first
         let bytes = write_gguf(
             &[],
-            &[("blk.0.attn_v.weight", vec![32], GGML_Q8_1, vec![0u8; 34])],
+            &[("blk.0.attn_v.weight", vec![32], GGML_Q8_1, vec![0u8; 36])],
         );
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();

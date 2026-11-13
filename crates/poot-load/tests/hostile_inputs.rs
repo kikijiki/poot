@@ -313,7 +313,7 @@ fn a_tensor_element_count_that_overflows_or_exceeds_the_cap_is_refused() {
 
 #[test]
 fn a_ggml_type_poot_cannot_read_is_refused_by_tensor_name() {
-    for ggml_type in [4u32, 9, 24, 39 + 1, 9999, u32::MAX] {
+    for ggml_type in [4u32, 19, 24, 39 + 1, 9999, u32::MAX] {
         let bytes = RawGguf::new(1, 0)
             .tensor("odd.weight", &[32, 2], ggml_type, 0)
             .finish(&[0u8; 256]);

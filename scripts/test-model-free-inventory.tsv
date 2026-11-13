@@ -496,6 +496,7 @@ poot-executor	poot-executor	model-free	lanes::tests::an_e4m3_table_pads_each_row
 poot-executor	poot-executor	model-free	lanes::tests::dense_e4m3_storage_has_no_encoding
 poot-executor	poot-executor	model-free	lanes::tests::encoding_of_agrees_with_encode_stored_for_every_dtype_and_lane
 poot-executor	poot-executor	model-free	lanes::tests::every_encoding_lands_the_oracle_bytes_in_chunks_of_any_size
+poot-executor	poot-executor	model-free	tests::timing::a_chain_labels_each_entrys_dispatches_with_its_own_steps
 poot-executor	poot-executor	model-free	tests::timing::absent_consumer_never_blocks_execution
 poot-executor	poot-executor	model-free	tests::timing::sample_every_skips_detail_on_the_declared_ratio_of_steps
 poot-executor	poot-executor	model-free	tests::timing::sc001_host_partition_sums_to_wall_without_device_subtraction
@@ -1265,7 +1266,9 @@ poot-graph-plan	poot-graph-plan::attention_split	model-free	a_device_with_unknow
 poot-graph-plan	poot-graph-plan::attention_split	model-free	a_live_decode_over_a_declared_position_slot_plans_the_split_schedule
 poot-graph-plan	poot-graph-plan::attention_split	model-free	a_low_head_decode_plans_two_launches_through_one_scratch
 poot-graph-plan	poot-graph-plan::attention_split	model-free	every_split_dispatch_stays_within_max_grid
+poot-graph-plan	poot-graph-plan::attention_split	model-free	the_key_walk_follows_the_caps
 poot-graph-plan	poot-graph-plan::attention_split	model-free	the_scratch_is_colored_with_the_values_and_reused_across_layers
+poot-graph-plan	poot-graph-plan::attention_split	model-free	the_split_ceiling_follows_the_compute_units_over_the_kv_head_rows
 poot-graph-plan	poot-graph-plan::attention_split	model-free	the_split_grid_follows_the_capacity_and_the_floor_does_not
 poot-graph-plan	poot-graph-plan::buffer_plan_liveness	model-free	a_scratch_never_shares_a_slot_with_a_live_value
 poot-graph-plan	poot-graph-plan::buffer_plan_liveness	model-free	no_two_live_values_share_a_slot_in_random_graphs
@@ -1581,6 +1584,7 @@ poot-kernelgen	poot-kernelgen	device	fused::tests::fused_row_parallel_matches_se
 poot-kernelgen	poot-kernelgen	device	fused::tests::fused_row_rmsnorm_multi_row
 poot-kernelgen	poot-kernelgen	device	fused::tests::fused_row_rmsnorm_one_pass
 poot-kernelgen	poot-kernelgen	device	fused::tests::fused_row_softmax_two_reductions
+poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::a_gemv_with_rows_and_depth_matches_reference_on_wgpu
 poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_wgpu
 poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_wgpu_kquant
 poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::contraction_tiled_folded_grid_matches_reference_on_wgpu
@@ -1589,12 +1593,14 @@ poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::contraction_tile
 poot-kernelgen	poot-kernelgen	device	packed::planar_ptx_tests::contraction_gemv_matches_reference_for_every_planar_format_on_ptx
 poot-kernelgen	poot-kernelgen	device	packed::planar_ptx_tests::contraction_tiled_matches_reference_for_every_planar_format_on_ptx
 poot-kernelgen	poot-kernelgen	device	packed::planar_wgpu_tests::the_register_tiled_body_runs_256_lane_workgroups_on_radv
+poot-kernelgen	poot-kernelgen	device	packed::ptx_tests::a_gemv_with_rows_and_depth_matches_reference_on_ptx
 poot-kernelgen	poot-kernelgen	device	packed::ptx_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_ptx
 poot-kernelgen	poot-kernelgen	device	packed::ptx_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_ptx_kquant
 poot-kernelgen	poot-kernelgen	device	packed::ptx_tests::contraction_tiled_matches_reference_aligned_and_ragged_on_ptx
 poot-kernelgen	poot-kernelgen	device	packed::ptx_tests::contraction_tiled_matches_reference_block_diagonal_ragged_on_ptx
 poot-kernelgen	poot-kernelgen	device	packed::ptx_tests::row_gather_matches_decode_blocks_rows_on_ptx
 poot-kernelgen	poot-kernelgen	device	packed::ptx_tests::row_gather_matches_decode_blocks_rows_on_ptx_kquant
+poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::a_gemv_with_rows_and_depth_matches_reference_on_rocm
 poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_rocm
 poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_rocm_kquant
 poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::contraction_matches_reference_for_every_planar_format_on_rocm
@@ -1667,6 +1673,7 @@ poot-kernelgen	poot-kernelgen	model-free	helpers::stride_tests::row_major_stride
 poot-kernelgen	poot-kernelgen	model-free	helpers::stride_tests::view_eff_strides_contiguous_matches_broadcast_eff_strides
 poot-kernelgen	poot-kernelgen	model-free	helpers::stride_tests::view_eff_strides_transposed_layout_is_not_row_major
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_gemv_refuses_a_narrowed_precision
+poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_launch_whose_rows_straddle_a_block_computes_nan
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_narrowed_packed_contraction_rounds_the_decoded_weight_and_the_activation
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_tiled_packed_contraction_refuses_an_epilogue_by_name
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_two_byte_aligned_run_reads_its_span_plus_one_word
@@ -1682,6 +1689,7 @@ poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_tiled_matches_reference_aligned_and_ragged
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::every_format_gemv_is_bit_identical_after_static_alignment
+poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::rows_and_depth_do_not_change_a_rows_sum
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_count_that_does_not_factor_over_the_digits_has_no_constant_offsets
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_field_of_four_pieces_decodes_in_the_emitted_kernel
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_run_moves_the_bit_offset_by_constants_over_the_digits
@@ -1692,6 +1700,10 @@ poot-kernelgen	poot-kernelgen	model-free	packed::float_decode_tests::e4m3fn_matc
 poot-kernelgen	poot-kernelgen	model-free	packed::float_decode_tests::e8m0_matches_scalar_on_the_admitted_domain
 poot-kernelgen	poot-kernelgen	model-free	packed::float_decode_tests::f16_matches_scalar_on_the_admitted_domain
 poot-kernelgen	poot-kernelgen	model-free	packed::float_decode_tests::f32_is_an_identity_bitcast
+poot-kernelgen	poot-kernelgen	model-free	packed::float_shift_tests::a_planar_gemv_is_bit_identical_after_sharing_its_scale
+poot-kernelgen	poot-kernelgen	model-free	packed::float_shift_tests::a_planar_run_decodes_its_scale_once
+poot-kernelgen	poot-kernelgen	model-free	packed::float_shift_tests::float_shift_decode_matches_scalar_on_the_admitted_domain
+poot-kernelgen	poot-kernelgen	model-free	packed::float_shift_tests::rows_and_depth_do_not_change_a_planar_rows_sum
 poot-kernelgen	poot-kernelgen	model-free	packed::identity_tests::every_format_emits_the_kernel_recorded_before_the_lattice_refactor
 poot-kernelgen	poot-kernelgen	model-free	packed::indexed::tests::a_folded_tiled_grid_equals_the_unfolded_one
 poot-kernelgen	poot-kernelgen	model-free	packed::indexed::tests::a_tile_whose_rows_skip_an_expert_reads_each_rows_own_slab
@@ -1729,6 +1741,7 @@ poot-kernelgen	poot-kernelgen	model-free	register_budget::the_fragment_attention
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_fragment_attention_stages_v_in_wide_stores
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_fragment_contraction_over_a_kn_weight_loads_every_operand_fragment_wide
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_fragment_dense_contraction_spills_no_register
+poot-kernelgen	poot-kernelgen	model-free	register_budget::the_gemv_geometries_within_the_register_budget_spill_no_register
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_pipelined_fragment_contraction_loads_ahead_of_its_multiplies
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_planned_packed_expert_tilings_spill_no_register
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_tiled_attention_at_its_planned_tilings_spills_no_register
@@ -1868,12 +1881,14 @@ poot-kernelgen	poot-kernelgen::fused_row_interp	model-free	fused_row_reads_a_pac
 poot-kernelgen	poot-kernelgen::gemv_index_width	model-free	a_narrowed_body_runs_32_bit_index_math_on_nvptx
 poot-kernelgen	poot-kernelgen::gemv_index_width	model-free	amdgpu_refuses_a_narrowed_body_by_name
 poot-kernelgen	poot-kernelgen::gemv_index_width	model-free	the_gemv_states_its_index_bound_only_where_it_forms_every_index_itself
+poot-kernelgen	poot-kernelgen::gemv_rows_depth	model-free	dense_rows_and_depth_do_not_change_a_rows_sum
 poot-kernelgen	poot-kernelgen::gemv_vector_activation	model-free	a_dense_vector_activation_read_matches_the_scalar_read_bit_for_bit
 poot-kernelgen	poot-kernelgen::gemv_vector_activation	model-free	nvptx_lowers_the_vector_activation_read_to_v4_loads
 poot-kernelgen	poot-kernelgen::index_cast_interp	model-free	a_cast_step_converts_an_i32_leaf_to_the_nearest_f32
 poot-kernelgen	poot-kernelgen::index_cast_interp	model-free	an_exact_i32_chain_then_a_cast_then_float_arithmetic_is_one_region
 poot-kernelgen	poot-kernelgen::indexed_interp	model-free	an_f16_packed_indexed_weight_is_refused_by_name
 poot-kernelgen	poot-kernelgen::indexed_interp	model-free	an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read
+poot-kernelgen	poot-kernelgen::indexed_interp	model-free	indexed_gemv_rows_and_depth_do_not_change_a_sum
 poot-kernelgen	poot-kernelgen::kernelgen_error_families	model-free	a_two_byte_float_is_only_ever_a_select_branch
 poot-kernelgen	poot-kernelgen::kernelgen_error_families	model-free	concat_family_rejects_zero_inputs
 poot-kernelgen	poot-kernelgen::kernelgen_error_families	model-free	float_region_rejects_a_cast_of_a_float_operand_and_mixed_arithmetic
@@ -3107,6 +3122,7 @@ poot-load	poot-load	model-free	gguf::tests::read_gguf_loads_a_q2_k_tensor_packed
 poot-load	poot-load	model-free	gguf::tests::read_gguf_loads_dense_types_with_no_widening
 poot-load	poot-load	model-free	gguf::tests::read_gguf_loads_rank3_experts_as_separate_owners_matching_the_files_per_expert_bytes
 poot-load	poot-load	model-free	gguf::tests::read_gguf_refuses_a_scheme_with_no_packed_path_by_name
+poot-load	poot-load	model-free	gguf::tests::read_gguf_refuses_the_activation_formats_by_name
 poot-load	poot-load	model-free	gguf::tests::read_gguf_skips_a_tensor_the_name_map_does_not_map
 poot-load	poot-load	model-free	gguf::tests::read_gguf_works_over_an_in_memory_buffer_with_no_temp_file
 poot-load	poot-load	model-free	gguf::tests::the_formats_the_loader_reads_are_the_gguf_format_list
@@ -3143,6 +3159,7 @@ poot-load	poot-load	model-free	tests::malformed_quantized_linears_are_refused_by
 poot-load	poot-load	model-free	tests::ple_table_shards_under_a_shared_scale_load_as_dense_e4m3
 poot-load	poot-load	model-free	tests::safetensors_rejects_malformed_header_instead_of_panicking
 poot-load	poot-load::flash_next_dequant	model-free	dq1_every_stored_type_decodes_to_the_reference
+poot-load	poot-load::flash_next_dequant	model-free	dq4_tq2_0_real_blocks_decode_to_the_reference
 poot-load	poot-load::gguf_reader_rss	checkpoint	read_gguf_of_q4_k_m_maps_without_anonymous_copies
 poot-load	poot-load::gguf_reader_rss	checkpoint	read_gguf_of_q8_0_maps_without_anonymous_copies
 poot-load	poot-load::gguf_shards	model-free	sh1_each_tensor_reads_its_own_shards_bytes
@@ -4359,6 +4376,7 @@ poot-ptx-device	poot-ptx-device::cross_backend	device	unary_tanh_ptx_matches_cpu
 poot-ptx-device	poot-ptx-device::device_caps_planning	device	a_live_ptx_device_reports_its_workgroup_subgroup_and_matrix_caps
 poot-ptx-device	poot-ptx-device::device_caps_planning	device	the_ptx_device_reports_live_free_memory_within_its_open_time_ceiling
 poot-ptx-device	poot-ptx-device::device_timing	device	plain_ptx_device_reports_unknown_device_time
+poot-ptx-device	poot-ptx-device::device_timing	device	ptx_dispatch_times_keep_their_plan_labels_across_a_stage_commit
 poot-ptx-device	poot-ptx-device::device_timing	device	timed_ptx_device_reads_a_nonzero_device_time_for_a_known_kernel
 poot-ptx-device	poot-ptx-device::device_timing	device	timed_ptx_device_reads_each_dispatch_of_a_captured_step
 poot-ptx-device	poot-ptx-device::feedback_end_to_end	device	the_engine_plans_the_expert_projection_with_the_drivers_verdicts_on_ptx
@@ -4528,6 +4546,7 @@ poot-quant	poot-quant	model-free	stored::tests::the_reader_streams_the_view_and_
 poot-quant	poot-quant	model-free	test_support::formats::tests::the_format_lists_name_every_variant_once
 poot-quant	poot-quant	model-free	tests::a_deferred_payload_refuses_a_bad_row_when_it_is_decoded
 poot-quant	poot-quant	model-free	tests::a_deferred_read_checks_every_block_it_touches_at_any_alignment
+poot-quant	poot-quant	model-free	tests::a_half_embedding_is_the_scalar_decode_up_to_its_rescale
 poot-quant	poot-quant	model-free	tests::adjacent_e2m1_is_not_gguf_mxfp4
 poot-quant	poot-quant	model-free	tests::adjacent_e2m1_payload_decodes_nibble_order_and_ragged_blocks
 poot-quant	poot-quant	model-free	tests::block32_formats_refuse_non_finite_fields_and_accept_everything_else
@@ -4627,6 +4646,7 @@ poot-rocm-device	poot-rocm-device::cross_backend	device	unary_log_rocm_matches_c
 poot-rocm-device	poot-rocm-device::cross_backend	device	unary_sqrt_rocm_matches_cpu
 poot-rocm-device	poot-rocm-device::cross_backend	device	unary_tanh_rocm_matches_cpu
 poot-rocm-device	poot-rocm-device::device_timing	device	plain_rocm_device_reports_unknown_device_time
+poot-rocm-device	poot-rocm-device::device_timing	device	rocm_dispatch_times_keep_their_plan_labels_across_a_stage_commit
 poot-rocm-device	poot-rocm-device::device_timing	device	timed_rocm_device_reads_a_nonzero_device_time_for_a_known_kernel
 poot-rocm-device	poot-rocm-device::device_timing	device	timing_does_not_change_the_rocm_scan_result
 poot-rocm-device	poot-rocm-device::float_ne	device	float_ne_is_ieee_on_nan_on_rocm

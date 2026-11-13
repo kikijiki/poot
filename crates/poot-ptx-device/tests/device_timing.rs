@@ -4,7 +4,8 @@
 
 use std::time::Duration;
 
-use poot_executor::{Device, DeviceTime, Engine};
+use poot_executor::{DetailedTiming, Device, DeviceTime, Engine, TimingOptions};
+use poot_executor_parity::commit_labels::run_dispatch_labels_survive_the_stage_commit;
 use poot_executor_parity::scan::device_time_of_step;
 use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_ptx_device::PtxDevice;
@@ -79,4 +80,20 @@ fn timed_ptx_device_reads_each_dispatch_of_a_captured_step() {
         sum <= measured.device_span.expect("span"),
         "the dispatch windows lie inside the step's span"
     );
+}
+
+/// POOT-1571: a step whose recording holds a state commit between two stages' dispatches times each dispatch under
+/// its own plan label: the device gives no copy a dispatch index, so no row of the step reads `unknown`.
+/// Mutation: in `PtxContext::copy_buffer` call `self.mark_capture()` after the memcpy; the commit takes a mark, so a row reads `unknown`.
+#[test]
+fn ptx_dispatch_times_keep_their_plan_labels_across_a_stage_commit() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new_with_device_timing()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::with_timing(
+        device,
+        TimingOptions::Detailed(DetailedTiming::every_step(16, 64, 4)),
+    );
+    run_dispatch_labels_survive_the_stage_commit(&mut engine, target).unwrap();
 }

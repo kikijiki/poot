@@ -1,7 +1,7 @@
-use super::lattice::{IQ2XS_LATTICE, IQ3S_LATTICE, IQ3XXS_LATTICE};
+use super::lattice::{IQ2S_LATTICE, IQ2XS_LATTICE, IQ2XXS_LATTICE, IQ3S_LATTICE, IQ3XXS_LATTICE};
 use crate::families::lattice::{Lattice, SignRule};
 use crate::format::{Field, FieldEncoding, OperandRole, Storage, ValueMap, WeightFormat};
-use crate::grids::{IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID};
+use crate::grids::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID};
 use crate::test_support::formats::GGUF_FORMATS;
 
 fn hex(text: &str) -> Vec<u8> {
@@ -617,10 +617,10 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// The lattice tables are ggml's, entry for entry: their digests equal those of the grids
-/// `gguf-py` (`gguf/quants.py`, `IQ2_XS.grid` and `IQ3_XXS.grid`, unpacked from `grid_hex`)
-/// builds, an independent copy of `ggml-common.h`'s `iq2xs_grid` and `iq3xxs_grid`. A single
-/// swapped or edited grid point changes the digest. Mutation: swap two entries of
-/// `IQ2XS_GRID`; the first assertion goes red.
+/// `gguf-py` (`gguf/quants.py`, `grid` of `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS` and `IQ3_S`, unpacked
+/// from `grid_hex`) builds, an independent copy of `ggml-common.h`'s `iq2xxs_grid`, `iq2xs_grid`,
+/// `iq2s_grid`, `iq3xxs_grid` and `iq3s_grid`. A single swapped or edited grid point changes the digest.
+/// Mutation: swap two entries of `IQ2XS_GRID`, `IQ2XXS_GRID` or `IQ2S_GRID`; the matching assertion goes red.
 #[test]
 fn the_lattice_tables_are_the_gguf_py_grids() {
     /// The table's cells as the little-endian byte run ggml's grids are.
@@ -632,9 +632,13 @@ fn the_lattice_tables_are_the_gguf_py_grids() {
             .flat_map(|word| word.to_le_bytes())
             .collect()
     }
+    assert_eq!(fnv1a(&cell_bytes(&IQ2XXS_LATTICE)), 0xbb4e_e025_b5ac_6e8e);
     assert_eq!(fnv1a(&cell_bytes(&IQ2XS_LATTICE)), 0xc9b1_ee61_e799_09bd);
+    assert_eq!(fnv1a(&cell_bytes(&IQ2S_LATTICE)), 0x123e_dd38_a3b6_2b90);
     assert_eq!(fnv1a(&cell_bytes(&IQ3XXS_LATTICE)), 0xdfa5_dc83_d6a1_55d5);
+    assert_eq!(IQ2XXS_LATTICE.points(), 256);
     assert_eq!(IQ2XS_LATTICE.points(), 512);
+    assert_eq!(IQ2S_LATTICE.points(), 1024);
     assert_eq!(fnv1a(&cell_bytes(&IQ3S_LATTICE)), 0xfa37_020c_25b4_4829);
     assert_eq!(IQ3XXS_LATTICE.points(), 256);
     assert_eq!(IQ3S_LATTICE.points(), 512);
@@ -669,7 +673,7 @@ fn the_eighth_sign_is_the_parity_of_the_stored_seven() {
     }
 }
 
-/// `dequantize_row_iq2_xs` and `dequantize_row_iq3_xxs` of `ggml/src/ggml-quants.c`, written
+/// `dequantize_row_iq2_xxs`, `_iq2_xs`, `_iq2_s`, `_iq3_xxs` and `_iq3_s` of `ggml/src/ggml-quants.c`, written
 /// as ggml loops over the raw block with ggml's `ksigns_iq2xs` / `kmask_iq2xs` semantics, one
 /// block at a time. The descriptor decodes the same random blocks bit for bit, so the bit
 /// layouts (which `qs` word and which scale nibble feeds which value) match ggml's loops.
@@ -695,6 +699,41 @@ fn ggml_dequantize(format: WeightFormat, block: &[u8]) -> Vec<f32> {
                     let word = qs[4 * ib32 + l];
                     let grid = IQ2XS_GRID[usize::from(word & 511)].to_le_bytes();
                     let signs = ksigns(u32::from(word >> 9));
+                    for (j, &magnitude) in grid.iter().enumerate() {
+                        let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                        y.push(db[l / 2] * f32::from(magnitude) * sign);
+                    }
+                }
+            }
+        }
+        WeightFormat::Iq2_Xxs => {
+            for ib32 in 0..8 {
+                let run = &block[2 + 8 * ib32..2 + 8 * ib32 + 8];
+                let aux32 = u32::from_le_bytes(run[4..8].try_into().unwrap());
+                let db = d * (0.5 + (aux32 >> 28) as f32) * 0.25;
+                for l in 0..4 {
+                    let grid = IQ2XXS_GRID[usize::from(run[l])].to_le_bytes();
+                    let signs = ksigns((aux32 >> (7 * l)) & 127);
+                    for (j, &magnitude) in grid.iter().enumerate() {
+                        let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                        y.push(db * f32::from(magnitude) * sign);
+                    }
+                }
+            }
+        }
+        WeightFormat::Iq2_S => {
+            let (qs, rest) = block[2..].split_at(64);
+            let (qh, scales) = rest.split_at(8);
+            for ib32 in 0..8 {
+                let db = [
+                    d * (0.5 + f32::from(scales[ib32] & 0xf)) * 0.25,
+                    d * (0.5 + f32::from(scales[ib32] >> 4)) * 0.25,
+                ];
+                for l in 0..4 {
+                    let point = usize::from(qs[4 * ib32 + l])
+                        | ((usize::from(qh[ib32]) << (8 - 2 * l)) & 0x300);
+                    let grid = IQ2S_GRID[point].to_le_bytes();
+                    let signs = qs[32 + 4 * ib32 + l];
                     for (j, &magnitude) in grid.iter().enumerate() {
                         let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
                         y.push(db[l / 2] * f32::from(magnitude) * sign);
@@ -757,7 +796,7 @@ fn ggml_dequantize(format: WeightFormat, block: &[u8]) -> Vec<f32> {
     y
 }
 
-/// Random `IQ2_XS` and `IQ3_XXS` blocks (every sign pattern, grid point and scale nibble
+/// Random lattice-format blocks (every sign pattern, grid point and scale nibble
 /// occurs) decode, through the descriptor interpreter, to exactly what ggml's loops give.
 /// Mutation: read the `Signs` field of `IQ3_XXS` at bit 529 instead of 528; red.
 #[test]

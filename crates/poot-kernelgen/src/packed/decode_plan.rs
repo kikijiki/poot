@@ -19,6 +19,7 @@ use super::kernel::emit_block_address;
 use super::source::{PieceAlignment, Source};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu};
+use poot_target::RoundingConversions;
 
 /// The `Scale`/`Min` factors of one block, hoisted once and reused by every element the block holds
 /// (`emit_value` combines them with the per-element code through the value formula).
@@ -53,7 +54,10 @@ impl DecodePlan {
         let Some(codes) = layout.field(OperandRole::Codes) else {
             return Err(reject(format, "no Codes field"));
         };
-        let family = Family::of(descriptor.value);
+        let family = Family::of(descriptor.value, &codes.field).ok_or(reject(
+            format,
+            "a float value map over a Codes field that is not float-encoded",
+        ))?;
         let extras = family
             .operands()
             .iter()
@@ -75,6 +79,16 @@ impl DecodePlan {
             extras,
             min_sign: descriptor.min_sign,
         })
+    }
+
+    /// This plan decoding its values through what the device keeps ([`Family::decoding_on`]): a value
+    /// that meets a scale takes the cheaper decode, which leaves the scale a power of two to absorb
+    /// ([`Self::emit_factors`] does, once per factor run).
+    pub(crate) fn on(mut self, conversions: RoundingConversions) -> Self {
+        if self.scale.is_some() || self.sub_scale.is_some() {
+            self.family = self.family.decoding_on(conversions);
+        }
+        self
     }
 
     /// The constant tables the decode reads, for the kernel body to declare
@@ -211,11 +225,7 @@ impl DecodePlan {
     }
 
     /// The `count` logical values `(row, k0 + j)` for `j in 0..count`, `k0` a multiple of `count` and every index
-    /// below `k_total`. A run of `count` elements starting at a multiple of `count` stays inside one block when
-    /// `count` divides the block, so the block is addressed once; when `count` also divides the factor run, the
-    /// run's factors are decoded once and shared by all its elements, and the run's code and sign bits are read
-    /// through shared 32-bit windows ([`Self::emit_field_run`]) rather than two word loads per element. Otherwise
-    /// each element addresses its own block and decodes its own factors.
+    /// below `k_total`: [`Self::emit_run_load`] then [`Self::emit_run_decode`] of what it loaded.
     pub(crate) fn emit_run(
         &self,
         e: &mut Emit,
@@ -225,67 +235,129 @@ impl DecodePlan {
         count: usize,
         k_total: Local,
     ) -> Vec<Local> {
+        let loaded = self.emit_run_load(e, src, row, k0, count, k_total);
+        self.emit_run_decode(e, src, (row, k0), count, k_total, &loaded)
+    }
+
+    /// Whether a run of `count` elements starting at a multiple of `count` shares its block address, its factors and
+    /// its code windows: `count` divides the block (the run stays inside one block, addressed once) and the factor
+    /// run (one [`Factors`] serves every element).
+    fn shares_run(&self, count: usize) -> bool {
+        self.values().is_multiple_of(count) && self.factor_run().is_multiple_of(count)
+    }
+
+    /// The loads of the run [`Self::emit_run`] decodes, apart from its decode. A run that [`Self::shares_run`]
+    /// addresses its block once, loads and decodes the run's factors once, and reads the code and sign bits through
+    /// shared 32-bit windows ([`Self::read_field_run`]); the locals it returns are the block and first in-block
+    /// index, the factors that exist (scale, then min) and the windows of the codes field then of each extra field,
+    /// the state [`Self::emit_run_decode`] cuts into values. Any other run addresses each element's block and
+    /// factors on its own, where the element is decoded, and loads nothing here.
+    pub(crate) fn emit_run_load(
+        &self,
+        e: &mut Emit,
+        src: Source,
+        row: Local,
+        k0: Local,
+        count: usize,
+        k_total: Local,
+    ) -> Vec<Local> {
+        if !self.shares_run(count) {
+            return Vec::new();
+        }
+        let (block, first) = emit_block_address(e, self.values(), row, k0, k_total);
+        let factors = self.emit_factors(e, src, block, first);
+        let block_bit = self.block_base_bit(e, block);
+        let mut loaded = vec![block, first];
+        loaded.extend(factors.scale);
+        loaded.extend(factors.min);
+        for field in std::iter::once(&self.codes).chain(&self.extras) {
+            loaded.extend(self.read_field_run(e, src, block_bit, field, first, count));
+        }
+        loaded
+    }
+
+    /// The `count` values of the run [`Self::emit_run_load`] loaded as `loaded` (empty for a run that is not
+    /// shared), each combined with the run's factors through the value formula.
+    pub(crate) fn emit_run_decode(
+        &self,
+        e: &mut Emit,
+        src: Source,
+        (row, k0): (Local, Local),
+        count: usize,
+        k_total: Local,
+        loaded: &[Local],
+    ) -> Vec<Local> {
         let values = self.values();
-        let run_block = values
-            .is_multiple_of(count)
-            .then(|| emit_block_address(e, values, row, k0, k_total));
-        let run_factors = run_block
-            .filter(|_| self.factor_run().is_multiple_of(count))
-            .map(|(block, first)| self.emit_factors(e, src, block, first));
-        if let (Some((block, first)), Some(factors)) = (run_block, &run_factors) {
-            let block_bit = self.block_base_bit(e, block);
-            let codes = self.emit_field_run(e, src, block_bit, &self.codes, first, count);
-            let extras: Vec<Vec<Local>> = self
-                .extras
-                .iter()
-                .map(|field| self.emit_field_run(e, src, block_bit, field, first, count))
-                .collect();
+        if !self.shares_run(count) {
+            let run_block = values
+                .is_multiple_of(count)
+                .then(|| emit_block_address(e, values, row, k0, k_total));
             return (0..count)
                 .map(|j| {
-                    let index = bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j));
-                    let extra_bits: Vec<Local> = extras.iter().map(|run| run[j]).collect();
-                    self.emit_value_of_bits(
-                        e,
-                        factors,
-                        (codes[j], &extra_bits),
-                        Position {
-                            index,
-                            known: Some((j, count)),
-                        },
-                    )
+                    let (block, i_in_block) = match run_block {
+                        Some((block, first)) => {
+                            (block, bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j)))
+                        }
+                        None => {
+                            let k_index = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
+                            emit_block_address(e, values, row, k_index, k_total)
+                        }
+                    };
+                    let factors = self.emit_factors(e, src, block, i_in_block);
+                    self.emit_value(e, src, block, i_in_block, &factors)
                 })
                 .collect();
         }
+        let (block, first) = (loaded[0], loaded[1]);
+        let mut rest = loaded[2..].iter().copied();
+        let has_scale = self.scale.is_some() || self.sub_scale.is_some();
+        let has_min = self.min.is_some() || self.sub_min.is_some();
+        let factors = Factors {
+            scale: has_scale.then(|| rest.next().expect("the loaded run has its scale")),
+            min: has_min.then(|| rest.next().expect("the loaded run has its min")),
+        };
+        let windows: Vec<Local> = rest.collect();
+        let mut windows = windows.as_slice();
+        // Only a field read element by element addresses its block's bits.
+        let fields = || std::iter::once(&self.codes).chain(&self.extras);
+        let block_bit = fields()
+            .any(|field| field_run_deltas(field, count).is_none())
+            .then(|| self.block_base_bit(e, block));
+        let mut take_field = |e: &mut Emit, field: &Field| {
+            let used = field_run_windows(field, count);
+            let (mine, after) = windows.split_at(used);
+            windows = after;
+            self.extract_field_run(e, src, block_bit, field, first, count, mine)
+        };
+        let codes = take_field(e, &self.codes);
+        let extras: Vec<Vec<Local>> = self
+            .extras
+            .iter()
+            .map(|field| take_field(e, field))
+            .collect();
         (0..count)
             .map(|j| {
-                let (block, i_in_block) = match run_block {
-                    Some((block, first)) => {
-                        (block, bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j)))
-                    }
-                    None => {
-                        let k_index = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
-                        emit_block_address(e, values, row, k_index, k_total)
-                    }
-                };
-                let own_factors;
-                let factors = match &run_factors {
-                    Some(factors) => factors,
-                    None => {
-                        own_factors = self.emit_factors(e, src, block, i_in_block);
-                        &own_factors
-                    }
-                };
-                self.emit_value(e, src, block, i_in_block, factors)
+                let index = bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j));
+                let extra_bits: Vec<Local> = extras.iter().map(|run| run[j]).collect();
+                self.emit_value_of_bits(
+                    e,
+                    &factors,
+                    (codes[j], &extra_bits),
+                    Position {
+                        index,
+                        known: Some((j, count)),
+                    },
+                )
             })
             .collect()
     }
 
-    /// `field`'s raw bits for the `count` in-block indices `first + j`, `first` a multiple of `count` and
-    /// `count` dividing the block. When every piece's bit layout moves by a fixed amount per `j`
-    /// ([`run_deltas`]), the run's bits are read once through shared 32-bit windows
-    /// ([`Self::emit_piece_run`]); a field whose layout does not factor that way for this `count` is read element
-    /// by element, as [`Self::emit_field_bits`] does.
-    fn emit_field_run(
+    /// The windows `field`'s raw bits for the `count` in-block indices `first + j` are cut from, `first` a multiple
+    /// of `count` and `count` dividing the block: when every piece's bit layout moves by a fixed amount per `j`
+    /// ([`run_deltas`]), each piece's run is read once through shared 32-bit windows ([`read_piece_run`]), the
+    /// pieces' windows in order ([`field_run_windows`] of them). Empty for a field whose layout does not factor
+    /// that way for this `count`, which [`Self::extract_field_run`] reads element by element.
+    fn read_field_run(
         &self,
         e: &mut Emit,
         src: Source,
@@ -298,42 +370,67 @@ impl DecodePlan {
             !field.pieces.is_empty(),
             "format tests: a field has at least one piece"
         );
-        let pieces: Option<Vec<Vec<Local>>> = field
+        let Some(pieces) = field_run_deltas(field, count) else {
+            return Vec::new();
+        };
+        field
             .pieces
             .iter()
-            .map(|piece| {
-                let deltas = run_deltas(&piece.layout, count)?;
+            .zip(&pieces)
+            .flat_map(|(piece, deltas)| {
                 let first_bit = self.emit_bit_layout(e, block_bit, &piece.layout, first);
-                Some(emit_piece_run(
-                    e,
-                    src,
-                    first_bit,
-                    (self.layout, piece, count),
-                    &deltas,
-                ))
+                read_piece_run(e, src, first_bit, (self.layout, piece, count), deltas)
             })
-            .collect();
-        match pieces {
-            Some(pieces) => (0..count)
-                .map(|j| {
-                    let mut bits = pieces[0][j];
-                    let mut below = field.pieces[0].width;
-                    for (run, piece) in pieces.iter().zip(field.pieces).skip(1) {
-                        // Low bits first: a piece shifts up by the widths below it.
-                        let shifted = bin(e, Ty::U32, BinOp::Shl, copy(run[j]), c32(below));
-                        bits = bin(e, Ty::U32, BinOp::BitOr, copy(bits), copy(shifted));
-                        below += piece.width;
-                    }
-                    bits
-                })
-                .collect(),
-            None => (0..count)
+            .collect()
+    }
+
+    /// `field`'s raw bits for the `count` in-block indices `first + j` of the block at bit `block_bit`, cut from the
+    /// `windows` [`Self::read_field_run`] loaded (none, for a field read element by element as
+    /// [`Self::emit_field_bits`] does, which needs `block_bit`; `None` when no field of the run does).
+    #[expect(clippy::too_many_arguments)] // the source and the run's address, with the windows read for it
+    fn extract_field_run(
+        &self,
+        e: &mut Emit,
+        src: Source,
+        block_bit: Option<Local>,
+        field: &Field,
+        first: Local,
+        count: usize,
+        windows: &[Local],
+    ) -> Vec<Local> {
+        let Some(pieces) = field_run_deltas(field, count) else {
+            let block_bit = block_bit.expect("a field read element by element has its block's bit");
+            return (0..count)
                 .map(|j| {
                     let i = bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j));
                     self.emit_field_bits(e, src, block_bit, field, i)
                 })
-                .collect(),
-        }
+                .collect();
+        };
+        let mut windows = windows;
+        let pieces: Vec<Vec<Local>> = field
+            .pieces
+            .iter()
+            .zip(&pieces)
+            .map(|(piece, deltas)| {
+                let (mine, after) = windows.split_at(piece_run_windows(deltas, piece.width));
+                windows = after;
+                extract_piece_run(e, piece.width as usize, deltas, mine)
+            })
+            .collect();
+        (0..count)
+            .map(|j| {
+                let mut bits = pieces[0][j];
+                let mut below = field.pieces[0].width;
+                for (run, piece) in pieces.iter().zip(field.pieces).skip(1) {
+                    // Low bits first: a piece shifts up by the widths below it.
+                    let shifted = bin(e, Ty::U32, BinOp::Shl, copy(run[j]), c32(below));
+                    bits = bin(e, Ty::U32, BinOp::BitOr, copy(bits), copy(shifted));
+                    below += piece.width;
+                }
+                bits
+            })
+            .collect()
     }
 
     /// The `Scale * SubScale` and `Min * SubMin` factors covering in-block index `i` (dquant.md's
@@ -359,7 +456,8 @@ impl DecodePlan {
             .sub_scale
             .as_ref()
             .map(|field| self.emit_field_number(e, src, block_bit, field, i));
-        let scale = combine_product(e, scale_whole, scale_sub);
+        let scale = combine_product(e, scale_whole, scale_sub)
+            .map(|scale| self.family.fold_scale(e, scale));
         let min_whole = self
             .min
             .as_ref()
@@ -477,25 +575,44 @@ fn run_deltas(layout: &BitLayout, count: usize) -> Option<Vec<usize>> {
 /// The most bits a stretch of one run read spans from its first value's offset: a 128-bit span is four words.
 const STRETCH_BITS: usize = 128;
 
-/// The `width`-bit values at bit `first_bit + deltas[j]` for each `j`, each stretch of nearby offsets read once
-/// through shared 32-bit windows ([`Source::read_run`]) and cut into its values with constant shifts. `run` is the
-/// block layout, the piece and the run length whose starts `first_bit` ranges over ([`PieceAlignment::of`]). A
-/// stretch ends where the next offset is a whole word past the last value's end, or more than [`STRETCH_BITS`] past
+/// A piece's bit offsets from a run's first value, as [`run_deltas`] gives them for each piece of `field`, or `None`
+/// when any piece does not factor over a run of `count`.
+fn field_run_deltas(field: &Field, count: usize) -> Option<Vec<Vec<usize>>> {
+    field
+        .pieces
+        .iter()
+        .map(|piece| run_deltas(&piece.layout, count))
+        .collect()
+}
+
+/// The 32-bit windows [`read_piece_run`] reads for every piece of `field` over a run of `count`, none when the field
+/// does not factor ([`field_run_deltas`]).
+fn field_run_windows(field: &Field, count: usize) -> usize {
+    field_run_deltas(field, count).map_or(0, |pieces| {
+        field
+            .pieces
+            .iter()
+            .zip(&pieces)
+            .map(|(piece, deltas)| piece_run_windows(deltas, piece.width))
+            .sum()
+    })
+}
+
+/// One stretch of a piece's run offsets read together (see [`stretches`]): its first offset, the offsets in it and
+/// the bits it spans.
+struct Stretch<'a> {
+    start: usize,
+    offsets: &'a [usize],
+    span: usize,
+}
+
+/// The `width`-bit offsets `deltas[j]` split into stretches that are read once each, through shared 32-bit windows.
+/// A stretch ends where the next offset is a whole word past the last value's end, or more than [`STRETCH_BITS`] past
 /// the stretch's start, so a run whose elements sit far apart reads each part separately and never a word nothing
-/// uses; elements at the same offset (a broadcast field) share one extraction.
-fn emit_piece_run(
-    e: &mut Emit,
-    src: Source,
-    first_bit: Local,
-    run: (BlockLayout, &Piece, usize),
-    deltas: &[usize],
-) -> Vec<Local> {
-    let (layout, piece, count) = run;
-    let width = piece.width as usize;
-    let mut distinct: Vec<usize> = deltas.to_vec();
-    distinct.sort_unstable();
-    distinct.dedup();
-    let mut values: Vec<(usize, Local)> = Vec::with_capacity(distinct.len());
+/// uses. `distinct` is the offsets sorted and deduplicated: elements at the same offset (a broadcast field) share
+/// one extraction.
+fn stretches(distinct: &[usize], width: usize) -> Vec<Stretch<'_>> {
+    let mut stretches = Vec::new();
     let mut at = 0;
     while at < distinct.len() {
         let start = distinct[at];
@@ -505,24 +622,85 @@ fn emit_piece_run(
                     || distinct[next] - distinct[next - 1] >= 32 + width
             })
             .unwrap_or(distinct.len());
-        let stretch = &distinct[at..end];
-        let span = stretch[stretch.len() - 1] - start + width;
-        let bit = if start == 0 {
-            first_bit
-        } else {
-            bin(e, Ty::Usize, BinOp::Add, copy(first_bit), cu(start))
-        };
-        let align = PieceAlignment::of(layout, piece, count, start);
-        let windows = src.read_run(e, bit, span, align);
-        for &delta in stretch {
-            let (window, shift) = ((delta - start) / 32, ((delta - start) % 32) as u32);
-            let low = bin(e, Ty::U32, BinOp::Shr, copy(windows[window]), c32(shift));
+        let offsets = &distinct[at..end];
+        stretches.push(Stretch {
+            start,
+            offsets,
+            span: offsets[offsets.len() - 1] - start + width,
+        });
+        at = end;
+    }
+    stretches
+}
+
+/// `deltas` sorted and deduplicated.
+fn distinct_offsets(deltas: &[usize]) -> Vec<usize> {
+    let mut distinct = deltas.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    distinct
+}
+
+/// The windows [`read_piece_run`] reads for a piece of `width` bits at offsets `deltas`.
+fn piece_run_windows(deltas: &[usize], width: u32) -> usize {
+    stretches(&distinct_offsets(deltas), width as usize)
+        .iter()
+        .map(|stretch| stretch.span.div_ceil(32))
+        .sum()
+}
+
+/// The 32-bit windows covering the `width`-bit values at bit `first_bit + deltas[j]` for each `j`, each stretch of
+/// nearby offsets read once ([`Source::read_run`]), the stretches' windows in order. `run` is the block layout, the
+/// piece and the run length whose starts `first_bit` ranges over ([`PieceAlignment::of`]).
+fn read_piece_run(
+    e: &mut Emit,
+    src: Source,
+    first_bit: Local,
+    run: (BlockLayout, &Piece, usize),
+    deltas: &[usize],
+) -> Vec<Local> {
+    let (layout, piece, count) = run;
+    let distinct = distinct_offsets(deltas);
+    stretches(&distinct, piece.width as usize)
+        .iter()
+        .flat_map(|stretch| {
+            let bit = if stretch.start == 0 {
+                first_bit
+            } else {
+                bin(e, Ty::Usize, BinOp::Add, copy(first_bit), cu(stretch.start))
+            };
+            let align = PieceAlignment::of(layout, piece, count, stretch.start);
+            src.read_run(e, bit, stretch.span, align)
+        })
+        .collect()
+}
+
+/// The `width`-bit values at the offsets `deltas[j]`, cut with constant shifts out of the `windows` that
+/// [`read_piece_run`] read for them.
+fn extract_piece_run(
+    e: &mut Emit,
+    width: usize,
+    deltas: &[usize],
+    windows: &[Local],
+) -> Vec<Local> {
+    let distinct = distinct_offsets(deltas);
+    let mut windows = windows;
+    let mut values: Vec<(usize, Local)> = Vec::with_capacity(distinct.len());
+    for stretch in stretches(&distinct, width) {
+        let (mine, after) = windows.split_at(stretch.span.div_ceil(32));
+        windows = after;
+        for &delta in stretch.offsets {
+            let (window, shift) = (
+                (delta - stretch.start) / 32,
+                ((delta - stretch.start) % 32) as u32,
+            );
+            let low = bin(e, Ty::U32, BinOp::Shr, copy(mine[window]), c32(shift));
             let joined = if shift as usize + width > 32 {
                 let high = bin(
                     e,
                     Ty::U32,
                     BinOp::Shl,
-                    copy(windows[window + 1]),
+                    copy(mine[window + 1]),
                     c32(32 - shift),
                 );
                 bin(e, Ty::U32, BinOp::BitOr, copy(low), copy(high))
@@ -542,7 +720,6 @@ fn emit_piece_run(
             };
             values.push((delta, value));
         }
-        at = end;
     }
     deltas
         .iter()
@@ -740,7 +917,7 @@ mod tests {
     }
 
     /// The field's raw bits at the `count` indices `first + j` of a block starting at bit `block_bit`, through
-    /// `emit_field_run` in the KIR interpreter.
+    /// `read_field_run`/`extract_field_run` in the KIR interpreter.
     fn run_bits(
         words: &[u32],
         field: &Field,
@@ -758,13 +935,16 @@ mod tests {
         let mut e = Emit::new(&mut al);
         let block_bit = e.let_(Ty::Usize, Rvalue::Use(cu(block_bit)));
         let first = e.let_(Ty::Usize, Rvalue::Use(cu(first)));
-        let bits = plan.emit_field_run(
+        let source = Source::plain(source);
+        let windows = plan.read_field_run(&mut e, source, block_bit, field, first, count);
+        let bits = plan.extract_field_run(
             &mut e,
-            Source::plain(source),
-            block_bit,
+            source,
+            Some(block_bit),
             field,
             first,
             count,
+            &windows,
         );
         for (j, value) in bits.into_iter().enumerate() {
             let as_f32 = e.let_(
@@ -809,7 +989,7 @@ mod tests {
         words
     }
 
-    /// `emit_field_run` equals a scalar read of every element: through the shared windows for a count that
+    /// `read_field_run`/`extract_field_run` equals a scalar read of every element: through the shared windows for a count that
     /// factors (blocks starting at bit 0, a word boundary, and 272, which is not one), through the element-by-
     /// element fallback for one that does not, for a broadcast field (one extraction shared by the group), for
     /// runs crossing two digits, and for a two-piece field whose pieces are joined low bits first.
@@ -882,8 +1062,8 @@ mod tests {
     /// POOT-1539 SC-4: a field of four pieces decodes in the emitted KIR as direct arithmetic on the block's
     /// bytes does, bit for bit: element by element (`emit_value`, the four scale nibbles through
     /// `emit_field_bits`) and as runs of 4, 8 and 32 (`emit_run`, the four code bit planes through
-    /// `emit_field_run`'s shared windows). Mutation: skip the last piece in `emit_field_bits` or in
-    /// `emit_field_run`; the matching rows go red.
+    /// the shared windows). Mutation: skip the last piece in `emit_field_bits` or in
+    /// `read_field_run`/`extract_field_run`; the matching rows go red.
     #[test]
     fn a_field_of_four_pieces_decodes_in_the_emitted_kernel() {
         use poot_quant::test_support::synthetic::{

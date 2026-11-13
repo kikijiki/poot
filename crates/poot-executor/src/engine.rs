@@ -3839,16 +3839,27 @@ impl<D: Device> Executor for Engine<D> {
         }
         let time = self.device.device_time();
         let wall_dur = step_t0.elapsed();
+        // The device numbers the chain's dispatches across its entries: each entry's profile row takes its own.
+        let mut first_dispatch = 0;
         for step in steps {
-            let replays = self.loaded_entry(exe, step.entry)?.replays;
+            let e = self.loaded_entry(exe, step.entry)?;
+            let replays = e.replays;
+            let dispatches: usize = e.stages.iter().map(|stage| stage.steps.len()).sum();
             let waited = if step.entry == last {
                 wait_dur
             } else {
                 std::time::Duration::ZERO
             };
             self.record_step_timing(
-                exe, step.entry, replays, encode_dur, waited, wall_dur, &time,
+                exe,
+                step.entry,
+                replays,
+                encode_dur,
+                waited,
+                wall_dur,
+                &time.window(first_dispatch, dispatches),
             )?;
+            first_dispatch += dispatches;
         }
         Ok(ChainOutputs::new(
             self,
