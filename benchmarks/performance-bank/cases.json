@@ -1433,6 +1433,88 @@
       "status": "runnable"
     },
     {
+      "id": "expert-prefill-packed-q4k-up",
+      "regime": "MoE prefill routed expert up projection over a packed Q4_K expert stack at a wide mixture's dimensions (128 tokens, each to 10 of 512 experts, K 2560, N 640), exact operands",
+      "level": "kernel",
+      "producer": "packed_grouped_experts",
+      "shape": {
+        "tokens": 128,
+        "top_k": 10,
+        "experts": 512,
+        "k": 2560,
+        "n": 640,
+        "order": "routed"
+      },
+      "storage": "q4_k",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32, one row per token, broadcast over the token's top_k routed rows as the MoE block traces it",
+        "weight": "each expert a random q4_k payload at a checkpoint's scale magnitude: random codes, every block scale 2^-8 .. 2^-5 (the runner's checkpoint_scaled_payload, seed 7e+101)",
+        "routing": "each routed row's expert drawn uniformly from the fixture stream after the activation, rows in row order",
+        "reference": "f64 loop over each row's own expert as the oracle decoder reads it",
+        "operand_precision": "exact"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "fixture_id": "0a27d77235fdf125626d6bbced6d69439e7afb6fbae5980b53ee0d283cf128cf",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "4afb14f29b9186b4ccdb1f19db039fe6a9d59a0acb461b902d04c12d009ad77b",
+      "status": "runnable"
+    },
+    {
+      "id": "expert-prefill-packed-q4k-down",
+      "regime": "MoE prefill routed expert down projection over a packed Q4_K expert stack at a wide mixture's dimensions (128 tokens, each to 10 of 512 experts, K 512, N 2560), exact operands",
+      "level": "kernel",
+      "producer": "packed_grouped_experts",
+      "shape": {
+        "tokens": 128,
+        "top_k": 10,
+        "experts": 512,
+        "k": 512,
+        "n": 2560,
+        "order": "routed"
+      },
+      "storage": "q4_k",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32, one row per token, broadcast over the token's top_k routed rows as the MoE block traces it",
+        "weight": "each expert a random q4_k payload at a checkpoint's scale magnitude: random codes, every block scale 2^-8 .. 2^-5 (the runner's checkpoint_scaled_payload, seed 7e+101)",
+        "routing": "each routed row's expert drawn uniformly from the fixture stream after the activation, rows in row order",
+        "reference": "f64 loop over each row's own expert as the oracle decoder reads it",
+        "operand_precision": "exact"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "fixture_id": "40b221f40090e8cf9bbc928755360e8e71aa5cb6fe4198e70c10021146052505",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "629257140a9532edc51bb8498d6050d61e0dc28de68018ca77b248eac15d3bed",
+      "status": "runnable"
+    },
+    {
       "id": "router-rank-prefill",
       "regime": "MoE prefill router rank over a wide mixture's scores (128 tokens, 512 experts), exact f32",
       "level": "kernel",

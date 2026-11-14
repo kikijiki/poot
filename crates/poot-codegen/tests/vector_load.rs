@@ -44,7 +44,7 @@ fn count(text: &str, needle: &str) -> usize {
 fn scalar_input_reads(ir: &str) -> usize {
     count(
         ir,
-        "VulkanBuffer_a0i32_12_1t(target(\"spirv.VulkanBuffer\", [0 x i32], 12, 1) %h1,",
+        "VulkanBuffer_a0i32_12_0t(target(\"spirv.VulkanBuffer\", [0 x i32], 12, 0) %h1,",
     )
 }
 

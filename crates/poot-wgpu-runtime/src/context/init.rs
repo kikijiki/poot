@@ -4,6 +4,7 @@ use crate::{
     CachedPipeline, Context, ContextOptions, DeviceHealth, DeviceTimingAccumulator, RuntimeError,
 };
 use poot_codegen::CompiledKernel;
+use poot_target::ArgAccess;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -383,12 +384,16 @@ impl Context {
                 ..Default::default()
             })
         };
-        // Match the proven per-dispatch layout: the n data buffers are storage (read_only=false, compatible
-        // with the emitted SPIR-V's binding declarations), the length buffer at slot n is read-only. (The
-        // kernel only writes the output; marking inputs writable is permitted and matches `dispatch_dev`.)
+        // The layout matches the emitted SPIR-V's binding declarations: a `&[T]` data buffer is read-only (the
+        // emitter declares it `NonWritable`, so WebGPU's rule on overlapping writable bindings never applies
+        // to inputs, POOT-1575), a `&mut [T]` one is writable, and the length buffer at slot n is read-only.
         // The reserved error-word buffer at slot n+1, when the body has a Trap (card 531c), is writable.
-        let mut bgl_entries: Vec<wgpu::BindGroupLayoutEntry> =
-            (0..n as u32).map(|i| storage_entry(i, false)).collect();
+        let mut bgl_entries: Vec<wgpu::BindGroupLayoutEntry> = kernel
+            .args()
+            .iter()
+            .zip(0u32..)
+            .map(|(arg, i)| storage_entry(i, arg.access() == ArgAccess::Read))
+            .collect();
         bgl_entries.push(storage_entry(n as u32, true));
         if has_error_word {
             bgl_entries.push(storage_entry(n as u32 + 1, false));

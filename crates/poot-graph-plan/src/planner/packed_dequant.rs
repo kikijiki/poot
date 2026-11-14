@@ -14,6 +14,7 @@
 //! out)` (activation is `eqn.inputs[0]`, the carrier is `eqn.inputs[1]`). A standalone `PackedDequant`
 //! has no kernel: nothing materializes a packed weight.
 
+use super::gemv_geometry::{GemvSite, NO_GEOMETRY, packed_gemv_geometry};
 use super::matmul::TiledDispatch;
 use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, FusedRegion,
@@ -21,18 +22,13 @@ use super::{
 };
 use crate::dtype_widen::ConstLanes;
 use crate::planner::{GraphTables, finalize};
-use crate::predicates::{
-    GemvFamily, GemvLaunch, IndexedRows, gemv_launch, gemv_wins, packed_contraction_m_per_block,
-    widened_to_fit_grid,
-};
+use crate::predicates::{IndexedRows, gemv_wins, packed_contraction_m_per_block};
 use crate::refusal::{Pins, Site};
 use poot_graph_ir::{ContractionRows, ExpertRows, OperandPrecision};
 use poot_kernelgen::{
-    PackedContraction, PackedKernelOp, PackedKernelSpec, PackedRows, PackedRunSharing, Schedule,
-    TiledRows, TiledShape, WeightLayout,
+    PackedContraction, PackedKernelOp, PackedKernelSpec, PackedRows, Schedule, TiledRows,
+    TiledShape, WeightLayout,
 };
-use poot_quant::format::WeightFormat;
-use poot_target::calibration::PORTABLE_PACKED_GEMV_RUN;
 use poot_target::{Backend, DeviceCaps};
 
 /// Plan one imported packed equation. A descriptor card 542a's table does not admit for this op is
@@ -185,7 +181,7 @@ fn try_plan_row_gather(
 /// `Blocks` carrier (with an epilogue, its leaves sit between the carriers and the metadata). The schedule is
 /// chosen from shapes alone
 /// (dquant.md D3, section 5): `M == 1` (one activation row per block) is `Schedule::Gemv`, its launch
-/// shape from the output count and the device's compute units ([`packed_gemv_launch`], card 653); `M > 1`
+/// shape from the output count and the device's compute units ([`packed_gemv_geometry`], POOT-1562); `M > 1`
 /// is `Schedule::RegisterTiled` (card 542b, dquant.md D6/Q9; POOT-1193), so prefill does not fall back to
 /// `Schedule::Serial` now that Card 545b has deleted the hand-written `TiledRegionDequant` family. Its lanes each
 /// accumulate a register tile, so one workgroup computes a [`Schedule::output_tile`]-sized output tile (chosen
@@ -256,10 +252,16 @@ fn try_plan_contraction(
             );
             // A decode row takes the Gemv unless the read is narrowed: that runs on a matrix unit or is refused.
             let gemv = if m_per_block == 1 && precision.is_exact() {
-                Some(
-                    packed_gemv_launch(site, rows * out_per_block, format, caps)?
-                        .schedule(backend, k),
-                )
+                let shape = GemvSite {
+                    outputs: rows * out_per_block,
+                    out_per_block,
+                    k,
+                    workgroup_limit: None,
+                };
+                // With no workgroup limit a geometry always fits: the first of the model's candidates.
+                let launch = packed_gemv_geometry(site, shape, format, backend, caps)?
+                    .ok_or_else(|| site.refuse(Capability::KernelGen(NO_GEOMETRY)))?;
+                Some(launch.schedule(backend, k))
             } else {
                 None
             };
@@ -382,58 +384,6 @@ fn try_plan_contraction(
 struct PackedLaunch {
     grid: [u32; 3],
     meta: Vec<u32>,
-}
-
-/// The `Schedule::Gemv` launch for a packed contraction with `outputs` output columns: [`gemv_launch`]'s rule over
-/// the packed family's calibrated columns (card 653: {16, 8} with 8-element runs was 3.7 ms of Gemv device time per
-/// Q4_K_M token on gfx1151 against 4.2 ms for the dense table and 9.7 ms for the one-column-per-workgroup body). A
-/// packed weight is `[N, K]` with `K` contiguous, so `cols` sets how many lanes share one row and so how long a
-/// contiguous run each trip reads.
-///
-/// A lane's run (`unroll`, the contiguous K elements it decodes per trip) is [`gemv_run`], from what the format's
-/// decode shares across a run and the device's calibrated cap (POOT-1398); the activation read over rows of `k`
-/// values is [`crate::predicates::gemv_activation`]'s (POOT-1405).
-fn packed_gemv_launch(
-    site: Site<'_>,
-    outputs: usize,
-    format: WeightFormat,
-    caps: &DeviceCaps,
-) -> Result<GemvLaunch, PlanError> {
-    let sharing = poot_kernelgen::packed_run_sharing(format)
-        .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-    let run = gemv_run(
-        sharing,
-        caps.gemm_launch().calibrated.figures().packed_gemv_max_run,
-    );
-    Ok(gemv_launch(outputs, GemvFamily::Packed { run }, caps))
-}
-
-/// The packed decode Gemv's lane run (POOT-1398, B1 of designs/quant-matmul-1390.md), at most `max_run`, the
-/// device's register and issue budget ([`poot_target::calibration::PerfCalibration::packed_gemv_max_run`]).
-///
-/// A decode that shares a run's block address, factors and code windows up to the factor run
-/// ([`PackedRunSharing::FactorRun`]) runs the longest divisor of the factor run within `max_run`: a longer run
-/// amortises the shared decode over more weights (gfx1151 at 17408 x 5120: Q4_K 101-110 -> 171-195 GB/s from run 8 to
-/// its factor run 32), and a run that does not divide the factor run decodes every element's factors, a cliff
-/// this never plans (Q6_K at run 32: 60 GB/s against 190 at its factor run 16). A planar format whose codes are
-/// one to an element shares its scale the same way (an FP8 block-128 weight at 17408 x 5120 on gfx1151: 211 GB/s at
-/// run 8, 223 at 16 and 224 at 32, POOT-1561), and a per-channel scale ([`PackedRunSharing::WholeRow`]) takes the
-/// device's longest run.
-///
-/// A decode that addresses each element on its own ([`PackedRunSharing::Elementwise`]) gains nothing from a
-/// longer run, which only spreads a lane's loads (GPTQ group 128 on gfx1151: 110-129 GB/s at run 8, 59 at 32;
-/// GPTQ act-order 29-32 at run 8, 17 at run 1; with the group's scale decoded once per run, still 111 GB/s at run 8,
-/// 60 at 16 and 51 at 32 at 17408 x 5120, POOT-1561), so it runs the portable run within `max_run`.
-fn gemv_run(sharing: PackedRunSharing, max_run: u32) -> u32 {
-    let max_run = max_run.max(1);
-    match sharing {
-        PackedRunSharing::FactorRun { factor_run } => (1..=max_run)
-            .rev()
-            .find(|&run| factor_run.is_multiple_of(run as usize))
-            .unwrap_or(1),
-        PackedRunSharing::WholeRow => max_run,
-        PackedRunSharing::Elementwise => max_run.min(PORTABLE_PACKED_GEMV_RUN),
-    }
 }
 
 /// The tiled shape of an indexed packed contraction of `m` rows against `descriptor`'s stacked experts, its rows
@@ -639,8 +589,15 @@ pub(super) fn packed_cost_shapes(
         .then(|| {
             let site = Site::new(g, eqn, backend, limits);
             let outputs = blocks * m_per_block * out_per_block;
-            packed_gemv_launch(site, outputs, descriptor.format(), caps)
+            let shape = GemvSite {
+                outputs,
+                out_per_block,
+                k,
+                workgroup_limit: None,
+            };
+            packed_gemv_geometry(site, shape, descriptor.format(), backend, caps)
                 .ok()
+                .flatten()
                 .map(|launch| launch.cost_shape(outputs))
         })
         .flatten();
@@ -649,8 +606,8 @@ pub(super) fn packed_cost_shapes(
 
 /// The packed Gemv of an indexed contraction of `m` rows against `descriptor`'s `experts` experts, or `None` when
 /// its launch would not fit the device's X grid even at one lane per column, or the rows grouped by expert cost less
-/// ([`gemv_wins`]). The launch is [`packed_gemv_launch`]'s table, widening `cols` (columns per workgroup) until the
-/// workgroup count fits.
+/// ([`gemv_wins`]). The launch is [`packed_gemv_geometry`]'s, over the geometries whose workgroup count fits the
+/// device's X grid.
 fn packed_indexed_gemv(
     site: Site<'_>,
     backend: Backend,
@@ -665,11 +622,13 @@ fn packed_indexed_gemv(
     let Some(outputs) = m.checked_mul(n) else {
         return Ok(None);
     };
-    let launch = widened_to_fit_grid(
-        packed_gemv_launch(site, outputs, descriptor.format(), caps)?,
+    let shape = GemvSite {
         outputs,
-        caps,
-    );
+        out_per_block: n,
+        k,
+        workgroup_limit: Some(caps.max_grid[0].max(1) as usize),
+    };
+    let launch = packed_gemv_geometry(site, shape, descriptor.format(), backend, caps)?;
     let grouped = packed_indexed_shape(
         descriptor,
         m,
@@ -701,27 +660,26 @@ mod tests {
 
     use crate::{CompileError, CompileOptions, Dispatch, KernelChoice, Target, compile};
 
-    /// SC-003 (card 653): a decode (`M == 1`) packed contraction compiled for a device with a
-    /// fixture `DeviceCaps::compute_units` plans the Gemv launch of `packed_gemv_launch`'s table - 16
-    /// columns per workgroup while that still launches `2 x compute_units` workgroups, else 8,
-    /// 256 lanes, 32-element runs (POOT-1398: Q8_0's factor run) - in the plan key, the grid and the body's workgroup. `N = 1280`
-    /// and `1264` straddle the 80-workgroup floor at 40 compute units; the same `N = 896` flips
-    /// with the compute units alone. Driven through `compile`. Mutation: pin
-    /// `cols` to 16 in `packed_gemv_launch`; every row whose entry is 8 goes red.
+    /// SC-003 (card 653, rewritten by POOT-1562): a decode (`M == 1`) packed contraction compiled for a device with a
+    /// fixture `DeviceCaps::compute_units` plans a Gemv whose launch, key and body agree whatever geometry the cost
+    /// model chose: 256 lanes, `rows` adjacent outputs per lane over `cols` columns per workgroup, so `n / (cols * rows)`
+    /// workgroups, and `rows` dividing the outputs of the block. `N = 1280`, `1264` and `896` straddle the points the
+    /// geometry changes on a small device. Driven through `compile`. Mutation: compute the grid from `cols` alone in
+    /// `try_plan_contraction`; a row whose plan has `rows > 1` goes red.
     #[test]
-    fn packed_decode_gemv_launch_follows_the_compute_unit_table() {
+    fn packed_decode_gemv_launch_agrees_with_its_planned_geometry() {
         let k = 256;
-        for (compute_units, n, cols) in [
-            (Some(40), 151_936, 16),
-            (Some(40), 4864, 16),
-            (Some(40), 1280, 16),
-            (Some(40), 1264, 8),
-            (Some(40), 896, 8),
-            (Some(40), 128, 8),
-            (Some(4), 896, 16),
-            // POOT-1468: no known compute-unit count plans the narrowest columns, however wide N is.
-            (None, 151_936, 8),
-            (None, 896, 8),
+        let mut seen_rows = std::collections::BTreeSet::new();
+        for (compute_units, n) in [
+            (Some(40), 151_936),
+            (Some(40), 4864),
+            (Some(40), 1280),
+            (Some(40), 1264),
+            (Some(40), 896),
+            (Some(40), 128),
+            (Some(4), 896),
+            (None, 151_936),
+            (None, 896),
         ] {
             let what = format!("compute_units={compute_units:?} N={n}");
             let builder = Builder::for_tests();
@@ -754,38 +712,38 @@ mod tests {
                 panic!("{what}: expected a single dispatch, got {plan:?}");
             };
             let grid = launch.grid;
-            // Q8_0's factor run is its 32-value block, the Vulkan class's cap.
-            let schedule = Schedule::Gemv {
-                width: 256,
-                cols,
-                unroll: 32,
-                activation: poot_kernelgen::GemvActivation::Scalar,
-                rows: poot_kernelgen::GemvRows::ONE,
-                depth: poot_kernelgen::LoadDepth::ONE,
-            };
             let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
                 PackedContraction {
                     format,
-                    schedule: planned,
+                    schedule:
+                        Schedule::Gemv {
+                            width, cols, rows, ..
+                        },
                     epilogue: None,
                     ..
                 },
             ))) = program.kernel_choice(eqn)
             else {
-                panic!("{what}: a packed contraction is a generated contraction request");
+                panic!("{what}: a decode packed contraction is a generated Gemv request");
             };
-            assert_eq!(
-                (*format, *planned),
-                (WeightFormat::Q8_0, schedule),
-                "{what}"
+            assert_eq!(*format, WeightFormat::Q8_0, "{what}");
+            assert_eq!(*width, 256, "{what}");
+            assert!(
+                n.is_multiple_of(rows.get() as usize),
+                "{what}: rows {rows:?}"
             );
             assert_eq!(
                 grid,
-                [n.div_ceil(cols as usize) as u32 * 256, 1, 1],
+                [n.div_ceil((*cols * rows.get()) as usize) as u32 * 256, 1, 1],
                 "{what}"
             );
             assert_eq!(body.workgroup_size, [256, 1, 1], "{what}");
+            seen_rows.insert(rows.get());
         }
+        assert!(
+            seen_rows.iter().any(|&rows| rows > 1),
+            "the fixtures reach a plan with several rows per lane: {seen_rows:?}"
+        );
     }
 
     /// Every packed format the Gemv admits.
@@ -826,19 +784,16 @@ mod tests {
         *unroll
     }
 
-    /// POOT-1398 (B1 of designs/quant-matmul-1390.md), GPU-free: the decode Gemv's lane run is the format's
-    /// factor run (the aligned elements that share one decoded scale/min), capped by the device's
-    /// calibrated `packed_gemv_max_run`. For every block-storage format (whose decode shares a run's block
-    /// address, factors and code windows) and every calibration (measured or portable) the planned run divides the factor run, never
-    /// exceeds it or the cap, and is the largest such run, so a run never straddles a factor boundary (the 1390
-    /// cliff: Q6_K at run 32 decodes every element's factors, 60 GB/s against 190 at 16). A planar format,
-    /// whose decode addresses each element on its own, runs the portable run within the cap. The measured rows
-    /// are pinned as literals on gfx1151 through HSA and Vulkan (cap 32): 32 for the formats whose sub-block is 32 values (Q4_K,
-    /// Q5_K, IQ4_XS, Q4_0, Q8_0), 16 for the 16-value ones (Q6_K, Q2_K, Q3_K), 8 for GPTQ and FP8; the
-    /// sm_120 caps it at its measured 16 (POOT-1405) and an unmeasured device, Vulkan or CUDA, at the portable 8. Driven through `compile`. Mutation: plan run 32 for Q6_K in
-    /// `packed_gemv_launch`; the divisibility and the pinned Q6_K row go red.
+    /// POOT-1398 (B1 of designs/quant-matmul-1390.md), GPU-free, as POOT-1562 states it: the decode Gemv's lane run is a
+    /// run the cost model chose among those the format's decode admits. For every block-storage format (whose decode
+    /// shares a run's block address, factors and code windows) and every calibration the planned run divides the factor
+    /// run, so a run never straddles a factor boundary (the 1390 cliff: Q6_K at run 32 decodes every element's factors,
+    /// 60 GB/s against 190 at 16); any other decode takes one of the runs the model offers. There is no device cap: the
+    /// model's register bound and its cost say how long a run is worth. Driven through `compile`. Mutation: let
+    /// `runs_of` offer every run to a decode that shares a factor run; Q6_K (factor run 16) plans run 32 and the
+    /// divisibility goes red.
     #[test]
-    fn the_packed_decode_gemv_run_is_the_factor_run_capped_by_the_device_calibration() {
+    fn the_packed_decode_gemv_run_divides_the_factor_run() {
         let wgpu = DeviceCaps {
             memory_budget_bytes: None,
             ..poot_test_util::device_caps::wgpu_rdna3_igpu()
@@ -888,90 +843,19 @@ mod tests {
                 },
             ),
         ];
-        use poot_quant::format::{GroupMap, ScaleEncoding};
-        let size = |n: usize| std::num::NonZeroUsize::new(n).unwrap();
-        let mut planned = std::collections::HashMap::new();
         for (class, target) in &targets {
-            let Target::Gpu { caps, .. } = target else {
-                unreachable!("every target is a GPU");
-            };
-            let cap = caps.gemm_launch().calibrated.figures().packed_gemv_max_run as usize;
             for format in packed_gemv_formats() {
                 let what = format!("{class} {format:?}");
                 let run = planned_gemv_run(format, target) as usize;
                 let sharing = poot_kernelgen::packed_run_sharing(format)
                     .unwrap_or_else(|error| panic!("{what}: {error}"));
-                assert!(run <= cap, "{what}: run {run} exceeds the class cap {cap}");
-                match sharing {
-                    PackedRunSharing::FactorRun { factor_run } => {
-                        assert!(
-                            factor_run.is_multiple_of(run),
-                            "{what}: run {run} does not divide the factor run {factor_run}"
-                        );
-                        let longer = (run + 1..=cap.min(factor_run))
-                            .find(|&longer| factor_run.is_multiple_of(longer));
-                        assert_eq!(
-                            longer, None,
-                            "{what}: run {run} is shorter than the factor run {factor_run} allows"
-                        );
-                    }
-                    PackedRunSharing::WholeRow => assert_eq!(
-                        run, cap,
-                        "{what}: a per-channel scale shares any run, so the device's longest runs"
-                    ),
-                    PackedRunSharing::Elementwise => assert_eq!(
-                        run,
-                        cap.min(8),
-                        "{what}: an elementwise decode runs the portable run"
-                    ),
+                assert!([4, 8, 16, 32, 1].contains(&run), "{what}: run {run}");
+                if let PackedRunSharing::FactorRun { factor_run } = sharing {
+                    assert!(
+                        factor_run.is_multiple_of(run),
+                        "{what}: run {run} does not divide the factor run {factor_run}"
+                    );
                 }
-                planned.insert((*class, format), run);
-            }
-        }
-        for (format, run) in [
-            (WeightFormat::Q4_K, 32),
-            (WeightFormat::Q5_K, 32),
-            (WeightFormat::Iq4_Xs, 32),
-            (WeightFormat::Q4_0, 32),
-            (WeightFormat::Q8_0, 32),
-            (WeightFormat::Q6_K, 16),
-            (WeightFormat::Q2_K, 16),
-            (WeightFormat::Q3_K, 16),
-            (
-                WeightFormat::E4m3PerChannel {
-                    scale: ScaleEncoding::Bf16,
-                },
-                32,
-            ),
-            (
-                WeightFormat::E4m3Block128 {
-                    scale: ScaleEncoding::Bf16,
-                },
-                32,
-            ),
-            (
-                WeightFormat::Gptq {
-                    groups: GroupMap::Contiguous { size: size(128) },
-                },
-                8,
-            ),
-            (
-                WeightFormat::Gptq {
-                    groups: GroupMap::Indexed { groups: size(32) },
-                },
-                8,
-            ),
-        ] {
-            assert_eq!(planned[&("hsa", format)], run, "hsa {format:?}");
-            assert_eq!(planned[&("vulkan", format)], run, "vulkan {format:?}");
-            assert_eq!(planned[&("cuda", format)], run.min(16), "cuda {format:?}");
-            // An unmeasured device plans the portable run whatever runtime drives it, Vulkan included.
-            for portable in ["vulkan-portable", "cuda-portable"] {
-                assert_eq!(
-                    planned[&(portable, format)],
-                    run.min(8),
-                    "{portable} {format:?}"
-                );
             }
         }
     }

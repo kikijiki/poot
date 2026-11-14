@@ -257,7 +257,7 @@ impl<'a> Emitter<'a> {
         let (idx_val, _) = self.load_place(&Place::local(idx_local), w)?;
         let byte_idx = self.fresh();
         let _ = writeln!(w, "  {byte_idx} = mul i32 {idx_val}, {elem_bytes}");
-        let (bufty, mangle) = self.coopmat_byte_buf(true);
+        let (bufty, mangle) = self.coopmat_byte_buf(self.param_writable(tile.local));
         let bind = tile.local.index - 1;
         let h = self.fresh();
         let _ = writeln!(

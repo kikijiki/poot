@@ -7,6 +7,9 @@ poot-kernelgen	contraction::dense::tests::a_narrow_stored_activation_and_a_narro
 poot-kernelgen	contraction::dense::tests::the_dense_tiled_body_matches_a_host_product_at_every_planned_tiling	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::fit::tests::an_underdetermined_corpus_gives_no_fit	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::fit::tests::the_fit_recovers_the_ratios_the_times_were_made_with	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::gemv_cost::tests::a_deeper_pipeline_rotates_its_carried_runs_each_trip	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::gemv_cost::tests::a_second_row_repeats_the_weight_loads_but_not_the_activation_read	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::gemv_cost::tests::a_warps_lines_follow_how_its_lanes_share_rows	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_compiled_selection_takes_the_cheapest_candidate_that_holds	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_contraction_below_the_device_takes_the_cheapest_lane_step	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_fragment_round_stages_whole_requests_of_every_operand_row	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case

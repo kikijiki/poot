@@ -130,6 +130,8 @@ poot-codegen	poot-codegen::narrow_and_schedule	model-free	the_narrowing_and_the_
 poot-codegen	poot-codegen::no_contract	model-free	amdgcn_marked_subtract_stays_unfused_in_the_compiled_isa
 poot-codegen	poot-codegen::no_contract	model-free	nvptx_marked_subtract_emits_constrained_intrinsic_under_strictfp
 poot-codegen	poot-codegen::no_contract	model-free	spirv_marked_subtract_is_decorated_nocontraction_unmarked_is_not
+poot-codegen	poot-codegen::readonly_inputs	model-free	a_shared_slice_param_is_declared_read_only_and_a_mutable_one_writable
+poot-codegen	poot-codegen::readonly_inputs	model-free	the_compiled_module_decorates_only_the_input_non_writable
 poot-codegen	poot-codegen::subgroup_shuffle	model-free	amdgcn_permutes_at_the_wave_lane_xor_the_mask_on_wave32_and_wave64
 poot-codegen	poot-codegen::subgroup_shuffle	model-free	nvptx_ir_butterflies_with_the_mask_and_an_f32_payload_travels_as_bits
 poot-codegen	poot-codegen::subgroup_shuffle	model-free	nvptx_ptx_holds_shfl_sync_bfly
@@ -1046,8 +1048,8 @@ poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::over_
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::over_cap_tiled_contraction_at_real_wgpu_caps_keeps_the_baked_workgroup
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::over_cap_tiled_contraction_folds_onto_a_2d_grid_not_the_wg_bump
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::over_cap_tiled_contraction_refuses_when_even_the_fold_cannot_address_every_tile
-poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::packed_decode_gemv_launch_follows_the_compute_unit_table
-poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::the_packed_decode_gemv_run_is_the_factor_run_capped_by_the_device_calibration
+poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::packed_decode_gemv_launch_agrees_with_its_planned_geometry
+poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::the_packed_decode_gemv_run_divides_the_factor_run
 poot-graph-plan	poot-graph-plan	model-free	planner::sampling::tests::greedy_plans_a_chunk_stage_and_a_combine_stage
 poot-graph-plan	poot-graph-plan	model-free	planner::sampling::tests::greedy_refuses_a_grid_past_the_target_limit
 poot-graph-plan	poot-graph-plan	model-free	planner::sampling::tests::greedy_refuses_a_vocabulary_whose_indices_are_not_exact_f32
@@ -1414,7 +1416,7 @@ poot-graph-plan	poot-graph-plan::operand_precision	model-free	options_that_name_
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	radv_caps_give_f16_attention_and_exact_contractions
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	rocm_caps_give_f16_contractions_and_f16_attention
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	the_kernel_request_carries_the_declared_precision
-poot-graph-plan	poot-graph-plan::packed_gemv_columns	model-free	a_packed_gemv_takes_the_columns_of_its_devices_calibration
+poot-graph-plan	poot-graph-plan::packed_gemv_geometry	model-free	the_gemv_geometry_is_the_cost_model_minimum
 poot-graph-plan	poot-graph-plan::packed_grouped_narrowing	model-free	a_tie_between_grouped_fragment_tilings_goes_to_the_deeper_round
 poot-graph-plan	poot-graph-plan::packed_grouped_narrowing	model-free	the_decision_between_the_gemv_and_the_grouped_tiling_prices_the_grouping
 poot-graph-plan	poot-graph-plan::planner_owned_precision	model-free	a_declared_narrowing_is_held_to_a_matrix_unit_or_refused
@@ -1625,6 +1627,9 @@ poot-kernelgen	poot-kernelgen	model-free	contraction::dense::tests::a_narrow_sto
 poot-kernelgen	poot-kernelgen	model-free	contraction::dense::tests::the_dense_tiled_body_matches_a_host_product_at_every_planned_tiling
 poot-kernelgen	poot-kernelgen	model-free	contraction::fit::tests::an_underdetermined_corpus_gives_no_fit
 poot-kernelgen	poot-kernelgen	model-free	contraction::fit::tests::the_fit_recovers_the_ratios_the_times_were_made_with
+poot-kernelgen	poot-kernelgen	model-free	contraction::gemv_cost::tests::a_deeper_pipeline_rotates_its_carried_runs_each_trip
+poot-kernelgen	poot-kernelgen	model-free	contraction::gemv_cost::tests::a_second_row_repeats_the_weight_loads_but_not_the_activation_read
+poot-kernelgen	poot-kernelgen	model-free	contraction::gemv_cost::tests::a_warps_lines_follow_how_its_lanes_share_rows
 poot-kernelgen	poot-kernelgen	model-free	contraction::invariant::a_compiled_choice_never_runs_a_tiling_its_compiler_spills
 poot-kernelgen	poot-kernelgen	model-free	contraction::invariant::the_chosen_schedule_never_loses_to_exact
 poot-kernelgen	poot-kernelgen	model-free	contraction::invariant::the_packed_sweep_covers_the_formats_the_grouped_rows_name
@@ -5539,6 +5544,7 @@ poot-wgpu-runtime	poot-wgpu-runtime	model-free	tests::require_backend_tests::wgp
 poot-wgpu-runtime	poot-wgpu-runtime	model-free	tests::segment_layout_tests::segment_layout_is_contiguous_in_request_order
 poot-wgpu-runtime	poot-wgpu-runtime	model-free	tests::segment_layout_tests::segment_layout_rejects_overlong_segment
 poot-wgpu-runtime	poot-wgpu-runtime::device_caps	device	wgpu_device_caps_matches_a_direct_adapter_query
+poot-wgpu-runtime	poot-wgpu-runtime::dispatch_probe	device	an_input_bound_as_the_output_of_one_dispatch_is_a_validation_error_on_gpu
 poot-wgpu-runtime	poot-wgpu-runtime::dispatch_probe	device	mixed_scalar_vec4_two_bindings_alias_one_buffer_runs_on_gpu
 poot-wgpu-runtime	poot-wgpu-runtime::dispatch_probe	model-free	mixed_scalar_vec4_one_binding_is_rejected_by_spirv_val
 poot-wgpu-runtime	poot-wgpu-runtime::run_add	device	add_device_resident

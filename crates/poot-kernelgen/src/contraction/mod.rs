@@ -11,6 +11,7 @@ mod epilogue;
 #[cfg(any(test, feature = "test-support"))]
 mod fit;
 mod gemv;
+mod gemv_cost;
 mod indexed;
 #[cfg(test)]
 mod invariant;
@@ -27,6 +28,7 @@ pub use epilogue::{Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep};
 #[cfg(any(test, feature = "test-support"))]
 pub use fit::{CostFit, fit_cost_ratios};
 pub(crate) use gemv::{GemvLaunch, Phased, RunAt, gemv_body};
+pub use gemv_cost::{GemvBodyCost, LaneMap};
 pub(crate) use indexed::{
     META_EXPERTS, META_N, META_PACKED_SLAB_WORDS, RowExpert, emit_poison, emit_row_expert,
     indexed_contraction,

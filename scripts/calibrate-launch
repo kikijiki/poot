@@ -18,6 +18,9 @@
 #   scripts/calibrate-launch rocm fragment [out-dir]       both packed cases (IQ2_XS up, IQ4_NL down) and the dense
 #                                                          cells in one hold: the rows benchmarks/calibration/<device>.tsv
 #                                                          is made of, which fit_fragment_cost.py there fits
+#   scripts/calibrate-launch rocm heldout [out-dir]        both Q4_K packed cases (up and down), the rows
+#                                                          benchmarks/calibration/<device>-heldout-q4k.tsv is made of, which
+#                                                          fit_fragment_cost.py --heldout scores without fitting (POOT-1565)
 #   scripts/calibrate-launch rocm|wgpu|ptx gemv [out-dir]  the dense decode Gemv's columns per workgroup, every power of
 #                                                          two up to 16 pinned over output counts from a launch that
 #                                                          starves the device to one that floods it (POOT-1490)
@@ -25,8 +28,8 @@
 # CALIBRATE_LAUNCH_BIN names a prebuilt example binary (the script then builds nothing), and CALIBRATE_LAUNCH_LOCKED=1
 # says the caller already holds the GPU lock and the heavy lock (gpu first), so one hold can cover several runs.
 set -euo pipefail
-backend="${1:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed|dense|fragment [out-dir]}"
-mode="${2:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed|dense|fragment [out-dir]}"
+backend="${1:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed|dense|fragment|heldout [out-dir]}"
+mode="${2:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed|dense|fragment|heldout [out-dir]}"
 out="${3:-calibrate-launch-$backend-$mode}"
 mkdir -p "$out"
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -86,6 +89,14 @@ fragment)
   echo "rows are in $out/*/rows.tsv; join them into benchmarks/calibration/<device>.tsv and run" >&2
   echo "python3 -I benchmarks/calibration/fit_fragment_cost.py --check" >&2
   ;;
+heldout)
+  # The held-out corpus of POOT-1565: a packed format the fit of `fragment` does not hold, one hold.
+  for case_id in expert-prefill-packed-q4k-up expert-prefill-packed-q4k-down; do
+    CALIBRATE_LAUNCH_CASE="$case_id" CALIBRATE_LAUNCH_BIN="$bin" CALIBRATE_LAUNCH_LOCKED=1 "$0" "$backend" packed "$out/$case_id"
+  done
+  echo "rows are in $out/*/rows.tsv; join them into benchmarks/calibration/<device>-heldout-q4k.tsv and run" >&2
+  echo "python3 -I benchmarks/calibration/fit_fragment_cost.py --heldout benchmarks/calibration/<device>-heldout-q4k.tsv" >&2
+  ;;
 gemv)
   "$bin" gemv-cells >"$out/cells.tsv"
   while IFS=$'\t' read -r cell cols; do
@@ -94,7 +105,7 @@ gemv)
   "$bin" gemv-fit --rows "$rows" --out "$out/entry.rs"
   ;;
 *)
-  echo "usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed|dense|fragment [out-dir]" >&2
+  echo "usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed|dense|fragment|heldout [out-dir]" >&2
   exit 2
   ;;
 esac

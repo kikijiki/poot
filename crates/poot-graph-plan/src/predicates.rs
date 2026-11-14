@@ -404,7 +404,7 @@ pub(crate) fn dense_decode_gemv_in(
     if out_shape.len() < 2 || n == 0 || out_numel != n {
         return None;
     }
-    let planned = gemv_launch(n, GemvFamily::Dense, caps);
+    let planned = gemv_launch(n, caps);
     let launch = match cols_pin {
         Some(cols) if cols == 0 || !planned.width.is_multiple_of(cols) => return None,
         Some(cols) => GemvLaunch { cols, ..planned },
@@ -419,6 +419,10 @@ pub(crate) struct GemvLaunch {
     pub(crate) width: u32,
     pub(crate) cols: u32,
     pub(crate) unroll: u32,
+    /// The adjacent output rows a lane accumulates over one activation read.
+    pub(crate) rows: kg::GemvRows,
+    /// The trips of weight loads a lane keeps in flight.
+    pub(crate) depth: kg::LoadDepth,
 }
 
 impl GemvLaunch {
@@ -427,7 +431,7 @@ impl GemvLaunch {
         kg::GemvShape {
             outputs,
             width: self.width,
-            cols: self.cols,
+            cols: self.cols * self.rows.get(),
         }
     }
 
@@ -439,37 +443,24 @@ impl GemvLaunch {
             cols: self.cols,
             unroll: self.unroll,
             activation: gemv_activation(backend, k, self.unroll),
-            rows: poot_kernelgen::GemvRows::ONE,
-            depth: poot_kernelgen::LoadDepth::ONE,
+            rows: self.rows,
+            depth: self.depth,
         }
     }
 }
 
-/// The weight a Gemv reads, which sets its columns table and its lane run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GemvFamily {
-    /// A dense `[N, K]` weight: the unroll is one vector load of the activation (`gemv_unroll`).
-    Dense,
-    /// A packed weight, its lanes decoding `run` contiguous `K` elements per trip ([`gemv_run`]).
-    Packed { run: u32 },
-}
-
-/// The Gemv launch for a contraction with `outputs` output columns: the one rule behind the dense (card 727) and
-/// packed (card 653) decode Gemv.
+/// The Gemv launch of a dense `[N, K]` weight with `outputs` output columns (card 727). (A packed weight's is the
+/// argmin of a cost model over the body its format emits: `planner::gemv_geometry`.)
 ///
-/// `width` and (dense) `unroll` are the device's [`poot_target::calibration::GemmLaunch`] geometry. `cols` is the
-/// family's calibrated `wide` while that still launches [`poot_target::calibration::GemmLaunch::fill_workgroups_per_unit`]
-/// workgroups per compute unit, else its `narrow`: a weight row is contiguous along K, so fewer `cols` give each row
-/// more lanes (`width / cols`) and a longer contiguous run per trip, and the narrower fallback keeps a small `N`
-/// from starving the device. A device whose compute units are unknown cannot show that the wide columns fill it, so
-/// it takes the narrow ones, which launch the most workgroups.
-pub(crate) fn gemv_launch(outputs: usize, family: GemvFamily, caps: &DeviceCaps) -> GemvLaunch {
+/// `width` and `unroll` are the device's [`poot_target::calibration::GemmLaunch`] geometry. `cols` is the calibrated
+/// `wide` while that still launches [`poot_target::calibration::GemmLaunch::fill_workgroups_per_unit`] workgroups per
+/// compute unit, else its `narrow`: a weight row is contiguous along K, so fewer `cols` give each row more lanes
+/// (`width / cols`) and a longer contiguous run per trip, and the narrower fallback keeps a small `N` from starving the
+/// device. A device whose compute units are unknown cannot show that the wide columns fill it, so it takes the narrow
+/// ones, which launch the most workgroups. One row per lane and one trip in flight: the dense body's own.
+pub(crate) fn gemv_launch(outputs: usize, caps: &DeviceCaps) -> GemvLaunch {
     let launch = caps.gemm_launch();
-    let figures = launch.calibrated.figures();
-    let (table, unroll) = match family {
-        GemvFamily::Dense => (figures.dense_gemv_cols, launch.gemv_unroll),
-        GemvFamily::Packed { run } => (figures.packed_gemv_cols, run),
-    };
+    let table = launch.calibrated.figures().dense_gemv_cols;
     let wide_fills = caps.compute_units.known().is_some_and(|units| {
         outputs.div_ceil(table.wide as usize)
             >= launch.fill_workgroups_per_unit as usize * units as usize
@@ -477,7 +468,9 @@ pub(crate) fn gemv_launch(outputs: usize, family: GemvFamily, caps: &DeviceCaps)
     GemvLaunch {
         width: launch.gemv_width,
         cols: if wide_fills { table.wide } else { table.narrow },
-        unroll,
+        unroll: launch.gemv_unroll,
+        rows: kg::GemvRows::ONE,
+        depth: kg::LoadDepth::ONE,
     }
 }
 
@@ -1218,7 +1211,7 @@ pub(crate) fn indexed_gemv_in(m: usize, n: usize, caps: &DeviceCaps) -> Option<G
         return None;
     }
     let outputs = m.checked_mul(n)?;
-    widened_to_fit_grid(gemv_launch(outputs, GemvFamily::Dense, caps), outputs, caps)
+    widened_to_fit_grid(gemv_launch(outputs, caps), outputs, caps)
 }
 
 /// `launch` with its columns per workgroup doubled (up to the workgroup width) until the `outputs` dot products launch

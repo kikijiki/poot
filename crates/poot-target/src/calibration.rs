@@ -19,36 +19,11 @@ pub const REGISTER_LANE_EDGE: u32 = 8;
 /// workgroup and LDS hold it.
 pub const REGISTER_LANE_EDGE_WIDE: u32 = 16;
 
-/// The packed decode Gemv's longest lane run on a device nobody measured: the run every device launched before
-/// POOT-1398. [`PerfCalibration::PORTABLE`]'s figure.
-pub const PORTABLE_PACKED_GEMV_RUN: u32 = 8;
-
 /// The fewest steps of a clustered attention walk a split-KV share takes, on a device nobody measured: a share of
 /// fewer steps spends more on the second launch's combine than the extra workgroup hides. The prior of the POOT-1549
 /// design's roofline model (`receipts/1549-design/model.txt`); a pod sweep of {2, 4, 8} replaces it per device.
 /// [`PerfCalibration::PORTABLE`]'s figure, and every measured entry's until its device is swept.
 pub const PORTABLE_ATTENTION_SPLIT_MIN_STEPS: u32 = 4;
-
-/// The packed decode Gemv's longest lane run on Strix Halo (gfx1151, through HSA or RADV), measured (POOT-1390):
-/// a 32-element run (one Q4_K/Q5_K sub-block) amortises the block addressing and the factor decode over
-/// four times the weights of the portable run and keeps the body within the register file on both
-/// compilers.
-pub const STRIX_HALO_PACKED_GEMV_RUN: u32 = 32;
-
-/// The packed decode Gemv's longest lane run on the RTX PRO 6000 Blackwell Server (sm_120), the one NVIDIA part it
-/// was measured on (POOT-1405). With the activation read in 16-byte groups and 32-bit index math, a 16-element run
-/// amortises a K-quant's block decode over twice the weights of the 8-element one, while a 32-element run spreads
-/// each warp-wide activation load over 16 cache lines and loses (Q4_K 980 at run 16 against 665 at 32 and 721 at
-/// 8 GB/s). Another NVIDIA part is unmeasured and plans with [`PerfCalibration::PORTABLE`] until a pod sweep says
-/// otherwise.
-pub const SM_120_PACKED_GEMV_RUN: u32 = 16;
-
-/// The Gemv columns of a packed weight on the RTX PRO 6000 Blackwell Server (sm_120), measured (POOT-1319, one secure
-/// pod): `{4, 2}` against the Strix Halo table's `{16, 8}` it borrowed, whole-model decode at ISL 128 (tokens/s,
-/// two repeats of three timed iterations each): Qwen3-4B Q4_K_M 162-168 -> 179-181, Qwen3.8-27B UD-Q4_K_XL 36.7-38.4
-/// -> 40.6, Qwen3.8-27B-FP8 15.9 -> 17.2. Narrower columns give each weight row more lanes and a longer contiguous
-/// run per trip, and launch more workgroups across the 188 compute units.
-pub const SM_120_PACKED_GEMV_COLS: GemvCols = GemvCols { wide: 4, narrow: 2 };
 
 /// The lanes of one wave64, the widest wave poot targets: the grain of a tiled attention's workgroup width, which
 /// is whole waves of the widest wave so it runs on every device.
@@ -60,17 +35,33 @@ pub(crate) const WAVE_LANES: u32 = 64;
 /// 4 4.7; ROCm decode 78 to 81 tok/s from `cols` 16 to 2). Nearly flat between 4 and 8, so not derivable.
 pub const STRIX_HALO_DENSE_GEMV_COLS: GemvCols = GemvCols { wide: 4, narrow: 2 };
 
-/// The Gemv columns of a packed weight on Strix Halo (card 653): `{16, 8}` with 8-element runs was 3.7 ms of Gemv
-/// device time per Q4_K_M token against 4.2 ms for the dense table and 9.7 ms for the one-column-per-workgroup
-/// body (gfx1151, qwen2.5-0.5b GGUF projection shapes).
-pub const STRIX_HALO_PACKED_GEMV_COLS: GemvCols = GemvCols {
-    wide: 16,
-    narrow: 8,
-};
-
 /// The width of the LDS-tree Gemv on Strix Halo behind RADV (Qwen2.5-0.5B decode, fused ms per token: w=32 50.9,
 /// 64 53.7, 128 39.8, 256 45.6). Non-monotone, so a measurement, not a derivation.
 pub const STRIX_HALO_LDS_GEMV_WIDTH: u32 = 128;
+
+/// The packed Gemv figures of a device nobody measured, and of Strix Halo until `calibrate-launch` measures it
+/// (POOT-1550 D4): the prior of the design's cost model in cycles of a ~2 GHz unit clock, over the structural facts of an
+/// RDNA3.5 compute unit (two SIMD32, 16 resident waves each). Nobody observed the three rates on this part: a plan on
+/// it says so ([`Calibrated::Portable`]).
+pub const PORTABLE_GEMV_DEVICE: GemvDevice = GemvDevice {
+    dram_latency_cycles: 1600.0,
+    l1_lines_per_cycle: 1.0,
+    dispatch_cycles: 8000.0,
+    issue_per_cycle: 2.0,
+    resident_lanes: 1024,
+};
+
+/// The packed Gemv figures of the RTX PRO 6000 Blackwell Server (sm_120): the design's model priors (800 ns loaded
+/// DRAM latency, one L1 line per cycle, 4 us per dispatch) at the part's 2.43 GHz SM clock, over its four warp
+/// schedulers and 1536 resident lanes per SM. The three rates are priors: the POOT-1563 pod session measures them and
+/// replaces these.
+pub const SM_120_GEMV_DEVICE: GemvDevice = GemvDevice {
+    dram_latency_cycles: 1944.0,
+    l1_lines_per_cycle: 1.0,
+    dispatch_cycles: 9720.0,
+    issue_per_cycle: 4.0,
+    resident_lanes: 1536,
+};
 
 /// The cost model's ratios of a device nobody identified them on, and of Strix Halo behind RADV: the POOT-1403 fit
 /// of the LDS read and the staged value (every tiling of a qwen3-0.6b prefill at 512 and 2048 tokens, ROCm), which
@@ -105,7 +96,11 @@ pub const PORTABLE_COST_RATIOS: CostRatios = CostRatios {
 /// figures and a tie rule that takes the deeper round (the grouped fragment tilings tie in the model) the packed cells
 /// choose within 1.02 of the fastest measured schedule (the shipped model: 1.49), and the IQ2_XS up projection at 128
 /// tokens, which the shipped model lost 2.5 % to the Gemv on, narrows to a tiling 14 % faster than the Gemv.
-/// `benchmarks/calibration/fit_fragment_cost.py` recomputes both figures from the rows.
+/// `benchmarks/calibration/fit_fragment_cost.py` recomputes both figures from the rows. A packed format the fit never
+/// saw (Q4_K up and down, 264 rows in `rocm-gfx1151-heldout-q4k.tsv`, POOT-1565) chooses within 1.26 of the fastest
+/// schedule, mean 1.180, where the scalar model of before the fit scores 1.218 and 1.125: the round and the grouping
+/// win the fitted formats and not the unfitted one on the mean. Refitting over both corpora puts the round at 673 inside
+/// the same optimal range (141 to 800) and changes no choice.
 pub const STRIX_HALO_HSA_COST_RATIOS: CostRatios = CostRatios {
     lds_read: 9.88,
     staged_value: 8.43,
@@ -150,6 +145,23 @@ pub struct GemvCols {
     pub narrow: u32,
 }
 
+/// The device figures the packed Gemv's launch score weighs a body's cost with (`poot-kernelgen`'s `GemvBodyCost`),
+/// in cycles of one compute unit's clock, so the clock itself never enters a score. The first three are rates only a
+/// measurement gives; the last two are structural facts of the unit.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GemvDevice {
+    /// Cycles a load waits for DRAM under load: what a lane's loads of one trip cost before its decode may use them.
+    pub dram_latency_cycles: f64,
+    /// Cache lines per cycle one unit's L1 serves.
+    pub l1_lines_per_cycle: f64,
+    /// Cycles one Gemv dispatch costs besides its trips: launch, ramp, the column tree and the store.
+    pub dispatch_cycles: f64,
+    /// Warp instructions one unit issues per cycle (its schedulers).
+    pub issue_per_cycle: f64,
+    /// Lanes one unit holds resident.
+    pub resident_lanes: u32,
+}
+
 /// The ratios of the contraction cost model, in FMA issues (the unit): what one lane's LDS read, one staged value
 /// (a global load, its LDS write and its share of the round's two barriers) and one value a Gemv lane reads straight
 /// from global memory cost. Memory-hierarchy ratios, which only a measurement of the device gives
@@ -182,8 +194,8 @@ pub struct CostRatios {
 pub struct PerfCalibration {
     /// The Gemv columns of a dense `[N, K]` weight.
     pub dense_gemv_cols: GemvCols,
-    /// The Gemv columns of a packed weight.
-    pub packed_gemv_cols: GemvCols,
+    /// The figures the packed Gemv's launch score weighs a body's cost with.
+    pub packed_gemv: GemvDevice,
     /// The workgroup width of the LDS-tree attention Gemv (`attn_scores_v_gemv_lds`: one output per workgroup,
     /// the decode scores-by-V matmul), where the width is not the saturating residency.
     pub lds_gemv_width: u32,
@@ -191,9 +203,6 @@ pub struct PerfCalibration {
     pub cost: CostRatios,
     /// The keys per staged block of the tiled attention schedule, widest first.
     pub attention_key_blocks: &'static [usize],
-    /// The longest run of contiguous K elements a packed decode Gemv lane decodes per trip: the register and issue
-    /// budget of the device's compiler. The planner runs the format's factor run up to this cap.
-    pub packed_gemv_max_run: u32,
     /// The fewest steps of a clustered attention walk a split-KV share takes: the floor of a share is `clusters`
     /// times this many keys. A ranking figure: a smaller floor splits a short cache into more workgroups.
     pub attention_split_min_steps: u32,
@@ -204,11 +213,10 @@ impl PerfCalibration {
     /// launch every device ran before it was measured, never a value nobody observed.
     pub const PORTABLE: Self = Self {
         dense_gemv_cols: STRIX_HALO_DENSE_GEMV_COLS,
-        packed_gemv_cols: STRIX_HALO_PACKED_GEMV_COLS,
+        packed_gemv: PORTABLE_GEMV_DEVICE,
         lds_gemv_width: STRIX_HALO_LDS_GEMV_WIDTH,
         cost: PORTABLE_COST_RATIOS,
         attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
-        packed_gemv_max_run: PORTABLE_PACKED_GEMV_RUN,
         attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
 
@@ -216,11 +224,10 @@ impl PerfCalibration {
     /// `calibrate-launch` identified on ROCm.
     pub const STRIX_HALO_HSA: Self = Self {
         dense_gemv_cols: STRIX_HALO_DENSE_GEMV_COLS,
-        packed_gemv_cols: STRIX_HALO_PACKED_GEMV_COLS,
+        packed_gemv: PORTABLE_GEMV_DEVICE,
         lds_gemv_width: STRIX_HALO_LDS_GEMV_WIDTH,
         cost: STRIX_HALO_HSA_COST_RATIOS,
         attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
-        packed_gemv_max_run: STRIX_HALO_PACKED_GEMV_RUN,
         attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
 
@@ -228,11 +235,10 @@ impl PerfCalibration {
     /// `calibrate-launch` could not identify behind RADV (POOT-1494) are spelled as [`Self::PORTABLE`]'s.
     pub const STRIX_HALO_VULKAN: Self = Self {
         dense_gemv_cols: STRIX_HALO_DENSE_GEMV_COLS,
-        packed_gemv_cols: STRIX_HALO_PACKED_GEMV_COLS,
+        packed_gemv: PORTABLE_GEMV_DEVICE,
         lds_gemv_width: STRIX_HALO_LDS_GEMV_WIDTH,
         cost: Self::PORTABLE.cost,
         attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
-        packed_gemv_max_run: STRIX_HALO_PACKED_GEMV_RUN,
         attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
 
@@ -243,7 +249,7 @@ impl PerfCalibration {
     /// (the dense sweep ties at every output count but one), the LDS-tree Gemv width and the attention key blocks.
     pub const SM_120: Self = Self {
         dense_gemv_cols: Self::PORTABLE.dense_gemv_cols,
-        packed_gemv_cols: SM_120_PACKED_GEMV_COLS,
+        packed_gemv: SM_120_GEMV_DEVICE,
         lds_gemv_width: Self::PORTABLE.lds_gemv_width,
         cost: CostRatios {
             lds_read: Self::PORTABLE.cost.lds_read,
@@ -253,7 +259,6 @@ impl PerfCalibration {
             group_scan: None,
         },
         attention_key_blocks: Self::PORTABLE.attention_key_blocks,
-        packed_gemv_max_run: SM_120_PACKED_GEMV_RUN,
         attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
 }
@@ -596,14 +601,54 @@ mod tests {
             source: "card 727: the narrower fallback keeps a small N from starving the device; same sweep as the wide columns",
         },
         Provenance {
-            name: "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
-            value: 16.0,
-            source: "card 653, gfx1151 per-kernel sweep over the qwen2.5-0.5b GGUF projection shapes: {16, 8} 3.7 ms Gemv device time per Q4_K_M token against 4.2 ms for the dense table and 9.7 ms for one column per workgroup",
+            name: "PORTABLE_GEMV_DRAM_LATENCY_CYCLES",
+            value: 1600.0,
+            source: "prior, not measured: the POOT-1550 design model's 800 ns loaded DRAM latency (receipts/1550-design/model.py LATENCY_NS) at a ~2 GHz unit clock. A device nobody identified plans with it and the plan records that",
         },
         Provenance {
-            name: "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
-            value: 8.0,
-            source: "card 653: same sweep as the wide columns; the plan of a device whose compute units are unknown",
+            name: "PORTABLE_GEMV_L1_LINES_PER_CYCLE",
+            value: 1.0,
+            source: "prior, not measured: the design model's one 128-byte line per cycle per unit (model.py L1_LINES_PER_CYCLE), which the POOT-1563 probe measures",
+        },
+        Provenance {
+            name: "PORTABLE_GEMV_DISPATCH_CYCLES",
+            value: 8000.0,
+            source: "prior, not measured: the design model's 4 us fixed cost per Gemv dispatch (model.py FIXED_US) at a ~2 GHz unit clock; the POOT-1319 fit of 35 K-quant rows gave 13.9 us on sm_120 in a per-dispatch-timed window, an upper bound",
+        },
+        Provenance {
+            name: "PORTABLE_GEMV_ISSUE_PER_CYCLE",
+            value: 2.0,
+            source: "structural: an RDNA3.5 compute unit has two SIMD32, each issuing one wave instruction per cycle (AMD RDNA3 ISA guide); the floor over the parts poot targets",
+        },
+        Provenance {
+            name: "PORTABLE_GEMV_RESIDENT_LANES",
+            value: 1024.0,
+            source: "structural: an RDNA3.5 SIMD holds 16 waves of 32 lanes, two SIMDs a compute unit (AMD RDNA3 ISA guide)",
+        },
+        Provenance {
+            name: "SM_120_GEMV_DRAM_LATENCY_CYCLES",
+            value: 1944.0,
+            source: "prior, not measured: the design model's 800 ns loaded GDDR7 latency (model.py LATENCY_NS) at the part's 2.43 GHz SM clock. The POOT-1563 pod session replaces it; until then the model's argmin is a prior",
+        },
+        Provenance {
+            name: "SM_120_GEMV_L1_LINES_PER_CYCLE",
+            value: 1.0,
+            source: "prior, not measured: model.py L1_LINES_PER_CYCLE, to be measured by POOT-1563's L1-broadcast probe, which separates the issue term from the L1 term",
+        },
+        Provenance {
+            name: "SM_120_GEMV_DISPATCH_CYCLES",
+            value: 9720.0,
+            source: "prior, not measured: model.py FIXED_US 4 us at 2.43 GHz; POOT-1563's streaming probe measures the dispatch's fixed cost",
+        },
+        Provenance {
+            name: "SM_120_GEMV_ISSUE_PER_CYCLE",
+            value: 4.0,
+            source: "structural: four warp schedulers per SM, one warp instruction each per cycle (NVIDIA Blackwell tuning guide, compute capability 12.0)",
+        },
+        Provenance {
+            name: "SM_120_GEMV_RESIDENT_LANES",
+            value: 1536.0,
+            source: "structural: 48 resident warps of 32 lanes per SM at compute capability 12.0 (CUDA programming guide, technical specifications table)",
         },
         Provenance {
             name: "STRIX_HALO_LDS_GEMV_WIDTH",
@@ -656,16 +701,6 @@ mod tests {
             source: "POOT-1490 calibrate-launch indexed on one RTX PRO 6000 Blackwell Server (sm_120, secure pod, 88 cells, 176 rows): the direct values at which the model's choices are never slower than the retired 32-row switch (within 5 %) and within 5 % of the best mean regret are 11.9 to 16.8; the geometric centre. Mean regret against the faster schedule 1.056 against the retired switch's 1.177. An RTX 4090 (sm_89) gave 7.6 to 11.9, so the figure moves between parts and this one is that part's; receipts/1490-cuda-sweep/",
         },
         Provenance {
-            name: "SM_120_PACKED_GEMV_COLS_WIDE",
-            value: 4.0,
-            source: "POOT-1319, one RTX PRO 6000 Blackwell Server (sm_120, secure pod), whole-model decode at ISL 128 under pinned (wide, narrow) pairs, tokens/s: Qwen3.8-27B UD-Q4_K_XL (16,8) 36.7-38.4, (8,4) 39.5, (4,2) 40.6, (4,4) 40.1, (2,1) 39.6, (8,8) 38.5, (16,16) 35.6, (32,16) 32.9, (1,1) 37.6; Qwen3-4B Q4_K_M (16,8) 162-168, (8,4) 175, (4,4) 177, (4,2) 179-181, (2,2) 161; Qwen3.8-27B-FP8 (16,8) 15.9, (4,2) 17.2. The Strix Halo pair (16,8) it replaces was borrowed, never measured here",
-        },
-        Provenance {
-            name: "SM_120_PACKED_GEMV_COLS_NARROW",
-            value: 2.0,
-            source: "POOT-1319, the same sweep as SM_120_PACKED_GEMV_COLS_WIDE: the narrow column of the best pair (4,2); (4,4) and (8,4) ran 1-3 % behind it on Qwen3-4B Q4_K_M and Qwen3.8-27B",
-        },
-        Provenance {
             name: "STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST",
             value: 32.0,
             source: "POOT-1402 bank sweep: a 64-key block was 20-30% slower than a 32-key one on ROCm and wgpu (Strix Halo) and no faster on PTX",
@@ -700,21 +735,6 @@ mod tests {
             value: 2.0,
             source: "NVIDIA datasheets, FP16 Tensor Core with FP32 accumulate, dense, over non-Tensor FP32: RTX 3090 (GA102 whitepaper) 71 over 35.6; RTX 4090 (Ada whitepaper) 165.2 over 82.6; RTX 5090 209.5 over 104.8. The floor over the parts of sm_86, sm_89 and sm_120: A40 (149.7 over 37.4) and L40S (362 over 91.6) run 4x",
         },
-        Provenance {
-            name: "PORTABLE_PACKED_GEMV_RUN",
-            value: 8.0,
-            source: "card 653: the 8-element run every class launched before POOT-1398; the run of a decode that addresses each element on its own (gemv_run's Elementwise arm)",
-        },
-        Provenance {
-            name: "STRIX_HALO_PACKED_GEMV_RUN",
-            value: 32.0,
-            source: "measured: gfx1151 ROCm and RADV at 17408 x 5120, run 32 vs 8: Q4_K 120 -> 195 GB/s, Q5_K 119 -> 190 (ROCm), Q4_K 143 -> 171-184 (Vulkan); POOT-1390 section 5 and the POOT-1398 receipt",
-        },
-        Provenance {
-            name: "SM_120_PACKED_GEMV_RUN",
-            value: 16.0,
-            source: "measured on one part only, RTX PRO 6000 Blackwell Server (sm_120), at 17408 x 5120 with the vector activation read and 32-bit index math, run 8 / 16 / 32 GB/s: Q4_K 721/980/665, Q5_K 747/955/741, Q6_K 861/1254/1253 (factor run 16), Q3_K 567/710/711, Q2_K 539/695/695, Q4_0 1026/1094/751, Q8_0 1383/1402/1260, IQ4_XS 894/856/601, IQ4_NL 998/911/641; POOT-1405 receipts. Other NVIDIA parts unmeasured",
-        },
     ];
 
     /// The provenance entry named `name`, whose value is `value` and whose source is stated.
@@ -741,7 +761,7 @@ mod tests {
     /// Every figure a `GemmLaunch` and every `PerfCalibration` entry carries has a provenance row whose value is
     /// the figure's and whose source is stated. Both structs are destructured without `..`, so a new field fails
     /// to compile here until it is listed. Each row pins the value as a literal, so a figure changed without its row fails. Mutation: change
-    /// `STRIX_HALO_PACKED_GEMV_RUN` without its row; the value check fails.
+    /// `SM_120_GEMV_DEVICE`'s latency without its row; the value check fails.
     #[test]
     fn every_launch_figure_has_provenance() {
         let GemmLaunch {
@@ -775,50 +795,20 @@ mod tests {
         assert_provenance("SATURATING_LANES", saturating_lanes);
         assert_provenance("FILL_WORKGROUPS_PER_UNIT", fill_workgroups_per_unit);
         assert_provenance("VECTOR_LOAD_BYTES", VECTOR_LOAD_BYTES);
-        for (entry, row, cols_rows) in [
-            (
-                PerfCalibration::PORTABLE,
-                "PORTABLE_PACKED_GEMV_RUN",
-                (
-                    "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
-                    "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
-                ),
-            ),
-            (
-                PerfCalibration::STRIX_HALO_HSA,
-                "STRIX_HALO_PACKED_GEMV_RUN",
-                (
-                    "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
-                    "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
-                ),
-            ),
-            (
-                PerfCalibration::STRIX_HALO_VULKAN,
-                "STRIX_HALO_PACKED_GEMV_RUN",
-                (
-                    "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
-                    "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
-                ),
-            ),
-            (
-                PerfCalibration::SM_120,
-                "SM_120_PACKED_GEMV_RUN",
-                (
-                    "SM_120_PACKED_GEMV_COLS_WIDE",
-                    "SM_120_PACKED_GEMV_COLS_NARROW",
-                ),
-            ),
+        for entry in [
+            PerfCalibration::PORTABLE,
+            PerfCalibration::STRIX_HALO_HSA,
+            PerfCalibration::STRIX_HALO_VULKAN,
+            PerfCalibration::SM_120,
         ] {
             let PerfCalibration {
                 dense_gemv_cols,
-                packed_gemv_cols,
+                packed_gemv: _,
                 lds_gemv_width,
                 cost: _,
                 attention_key_blocks,
-                packed_gemv_max_run,
                 attention_split_min_steps,
             } = entry;
-            assert_provenance(row, packed_gemv_max_run);
             assert_provenance(
                 "PORTABLE_ATTENTION_SPLIT_MIN_STEPS",
                 attention_split_min_steps,
@@ -827,8 +817,6 @@ mod tests {
             // which are the same values): one row each, checked against whichever entry carries it.
             assert_provenance("STRIX_HALO_DENSE_GEMV_COLS_WIDE", dense_gemv_cols.wide);
             assert_provenance("STRIX_HALO_DENSE_GEMV_COLS_NARROW", dense_gemv_cols.narrow);
-            assert_provenance(cols_rows.0, packed_gemv_cols.wide);
-            assert_provenance(cols_rows.1, packed_gemv_cols.narrow);
             assert_provenance("STRIX_HALO_LDS_GEMV_WIDTH", lds_gemv_width);
             let [widest, narrowest] = attention_key_blocks else {
                 panic!("two key blocks, widest first: {attention_key_blocks:?}");
@@ -838,6 +826,41 @@ mod tests {
                 "STRIX_HALO_ATTENTION_KEY_BLOCK_NARROWEST",
                 *narrowest as u32,
             );
+        }
+        for (device, [latency, l1, dispatch, issue, resident]) in [
+            (
+                PerfCalibration::PORTABLE.packed_gemv,
+                [
+                    "PORTABLE_GEMV_DRAM_LATENCY_CYCLES",
+                    "PORTABLE_GEMV_L1_LINES_PER_CYCLE",
+                    "PORTABLE_GEMV_DISPATCH_CYCLES",
+                    "PORTABLE_GEMV_ISSUE_PER_CYCLE",
+                    "PORTABLE_GEMV_RESIDENT_LANES",
+                ],
+            ),
+            (
+                PerfCalibration::SM_120.packed_gemv,
+                [
+                    "SM_120_GEMV_DRAM_LATENCY_CYCLES",
+                    "SM_120_GEMV_L1_LINES_PER_CYCLE",
+                    "SM_120_GEMV_DISPATCH_CYCLES",
+                    "SM_120_GEMV_ISSUE_PER_CYCLE",
+                    "SM_120_GEMV_RESIDENT_LANES",
+                ],
+            ),
+        ] {
+            let GemvDevice {
+                dram_latency_cycles,
+                l1_lines_per_cycle,
+                dispatch_cycles,
+                issue_per_cycle,
+                resident_lanes,
+            } = device;
+            assert_provenance(latency, dram_latency_cycles);
+            assert_provenance(l1, l1_lines_per_cycle);
+            assert_provenance(dispatch, dispatch_cycles);
+            assert_provenance(issue, issue_per_cycle);
+            assert_provenance(resident, resident_lanes);
         }
         // The cost ratios: the portable prior is the unidentified devices' (RADV borrows it, sm_120 borrows all but the direct value), ROCm
         // gfx1151 has its own.
@@ -893,10 +916,6 @@ mod tests {
             "VECTOR_LOAD_BYTES",
             "STRIX_HALO_DENSE_GEMV_COLS_WIDE",
             "STRIX_HALO_DENSE_GEMV_COLS_NARROW",
-            "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
-            "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
-            "SM_120_PACKED_GEMV_COLS_WIDE",
-            "SM_120_PACKED_GEMV_COLS_NARROW",
             "STRIX_HALO_LDS_GEMV_WIDTH",
             "PORTABLE_LDS_READ_COST",
             "PORTABLE_STAGED_VALUE_COST",
@@ -914,9 +933,16 @@ mod tests {
             "SM90_MATRIX_FMA_RATE",
             "GEFORCE_MATRIX_FMA_RATE",
             "PORTABLE_ATTENTION_SPLIT_MIN_STEPS",
-            "PORTABLE_PACKED_GEMV_RUN",
-            "STRIX_HALO_PACKED_GEMV_RUN",
-            "SM_120_PACKED_GEMV_RUN",
+            "PORTABLE_GEMV_DRAM_LATENCY_CYCLES",
+            "PORTABLE_GEMV_L1_LINES_PER_CYCLE",
+            "PORTABLE_GEMV_DISPATCH_CYCLES",
+            "PORTABLE_GEMV_ISSUE_PER_CYCLE",
+            "PORTABLE_GEMV_RESIDENT_LANES",
+            "SM_120_GEMV_DRAM_LATENCY_CYCLES",
+            "SM_120_GEMV_L1_LINES_PER_CYCLE",
+            "SM_120_GEMV_DISPATCH_CYCLES",
+            "SM_120_GEMV_ISSUE_PER_CYCLE",
+            "SM_120_GEMV_RESIDENT_LANES",
         ]);
     }
 
@@ -982,9 +1008,9 @@ mod tests {
         );
     }
 
-    /// The packed Gemv run an unmeasured device plans with is the portable 8, whichever runtime drives it, and a
-    /// measured one carries its own: the launch a plan is made with names which. Mutation: make `figures` return
-    /// the measured run for `Portable`.
+    /// The packed Gemv figures an unmeasured device plans with are the portable prior's, whichever runtime drives it, and
+    /// a measured one carries its own: the launch a plan is made with names which. Mutation: make `figures` return
+    /// the measured figures for `Portable`.
     #[test]
     fn a_launch_carries_the_figures_of_its_calibration() {
         let launch = |calibrated| {
@@ -997,9 +1023,11 @@ mod tests {
         let portable = launch(Calibrated::Portable);
         let strix = launch(Calibrated::STRIX_HALO_HSA);
         let sm_120 = launch(Calibrated::SM_120);
-        assert_eq!(portable.calibrated.figures().packed_gemv_max_run, 8);
-        assert_eq!(strix.calibrated.figures().packed_gemv_max_run, 32);
-        assert_eq!(sm_120.calibrated.figures().packed_gemv_max_run, 16);
+        assert_eq!(
+            portable.calibrated.figures().packed_gemv,
+            PORTABLE_GEMV_DEVICE
+        );
+        assert_eq!(sm_120.calibrated.figures().packed_gemv, SM_120_GEMV_DEVICE);
         assert_ne!(
             portable, strix,
             "the launch must record which calibration it used"

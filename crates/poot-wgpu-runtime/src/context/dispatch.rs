@@ -10,6 +10,7 @@ use crate::{
 };
 use poot_codegen::CompiledKernel;
 use poot_runtime_common::BufferRole;
+use poot_target::ArgAccess;
 use std::borrow::Cow;
 use std::time::Duration;
 use wgpu::util::DeviceExt;
@@ -504,11 +505,15 @@ impl Context {
                 ..Default::default()
             })
         };
-        // All data slots are writable in the descriptor (the emitter emits writable buffers); only the
-        // length buffer is read-only. The error word (if any), right after it, is writable (the kernel
-        // atomically writes its trap code there).
-        let mut bgl_entries: Vec<wgpu::BindGroupLayoutEntry> =
-            (0..n as u32).map(|i| storage_entry(i, false)).collect();
+        // The descriptor matches the emitted SPIR-V: a `&[T]` data slot is read-only, a `&mut [T]` one is
+        // writable; the length buffer is read-only. The error word (if any), right after it, is
+        // writable (the kernel atomically writes its trap code there).
+        let mut bgl_entries: Vec<wgpu::BindGroupLayoutEntry> = kernel
+            .args()
+            .iter()
+            .zip(0u32..)
+            .map(|(arg, i)| storage_entry(i, arg.access() == ArgAccess::Read))
+            .collect();
         bgl_entries.push(storage_entry(n as u32, true));
         if needs_error_word {
             bgl_entries.push(storage_entry(n as u32 + 1, false));

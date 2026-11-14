@@ -3,6 +3,8 @@
     python3 benchmarks/calibration/fit_fragment_cost.py [rows.tsv]        print the figures and how they serve
     python3 benchmarks/calibration/fit_fragment_cost.py --check [rows.tsv]  fail unless crates/poot-target's
                                                                           figures are this fit's result
+    python3 benchmarks/calibration/fit_fragment_cost.py --heldout rows.tsv  score the shipped figures on rows of a
+                                                                          format the corpus does not hold (POOT-1565)
 
 `rows.tsv` (default `rocm-gfx1151.tsv`, recorded by `scripts/calibrate-launch rocm fragment`) holds one row per pinned
 schedule: the cell it was measured in, the device microseconds of its contraction and of its `expert_group` dispatch,
@@ -24,6 +26,10 @@ model chooses over the fastest measured schedule of the cell, the chosen schedul
 grid of one octave in four; among the optimal cells the one that fits the corpus best and has every neighbour optimal
 too (so a measurement shift of one grid step moves no decision). `group_scan` is the least-squares time of a scan step
 over the packed rows, in units of `a`.
+
+`--heldout` scores the figures `calibration.rs` ships, with the unit `a` they imply over `rocm-gfx1151.tsv`, on the cells
+of another file, and the same cells under the scalar model before POOT-1547: worst and mean regret of each. Nothing in
+that file is fitted.
 
 Stdlib only; the grid and the least squares are small.
 """
@@ -122,6 +128,39 @@ def fit(rows):
                 optimal=(ROUND_GRID[min(optimal)], ROUND_GRID[max(optimal)]), rows=len(rows))
 
 
+def regrets(rows, a, fragment_round, scan, grouped=True):
+    """The regret of the model's choice in every cell: `{cell: (regret, chosen row, fastest row)}`. With `grouped`
+    false no tiling is priced as grouped by expert, the scalar model before POOT-1547."""
+    cells = collections.defaultdict(list)
+    for r in rows:
+        cells[r["cell"]].append(r if grouped else dict(r, grouped=False))
+
+    def predicted(r):
+        total = a * units(r, fragment_round)
+        if r["grouped"]:
+            total += scan * a * 2 * math.ceil(GROUP_BUCKETS / GROUP_LANES) * r["rows"]
+        return total
+
+    result = {}
+    for name, cell in cells.items():
+        chosen = min(cell, key=predicted)
+        fastest = min(cell, key=lambda r: r["step"])
+        result[name] = (chosen["step"] / fastest["step"], chosen, fastest)
+    return result
+
+
+def heldout(corpus, rows):
+    """The shipped figures and the scalar model of before POOT-1547, each as `(worst, mean, per-cell regrets)` on the
+    cells of `rows`; the unit of each is its own least-squares scale over `corpus`."""
+    fragment_round, scan = constants()
+    served = regrets(rows, scale(corpus, fragment_round), fragment_round, scan)
+    scalar = regrets(rows, scale([dict(r, grouped=False) for r in corpus], 0.0), 0.0, 0.0, grouped=False)
+    return {
+        label: (max(v[0] for v in r.values()), sum(v[0] for v in r.values()) / len(r), r)
+        for label, r in (("shipped", served), ("scalar", scalar))
+    }
+
+
 def shipped(rows):
     """The scalar model with no fragment round and no grouping, as it chose before POOT-1547: every fragment tiling
     keeps its LDS reads and staged values."""
@@ -146,6 +185,14 @@ def constants():
 def main(argv):
     check = "--check" in argv
     paths = [a for a in argv if not a.startswith("--")]
+    if "--heldout" in argv:
+        corpus = load(HERE / "rocm-gfx1151.tsv")
+        for label, (worst, mean, cells) in heldout(corpus, load(paths[0])).items():
+            print(f"{label}: worst regret {worst:.3f}, mean {mean:.4f}")
+            for name, (regret, chosen, fastest) in sorted(cells.items()):
+                print(f"  {name:22s} {regret:.3f}  chose {chosen['precision']} {chosen['tile']} {chosen['step']:.0f} us,"
+                      f" fastest {fastest['precision']} {fastest['tile']} {fastest['step']:.0f} us")
+        return 0
     rows = load(paths[0] if paths else HERE / "rocm-gfx1151.tsv")
     result = fit(rows)
     old = shipped(rows)

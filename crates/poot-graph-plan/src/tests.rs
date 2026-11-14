@@ -5,7 +5,7 @@ use crate::dtype_widen::{bf16_const_feeds_only_packed_readers, widen_mismatched_
 use crate::graph_validation::ValidationPacketSource;
 use crate::planner::{Planned, fty_ty};
 use crate::predicates::{
-    ELEMENTWISE_2D_WIDTH, GemvFamily, GemvLaunch, GraphTables, dense_decode_gemv_in, gemv_launch,
+    ELEMENTWISE_2D_WIDTH, GemvLaunch, GraphTables, dense_decode_gemv_in, gemv_launch,
     is_elementwise_2d_in, lds_gemv_width,
 };
 use crate::refusal::RefusalDtypes;
@@ -6299,7 +6299,7 @@ fn a_gemv_reads_activation_vectors_only_where_every_run_is_a_whole_aligned_group
 /// `try_plan_contraction`'s longest binding; the `[65536, 5120]` row goes red.
 #[test]
 fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lowers_it() {
-    let packed_dispatch = |backend: Backend, caps: DeviceCaps, n: usize, k: usize| -> Dispatch {
+    let packed_gemv = |backend: Backend, caps: DeviceCaps, n: usize, k: usize| -> (Dispatch, u32) {
         let builder = Builder::for_tests();
         let x = builder
             .slot_named(
@@ -6323,36 +6323,49 @@ fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lo
                 .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .unwrap_or_else(|error| panic!("packed {backend:?} [{n}, {k}]: {error}"));
-        let (_, plan) = program
+        let (eqn, plan) = program
             .planned()
             .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
             .expect("a planned packed contraction");
-        plan.single()
+        let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
+            kg::PackedContraction {
+                schedule: Schedule::Gemv { unroll, .. },
+                ..
+            },
+        ))) = program.kernel_choice(eqn)
+        else {
+            panic!("a decode packed contraction is a generated Gemv request");
+        };
+        let dispatch = plan
+            .single()
             .unwrap_or_else(|| panic!("one Gemv dispatch, got {plan:?}"))
-            .clone()
+            .clone();
+        (dispatch, *unroll)
     };
-    // The generator's Gemv overshoot at 256 lanes and a `run`-element lane run.
+    let packed_dispatch = |backend: Backend, caps: DeviceCaps, n: usize, k: usize| -> Dispatch {
+        packed_gemv(backend, caps, n, k).0
+    };
+    // The generator's Gemv overshoot at 256 lanes and a `run`-element lane run, the run the planner chose.
     let gemv_slack = |run: u32| 256 * run + run + 256 + 64;
-    // The measured part (sm_120) runs 16 elements per lane; an unmeasured NVIDIA part runs the portable 8.
     let sm_120 = DeviceCaps {
         perf_calibration: poot_target::calibration::Calibrated::SM_120,
         ..default_caps_for(Backend::Nvptx)
     };
-    let narrowed = packed_dispatch(Backend::Nvptx, sm_120, 64, 256);
+    let (narrowed, run) = packed_gemv(Backend::Nvptx, sm_120, 64, 256);
     assert_eq!(
         narrowed.body().index_width,
         poot_kernel_ir::IndexWidth::U32(poot_kernel_ir::IndexBound {
             scale: 32,
-            slack: gemv_slack(16)
+            slack: gemv_slack(run)
         }),
         "Q4_K [64, 256] on sm_120"
     );
-    let portable = packed_dispatch(Backend::Nvptx, default_caps_for(Backend::Nvptx), 64, 256);
+    let (portable, run) = packed_gemv(Backend::Nvptx, default_caps_for(Backend::Nvptx), 64, 256);
     assert_eq!(
         portable.body().index_width,
         poot_kernel_ir::IndexWidth::U32(poot_kernel_ir::IndexBound {
             scale: 32,
-            slack: gemv_slack(8)
+            slack: gemv_slack(run)
         }),
         "Q4_K [64, 256] on an unmeasured NVIDIA part"
     );
@@ -6409,7 +6422,7 @@ fn dense_gemv_columns_stay_narrow_on_unknown_compute_units() {
         compute_units: Queried::Unknown,
         ..caps
     };
-    let cols = |n, caps: &DeviceCaps| gemv_launch(n, GemvFamily::Dense, caps).cols;
+    let cols = |n, caps: &DeviceCaps| gemv_launch(n, caps).cols;
     assert_eq!(cols(n, &caps), 4, "known, filled");
     assert_eq!(cols(n, &unknown), 2, "unknown");
     assert_eq!(cols(8, &caps), 2, "known, starved");
@@ -6445,7 +6458,7 @@ fn dense_bf16_decode_gemv_selection_rows() {
             dense_decode_gemv_in(eqn, &out_shape, out_numel, None, &caps).unwrap_or_else(|| {
                 panic!("{backend:?}: the dense Gemv must take the M == 1 contraction")
             });
-        assert_eq!(launch, gemv_launch(n, GemvFamily::Dense, &caps));
+        assert_eq!(launch, gemv_launch(n, &caps));
         let GemvLaunch { width, unroll, .. } = launch;
         // K = 32 and the 4-element run put every run on a 16-byte group: NVPTX reads them as vectors.
         let activation = if backend == Backend::Nvptx {

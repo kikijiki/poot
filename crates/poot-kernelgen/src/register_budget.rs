@@ -1114,7 +1114,7 @@ fn the_planned_packed_expert_tilings_spill_no_register() {
 /// does not admit is refused by the request (`ExceedsBound`) before any body exists. The bound is
 /// [`crate::Schedule::gemv_loop_registers`] against the lane's `loop_registers` budget. The sweep covers every block
 /// format (2- to 8-bit codes, with and without sub-block factors and lattices) at runs of 8, 16 and, where the
-/// format shares its factors across 32 values, 32 (the runs the planner plans, `gemv_run`), and every planar format
+/// format shares its factors across 32 values, 32 (the runs the planner plans, `runs_of`), and every planar format
 /// (FP8, FP4, GPTQ, AWQ) at the same runs, and a dense bf16 weight at
 /// runs of 4 and 8, over 256 lanes. It prints the compiler's count beside the model's so the bound can be read against
 /// the hardware. Mutation: make `require_gemv_registers` return `Ok(())`; the geometries the bound refuses are

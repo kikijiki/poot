@@ -22,8 +22,8 @@ pub(crate) use indexed::packed_run_carried_registers;
 pub use indexed::packed_run_held_registers;
 pub(crate) use kernel::packed_contraction;
 pub use kernel::{
-    PackedKernelOp, PackedKernelSpec, PackedRunSharing, packed_kernel, packed_run_sharing,
-    packed_value_bits,
+    PackedKernelOp, PackedKernelSpec, PackedRunSharing, packed_gemv_body_cost, packed_kernel,
+    packed_run_sharing, packed_value_bits,
 };
 
 #[cfg(test)]

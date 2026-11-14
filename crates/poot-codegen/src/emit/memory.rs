@@ -224,7 +224,7 @@ impl<'a> Emitter<'a> {
                 Ok((p, elem_llty, 1))
             }
             Target::SpirvVulkan => {
-                let (bufty, mangle) = self.spirv_buf(&elem, true)?;
+                let (bufty, mangle) = self.spirv_buf(&elem, self.param_writable(place.local))?;
                 let p = self.fresh();
                 let _ = writeln!(
                     w,
@@ -276,7 +276,7 @@ impl<'a> Emitter<'a> {
         w: &mut String,
     ) -> Result<(String, String, u32), EmitError> {
         let elem_llty = self.scalar_llty(vec_ty)?;
-        let (bufty, mangle) = self.spirv_buf(vec_ty, true)?;
+        let (bufty, mangle) = self.spirv_buf(vec_ty, self.param_writable(param))?;
         let p = self.fresh();
         let _ = writeln!(
             w,
@@ -337,7 +337,7 @@ impl<'a> Emitter<'a> {
             return Ok((v, vec_llty));
         }
         let lane_llty = self.scalar_llty(elem)?;
-        let (bufty, mangle) = self.spirv_buf(elem, true)?;
+        let (bufty, mangle) = self.spirv_buf(elem, self.param_writable(place.local))?;
         let lane_align = align_of(&lane_llty);
         let mut vector = "poison".to_string();
         for lane in 0..*lanes {

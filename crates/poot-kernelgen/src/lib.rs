@@ -63,8 +63,9 @@ pub use stable_rank::{STABLE_RANK_MAX_LANES, StableRankSpec};
 pub use contraction::{CostFit, fit_cost_ratios};
 pub use contraction::{
     CostTerms, DenseTiledWeight, Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep, Feasibility,
-    GemvActivation, GemvRows, GemvShape, LoadDepth, RegisterTiling, RunLength, Schedule, Selection,
-    SpillCheck, StagedWeight, TileSize, TiledRows, TiledShape, probe_body,
+    GemvActivation, GemvBodyCost, GemvRows, GemvShape, LaneMap, LoadDepth, RegisterTiling,
+    RunLength, Schedule, Selection, SpillCheck, StagedWeight, TileSize, TiledRows, TiledShape,
+    probe_body,
 };
 pub use fused::{
     FusedInput, FusedKernel, FusedScalarOp, FusedStep, LaneId, LeafId, LeafTy, RowKernel, RowOp,
@@ -94,8 +95,8 @@ pub use fused::{
 pub use gemv::attn_scores_v_gemv_lds;
 pub use matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
 pub use packed::{
-    PackedRunSharing, packed_kernel, packed_run_held_registers, packed_run_sharing,
-    packed_value_bits,
+    PackedRunSharing, packed_gemv_body_cost, packed_kernel, packed_run_held_registers,
+    packed_run_sharing, packed_value_bits,
 };
 pub use reduce::reduce_last_dt;
 

@@ -172,7 +172,8 @@ impl<'a> Emitter<'a> {
     // ---- SPIR-V buffer type helpers ------------------------------------------------------------
 
     /// (buffer target type, intrinsic mangle) for a data buffer of `elem`. `writable` selects the
-    /// `(...,12,1)` shape (poot always emits writable data buffers; only the length buffer is read-only).
+    /// `(...,12,1)` shape; a `&[T]` param and the length buffer are declared `(...,12,0)`, which the SPIR-V
+    /// backend lowers to `NonWritable`.
     pub(super) fn spirv_buf(
         &self,
         elem: &Ty,

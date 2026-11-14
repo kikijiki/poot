@@ -382,11 +382,19 @@ run_lane_tests() {
   local inventory=$1
   local only=${2:-}
   local exclusions
+  # One `binary_id(..) & (test(..) | ..)` group per binary, not one per test: the filter is a single argv
+  # string, and Linux refuses one over 131072 bytes (MAX_ARG_STRLEN), which the per-test form had reached.
   exclusions=$(awk -F '\t' '
     NR > 1 && $3 != "model-free" {
-      printf "%s(binary_id(=%s) & test(=%s))", sep, $2, $4
-      sep = " | "
+      if ($2 != binary) {
+        if (binary != "") printf ")) | "
+        printf "(binary_id(=%s) & (test(=%s)", $2, $4
+        binary = $2
+      } else {
+        printf " | test(=%s)", $4
+      }
     }
+    END { if (binary != "") printf "))" }
   ' "$inventory")
   local -a package_args=() filter=()
   while IFS= read -r -d '' arg; do

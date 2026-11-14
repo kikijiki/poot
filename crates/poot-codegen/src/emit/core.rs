@@ -196,6 +196,16 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Whether slice param `l` is a `&mut [T]`. A SPIR-V buffer is declared `NonWritable` exactly when its
+    /// param is a shared slice, so WebGPU's rule on overlapping writable bindings never applies to a
+    /// kernel's inputs (POOT-1575).
+    pub(super) fn param_writable(&self, l: Local) -> bool {
+        matches!(
+            self.body.locals[l.index as usize].ty,
+            Ty::Ref { mutable: true, .. }
+        )
+    }
+
     // ---- driver --------------------------------------------------------------------------------
 
     pub(super) fn run(&mut self) -> Result<(), EmitError> {
@@ -427,7 +437,7 @@ impl<'a> Emitter<'a> {
         if self.target == Target::SpirvVulkan {
             for p in self.body.params() {
                 let elem = self.param_bind_ty(p)?;
-                let (bufty, mangle) = self.spirv_buf(&elem, true)?;
+                let (bufty, mangle) = self.spirv_buf(&elem, self.param_writable(p))?;
                 let _ = writeln!(
                     w,
                     "  %h{} = tail call {bufty} @llvm.spv.resource.handlefrombinding.{mangle}(i32 0, i32 {bind}, i32 1, i32 0, ptr nonnull @.pn{bind})",

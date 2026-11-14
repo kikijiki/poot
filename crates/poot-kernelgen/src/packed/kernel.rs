@@ -16,8 +16,9 @@ use super::source::Source;
 use crate::KernelGenError;
 use crate::PackedRows;
 use crate::contraction::{
-    BoundEpilogue, Epilogue, GemvLaunch, Phased, RunAt, Schedule, TiledBody, TiledExtents,
-    TiledLaunch, TiledWeight, gemv_body, tiled_body,
+    BoundEpilogue, Epilogue, GemvActivation, GemvBodyCost, GemvLaunch, GemvRows, LoadDepth, Phased,
+    RunAt, Schedule, StagedWeight, TiledBody, TiledExtents, TiledLaunch, TiledWeight, gemv_body,
+    tiled_body,
 };
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, WeightLayout, elem, guard, ld, local, slice_dtype, slice_f32};
@@ -97,6 +98,83 @@ pub fn packed_value_bits(format: WeightFormat) -> u32 {
             .find(|operand| operand.role == poot_quant::format::PlanarRole::Codes)
             .map_or(32, |operand| operand.bits),
     }
+}
+
+/// The cost of one trip of the Gemv `schedule` over a `format` weight, read off the body it generates
+/// ([`GemvBodyCost`], POOT-1562): the planner's input for scoring a launch geometry. A schedule whose lane would hold
+/// more registers than `caps` budgets for a loop is the same typed refusal its generator gives, so a planner
+/// enumerating candidates reads the register bound from here and holds none of its own.
+///
+/// A trip's instructions and loads depend on the run, the rows, the depth and the activation read, not on the
+/// workgroup's column count, and the register bound on those and the width: one answer per such key serves every
+/// `cols`, and a planner scores hundreds of candidates per site, so it is memoized per thread.
+pub fn packed_gemv_body_cost(
+    format: WeightFormat,
+    schedule: Schedule,
+    caps: &poot_target::DeviceCaps,
+) -> Result<GemvBodyCost, KernelGenError> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    const GENERATOR: &str = "packed_gemv_body_cost";
+    let Schedule::Gemv {
+        width,
+        unroll,
+        activation,
+        rows,
+        depth,
+        ..
+    } = schedule
+    else {
+        return Err(KernelGenError::Unsupported {
+            request: GENERATOR,
+            reason: "only a Gemv has a trip cost",
+        });
+    };
+    type Key = (
+        WeightFormat,
+        (u32, u32),
+        (GemvActivation, GemvRows, LoadDepth),
+        RoundingConversions,
+        u32,
+    );
+    thread_local! {
+        static COSTS: RefCell<HashMap<Key, Result<GemvBodyCost, KernelGenError>>> = RefCell::new(HashMap::new());
+    }
+    let budget = caps.gemm_launch().register_budget.loop_registers(width);
+    let key = (
+        format,
+        (width, unroll),
+        (activation, rows, depth),
+        caps.rounding_conversions,
+        budget,
+    );
+    if let Some(cost) = COSTS.with(|costs| costs.borrow().get(&key).cloned()) {
+        return cost;
+    }
+    let cost = (|| {
+        schedule.require_gemv_registers(StagedWeight::Packed(format), caps, GENERATOR)?;
+        // One lane on one column: the trip's statements do not depend on the lane map.
+        let launch = GemvLaunch::new(1, 1, unroll, activation, rows, depth)?;
+        let body = contraction_gemv(
+            GENERATOR,
+            format,
+            launch,
+            None,
+            PackedRows::Blocks,
+            caps.rounding_conversions,
+        )?;
+        let weight_stride = f64::from(unroll) * f64::from(packed_value_bits(format)) / 8.0;
+        let activation_stride = f64::from(unroll) * size_of::<f32>() as f64;
+        GemvBodyCost::of_trip(&body, weight_stride, activation_stride).ok_or(
+            KernelGenError::Unsupported {
+                request: GENERATOR,
+                reason: "the generated Gemv has no K loop",
+            },
+        )
+    })();
+    COSTS.with(|costs| costs.borrow_mut().insert(key, cost.clone()));
+    cost
 }
 
 /// The packed operand load of a [`crate::ContractionSpec`]: `format`'s descriptor-driven decode served to

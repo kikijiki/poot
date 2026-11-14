@@ -423,6 +423,7 @@ poot-wgpu-runtime	tests::storage_checked_write_tests::write_into_a_buffer_retagg
 poot-wgpu-runtime	tests::storage_checked_write_tests::write_into_a_genuinely_mismatched_buffer_is_refused
 poot-wgpu-runtime	tests::vec4_probe_tests::vec4_load_store_runs_on_gpu
 poot-wgpu-runtime::device_caps	wgpu_device_caps_matches_a_direct_adapter_query
+poot-wgpu-runtime::dispatch_probe	an_input_bound_as_the_output_of_one_dispatch_is_a_validation_error_on_gpu
 poot-wgpu-runtime::dispatch_probe	mixed_scalar_vec4_two_bindings_alias_one_buffer_runs_on_gpu
 poot-wgpu-runtime::run_add	add_device_resident
 poot-wgpu-runtime::run_add	add_runs_on_gpu

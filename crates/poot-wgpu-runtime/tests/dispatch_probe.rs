@@ -145,9 +145,10 @@ fn mixed_scalar_vec4_one_binding_is_rejected_by_spirv_val() {
 /// Case 2, positive half (P1 fallback design): the same GPU buffer bound at two binding indices,
 /// binding 0 as scalar `[0 x float]` and binding 1 as vec4 `[0 x <4 x float>]`
 /// (`C2_mixed_scalar_vec4_two_bindings_WORKS.ll`), via `dispatch_dev` with the same `DeviceBuffer` as
-/// the sole `ins` entry (binding 0) and `out` (binding 1). poot_wgpu_runtime's binding API already
-/// supports one logical buffer with two typed views; only poot-codegen needs per-param dtype-view
-/// emission for P1.
+/// both `ins` entries; the result goes to a separate `out` (binding 2), because an input slot is
+/// read-only and WebGPU forbids a writable view of a buffer another binding reads. poot_wgpu_runtime's
+/// binding API already supports one logical buffer with two typed views; only poot-codegen needs
+/// per-param dtype-view emission for P1.
 #[test]
 fn mixed_scalar_vec4_two_bindings_alias_one_buffer_runs_on_gpu() {
     require_tools(&["llc", "spirv-val"]);
@@ -157,13 +158,15 @@ fn mixed_scalar_vec4_two_bindings_alias_one_buffer_runs_on_gpu() {
     let ll = include_str!("fixtures/dispatch_probe/C2_mixed_scalar_vec4_two_bindings_WORKS.ll");
     let spv = compile_and_validate(ll, "c2_mixed_two_bindings");
 
-    // layout: [0..4) vec4 "body", [4] scalar "tail", [5] written result; padded to 8 so the buffer is a
-    // vec4 multiple.
+    // layout: [0..4) vec4 "body", [4] scalar "tail"; padded to 8 so the buffer is a vec4 multiple. The
+    // result lands in a separate one-word output.
     let data = [10.0f32, 20.0, 30.0, 40.0, 50.0, 0.0, 0.0, 0.0];
     let shared: DeviceBuffer = ctx.upload_f32(&data);
+    let result: DeviceBuffer = ctx.upload_f32(&[0.0]);
     let kernel = kernel_from_spv(
         &spv,
         vec![
+            ArgSchema::new(ElementKind::F32, ArgAccess::Read),
             ArgSchema::new(ElementKind::F32, ArgAccess::Read),
             ArgSchema::new(ElementKind::F32, ArgAccess::Write),
         ],
@@ -173,17 +176,60 @@ fn mixed_scalar_vec4_two_bindings_alias_one_buffer_runs_on_gpu() {
         &kernel,
         [1, 1, 1],
         [1, 1, 1],
-        &[&shared], // binding 0: scalar view
-        &shared,    // binding 1: vec4 view - the SAME wgpu buffer, aliased
+        &[&shared, &shared], // bindings 0 (scalar view) and 1 (vec4 view): the SAME wgpu buffer, read-only
+        &result,
     )
     .expect("dispatch");
 
-    let out = ctx.download_f32(&shared).expect("readback");
+    let out = ctx.download_f32(&result).expect("readback");
     let vsum = data[0] + data[1] + data[2] + data[3]; // 100
     let want_total = vsum + data[4]; // + tail (50) = 150
     assert_eq!(
-        out[5], want_total,
-        "binding-0 write of a binding-1 vec4 read + binding-0 scalar read: both views must see the \
-         same underlying buffer"
+        out[0], want_total,
+        "a binding-1 vec4 read + a binding-0 scalar read: both views must see the same underlying buffer"
     );
+}
+
+/// POOT-1575 (W5 of POOT-1566): an input slot is declared read-only in the bind group layout, so one buffer
+/// bound as an input and as the output of one dispatch is a wgpu validation error ("conflicting usages":
+/// a read-only and an exclusive writable use of one buffer). Before, every data slot was declared writable
+/// and the dispatch passed, which WebGPU's writable-aliasing rule forbids.
+///
+/// Mutation (red): declare every data slot writable again in `Context::dispatch_dev`'s layout
+/// (`storage_entry(i, false)` in `Context::cached_pipeline`); the dispatch no longer panics.
+#[test]
+fn an_input_bound_as_the_output_of_one_dispatch_is_a_validation_error_on_gpu() {
+    require_tools(&["llc", "spirv-val"]);
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
+    };
+    let ll = include_str!("fixtures/dispatch_probe/C2_mixed_scalar_vec4_two_bindings_WORKS.ll");
+    let spv = compile_and_validate(ll, "c2_input_as_output");
+    let shared: DeviceBuffer = ctx.upload_f32(&[10.0f32, 20.0, 30.0, 40.0, 50.0, 0.0, 0.0, 0.0]);
+    let kernel = kernel_from_spv(
+        &spv,
+        vec![
+            ArgSchema::new(ElementKind::F32, ArgAccess::Read),
+            ArgSchema::new(ElementKind::F32, ArgAccess::Read),
+            ArgSchema::new(ElementKind::F32, ArgAccess::Write),
+        ],
+    );
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ctx.dispatch_dev(
+            "c2_input_as_output",
+            &kernel,
+            [1, 1, 1],
+            [1, 1, 1],
+            &[&shared, &shared],
+            &shared,
+        );
+        let _ = ctx.download_f32(&shared);
+    }))
+    .expect_err("the dispatch must be refused by wgpu validation");
+    let message = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| refused.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default();
+    assert!(message.contains("conflicting usages"), "{message}");
 }

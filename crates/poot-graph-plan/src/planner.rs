@@ -216,6 +216,7 @@ mod block_top_k;
 mod cast;
 mod choice;
 mod elementwise;
+mod gemv_geometry;
 mod matmul;
 mod moe;
 mod movement;
