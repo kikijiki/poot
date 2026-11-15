@@ -255,6 +255,7 @@ poot-kernelgen::index_cast_interp	an_exact_i32_chain_then_a_cast_then_float_arit
 poot-kernelgen::indexed_interp	an_f16_packed_indexed_weight_is_refused_by_name	kernelgen `indexed_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::indexed_interp	an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read	kernelgen `indexed_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::indexed_interp	indexed_gemv_rows_and_depth_do_not_change_a_sum	kernelgen `indexed_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::kernelgen_error_families	a_layout_past_its_source_is_refused	kernelgen `kernelgen_error_families` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::kernelgen_error_families	a_two_byte_float_is_only_ever_a_select_branch	kernelgen `kernelgen_error_families` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::kernelgen_error_families	concat_family_rejects_zero_inputs	kernelgen `kernelgen_error_families` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::kernelgen_error_families	float_region_rejects_a_cast_of_a_float_operand_and_mixed_arithmetic	kernelgen `kernelgen_error_families` test binary (emit, interpreter or dispatch rows); the lane runs the package whole

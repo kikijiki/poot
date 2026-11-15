@@ -18,6 +18,10 @@
 # Card 675: the Gumbel-max sampler's SC-001 (sample_gumbel_no_contract.rs) - the
 # committed production asset dispatched on a fixture where FMA contraction would flip the winner.
 #
+# POOT-1577: the register-oracle rows compare the driver's verdicts with a table of the part they run on (sm_120 ptxas' sweep,
+# sm_86 and sm_89 the driver's own; crates/poot-ptx-device/tests/data): the narrow kernels near the 255-register ceiling spill
+# on one part and not on another. A pod on a part with no table fails those rows by name: sweep it and add its table.
+#
 # POOT-1124: the split-KV decode attention (split_kv_decode.rs) against the CPU oracle at the named tolerance, and its
 # captured replay bit-identical to the recording pass. The two-device row is in ptx-2gpu.txt.
 poot-kernelgen	packed::planar_ptx_tests::contraction_gemv_matches_reference_for_every_planar_format_on_ptx

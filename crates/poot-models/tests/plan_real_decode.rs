@@ -503,7 +503,7 @@ fn amdgcn_view_promotion_matches_spirv_on_real_qwen2_decode_configs() {
 
 /// Card 549 SC-003 (R-546-9): the same fixture plans the same number of views on Nvptx as on
 /// AmdGcn, now that `poot_codegen::capability(Nvptx).strided_views` is `true` - every
-/// `is_strided_capable` kernel body PTX dispatches is the same backend-neutral `poot-kernelgen`
+/// layout-reading kernel body PTX dispatches is the same backend-neutral `poot-kernelgen`
 /// body wgpu/ROCm already read strided operands through, so there was never a codegen reason for
 /// PTX alone to pay the extra materialize copy. GPU-free (planning only). Mirrors
 /// `amdgcn_view_promotion_matches_spirv_on_real_qwen2_decode_configs` above, against Nvptx

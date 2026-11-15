@@ -41,7 +41,7 @@ fn concat2_plan_selection() {
             "{dt:?} {backend:?}: one dispatch, no metadata buffer"
         );
         let KernelChoice::Generated(poot_kernelgen::KernelRequest::Movement(MovementSpec {
-            op: MovementOp::Concat { axis, in_shapes },
+            op: MovementOp::Concat { axis, inputs },
             out_shape,
             ..
         })) = choice_
@@ -49,7 +49,10 @@ fn concat2_plan_selection() {
             panic!("{dt:?} {backend:?}: expected the generated concat");
         };
         assert_eq!(axis, 1);
-        assert_eq!(in_shapes, [vec![2, 3], vec![2, 5]]);
+        assert_eq!(
+            inputs,
+            [vec![2, 3], vec![2, 5]].map(poot_kernelgen::MovementRead::contiguous)
+        );
         assert_eq!(out_shape, [2, 8]);
     }
 }

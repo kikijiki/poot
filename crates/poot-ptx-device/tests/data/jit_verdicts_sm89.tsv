@@ -1,0 +1,829 @@
+# POOT-1577 sm_89 JIT verdicts of the same 826 kernels as ptxas_sweep_sm120.tsv, taken on a secure RTX 4090 pod (xw89bxx49ocnhd, cuDriverGetVersion 13020, 2026-11-14): the driver JIT's own register count and local-memory verdict (cuModuleLoadData, CU_FUNC_ATTRIBUTE_NUM_REGS / LOCAL_SIZE_BYTES) of the sm_80 PTX the planner emits for the sm_120 sweep's tilings. ptxas was not run on this part, so this table says what the driver compiles here, not that ptxas agrees; the ptxas comparison is the sm_120 table's.
+# Why a table of its own: the exact kernels agree with sm_120 on every verdict, but 55 narrow (f16 fragment) kernels sit near the 255-register ceiling and the JIT's allocation differs by compute capability: they spill on one part and not on another (44 spill on sm_120 and hold here, 11 the reverse).
+# shape_id	rows	precision	block	schedule	jit_regs	spills
+D1	16	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 4, run: 4 }	108	0
+D1	16	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 8, run: 4 }	191	0
+D1	16	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	67	0
+D1	16	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	128	0
+D1	16	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 4, run: 4 }	80	0
+D1	16	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 8, run: 4 }	159	0
+D1	16	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+D1	16	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	120	0
+D1	16	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	124	0
+D1	16	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	214	0
+D1	16	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	255	0
+D1	16	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D1	16	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	168	0
+D1	16	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	0
+D1	16	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	254	0
+D1	16	narrow	128	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	170	0
+D1	16	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	168	0
+D1	16	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	170	0
+D1	16	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 32 }	154	0
+D1	16	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	254	1
+D1	16	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+D1	16	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	168	0
+D1	16	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	168	0
+D1	16	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+D1	16	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	168	0
+D1	16	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+D1	16	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	138	0
+D1	16	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	255	0
+D1	16	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	242	0
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	178	0
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	168	0
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	222	0
+D1	16	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	202	0
+D1	16	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D1	16	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	220	0
+D1	16	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	219	0
+D1	2048	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 4, run: 4 }	108	0
+D1	2048	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 8, run: 4 }	191	0
+D1	2048	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	67	0
+D1	2048	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	128	0
+D1	2048	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 4, run: 4 }	80	0
+D1	2048	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 8, run: 4 }	159	0
+D1	2048	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+D1	2048	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	120	0
+D1	2048	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	124	0
+D1	2048	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	214	0
+D1	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	255	0
+D1	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D1	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	168	0
+D1	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	0
+D1	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	254	0
+D1	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	170	0
+D1	2048	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	168	0
+D1	2048	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	170	0
+D1	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 32 }	154	0
+D1	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	254	1
+D1	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+D1	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	168	0
+D1	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	168	0
+D1	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+D1	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	168	0
+D1	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+D1	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	138	0
+D1	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	255	0
+D1	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	242	0
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	178	0
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	168	0
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	222	0
+D1	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	202	0
+D1	2048	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D1	2048	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	220	0
+D1	2048	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	219	0
+D1	512	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 4, run: 4 }	108	0
+D1	512	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 8, run: 4 }	191	0
+D1	512	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	67	0
+D1	512	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	128	0
+D1	512	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 4, run: 4 }	80	0
+D1	512	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 8, run: 4 }	159	0
+D1	512	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+D1	512	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	120	0
+D1	512	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	124	0
+D1	512	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	214	0
+D1	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	255	0
+D1	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D1	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	168	0
+D1	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	0
+D1	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	254	0
+D1	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	170	0
+D1	512	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	168	0
+D1	512	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	170	0
+D1	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 32 }	154	0
+D1	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	254	1
+D1	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+D1	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	168	0
+D1	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	168	0
+D1	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+D1	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	168	0
+D1	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+D1	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	138	0
+D1	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	255	0
+D1	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	242	0
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	178	0
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	168	0
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	222	0
+D1	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	202	0
+D1	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D1	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	220	0
+D1	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	219	0
+D2	512	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 4, run: 4 }	118	0
+D2	512	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 8, run: 4 }	173	0
+D2	512	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	64	0
+D2	512	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	128	0
+D2	512	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 4, run: 4 }	80	0
+D2	512	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 8, run: 4 }	168	0
+D2	512	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+D2	512	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	128	0
+D2	512	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	120	0
+D2	512	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	232	0
+D2	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	252	0
+D2	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D2	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	166	0
+D2	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	254	0
+D2	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	254	0
+D2	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	166	0
+D2	512	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	167	0
+D2	512	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	166	0
+D2	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	0
+D2	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	241	0
+D2	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	244	0
+D2	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	228	0
+D2	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	167	0
+D2	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	166	0
+D2	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	0
+D2	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	166	0
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	168	0
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	0
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	0
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	255	0
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D2	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	0
+D2	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	248	0
+D2	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	0
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	236	0
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	165	0
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	168	0
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	0
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	0
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	175	0
+D2	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	169	0
+D2	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	124	0
+D2	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	174	0
+D2	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	178	0
+D3	512	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 4, run: 4 }	80	0
+D3	512	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 8, run: 4 }	128	0
+D3	512	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	48	0
+D3	512	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	80	0
+D3	512	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 4, run: 4 }	64	0
+D3	512	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 8, run: 4 }	127	0
+D3	512	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	62	0
+D3	512	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	80	0
+D3	512	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	124	0
+D3	512	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	168	0
+D3	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	250	0
+D3	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D3	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	252	0
+D3	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	252	0
+D3	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	164	0
+D3	512	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	127	0
+D3	512	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	128	0
+D3	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	166	0
+D3	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	166	0
+D3	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+D3	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	168	0
+D3	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	254	1
+D3	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	168	0
+D3	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	254	0
+D3	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+D3	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	238	0
+D3	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	254	0
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	254	0
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	168	0
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	168	0
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	126	0
+D3	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	230	0
+D3	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+D3	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	164	0
+D3	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D3	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	252	0
+D3	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	164	0
+D3	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	252	0
+D3	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D3	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	168	0
+D3	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	254	0
+D3	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	252	0
+D3	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	126	0
+D3	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	162	0
+D3	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D3	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	126	0
+D3	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	166	0
+D4	2048	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 4, run: 4 }	64	0
+D4	2048	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 8, run: 4 }	128	0
+D4	2048	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	40	0
+D4	2048	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	71	0
+D4	2048	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 4, run: 4 }	64	0
+D4	2048	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 8, run: 4 }	96	0
+D4	2048	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	40	0
+D4	2048	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	79	0
+D4	2048	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	96	0
+D4	2048	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	168	0
+D4	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+D4	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D4	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	252	0
+D4	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	252	0
+D4	2048	narrow	128	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	126	0
+D4	2048	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	166	0
+D4	2048	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	127	0
+D4	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+D4	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	254	0
+D4	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	254	0
+D4	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	126	0
+D4	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	248	0
+D4	2048	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	168	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	170	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	254	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	168	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	254	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	96	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	168	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	254	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	100	0
+D4	2048	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	128	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	253	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	254	1
+D4	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D4	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D4	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	166	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	254	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	254	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	128	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	126	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	104	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	126	0
+D4	2048	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	128	0
+D5	512	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 4, run: 4 }	64	0
+D5	512	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 8, run: 4 }	128	0
+D5	512	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	40	0
+D5	512	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	71	0
+D5	512	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 4, run: 4 }	64	0
+D5	512	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 8, run: 4 }	96	0
+D5	512	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	40	0
+D5	512	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	79	0
+D5	512	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	96	0
+D5	512	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	168	0
+D5	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+D5	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D5	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	252	0
+D5	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	252	0
+D5	512	narrow	128	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	126	0
+D5	512	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	166	0
+D5	512	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	128	0
+D5	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	176	0
+D5	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	252	0
+D5	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	254	0
+D5	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D5	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	184	0
+D5	512	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+D5	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	166	0
+D5	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	172	0
+D5	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	254	0
+D5	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	0
+D5	512	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+D5	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	176	0
+D5	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	96	0
+D5	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	166	0
+D5	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	254	0
+D5	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	100	0
+D5	512	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	128	0
+D5	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+D5	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	253	0
+D5	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	255	1
+D5	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+D5	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+D5	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	0
+D5	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+D5	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	166	0
+D5	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	254	0
+D5	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	254	0
+D5	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	128	0
+D5	512	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	126	0
+D5	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	104	0
+D5	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	128	0
+D5	512	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	128	0
+G1	128	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	80	0
+G1	128	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	162	0
+G1	128	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+G1	128	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	128	0
+G1	128	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	166	0
+G1	128	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	254	0
+G1	128	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	128	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	252	0
+G1	128	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	128	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+G1	128	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	244	0
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	246	0
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	230	0
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	230	0
+G1	128	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	217	0
+G1	128	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+G1	128	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	230	0
+G1	128	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	226	0
+G1	1280	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 4, run: 4 }	127	0
+G1	1280	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 8, run: 4 }	183	0
+G1	1280	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	80	0
+G1	1280	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	162	0
+G1	1280	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 4, run: 4 }	113	0
+G1	1280	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 8, run: 4 }	168	0
+G1	1280	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+G1	1280	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	128	0
+G1	1280	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	166	0
+G1	1280	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	254	0
+G1	1280	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	252	0
+G1	1280	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	1280	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	230	0
+G1	1280	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	255	1
+G1	1280	narrow	128	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	176	0
+G1	1280	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	222	0
+G1	1280	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	170	0
+G1	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	252	0
+G1	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	234	0
+G1	1280	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	234	0
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	200	0
+G1	1280	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	250	0
+G1	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+G1	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	244	0
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	246	0
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	230	0
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	230	0
+G1	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	217	0
+G1	1280	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+G1	1280	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	230	0
+G1	1280	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	226	0
+G1	20480	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 4, run: 4 }	127	0
+G1	20480	exact	128	RegisterTiled { lanes: 16, rows: 8, cols: 8, run: 4 }	183	0
+G1	20480	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	80	0
+G1	20480	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	162	0
+G1	20480	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 4, run: 4 }	113	0
+G1	20480	exact	32	RegisterTiled { lanes: 8, rows: 4, cols: 8, run: 4 }	168	0
+G1	20480	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+G1	20480	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	128	0
+G1	20480	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	166	0
+G1	20480	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	254	0
+G1	20480	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	252	0
+G1	20480	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	128	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	20480	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	230	0
+G1	20480	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	128	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 32 }	255	1
+G1	20480	narrow	128	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	176	0
+G1	20480	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	222	0
+G1	20480	narrow	128	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	170	0
+G1	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	252	0
+G1	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 32 }	234	0
+G1	20480	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	234	0
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	168	0
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	200	0
+G1	20480	narrow	32	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	250	0
+G1	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+G1	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	244	0
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	246	0
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	230	0
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	230	0
+G1	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	217	0
+G1	20480	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+G1	20480	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	230	0
+G1	20480	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	226	0
+G1	5120	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	80	0
+G1	5120	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	162	0
+G1	5120	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+G1	5120	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	128	0
+G1	5120	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	166	0
+G1	5120	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	254	0
+G1	5120	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	5120	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	252	0
+G1	5120	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	5120	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+G1	5120	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	244	0
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	246	0
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	230	0
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	230	0
+G1	5120	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	217	0
+G1	5120	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+G1	5120	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	230	0
+G1	5120	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	226	0
+G1	81920	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	80	0
+G1	81920	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	162	0
+G1	81920	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+G1	81920	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	128	0
+G1	81920	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	166	0
+G1	81920	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	254	0
+G1	81920	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	81920	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	252	0
+G1	81920	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	252	0
+G1	81920	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	254	0
+G1	81920	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	244	0
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	246	0
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	230	0
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	230	0
+G1	81920	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	217	0
+G1	81920	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+G1	81920	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	230	0
+G1	81920	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	226	0
+G2	1280	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	56	0
+G2	1280	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	95	0
+G2	1280	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	48	0
+G2	1280	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	116	0
+G2	1280	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	122	0
+G2	1280	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	168	0
+G2	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	188	0
+G2	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	168	0
+G2	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G2	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G2	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	163	0
+G2	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	168	0
+G2	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	254	0
+G2	1280	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G2	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	249	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G2	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G2	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+G2	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	167	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G2	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G2	1280	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G2	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	168	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	254	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G2	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	164	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	254	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	252	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	128	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	128	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	174	0
+G2	1280	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	174	0
+G2	20480	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	56	0
+G2	20480	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	95	0
+G2	20480	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	48	0
+G2	20480	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	116	0
+G2	20480	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	122	0
+G2	20480	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	168	0
+G2	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	188	0
+G2	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	168	0
+G2	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G2	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G2	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	163	0
+G2	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	168	0
+G2	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	254	0
+G2	20480	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G2	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	249	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G2	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G2	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+G2	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	167	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G2	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G2	20480	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G2	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	168	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	254	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G2	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	164	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	254	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	252	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	128	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	128	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	174	0
+G2	20480	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	174	0
+G3	1024	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	79	0
+G3	1024	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	128	0
+G3	1024	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+G3	1024	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	128	0
+G3	1024	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	128	0
+G3	1024	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	251	0
+G3	1024	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 32 }	182	0
+G3	1024	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	255	1
+G3	1024	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	255	1
+G3	1024	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	255	0
+G3	1024	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	253	0
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	209	0
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	236	0
+G3	1024	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	219	0
+G3	1024	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+G3	1024	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	236	0
+G3	1024	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	228	0
+G3	16384	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 4, run: 4 }	79	0
+G3	16384	exact	16	RegisterTiled { lanes: 8, rows: 2, cols: 8, run: 4 }	128	0
+G3	16384	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 4, run: 4 }	64	0
+G3	16384	exact	64	RegisterTiled { lanes: 16, rows: 4, cols: 8, run: 4 }	128	0
+G3	16384	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 4, run: 4 }	128	0
+G3	16384	exact	64	RegisterTiled { lanes: 8, rows: 8, cols: 8, run: 4 }	251	0
+G3	16384	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 32 }	182	0
+G3	16384	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	255	1
+G3	16384	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	16	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 32 }	255	1
+G3	16384	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	16	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 1, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 32 }	255	0
+G3	16384	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 1 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 1, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 4, cols: 4 }, run: 4, depth: 32 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	253	0
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 1, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	254	0
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	209	0
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 64 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 4 }, run: 4, depth: 32 }	255	1
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 1 }, run: 4, depth: 64 }	236	0
+G3	16384	narrow	64	FragmentTiled { waves_m: 2, waves_n: 4, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 2, cols: 2 }, run: 4, depth: 32 }	219	0
+G3	16384	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 1 }, run: 4, depth: 64 }	128	0
+G3	16384	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 2 }, run: 4, depth: 64 }	236	0
+G3	16384	narrow	64	FragmentTiled { waves_m: 4, waves_n: 2, tile: FragmentTile { dtype: F16, layout: Opaque, rows: 1, cols: 4 }, run: 4, depth: 32 }	228	0

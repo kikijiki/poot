@@ -1,9 +1,11 @@
 """Runner-result fixtures shared by the harness tests: valid poot payloads and a fake observed run."""
 
+import contextlib
 import json
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from performance_receipt import PREPARATION_LAYERS  # noqa: E402
@@ -41,6 +43,37 @@ OPTIONAL_OBSERVER_FIELDS = (
     "energy_wh",
     "util_series",
 )
+
+
+class QuietMeter:
+    """A load meter that saw nothing foreign: the stand-in for `host_load.LoadMeter` in a test that runs a cell."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def result(self):
+        return {"available": True, "quiet": True, "contended": False}
+
+
+@contextlib.contextmanager
+def quiet_host():
+    """Fake every source of the host's load and temperature that `bench.run_quiet_cell` reads (POOT-1601).
+
+    A unit test of the sweep must not depend on the machine it runs on: the real quiet gate waits while the box is
+    busy, the real meter would discard a cell a neighbour disturbed, and the real thermal gate waits for the box to
+    cool. The host here is quiet, has no thermal source (so is not gated) and meters nothing.
+    """
+    import bench
+
+    with (
+        mock.patch.object(bench.host_load, "wait_quiet", return_value=(True, 0.0, {"quiet": True})),
+        mock.patch.object(bench.host_load, "LoadMeter", QuietMeter),
+        mock.patch.object(bench.thermal, "SysfsThermal", return_value=mock.Mock(sensors={})),
+    ):
+        yield
 
 
 def observation(

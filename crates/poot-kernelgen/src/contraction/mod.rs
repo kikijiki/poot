@@ -1241,6 +1241,7 @@ mod tests {
             };
             let gemv = GemvShape {
                 outputs: n,
+                k,
                 width: 128,
                 cols: 4,
             };
@@ -1311,6 +1312,7 @@ mod tests {
         };
         let gemv = GemvShape {
             outputs: rows * 1024,
+            k: 1024,
             width: 256,
             cols: 4,
         };
@@ -1498,6 +1500,7 @@ mod tests {
         };
         let gemv = |rows: usize| GemvShape {
             outputs: rows * 2048,
+            k: 2048,
             width: 256,
             cols: 4,
         };

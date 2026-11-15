@@ -11,7 +11,7 @@ sys.path.insert(0, str(HARNESS_DIR))
 
 import bench  # noqa: E402
 import observer  # noqa: E402
-from runner_fixtures import run_fixture_runner  # noqa: E402
+from runner_fixtures import quiet_host, run_fixture_runner  # noqa: E402
 from test_benchmark_repeats import write_stub_workspace  # noqa: E402
 
 LLAMACPP_RUNNER = bench.BENCH_ROOT / "runners" / "llamacpp" / "run.py"
@@ -36,6 +36,7 @@ def run_two_repeats(directory, gpus):
     argv = ["bench", "--manifest", str(manifest), "--runners", str(runners), "run", "--framework", "poot",
             "--models-dir", str(directory), "--results-dir", str(results), "--run-id", "r", "--repeats", "2"]
     with (
+        quiet_host(),
         mock.patch.object(sys, "argv", argv),
         mock.patch.object(bench, "capture_env", side_effect=[env_listing(g) for g in gpus]),
         mock.patch.object(observer, "run_observed", side_effect=run_fixture_runner),

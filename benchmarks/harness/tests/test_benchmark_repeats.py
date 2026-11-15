@@ -13,7 +13,7 @@ sys.path.insert(0, str(HARNESS_DIR))
 import bench  # noqa: E402
 import performance_receipt as receipts  # noqa: E402
 import observer  # noqa: E402
-from runner_fixtures import run_fixture_runner, valid_single  # noqa: E402
+from runner_fixtures import quiet_host, run_fixture_runner, valid_single  # noqa: E402
 
 # The host a run is on: `bench run` refuses a host that lists no GPU, whatever box the suite runs on.
 HOST_WITH_GPU = {"gpu_name": "NVIDIA GeForce RTX 3090", "gpu_driver": None}
@@ -69,8 +69,7 @@ def bench_run(directory, results, *extra):
         mock.patch.object(sys, "argv", argv),
         mock.patch.object(bench, "capture_env", side_effect=lambda manifest: HOST_WITH_GPU),
         mock.patch.object(observer, "run_observed", side_effect=run_fixture_runner),
-        mock.patch.object(bench.thermal, "SysfsThermal", return_value=mock.Mock(sensors={})),  # no thermal source: not gated
-        mock.patch.object(bench.host_load, "wait_quiet", return_value=(True, 0.0, {"quiet": True})),  # the box under test is shared
+        quiet_host(),  # the box under test is shared, hot or busy: neither gate reads it
         mock.patch("sys.stdout"),
         mock.patch("sys.stderr"),
     ):

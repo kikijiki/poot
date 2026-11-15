@@ -36,7 +36,9 @@
 use std::num::NonZeroUsize;
 
 use poot_executor::{Device, Engine};
-use poot_executor_parity::strided_read::{check_order, measure_strides, report};
+use poot_executor_parity::strided_read::{
+    ORDER_ATTEMPTS, measure_strides, measure_until_ordered, report,
+};
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_wgpu_device::device::WgpuDevice;
@@ -74,11 +76,15 @@ fn read_rate_rises_with_the_dram_channels_a_stride_reaches() {
     };
     let target = device.target();
     let mut engine = Engine::new(device);
-    let rates = measure_strides(&mut engine, target, ROWS, &STRIDES, RUNS);
     let contiguous = measure_strides(&mut engine, target, ROWS, &[CONTIGUOUS], RUNS);
     let extra = measure_strides(&mut engine, target, ROWS, &EXTRA_STRIDES, RUNS);
-    eprintln!("{}", report(&[rates.clone(), extra, contiguous].concat()));
-    if let Err(broken) = check_order(&rates) {
-        panic!("a stride that reaches more channels does not read faster:\n{broken}");
-    }
+    // A measurement another consumer of the GPU's DRAM bandwidth spoiled is taken again (POOT-1498).
+    let rates = measure_until_ordered(
+        || measure_strides(&mut engine, target, ROWS, &STRIDES, RUNS),
+        ORDER_ATTEMPTS,
+    )
+    .unwrap_or_else(|broken| {
+        panic!("a stride that reaches more channels does not read faster:\n{broken}")
+    });
+    eprintln!("{}", report(&[rates, extra, contiguous].concat()));
 }

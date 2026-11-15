@@ -71,5 +71,42 @@ class HeldOutQ4K(unittest.TestCase):
         self.assertLessEqual(mean, self.MEAN_REGRET)
 
 
+class Sm89GemvFigures(unittest.TestCase):
+    """POOT-1602: the RTX 4090's direct value and Gemv dot cost (`SM_89_COST_RATIOS`) are the fit's result over both
+    corpora of that part, and they choose the two packed cells at 128 tokens within 1.10 of their fastest schedule (the
+    IQ2_XS up projection's Gemv, the IQ4_NL down projection's narrowed tile), which no direct value does without the
+    dot term. Mutation: set `gemv_dot` to 0 in the second row's call; the IQ4_NL cell
+    chooses the Gemv (`'gemv' != 'fragment'`, regret 1.457)."""
+
+    def setUp(self):
+        self.fragment = fit.load(CALIBRATION / "ptx-sm89.tsv")
+        self.indexed = fit.load_indexed(CALIBRATION / "ptx-sm89-indexed.tsv")
+
+    def test_the_committed_figures_are_the_fits_result(self):
+        self.assertEqual(len(self.fragment), 551)
+        self.assertEqual(len(self.indexed), 88)
+        result = fit.fit_sm89(self.fragment, self.indexed)
+        self.assertEqual(fit.sm89_constants(), (round(result["direct_value"], 1), float(round(result["gemv_dot"]))))
+
+    def test_both_packed_cells_at_128_tokens_choose_within_the_band(self):
+        direct_value, gemv_dot = fit.sm89_constants()
+        with fit.ratios(fit.SM89_PRIOR_LDS_READ, fit.SM89_PRIOR_STAGED_VALUE, direct_value, gemv_dot):
+            cells = fit.regrets_of(self.fragment)
+        self.assertEqual(cells["packed-iq2xs-up:128"][1]["kind"], "gemv")
+        self.assertLessEqual(cells["packed-iq2xs-up:128"][0], 1.10)
+        self.assertEqual(cells["packed-iq4nl-down:128"][1]["kind"], "fragment")
+        self.assertLessEqual(cells["packed-iq4nl-down:128"][0], 1.10)
+        mean = sum(v[0] for v in cells.values()) / len(cells)
+        self.assertLessEqual(mean, 1.099)
+
+    def test_no_direct_value_serves_both_cells_without_the_dot_term(self):
+        for direct_value in fit.DIRECT_GRID:
+            with fit.ratios(fit.SM89_PRIOR_LDS_READ, fit.SM89_PRIOR_STAGED_VALUE, direct_value, 0.0):
+                cells = fit.regrets_of(self.fragment)
+            self.assertGreater(
+                max(cells["packed-iq2xs-up:128"][0], cells["packed-iq4nl-down:128"][0]), 1.10, direct_value
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

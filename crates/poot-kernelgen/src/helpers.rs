@@ -335,23 +335,6 @@ pub(crate) fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     s
 }
 
-/// Broadcast-effective strides of `operand` against `out` (right-aligned): 0 where the operand is
-/// broadcast (dim is 1 or missing), else the operand's own row-major stride for that dim.
-pub(crate) fn broadcast_eff_strides(out: &[usize], operand: &[usize]) -> Vec<usize> {
-    let r = out.len();
-    let own = row_major_strides(operand);
-    let offset = r - operand.len();
-    let mut eff = vec![0usize; r];
-    for (d, slot) in eff.iter_mut().enumerate() {
-        if d < offset {
-            continue; // operand is broadcast over this leading dim
-        }
-        let od = d - offset;
-        *slot = if operand[od] == 1 { 0 } else { own[od] };
-    }
-    eff
-}
-
 /// A value's physical GPU binding as (strides, offset): either a fresh row-major buffer or a strided view of a
 /// source buffer. A contiguous value (the default) has row-major strides and offset 0 (`Layout::contiguous`).
 ///
@@ -374,11 +357,48 @@ impl Layout {
             offset: 0,
         }
     }
+
+    /// The layout of this value transposed: output axis `d` is this value's axis `perm[d]`. The offset does not
+    /// move.
+    pub fn permuted(&self, perm: &[usize]) -> Layout {
+        Layout {
+            strides: perm.iter().map(|&axis| self.strides[axis]).collect(),
+            offset: self.offset,
+        }
+    }
+
+    /// The layout of this value cut to start at position `start` of `axis`: the strides stay and the offset
+    /// advances by `start` steps of that axis.
+    pub fn sliced(&self, axis: usize, start: usize) -> Layout {
+        Layout {
+            strides: self.strides.clone(),
+            offset: self.offset + start * self.strides[axis],
+        }
+    }
+
+    /// The layout of this value of logical shape `shape` broadcast, right-aligned, to `to`: stride 0 on every
+    /// axis the value lacks or holds at extent 1 (see [`view_eff_strides`]).
+    pub fn broadcast(&self, shape: &[usize], to: &[usize]) -> Layout {
+        let (strides, offset) = view_eff_strides(to, shape, self);
+        Layout { strides, offset }
+    }
+
+    /// One past the last element of the source buffer a value of `shape` reads through this layout: the bound
+    /// every reader checks against its source's element count. A broadcast axis (stride 0) and a unit axis add
+    /// nothing.
+    pub fn extent_end(&self, shape: &[usize]) -> usize {
+        let last: usize = shape
+            .iter()
+            .zip(&self.strides)
+            .map(|(&extent, &stride)| extent.saturating_sub(1).saturating_mul(stride))
+            .fold(0, usize::saturating_add);
+        self.offset.saturating_add(last).saturating_add(1)
+    }
 }
 
 /// Effective per-output-dim strides (+ base offset) for reading an operand of declared shape `operand_shape`,
 /// physical layout `layout`, against `out_shape`. Generalizes [`broadcast_eff_strides`] to operands that may be
-/// strided views (a transpose/slice/broadcast read directly by a strided-capable consumer).
+/// strided views (a transpose/slice/broadcast read directly by a layout-reading consumer).
 ///
 /// Equals `(broadcast_eff_strides(out_shape, operand_shape), 0)` when `layout` is
 /// `Layout::contiguous(operand_shape)`: same right-alignment for a lower-rank operand, and the same zero-stride
@@ -704,6 +724,24 @@ impl WeightLane {
 #[cfg(test)]
 mod stride_tests {
     use super::*;
+
+    /// Broadcast-effective strides of `operand` against `out` (right-aligned): 0 where the operand is
+    /// broadcast (dim is 1 or missing), else the operand's own row-major stride for that dim. The oracle the tests
+    /// check [`view_eff_strides`] against.
+    fn broadcast_eff_strides(out: &[usize], operand: &[usize]) -> Vec<usize> {
+        let r = out.len();
+        let own = row_major_strides(operand);
+        let offset = r - operand.len();
+        let mut eff = vec![0usize; r];
+        for (d, slot) in eff.iter_mut().enumerate() {
+            if d < offset {
+                continue; // operand is broadcast over this leading dim
+            }
+            let od = d - offset;
+            *slot = if operand[od] == 1 { 0 } else { own[od] };
+        }
+        eff
+    }
 
     #[test]
     fn row_major_strides_contiguous() {

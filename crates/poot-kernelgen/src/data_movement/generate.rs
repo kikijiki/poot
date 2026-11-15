@@ -6,10 +6,10 @@
 use poot_kernel_ir::{BinOp, Body, Local, LocalDecl, Operand, Place, Rvalue, Ty};
 
 use super::builder::Cfg;
-use super::spec::{MovementOp, MovementSpec, Storage, UpdateIndex, rows_of};
+use super::spec::{MovementOp, MovementRead, MovementSpec, Storage, UpdateIndex, rows_of};
 use crate::KernelGenError;
 use crate::emit::{c32, copy, cu};
-use crate::helpers::{broadcast_eff_strides, elem, ld, local, row_major_strides, slice_dtype};
+use crate::helpers::{elem, ld, local, row_major_strides, slice_dtype};
 
 /// A kernel buffer and the logical shape it holds.
 pub(crate) struct Buf {
@@ -34,15 +34,14 @@ pub fn movement_body(
     let mut data_shapes: Vec<Vec<usize>> = Vec::new();
     let mut reads_index = false;
     match &spec.op {
-        MovementOp::Transpose { in_shape, .. }
-        | MovementOp::Slice { in_shape, .. }
-        | MovementOp::Broadcast { in_shape }
-        | MovementOp::Reshape { in_shape } => data_shapes.push(in_shape.clone()),
+        MovementOp::Copy { source, .. } => data_shapes.push(source.clone()),
         MovementOp::Gather { in_shape, .. } => {
             data_shapes.push(in_shape.clone());
             reads_index = true;
         }
-        MovementOp::Concat { in_shapes, .. } => data_shapes.extend(in_shapes.iter().cloned()),
+        MovementOp::Concat { inputs, .. } => {
+            data_shapes.extend(inputs.iter().map(|input| input.source.clone()));
+        }
         MovementOp::UpdateSlice {
             update_shape,
             index,
@@ -254,27 +253,10 @@ impl Source<'_> {
         let storage = &self.spec.storage;
         let out_shape = &self.spec.out_shape;
         match &self.spec.op {
-            MovementOp::Transpose { in_shape, perm } => {
-                let in_strides = row_major_strides(in_shape);
-                let terms: Vec<usize> = perm.iter().map(|&axis| in_strides[axis]).collect();
-                let src = remap_index(cfg, out_shape, &terms, 0, flat);
+            MovementOp::Copy { from, .. } => {
+                let src = remap_index(cfg, out_shape, &from.strides, from.offset, flat);
                 read_lane(cfg, storage, &self.inputs[0], src)
             }
-            MovementOp::Slice {
-                in_shape,
-                axis,
-                start,
-            } => {
-                let in_strides = row_major_strides(in_shape);
-                let src = remap_index(cfg, out_shape, &in_strides, start * in_strides[*axis], flat);
-                read_lane(cfg, storage, &self.inputs[0], src)
-            }
-            MovementOp::Broadcast { in_shape } => {
-                let terms = broadcast_eff_strides(out_shape, in_shape);
-                let src = remap_index(cfg, out_shape, &terms, 0, flat);
-                read_lane(cfg, storage, &self.inputs[0], src)
-            }
-            MovementOp::Reshape { .. } => read_lane(cfg, storage, &self.inputs[0], flat),
             MovementOp::Gather {
                 in_shape,
                 axis,
@@ -313,26 +295,28 @@ impl Source<'_> {
                 }
                 read_lane(cfg, storage, &self.inputs[0], src)
             }
-            MovementOp::Concat { axis, in_shapes } => {
+            MovementOp::Concat { axis, inputs } => {
                 let axis_split = AxisSplit::of(out_shape, *axis);
                 let (outer, a, inner_i) = axis_split.coords(cfg, flat);
                 // Input 0 is read at a clamped coordinate so every thread has a valid first value; each
                 // later input overwrites it for the coordinates it owns. The selection is a flat run of
                 // single `if` regions, never an N-deep ladder.
-                let first_extent = in_shapes[0][*axis];
+                let first_extent = inputs[0].shape[*axis];
                 let clamped = cfg.bin(Ty::Usize, BinOp::Min, copy(a), cu(first_extent - 1));
                 let first_src = axis_split.source(cfg, outer, clamped, inner_i, first_extent);
+                let first_src = inputs[0].index(cfg, first_src);
                 let first = read_lane(cfg, storage, &self.inputs[0], first_src);
                 let value = cfg.var(storage.unit_ty(), Rvalue::Use(copy(first)));
                 let mut start = first_extent;
-                for (k, shape) in in_shapes.iter().enumerate().skip(1) {
-                    let extent = shape[*axis];
+                for (k, input) in inputs.iter().enumerate().skip(1) {
+                    let extent = input.shape[*axis];
                     let at_least = cfg.bin(Ty::Bool, BinOp::Ge, copy(a), cu(start));
                     let below = cfg.bin(Ty::Bool, BinOp::Lt, copy(a), cu(start + extent));
                     let owns = cfg.both(at_least, below);
                     cfg.if_then(owns, |cfg| {
                         let within = cfg.bin(Ty::Usize, BinOp::Sub, copy(a), cu(start));
                         let src = axis_split.source(cfg, outer, within, inner_i, extent);
+                        let src = input.index(cfg, src);
                         let moved = read_lane(cfg, storage, &self.inputs[k], src);
                         cfg.assign(Place::local(value), Rvalue::Use(copy(moved)));
                     });
@@ -567,6 +551,19 @@ fn remap_index(
         src = cfg.bin(Ty::Usize, BinOp::Add, copy(src), copy(step));
     }
     src
+}
+
+impl MovementRead {
+    /// The index in the source buffer of logical element `flat` of this read: `flat` itself for the row-major
+    /// layout (the body is the one a plain buffer reads), else the layout's strides over the element's
+    /// coordinates.
+    fn index(&self, cfg: &mut Cfg, flat: Local) -> Local {
+        if self.is_contiguous() {
+            flat
+        } else {
+            remap_index(cfg, &self.shape, &self.from.strides, self.from.offset, flat)
+        }
+    }
 }
 
 /// Element `position` of an `I32` index buffer, as a `usize`.

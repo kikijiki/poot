@@ -23,6 +23,7 @@ use poot_kernelgen::BodyLimits;
 use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps};
 
 use crate::dtype_widen::ConstLanes;
+use crate::predicates::check_operand_layouts;
 use crate::{
     Binding, Capability, CompileError, ImportedKernel, Plan, PlanError, ScratchId, Sink, Source,
     Target, compute_views, numel, value_ids,
@@ -281,6 +282,7 @@ pub(crate) fn plan_graph(
     let id = target.id();
     check_kv_head_strides(g, target)?;
     let views = compute_views(g, id);
+    check_operand_layouts(GraphTables::from(g), &views, id, *limits)?;
     // Each equation generates its own bodies; a model repeats every kernel in every layer, so the plan keeps one
     // body per kernel key and the rest are dropped as each equation finishes, not all held until the graph is done.
     let bodies = std::cell::RefCell::new(SharedBodies::default());

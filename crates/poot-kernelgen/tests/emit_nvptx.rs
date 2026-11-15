@@ -123,7 +123,10 @@ fn emit_nvptx_kernel_set() {
         movement(
             "bcast",
             vec![2, 3],
-            kg::MovementOp::Broadcast { in_shape: vec![3] },
+            kg::MovementOp::Copy {
+                source: vec![3],
+                from: kg::Layout::contiguous(&[3]).broadcast(&[3], &[2, 3]),
+            },
         ),
         gather_axis0_dt("gather", Ty::F32, 2),
         movement(

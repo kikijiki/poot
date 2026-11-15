@@ -598,7 +598,7 @@ pub(super) fn packed_cost_shapes(
             packed_gemv_geometry(site, shape, descriptor.format(), backend, caps)
                 .ok()
                 .flatten()
-                .map(|launch| launch.cost_shape(outputs))
+                .map(|launch| launch.cost_shape(outputs, k))
         })
         .flatten();
     Some((tiled, gemv))
@@ -638,7 +638,7 @@ fn packed_indexed_gemv(
             block: 0,
         },
     );
-    let gemv = launch.map(|launch| launch.cost_shape(outputs));
+    let gemv = launch.map(|launch| launch.cost_shape(outputs, k));
     Ok(gemv_wins(site.indexed_rows_pin(), gemv, grouped, caps)
         .then(|| launch.map(|launch| launch.schedule(backend, k)))
         .flatten())

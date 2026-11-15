@@ -3142,9 +3142,9 @@ mod tests {
         let transpose = KernelRequest::Movement(MovementSpec::new(
             Storage::Elements { carrier: Ty::F32 },
             vec![3, 2],
-            MovementOp::Transpose {
-                in_shape: vec![2, 3],
-                perm: vec![1, 0],
+            MovementOp::Copy {
+                source: vec![2, 3],
+                from: crate::Layout::contiguous(&[2, 3]).permuted(&[1, 0]),
             },
         ));
         assert!(unsupported(&transpose).contains("gather"));

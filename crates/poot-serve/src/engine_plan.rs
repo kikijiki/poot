@@ -13,6 +13,7 @@
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use poot_executor::{Collectives, Coordinator, Device, Executor, SharedKernelsMismatch};
 use poot_graph_ir::op::SampleRule;
@@ -767,6 +768,7 @@ fn fit_and_prepare(
     }
     let mut planning_weight_bytes_read = 0u64;
     let mut planning_kernels_resolved = 0u64;
+    let planning_started = Instant::now();
     let fit = poot_llm::driver::capacity::fit(
         &domain(workload.rows(), workload.max_seq()),
         |candidate| {
@@ -804,6 +806,7 @@ fn fit_and_prepare(
         FitError::Plan(error) => error.into(),
         other => StartupError::Capacity(other),
     })?;
+    let planning = planning_started.elapsed();
     let Fit {
         chosen,
         footprint,
@@ -836,6 +839,7 @@ fn fit_and_prepare(
         driver = driver.with_expert_pool(slots)?;
     }
     let rows = [chosen.rows];
+    let prepare_started = Instant::now();
     let driver = match workload {
         Workload::Generate { .. } => {
             let mut driver = driver
@@ -864,6 +868,13 @@ fn fit_and_prepare(
             driver
         }
     };
+    // The two startup phases compile the same entries, the first over recording devices and the second
+    // over the real one, so each costs what the other does (POOT-1600).
+    tracing::info!(
+        planning_secs = planning.as_secs_f64(),
+        prepare_secs = prepare_started.elapsed().as_secs_f64(),
+        "engine startup phases"
+    );
     verify_prepared(
         &footprint,
         &driver.live_device_bytes(),

@@ -120,34 +120,16 @@ pub(super) fn plan(
     Ok(planned)
 }
 
-/// How the stacked weight `w` (logical `[E, K, N]`) sits in its buffer: row-major `[E, K, N]` when it is no view,
-/// and the checkpoint's `[E, N, K]` when it is the view a `Transpose { perm: [0, 2, 1] }` of such a stack became
-/// ([`crate::compute_views`]), which the contraction reads in place. Any other view is refused, typed.
-fn weight_layout(
-    site: Site<'_>,
-    value: ValueId,
-    shape: &[usize],
-    views: &HashMap<ValueId, Layout>,
-) -> Result<kg::WeightLayout, PlanError> {
-    stored_layout(value, shape, views)
-        .ok_or_else(|| site.refuse(Capability::OperandLayout { value }))
-}
-
-/// [`weight_layout`]'s layout, `None` for a view it refuses.
-fn stored_layout(
-    value: ValueId,
-    shape: &[usize],
-    views: &HashMap<ValueId, Layout>,
-) -> Option<kg::WeightLayout> {
-    let Some(view) = views.get(&value) else {
-        return Some(kg::WeightLayout::Kn);
-    };
-    let (k, n) = (shape[1], shape[2]);
-    let stored_nk = Layout {
-        strides: vec![k * n, 1, k],
-        offset: 0,
-    };
-    (*view == stored_nk).then_some(kg::WeightLayout::Nk)
+/// How the stacked weight `w` sits in its buffer: row-major `[E, K, N]` when it is no view, and the checkpoint's
+/// `[E, N, K]` when it is the view a `Transpose { perm: [0, 2, 1] }` of such a stack became
+/// ([`crate::compute_views`]), which the contraction reads in place. [`LayoutDemand::IndexedWeight`] admits no
+/// other view, so none reaches here ([`crate::predicates::check_operand_layouts`] proves it on every compile).
+fn weight_layout(value: ValueId, views: &HashMap<ValueId, Layout>) -> kg::WeightLayout {
+    if views.contains_key(&value) {
+        kg::WeightLayout::Nk
+    } else {
+        kg::WeightLayout::Kn
+    }
 }
 
 /// The storage the stacked weight `w` is read in: f32, or BF16 packed lanes, which only a const upload (or a view
@@ -225,7 +207,7 @@ pub(crate) fn grouping_candidate(
     }
     let grouped = indexed_tiled_shape(
         (m, k, n, experts),
-        stored_layout(ids[1], w, views)?,
+        weight_layout(ids[1], views),
         stack_storage(tables, views, ids[1])?,
         precision,
         kg::TiledRows::Grouped {
@@ -233,7 +215,7 @@ pub(crate) fn grouping_candidate(
             block: 0,
         },
     );
-    let gemv = indexed_gemv_in(m, n, caps).map(|launch| launch.cost_shape(m * n));
+    let gemv = indexed_gemv_in(m, n, caps).map(|launch| launch.cost_shape(m * n, k));
     (!gemv_wins(pin, gemv, grouped, caps)).then_some(grouped)
 }
 
@@ -260,7 +242,7 @@ fn plan_indexed(
     }
     let (x, w) = (g.aval(ids[0]).shape.clone(), g.aval(ids[1]).shape.clone());
     let (m, k, experts, n) = (x[0], x[1], w[0], w[2]);
-    let layout = weight_layout(site, ids[1], &w, views)?;
+    let layout = weight_layout(ids[1], views);
     let weight =
         stack_storage(g, views, ids[1]).ok_or_else(|| site.refuse(Capability::DtypeLowering))?;
     if experts == 0 {
@@ -295,7 +277,7 @@ fn plan_indexed(
             indexed_gemv_in(m, n, caps).filter(|launch| {
                 gemv_wins(
                     site.indexed_rows_pin(),
-                    Some(launch.cost_shape(m * n)),
+                    Some(launch.cost_shape(m * n, k)),
                     grouped,
                     caps,
                 )

@@ -1224,7 +1224,8 @@ mod caps_tests {
             caps_from_attributes(1, &attrs).perf_calibration
         };
         assert_eq!(calibrated(12, 0), Calibrated::SM_120);
-        for (major, minor) in [(8, 0), (9, 0), (12, 1)] {
+        assert_eq!(calibrated(8, 9), Calibrated::SM_89);
+        for (major, minor) in [(8, 0), (8, 6), (9, 0), (12, 1)] {
             assert_eq!(
                 calibrated(major, minor),
                 Calibrated::Portable,

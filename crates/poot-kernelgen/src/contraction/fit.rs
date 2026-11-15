@@ -109,6 +109,7 @@ mod tests {
             occupancy: (tiles * lanes / device_lanes).max(1.0),
             rounds_per_k: None,
             grouping_per_k: 0.0,
+            dots_per_k: 0.0,
         }
     }
 
@@ -133,6 +134,7 @@ mod tests {
             direct_value: 4.0,
             fragment_round: None,
             group_scan: None,
+            gemv_dot: None,
         };
         let samples: Vec<_> = corpus()
             .into_iter()

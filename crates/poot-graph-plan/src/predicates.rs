@@ -89,60 +89,86 @@ impl<'g> From<&'g Graph> for GraphTables<'g> {
     }
 }
 
-/// The eqns that read each value as a value-operand, by index into `g.eqns` (the reverse of a producer
-/// map). [`compute_views`] uses it to check that every consumer of a movement op's output can take a
-/// strided input.
-fn consumers(g: GraphTables<'_>) -> HashMap<ValueId, Vec<usize>> {
-    let mut out: HashMap<ValueId, Vec<usize>> = HashMap::new();
-    for (i, eqn) in g.eqns.iter().enumerate() {
-        for v in value_ids(eqn) {
-            out.entry(v).or_default().push(i);
-        }
-    }
-    out
+/// What a consumer needs of the layout it reads one value operand through.
+///
+/// One rule decides it, [`operand_demand`], and every reader of it agrees: the promotion pass
+/// ([`compute_views`]) asks it before it makes a value a view, the bar loop asks [`LayoutDemand::admits`] of the
+/// composed layout, the planner families plan the layout they were promised, and [`check_operand_layouts`] proves
+/// the plan against it on every compile. A value is a view only where its demand is not `Dense`; where the demand
+/// is not met, one movement copy reads the chain's root through the composed layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LayoutDemand {
+    /// Any layout inside the source: the reader indexes every element through its layout (a pointwise leaf, a
+    /// movement's data, a concat part).
+    Any,
+    /// Row-major from the root's base: the consumer reads the buffer flat (a contraction, a gather, an attention,
+    /// a packed payload). A value read this way is never a view.
+    Dense,
+    /// The indexed contraction's stacked weight `[E, K, N]`: row-major, or the checkpoint's `[E, N, K]` transpose
+    /// of it, which the contraction reads in place.
+    IndexedWeight,
 }
 
-/// Can this eqn read a strided (non-row-major) value operand directly, with no materialize copy first?
+impl LayoutDemand {
+    /// Whether a value of `shape` read through `layout` meets this demand.
+    pub(crate) fn admits(self, layout: &Layout, shape: &[usize]) -> bool {
+        match self {
+            LayoutDemand::Any => true,
+            LayoutDemand::Dense => *layout == Layout::contiguous(shape),
+            LayoutDemand::IndexedWeight => {
+                *layout == Layout::contiguous(shape)
+                    || matches!(shape, &[_, k, n] if *layout == Layout {
+                        strides: vec![k * n, 1, k],
+                        offset: 0,
+                    })
+            }
+        }
+    }
+}
+
+/// The layout demand of value operand `position` of `eqn` (an index into `eqn.inputs`): the one function behind
+/// view promotion, the bar loop, the planner families and the compile invariant. A literal reads nothing.
 ///
-/// Every pointwise op can: an elementwise `Binary` (against another value or a literal) and a `Unary` are
-/// pointwise regions of one step, `Fused` / `FusedRow` are regions of many, and the pointwise synthesizer
-/// (`fused_views`) reads each leaf through its own layout. The indexed contraction reads its weight operand
-/// (operand 1 only) strided, so a `Transpose` of the stacked expert weight is a view there. Everything else
-/// (other contractions, gather/scatter, concat, standalone `Reduce`, `Reshape`, `DynamicUpdateSlice`) keeps
-/// materializing. The qwen2 decode graph's RoPE `rotate_half` (`concat(neg(slice), slice)`) is the case this
-/// exists for.
-fn is_strided_capable(eqn: &Eqn, value: ValueId) -> bool {
+/// Every pointwise op reads its leaves through their layouts (the pointwise synthesizer, `fused_views`): an
+/// elementwise `Binary`, a `Unary`, a `Fused` region of f32 or exact-I32 leaves, a `FusedRow` of f32 leaves. A
+/// movement reads its data through the composed layout of the chain it ends, and a `Concat` reads each part
+/// through its own: both over element storage (f32 or I32 words; a packed payload and a two-byte element are read
+/// dense). The indexed contraction reads its stacked weight (operand 1 only) strided, so a `Transpose` of the
+/// stack is never materialized. Everything else reads its operands flat.
+pub(crate) fn operand_demand(g: GraphTables<'_>, eqn: &Eqn, position: usize) -> LayoutDemand {
+    let Some(Operand::Value(value)) = eqn.inputs.get(position) else {
+        return LayoutDemand::Dense;
+    };
+    let words = matches!(g.aval(*value).dtype, DType::F32 | DType::I32);
     match &eqn.op {
-        OpKind::Binary(_) | OpKind::Unary(_) | OpKind::Fused(_) | OpKind::FusedRow(_) => true,
-        // The indexed contraction reads its stacked weight (operand 1 only) through a transposed layout, so a
-        // `Transpose` feeding it is never materialized. Its activation, ids and epilogue leaves are read flat.
+        OpKind::Binary(_) | OpKind::Unary(_) | OpKind::Fused(_) if words => LayoutDemand::Any,
+        OpKind::FusedRow(_) if g.aval(*value).dtype == DType::F32 => LayoutDemand::Any,
+        OpKind::Transpose { .. }
+        | OpKind::Slice { .. }
+        | OpKind::Broadcast { .. }
+        | OpKind::Reshape { .. }
+        | OpKind::Concat { .. }
+            if words =>
+        {
+            LayoutDemand::Any
+        }
+        // The stacked weight is read in place only where it is read once: as the activation, the ids or an
+        // epilogue leaf it is read flat.
         OpKind::IndexedMatMul { .. }
         | OpKind::ContractionEpilogue {
             head: ContractionHead::Indexed { .. },
             ..
-        } => reads_as_indexed_weight(eqn, value),
-        _ => false,
+        } if position == 1 && value_ids(eqn).iter().filter(|&&v| v == *value).count() == 1 => {
+            LayoutDemand::IndexedWeight
+        }
+        _ => LayoutDemand::Dense,
     }
 }
 
-/// Whether `eqn` is an indexed contraction that reads `value` as its stacked weight and nowhere else.
-fn reads_as_indexed_weight(eqn: &Eqn, value: ValueId) -> bool {
-    matches!(
-        eqn.op,
-        OpKind::IndexedMatMul { .. }
-            | OpKind::ContractionEpilogue {
-                head: ContractionHead::Indexed { .. },
-                ..
-            }
-    ) && matches!(eqn.inputs.get(1), Some(Operand::Value(weight)) if *weight == value)
-        && value_ids(eqn).iter().filter(|&&v| v == value).count() == 1
-}
-
 /// Is `op` one of the 4 movement ops promoted to a view (Transpose/Slice/Broadcast/Reshape)? Used by
-/// [`compute_views`] for the candidate check and to let a promoted movement op count as a strided-capable
-/// consumer of another one it composes with. A `Reshape` is a view only over a value that is itself a view
-/// (and only when the view's strides split, insert, remove or chain-merge axes, [`reshape_strides`]); over a
-/// dense value it stays the zero-cost `Plan::Alias`.
+/// [`compute_views`] for the candidate check. A `Reshape` is a view only over a value that is itself a view (and
+/// only when the view's layout splits, inserts, removes or chain-merges axes, [`reshape_strides`]); over a dense
+/// value it stays the zero-cost `Plan::Alias`.
 fn is_movement_view_candidate(op: &OpKind) -> bool {
     matches!(
         op,
@@ -209,30 +235,75 @@ fn reshape_strides(
     }
 }
 
+/// The layout of the output of movement `op` read from its input, which is of logical shape `in_shape` and sits in
+/// its source buffer as `in_layout` (`Layout::contiguous` when the input is no view): the composition both
+/// [`compute_views`] and the movement planner apply, so a chain ends in one layout over its root whether its links
+/// are views or one materialized copy. `None` for a reshape whose axes `in_layout` cannot merge or split
+/// ([`reshape_strides`]).
+pub(crate) fn compose_movement(
+    op: &OpKind,
+    in_shape: &[usize],
+    in_layout: &Layout,
+    out_shape: &[usize],
+) -> Option<Layout> {
+    match op {
+        OpKind::Transpose { perm } => Some(in_layout.permuted(perm)),
+        OpKind::Slice { axis, start, .. } => Some(in_layout.sliced(*axis, *start)),
+        OpKind::Broadcast { shape } => Some(in_layout.broadcast(in_shape, shape)),
+        OpKind::Reshape { shape } => {
+            reshape_strides(in_shape, &in_layout.strides, shape).map(|strides| Layout {
+                strides,
+                offset: in_layout.offset,
+            })
+        }
+        _ => unreachable!("only a movement view candidate composes a layout (out {out_shape:?})"),
+    }
+}
+
+/// The logical shape of the buffer `value` is read from: the shape of the first value down its chain of promoted
+/// views that is no view. A view's layout is expressed over that shape ([`compose_layouts`]), so it is the bound
+/// every reader of the layout checks.
+pub(crate) fn view_source_shape(
+    g: GraphTables<'_>,
+    views: &HashMap<ValueId, Layout>,
+    value: ValueId,
+) -> Vec<usize> {
+    let mut current = value;
+    while views.contains_key(&current) {
+        let producer = g
+            .eqns
+            .iter()
+            .rev()
+            .find(|eqn| eqn.out == current)
+            .expect("a promoted view has a producing equation");
+        current = value_ids(producer)[0];
+    }
+    g.aval(current).shape.clone()
+}
+
 /// Which values become a [`Plan::View`] (no dispatch) instead of a materialize copy, composing a whole
 /// chain of movement ops into one Layout each (spec 132). WGPU and AMD GCN only; any other backend gets an
 /// empty map and takes the pre-existing movement lowering.
 ///
-/// Two passes, since deciding promotion needs consumers (later in topological order) and composing a
-/// Layout needs the input's Layout (earlier):
+/// Two passes, since deciding promotion needs consumers and composing a Layout needs the input's Layout
+/// (earlier):
 ///
-/// - Pass A walks `g.eqns` in reverse and decides the promoted set. A `Transpose`/`Slice`/`Broadcast`/`Reshape`
-///   output (not pinned, F32, or BF16 read only as an indexed contraction's weight) is promoted when every
-///   consumer is `is_strided_capable` or is itself a
-///   movement-view candidate already promoted (consumers are visited first in reverse order).
+/// - Pass A decides the promoted set. A `Transpose`/`Slice`/`Broadcast`/`Reshape` output (not pinned, with at
+///   least one reader) is promoted when no reader's [`operand_demand`] is `Dense`. A movement reader counts as a
+///   reader whether or not it is promoted itself: the chain's tail then materializes as one copy that reads the
+///   root through the whole chain's layout, instead of one copy per link. A reshape that is not promoted is the
+///   exception: it is free over a dense value, so it keeps the value under it dense.
 /// - Pass B walks forward and composes each promoted value's Layout onto its input's Layout
 ///   (`Layout::contiguous` if the input was not promoted). A chain tail therefore has a Layout expressed
 ///   in terms of the original contiguous source, matching `poot_eval::apply_movement` over the whole
 ///   chain (see the `view_..._chain_matches_oracle_fuzz` test).
 ///
-/// A `Reshape` promotes only over a view whose strides it can keep ([`reshape_strides`]), and that depends on
-/// the input's composed Layout, which pass B alone knows. A reshape pass B cannot compose is barred and both
-/// passes run again without it, so the slice under it materializes as before. Barring only shrinks the promoted
-/// set, so the loop ends.
+/// A `Reshape` composes only over a view whose strides it can split or merge ([`reshape_strides`]), and that
+/// depends on the input's composed Layout, which pass B alone knows. The reshape's input is barred when it cannot,
+/// so it materializes and the reshape reads it dense. A promoted value whose composed layout a reader's demand
+/// does not [`admit`](LayoutDemand::admits) is barred too. Barring only shrinks the promoted set, so the loop ends.
 ///
-/// A value with no consumer is not promoted. A pinned value, a non-F32 dtype, or a non-strided-capable leaf
-/// consumer down the chain keeps the rest of the chain materialized. Unpromoted ops keep the
-/// metadata-launch index-remap copy.
+/// A value with no consumer is not promoted. A pinned value keeps the chain's materialization at its own copy.
 ///
 /// Every pinned value ([`Graph::pinned_values`]: the output, each validation value, and both sides of each
 /// state pair) keeps its own materialized buffer, so a validation packet can copy it row-major from offset 0.
@@ -243,69 +314,61 @@ pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId,
     if !strided {
         return HashMap::new();
     }
-    let cons = consumers(g.into());
+    let tables = GraphTables::from(g);
+    let readers = readers(tables);
     let pinned: std::collections::HashSet<ValueId> = g.pinned_values().collect();
     let mut barred: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
     loop {
-        let promoted = promoted_movement(g, &cons, &pinned, &barred);
-        let (views, uncomposable) = compose_layouts(g, &promoted);
-        if uncomposable.is_empty() {
+        let promoted = promoted_movement(tables, &readers, &pinned, &barred);
+        let (views, unreadable) = compose_layouts(tables, &promoted, &readers);
+        if unreadable.is_empty() {
             return views;
         }
-        barred.extend(uncomposable);
+        barred.extend(unreadable);
     }
 }
 
-/// Pass A of [`compute_views`] (reverse topological order): the promoted set, no strides yet. A value in
-/// `barred` is never promoted.
+/// Every operand read of every value: the eqn (an index into `g.eqns`) and the position in its inputs.
+fn readers(g: GraphTables<'_>) -> HashMap<ValueId, Vec<(usize, usize)>> {
+    let mut out: HashMap<ValueId, Vec<(usize, usize)>> = HashMap::new();
+    for (i, eqn) in g.eqns.iter().enumerate() {
+        for (position, operand) in eqn.inputs.iter().enumerate() {
+            if let Operand::Value(v) = operand {
+                out.entry(*v).or_default().push((i, position));
+            }
+        }
+    }
+    out
+}
+
+/// Pass A of [`compute_views`] (reverse topological order, so a reader's own promotion is known): the promoted
+/// set, no strides yet. A value in `barred` is never promoted.
+///
+/// A reader that is a movement counts whether or not it is promoted, with one exception: a `Reshape` that is not
+/// promoted reads its input dense, where over a dense value it is the zero-cost `Plan::Alias`. Promoting the view
+/// under it would make the reshape a copy, and every reshape of a value that several of them read a copy of its
+/// own, where the dense value costs one.
 fn promoted_movement(
-    g: &Graph,
-    cons: &HashMap<ValueId, Vec<usize>>,
+    g: GraphTables<'_>,
+    readers: &HashMap<ValueId, Vec<(usize, usize)>>,
     pinned: &std::collections::HashSet<ValueId>,
     barred: &std::collections::HashSet<ValueId>,
 ) -> std::collections::HashSet<ValueId> {
-    let mut promoted: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
-    for eqn in g.eqns().iter().rev() {
+    let mut promoted = std::collections::HashSet::new();
+    for eqn in g.eqns.iter().rev() {
         let out = eqn.out;
-        if pinned.contains(&out) || barred.contains(&out) || !is_movement_view_candidate(&eqn.op) {
+        if !is_movement_view_candidate(&eqn.op) || pinned.contains(&out) || barred.contains(&out) {
             continue;
         }
-        // A strided view is read element by element, so any f32 reader that takes strides reads it. A BF16 view
-        // is only ever the packed expert stack an indexed contraction reads in place; its other readers have no
-        // BF16 lane, and a reshape of it is never one (the stack is transposed, not reshaped).
-        //
-        // An I32 view is read only by float pointwise regions (a region whose output is F32 reads an I32 leaf
-        // through its layout like any other): a cast step or an exact step of the region consumes the word in
-        // place, where a materialized I32 copy would cost a dispatch. An exact-I32 reader keeps its own plan
-        // for an I32 movement.
-        let admitted = match g.aval(out).dtype {
-            DType::F32 => true,
-            DType::I32 => cons.get(&out).is_some_and(|users| {
-                users.iter().all(|&i| {
-                    matches!(g.eqns()[i].op, OpKind::Fused(_))
-                        && g.aval(g.eqns()[i].out).dtype == DType::F32
-                })
-            }),
-            DType::BF16 if !matches!(eqn.op, OpKind::Reshape { .. }) => {
-                cons.get(&out).is_some_and(|users| {
-                    users
-                        .iter()
-                        .all(|&i| reads_as_indexed_weight(&g.eqns()[i], out))
-                })
-            }
-            _ => false,
-        };
-        if !admitted {
-            continue;
-        }
-        let all_strided_capable = cons.get(&out).is_some_and(|users| {
-            users.iter().all(|&i| {
-                let c = &g.eqns()[i];
-                is_strided_capable(c, out)
-                    || (is_movement_view_candidate(&c.op) && promoted.contains(&c.out))
+        let readable = readers.get(&out).is_some_and(|reads| {
+            reads.iter().all(|&(i, position)| {
+                let reader = &g.eqns[i];
+                let dense_reshape =
+                    matches!(reader.op, OpKind::Reshape { .. }) && !promoted.contains(&reader.out);
+                !dense_reshape && operand_demand(g, reader, position) != LayoutDemand::Dense
             })
         });
-        if all_strided_capable {
+        if readable {
             promoted.insert(out);
         }
     }
@@ -313,61 +376,76 @@ fn promoted_movement(
 }
 
 /// Pass B of [`compute_views`] (forward topological order): each promoted value's Layout composed from its
-/// input's, and the promoted reshapes whose input Layout has no stride for the new shape. A promoted `Reshape`
-/// over a value that is no view has no Layout of its own: it stays a `Plan::Alias`.
+/// input's, and the values to bar: the input of a reshape (promoted or not) whose input Layout has no stride for
+/// the new shape, and a promoted value whose composed Layout a reader's demand does not admit. A reshape over a
+/// value that is no view has no Layout of its own: it stays a `Plan::Alias`.
 fn compose_layouts(
-    g: &Graph,
+    g: GraphTables<'_>,
     promoted: &std::collections::HashSet<ValueId>,
+    readers: &HashMap<ValueId, Vec<(usize, usize)>>,
 ) -> (HashMap<ValueId, Layout>, Vec<ValueId>) {
     let mut views: HashMap<ValueId, Layout> = HashMap::new();
-    let mut uncomposable = Vec::new();
-    for eqn in g.eqns() {
+    let mut unreadable = Vec::new();
+    for eqn in g.eqns {
+        if !is_movement_view_candidate(&eqn.op) {
+            continue;
+        }
         let out = eqn.out;
+        let input = value_ids(eqn)[0];
+        let in_shape = &g.aval(input).shape;
+        let in_layout = match (views.get(&input), &eqn.op) {
+            (Some(layout), _) => layout.clone(),
+            (None, OpKind::Reshape { .. }) => continue,
+            (None, _) => Layout::contiguous(in_shape),
+        };
+        let Some(layout) = compose_movement(&eqn.op, in_shape, &in_layout, &g.aval(out).shape)
+        else {
+            unreadable.push(input);
+            continue;
+        };
         if !promoted.contains(&out) {
             continue;
         }
-        let ids = value_ids(eqn);
-        let in_shape = g.aval(ids[0]).shape.clone();
-        let in_layout = match (views.get(&ids[0]), &eqn.op) {
-            (Some(layout), _) => layout.clone(),
-            (None, OpKind::Reshape { .. }) => continue,
-            (None, _) => Layout::contiguous(&in_shape),
-        };
-        let (strides, offset) = match &eqn.op {
-            // Transpose permutes the view's strides; the base offset does not move.
-            OpKind::Transpose { perm } => (
-                (0..perm.len())
-                    .map(|d| in_layout.strides[perm[d]])
-                    .collect(),
-                in_layout.offset,
-            ),
-            // Slice keeps the strides; the offset advances by start*stride[axis].
-            OpKind::Slice { axis, start, .. } => {
-                let out_shape = &g.aval(out).shape;
-                (
-                    (0..out_shape.len()).map(|d| in_layout.strides[d]).collect(),
-                    in_layout.offset + start * in_layout.strides[*axis],
-                )
-            }
-            // `view_eff_strides`: 0 on a size-1 logical dim, else the view's own stride, right-aligned.
-            OpKind::Broadcast { shape: s } => kg::view_eff_strides(s, &in_shape, &in_layout),
-            // Reshape keeps the offset; its strides are the no-copy split or merge of the input's.
-            OpKind::Reshape { shape } => {
-                match reshape_strides(&in_shape, &in_layout.strides, shape) {
-                    Some(strides) => (strides, in_layout.offset),
-                    None => {
-                        uncomposable.push(out);
-                        continue;
-                    }
-                }
-            }
-            _ => unreachable!(
-                "promoted only ever contains Transpose/Slice/Broadcast/Reshape outputs (is_movement_view_candidate)"
-            ),
-        };
-        views.insert(out, Layout { strides, offset });
+        let shape = &g.aval(out).shape;
+        let admitted = readers.get(&out).is_some_and(|reads| {
+            reads.iter().all(|&(i, position)| {
+                operand_demand(g, &g.eqns[i], position).admits(&layout, shape)
+            })
+        });
+        if admitted {
+            views.insert(out, layout);
+        } else {
+            unreadable.push(out);
+        }
     }
-    (views, uncomposable)
+    (views, unreadable)
+}
+
+/// The compile invariant of the layout rule: every value operand that is a promoted view meets its reader's
+/// [`operand_demand`]. [`compute_views`] already promotes by that demand, so this holds by construction; it is checked
+/// again here, on every compile, because a view a reader cannot read would be read as if it were dense (wrong
+/// elements, no error). A violation is the typed [`Capability::OperandLayout`] naming the equation.
+pub(crate) fn check_operand_layouts(
+    g: GraphTables<'_>,
+    views: &HashMap<ValueId, Layout>,
+    target: impl Into<TargetId> + Copy,
+    limits: poot_kernelgen::BodyLimits,
+) -> Result<(), PlanError> {
+    for eqn in g.eqns {
+        for (position, operand) in eqn.inputs.iter().enumerate() {
+            let Operand::Value(value) = operand else {
+                continue;
+            };
+            let Some(layout) = views.get(value) else {
+                continue;
+            };
+            if !operand_demand(g, eqn, position).admits(layout, &g.aval(*value).shape) {
+                return Err(Site::new(g, eqn, target, limits)
+                    .refuse(Capability::OperandLayout { value: *value }));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Workgroup width (lanes per output column) for the LDS decode attention GEMV (`kernelgen::attn_scores_v_gemv_lds`),
@@ -426,10 +504,11 @@ pub(crate) struct GemvLaunch {
 }
 
 impl GemvLaunch {
-    /// The launch as the cost model reads it, over `outputs` dot products.
-    pub(crate) fn cost_shape(self, outputs: usize) -> kg::GemvShape {
+    /// The launch as the cost model reads it, over `outputs` dot products of depth `k`.
+    pub(crate) fn cost_shape(self, outputs: usize, k: usize) -> kg::GemvShape {
         kg::GemvShape {
             outputs,
+            k,
             width: self.width,
             cols: self.cols * self.rows.get(),
         }

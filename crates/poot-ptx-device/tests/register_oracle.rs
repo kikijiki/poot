@@ -28,7 +28,50 @@ use poot_tensor::DType;
 /// The driver the sweep's verdicts were taken on (`cuDriverGetVersion` of 595.91.07): the table says nothing of
 /// another compiler, so a row on a different driver fails by name and the sweep is repeated.
 const SWEEP_DRIVER_RELEASE: u32 = 13_020;
-const SWEEP_COMPUTE_CAPABILITY: (u32, u32) = (12, 0);
+
+/// A part the oracle is tabled for: its compute capability and the verdicts of the sweep's kernels on it. The kernels
+/// are the same on every part (the PTX is sm_80 text planned under sm_120's register model); the verdicts are not: the
+/// narrow fragment kernels near the 255-register ceiling spill on one part and hold on another (POOT-1577: 55 of the
+/// 826 differ between sm_120 and sm_86, all of them narrow), so each part is compared with its own table. The sm_120
+/// table is ptxas' (POOT-1537) and says the driver agrees with ptxas there; the others are the driver's own verdicts
+/// and say the oracle reports what this driver compiles, with no claim about ptxas.
+#[derive(Clone, Copy)]
+struct Part {
+    compute_capability: (u32, u32),
+    table: &'static str,
+}
+
+const PARTS: [Part; 3] = [
+    Part {
+        compute_capability: (12, 0),
+        table: include_str!("data/ptxas_sweep_sm120.tsv"),
+    },
+    Part {
+        compute_capability: (8, 9),
+        table: include_str!("data/jit_verdicts_sm89.tsv"),
+    },
+    Part {
+        compute_capability: (8, 6),
+        table: include_str!("data/jit_verdicts_sm86.tsv"),
+    },
+];
+
+/// The part the sweep's kernels were planned for (its register model) and ptxas was run on.
+const SWEEP_PART: Part = PARTS[0];
+
+impl Part {
+    /// The part's table rows by key `shape rows precision block schedule`: the registers and whether the kernel spills.
+    fn rows(self) -> BTreeMap<String, (u32, bool)> {
+        self.table
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                let f: Vec<&str> = line.split('\t').collect();
+                (f[..5].join(" "), (f[5].parse().unwrap(), f[6] == "1"))
+            })
+            .collect()
+    }
+}
 /// The distinct kernel bodies of the sm_120 sweep. The table was swept at 385 (POOT-1509), when a narrowed bf16 dense
 /// weight was stored f16 and shared its body with the f16 shape; since POOT-1535 it stays bf16 and the narrowed
 /// contraction rounds it in staging, a body of its own. It was swept again on a pod (POOT-1537) after the run readers,
@@ -213,18 +256,6 @@ struct Kernel {
     probe: RegisterProbe,
 }
 
-/// The sweep table's rows by key `shape rows precision block schedule`.
-fn table() -> BTreeMap<String, (u32, bool)> {
-    include_str!("data/ptxas_sweep_sm120.tsv")
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .map(|line| {
-            let f: Vec<&str> = line.split('\t').collect();
-            (f[..5].join(" "), (f[5].parse().unwrap(), f[6] == "1"))
-        })
-        .collect()
-}
-
 /// Plan `shape` at `rows` and `precision` with `tiling` pinned, and take the contraction's body.
 fn contraction_body(
     shape: &Shape,
@@ -257,10 +288,11 @@ fn contraction_body(
         .map(|d| d.body().clone())
 }
 
-/// Every kernel of the sm_120 sweep table, rebuilt: the candidate tilings of each shape under the device's register
-/// model and under the lifted one (the sweep's union), those the table names, each planned with its tiling pinned.
-fn sweep_kernels() -> Vec<Kernel> {
-    let table = table();
+/// Every kernel of the sweep, rebuilt, with `part`'s verdicts: the candidate tilings of each shape under the device's
+/// register model and under the lifted one (the sweep's union), those the table names, each planned with its tiling
+/// pinned.
+fn sweep_kernels(part: Part) -> Vec<Kernel> {
+    let table = part.rows();
     let mut seen = HashSet::new();
     let mut kernels = Vec::new();
     for shape in shapes() {
@@ -311,15 +343,49 @@ fn sweep_kernels() -> Vec<Kernel> {
 /// lifted register model admits are missing.
 #[test]
 fn the_sweep_table_is_the_planners_kernels() {
-    let kernels = sweep_kernels();
+    let kernels = sweep_kernels(SWEEP_PART);
     let distinct: HashSet<_> = kernels.iter().map(|k| k.probe.digest()).collect();
     assert_eq!(distinct.len(), SWEEP_DISTINCT_BODIES);
     assert_eq!(kernels.iter().filter(|k| k.spills).count(), 374);
 }
 
-fn open() -> Option<PtxDevice> {
+/// Every part's table names the sweep's kernels, no more and no fewer: a table of another part is the same 826 keys
+/// with that part's verdicts. Needs no device.
+#[test]
+fn every_parts_table_names_the_sweeps_kernels() {
+    let keys: Vec<_> = SWEEP_PART.rows().into_keys().collect();
+    for part in PARTS {
+        let rows = part.rows();
+        assert!(
+            rows.keys().eq(keys.iter()),
+            "sm_{}{}: the table's kernels are not the sweep's",
+            part.compute_capability.0,
+            part.compute_capability.1
+        );
+    }
+}
+
+/// The device and the table of the part it is. A part with no table has nothing to be compared with: the row fails
+/// naming it, so the sweep is taken there and a table added, instead of the row asserting another part's verdicts.
+fn open() -> Option<(PtxDevice, Part)> {
     isolated_kernel_cache();
-    poot_runtime_common::device_skip::open_or_skip(DeviceBackend::Ptx, PtxDevice::new())
+    let device =
+        poot_runtime_common::device_skip::open_or_skip(DeviceBackend::Ptx, PtxDevice::new())?;
+    let compute_capability = device
+        .context()
+        .compiler_probe()
+        .expect("the device's compiler")
+        .compute_capability();
+    let part = PARTS
+        .into_iter()
+        .find(|part| part.compute_capability == compute_capability)
+        .unwrap_or_else(|| {
+            panic!(
+                "no verdict table for sm_{}{}: sweep the kernels on this part and add its table (POOT-1577)",
+                compute_capability.0, compute_capability.1
+            )
+        });
+    Some((device, part))
 }
 
 /// This process keeps its kernels and verdicts in a directory of its own: a verdict a run of the lane (or of a mutated
@@ -351,14 +417,14 @@ fn engine_feedback(device: PtxDevice) -> (Engine<PtxDevice>, RegisterFeedback) {
 /// (374 tilings) the compiler spills read "holds".
 #[test]
 fn the_ptx_oracle_matches_the_ptxas_sweep_verdicts() {
-    let Some(device) = open() else { return };
-    let kernels = sweep_kernels();
+    let Some((device, part)) = open() else { return };
+    let kernels = sweep_kernels(part);
     let (_engine, feedback) = engine_feedback(device);
     assert_eq!(
         feedback.compiler(),
         KernelCompiler::CudaDriver {
             release: SWEEP_DRIVER_RELEASE,
-            compute_capability: SWEEP_COMPUTE_CAPABILITY,
+            compute_capability: part.compute_capability,
         },
         "the sweep's verdicts are the driver 595.91.07's; another compiler needs the sweep repeated"
     );
@@ -412,8 +478,8 @@ fn the_ptx_oracle_matches_the_ptxas_sweep_verdicts() {
 }
 
 /// The smallest sweep kernel that spills, and one that does not: probes for the rows below.
-fn probes() -> (RegisterProbe, RegisterProbe) {
-    let kernels = sweep_kernels();
+fn probes(part: Part) -> (RegisterProbe, RegisterProbe) {
+    let kernels = sweep_kernels(part);
     let pick = |spills| {
         kernels
             .iter()
@@ -431,8 +497,8 @@ fn probes() -> (RegisterProbe, RegisterProbe) {
 /// engine compiles.
 #[test]
 fn a_ptx_verdict_is_compiled_once() {
-    let Some(device) = open() else { return };
-    let (spilling, clean) = probes();
+    let Some((device, part)) = open() else { return };
+    let (spilling, clean) = probes(part);
     let probes_of =
         |engine: &Engine<PtxDevice>| engine.device().context().native_counters().register_probes;
     let (first, feedback) = engine_feedback(device);
@@ -464,8 +530,8 @@ fn a_ptx_verdict_is_compiled_once() {
 /// `with_current`); the second thread's call fails.
 #[test]
 fn a_probe_the_jit_refuses_is_a_compile_error() {
-    let Some(device) = open() else { return };
-    let (spilling, clean) = probes();
+    let Some((device, part)) = open() else { return };
+    let (spilling, clean) = probes(part);
     let compiler = device
         .context()
         .compiler_probe()

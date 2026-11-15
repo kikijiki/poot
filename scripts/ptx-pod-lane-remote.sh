@@ -59,7 +59,7 @@ fi
 if [ -x /root/calibrate_launch ]; then
   mkdir -p /root/calibrate
   export POOT_BANK_DEVICE="$(nvidia-smi --query-gpu=name --format=csv,noheader)" CALIBRATE_LAUNCH_BIN=/root/calibrate_launch CALIBRATE_LAUNCH_LOCKED=1
-  for mode in tilings indexed gemv; do
+  for mode in $(cat /root/calibrate-modes); do
     bash scripts/calibrate-launch ptx "$mode" "/root/calibrate/$mode" > "/root/calibrate/$mode.log" 2>&1; echo "calibrate $mode exit $?"
     tail -3 "/root/calibrate/$mode.log"
   done

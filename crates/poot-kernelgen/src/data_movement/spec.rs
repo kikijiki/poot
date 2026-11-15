@@ -5,6 +5,7 @@ use poot_kernel_ir::Ty;
 
 use crate::KernelGenError;
 use crate::elementwise::ELEMENTWISE_2D_WORKGROUP_SIZE;
+use crate::helpers::Layout;
 use crate::request::Fold;
 
 const G: &str = "data_movement";
@@ -105,36 +106,70 @@ pub struct UnitWindow {
     pub threads: usize,
 }
 
+/// One input of a movement read through a layout: the logical `shape` it presents, the logical shape `source` of
+/// the buffer that holds it, and the `from` layout that places each logical element in that buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovementRead {
+    /// The logical shape read.
+    pub shape: Vec<usize>,
+    /// The logical shape of the buffer read (a view's root; `shape` itself for a value that is no view).
+    pub source: Vec<usize>,
+    /// One stride per axis of `shape` and a flat offset, in the elements of `source`.
+    pub from: Layout,
+}
+
+impl MovementRead {
+    /// A value read row-major from its own buffer.
+    pub fn contiguous(shape: Vec<usize>) -> Self {
+        Self {
+            from: Layout::contiguous(&shape),
+            source: shape.clone(),
+            shape,
+        }
+    }
+
+    /// Whether the layout is the row-major default, which a body reads by the flat index alone.
+    pub(crate) fn is_contiguous(&self) -> bool {
+        self.from == Layout::contiguous(&self.shape)
+    }
+
+    /// The layout's checks against its source: one stride per axis, and every element inside the buffer.
+    pub(super) fn validate(&self, what: &str) -> Result<(), KernelGenError> {
+        if self.from.strides.len() != self.shape.len() {
+            return Err(KernelGenError::CountMismatch {
+                generator: G,
+                what: format!("{what} layout strides"),
+                expected: self.shape.len(),
+                actual: self.from.strides.len(),
+            });
+        }
+        let end = self.from.extent_end(&self.shape);
+        let bound = self.source.iter().product::<usize>();
+        if end > bound {
+            return Err(KernelGenError::ExceedsBound {
+                generator: G,
+                what: format!("{what} layout extent"),
+                value: end,
+                bound,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// The index mapping of one movement. The output shape is [`MovementSpec::out_shape`]; every input shape a
 /// variant carries is the logical shape, whatever the storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MovementOp {
-    /// `out[idx] = in[idx permuted]`: output axis `d` reads input axis `perm[d]`.
-    Transpose {
-        /// The input's logical shape.
-        in_shape: Vec<usize>,
-        /// The input axis each output axis reads: a permutation of `0..rank`.
-        perm: Vec<usize>,
-    },
-    /// `out = in[.., start..start + out_shape[axis], ..]` along `axis`.
-    Slice {
-        /// The input's logical shape.
-        in_shape: Vec<usize>,
-        /// The axis the slice is taken along.
-        axis: usize,
-        /// First input position on `axis` that the slice reads.
-        start: usize,
-    },
-    /// `out` is `in` broadcast to `out_shape` (right-aligned; a broadcast axis reads the same element).
-    Broadcast {
-        /// The input's logical shape, right-aligned against `out_shape`.
-        in_shape: Vec<usize>,
-    },
-    /// The flat logical order is unchanged and the row length changes. A `PackedRows` reshape that moves
-    /// the last axis needs it because row padding is not part of the logical tensor.
-    Reshape {
-        /// The input's logical shape (same flat order as the output).
-        in_shape: Vec<usize>,
+    /// `out[i] = source[from(i)]`: every output element read through `from`, a [`Layout`] over the logical
+    /// shape `source`. A transpose, a slice, a broadcast, a reshape of a view and any chain of them is one
+    /// `Copy` whose layout is the chain's composition over the chain's root. A packed payload is read by its
+    /// logical flat index in `source`, which is then the input itself (a packed value is never a view).
+    Copy {
+        /// The logical shape of the buffer read (the chain's root).
+        source: Vec<usize>,
+        /// Where each output element sits in `source`: one stride per output axis and a flat offset.
+        from: Layout,
     },
     /// `out[.., g, ..] = in[.., index[g], ..]` along `axis`; `index` is an `I32` buffer of `index_numel`
     /// elements (a scalar index is 1).
@@ -150,8 +185,8 @@ pub enum MovementOp {
     Concat {
         /// The axis the inputs are joined along.
         axis: usize,
-        /// The logical shape of each input, in join order.
-        in_shapes: Vec<Vec<usize>>,
+        /// Each input in join order, read through its own layout.
+        inputs: Vec<MovementRead>,
     },
     /// `out = operand` with `update` written at `[.., index..index + extent, ..]` on `axis`, where the
     /// operand has `out_shape` and the update has `update_shape`.
@@ -296,6 +331,18 @@ impl MovementSpec {
         (extent.div_ceil(lanes) + 1).min(row_len.div_ceil(lanes))
     }
 
+    /// A packed payload moves by its logical flat index, so every input read of a packed movement is row-major.
+    fn packed_reads_are_contiguous(&self, read: &MovementRead) -> Result<(), KernelGenError> {
+        if matches!(self.storage, Storage::PackedRows { .. }) && !read.is_contiguous() {
+            return Err(KernelGenError::Unsupported {
+                request: G,
+                reason: "a packed payload is read by its logical flat index: only the contiguous \
+                         layout is a packed read",
+            });
+        }
+        Ok(())
+    }
+
     /// The generator's own preconditions on the request, checked before a statement exists.
     pub(super) fn validate(&self) -> Result<(), KernelGenError> {
         self.storage.check()?;
@@ -369,68 +416,14 @@ impl MovementSpec {
             None => Ok(()),
         };
         match &self.op {
-            MovementOp::Transpose { in_shape, perm } => {
-                same_rank("in_shape", in_shape)?;
-                same_rank("perm", perm)?;
-                nonempty("in_shape", in_shape)?;
-                let mut seen = vec![false; rank];
-                for &axis in perm {
-                    axis_in_range(axis, rank)?;
-                    if std::mem::replace(&mut seen[axis], true) {
-                        return Err(KernelGenError::Unsupported {
-                            request: G,
-                            reason: "a transpose permutation names an axis twice",
-                        });
-                    }
+            MovementOp::Copy { source, from } => {
+                nonempty("source", source)?;
+                MovementRead {
+                    shape: self.out_shape.clone(),
+                    source: source.clone(),
+                    from: from.clone(),
                 }
-                Ok(())
-            }
-            MovementOp::Slice {
-                in_shape,
-                axis,
-                start,
-            } => {
-                same_rank("in_shape", in_shape)?;
-                nonempty("in_shape", in_shape)?;
-                axis_in_range(*axis, rank)?;
-                let end = start.saturating_add(self.out_shape[*axis]);
-                if end > in_shape[*axis] {
-                    return Err(KernelGenError::ExceedsBound {
-                        generator: G,
-                        what: "slice end".to_string(),
-                        value: end,
-                        bound: in_shape[*axis],
-                    });
-                }
-                Ok(())
-            }
-            MovementOp::Broadcast { in_shape } => {
-                nonempty("in_shape", in_shape)?;
-                if in_shape.len() > rank {
-                    return Err(KernelGenError::ExceedsBound {
-                        generator: G,
-                        what: "in_shape rank".to_string(),
-                        value: in_shape.len(),
-                        bound: rank,
-                    });
-                }
-                Ok(())
-            }
-            MovementOp::Reshape { in_shape } => {
-                nonempty("in_shape", in_shape)?;
-                let (elements, expected) = (
-                    in_shape.iter().product::<usize>(),
-                    self.out_shape.iter().product::<usize>(),
-                );
-                if elements != expected {
-                    return Err(KernelGenError::NotEqualTo {
-                        generator: G,
-                        dim: "reshape element count".to_string(),
-                        value: elements,
-                        expected,
-                    });
-                }
-                Ok(())
+                .validate("copy")
             }
             MovementOp::Gather {
                 in_shape,
@@ -449,10 +442,10 @@ impl MovementSpec {
                 }
                 Ok(())
             }
-            MovementOp::Concat { axis, in_shapes } => {
+            MovementOp::Concat { axis, inputs } => {
                 axis_in_range(*axis, rank)?;
                 // One input is a copy, the degenerate concat.
-                if in_shapes.is_empty() {
+                if inputs.is_empty() {
                     return Err(KernelGenError::BelowMinimum {
                         generator: G,
                         what: "concat inputs".to_string(),
@@ -461,9 +454,13 @@ impl MovementSpec {
                     });
                 }
                 let mut total = 0;
-                for shape in in_shapes {
+                for input in inputs {
+                    let shape = &input.shape;
                     same_rank("concat input", shape)?;
                     nonempty("concat input", shape)?;
+                    nonempty("concat input source", &input.source)?;
+                    self.packed_reads_are_contiguous(input)?;
+                    input.validate("concat input")?;
                     for d in (0..rank).filter(|&d| d != *axis) {
                         if shape[d] != self.out_shape[d] {
                             return Err(KernelGenError::ShapeMismatch {

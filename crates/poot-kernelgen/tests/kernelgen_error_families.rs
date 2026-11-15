@@ -69,26 +69,29 @@ fn fused_family_rejects_leaf_count_mismatch_and_zero_width() {
 
 #[test]
 fn movement_family_rejects_rank_and_count_mismatches() {
-    // Mutation target: the transpose input-rank check in `MovementSpec::validate`.
+    // Mutation target: the layout stride-count check in `MovementRead::validate`.
     let spec = poot_kernelgen::MovementSpec::new;
     let err = poot_kernelgen::movement_body(
         "t",
         &spec(
-            poot_kernelgen::Storage::BYTE_LANES,
+            poot_kernelgen::Storage::Elements { carrier: Ty::F32 },
             vec![2, 3],
-            poot_kernelgen::MovementOp::Transpose {
-                in_shape: vec![3, 2, 1],
-                perm: vec![0, 1],
+            poot_kernelgen::MovementOp::Copy {
+                source: vec![3, 2, 1],
+                from: poot_kernelgen::Layout {
+                    strides: vec![1, 3, 1],
+                    offset: 0,
+                },
             },
         ),
         None,
     )
-    .expect_err("out_shape rank 2 != in_shape rank 3");
+    .expect_err("out_shape rank 2 != layout rank 3");
     assert_eq!(
         err,
         KernelGenError::CountMismatch {
             generator: "data_movement",
-            what: "in_shape rank".to_string(),
+            what: "copy layout strides".to_string(),
             expected: 2,
             actual: 3,
         }
@@ -101,7 +104,7 @@ fn movement_family_rejects_rank_and_count_mismatches() {
             vec![2, 4],
             poot_kernelgen::MovementOp::Concat {
                 axis: 1,
-                in_shapes: vec![vec![2, 3]],
+                inputs: vec![poot_kernelgen::MovementRead::contiguous(vec![2, 3])],
             },
         ),
         None,
@@ -114,6 +117,65 @@ fn movement_family_rejects_rank_and_count_mismatches() {
             dim: "concat extents on axis 1".to_string(),
             value: 3,
             expected: 4,
+        }
+    );
+}
+
+/// POOT-1576 SC-b6: a layout that reads past its source buffer is a typed `ExceedsBound`, for the copy and for a
+/// concat part, never an out-of-bounds read in the body.
+///
+/// Mutation: drop the `extent_end` check in `MovementRead::validate`; both requests generate and this row goes red
+/// (the interpreter would fault reading past the source).
+#[test]
+fn a_layout_past_its_source_is_refused() {
+    let storage = poot_kernelgen::Storage::Elements { carrier: Ty::F32 };
+    let past = || poot_kernelgen::Layout::contiguous(&[2, 5]).sliced(1, 4);
+    let err = poot_kernelgen::movement_body(
+        "t",
+        &poot_kernelgen::MovementSpec::new(
+            storage.clone(),
+            vec![2, 3],
+            poot_kernelgen::MovementOp::Copy {
+                source: vec![2, 5],
+                from: past(),
+            },
+        ),
+        None,
+    )
+    .expect_err("columns 4..7 of a 5-wide source");
+    assert_eq!(
+        err,
+        KernelGenError::ExceedsBound {
+            generator: "data_movement",
+            what: "copy layout extent".to_string(),
+            value: 12,
+            bound: 10,
+        }
+    );
+    let err = poot_kernelgen::movement_body(
+        "t",
+        &poot_kernelgen::MovementSpec::new(
+            storage,
+            vec![2, 3],
+            poot_kernelgen::MovementOp::Concat {
+                axis: 1,
+                inputs: vec![poot_kernelgen::MovementRead {
+                    shape: vec![2, 3],
+                    source: vec![2, 5],
+                    from: past(),
+                }],
+            },
+        ),
+        None,
+    )
+    .expect_err("the part reads past its source too");
+    assert_eq!(
+        err,
+        KernelGenError::ExceedsBound {
+            generator: "data_movement",
+            what: "concat input layout extent".to_string(),
+            value: 12,
+            bound: 10,
         }
     );
 }
@@ -147,7 +209,7 @@ fn rope_family_rejects_zero_rank_and_odd_rot() {
 
 #[test]
 fn concat_family_rejects_zero_inputs() {
-    // Mutation target: the `in_shapes.is_empty()` check in `MovementSpec::validate`.
+    // Mutation target: the `inputs.is_empty()` check in `MovementSpec::validate`.
     let err = poot_kernelgen::movement_body(
         "t",
         &poot_kernelgen::MovementSpec::new(
@@ -155,7 +217,7 @@ fn concat_family_rejects_zero_inputs() {
             vec![1],
             poot_kernelgen::MovementOp::Concat {
                 axis: 0,
-                in_shapes: vec![],
+                inputs: vec![],
             },
         ),
         None,

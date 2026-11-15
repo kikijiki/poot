@@ -6,7 +6,10 @@
 //! launch's lanes against the device's saturating lanes, but never less than one lane's own sequence of steps.
 //!
 //! Calibration: every ratio is the device's ([`poot_target::calibration::PerfCalibration::cost`]; the tiling ratios of
-//! gfx1151 through HSA were fitted by POOT-1494, the Gemv's direct value by the POOT-1489 microbench).
+//! gfx1151 through HSA were fitted by POOT-1494, the Gemv's direct value by the POOT-1489 microbench; on sm_89 the
+//! direct value and the Gemv's per-dot-product cost together by POOT-1602). A Gemv pays what its dot products cost
+//! whatever their `K` beside its per-`K` reads, which is what lets a short-`K` Gemv lose to a tile that its long-`K`
+//! twin of the same work beats.
 //!
 //! One model ranks the tilings of one contraction ([`ContractionCost::tiled`]), the Gemv against a matrix unit
 //! ([`ContractionCost::gemv`]) and the per-row Gemv of an indexed contraction against the tiling of its rows grouped
@@ -57,6 +60,9 @@ pub struct CostTerms {
     /// The scan steps of the expert grouping this contraction's rows need, per `K` value (the grouping runs once, in
     /// one workgroup, so the occupancy does not scale it): none for dense rows and for a Gemv.
     pub grouping_per_k: f64,
+    /// The dot products one lane finishes per `K` value (its share of its workgroup's outputs over `K`), which a
+    /// device that identified it weighs by [`CostRatios::gemv_dot`]: a Gemv's, none for a tiling.
+    pub dots_per_k: f64,
 }
 
 impl CostTerms {
@@ -71,7 +77,7 @@ impl CostTerms {
                     + self.staged_per_lane * (ratios.staged_value + self.rounding)
                     + self.direct_per_lane * ratios.direct_value
             }
-        };
+        } + ratios.gemv_dot.map_or(0.0, |dot| self.dots_per_k * dot);
         lane_step * self.occupancy
             + ratios
                 .group_scan
@@ -84,9 +90,11 @@ impl CostTerms {
 pub struct GemvShape {
     /// Dot products launched: the rows times the output columns.
     pub outputs: usize,
+    /// The depth of each dot product.
+    pub k: usize,
     /// Lanes of a workgroup, a multiple of `cols`.
     pub width: u32,
-    /// Adjacent output columns a workgroup owns.
+    /// Output columns a workgroup owns (its column groups times the rows of each).
     pub cols: u32,
 }
 
@@ -179,13 +187,16 @@ impl ContractionCost {
                 && matches!(shape.rows, TiledRows::Grouped { .. }))
             .then(|| 1.0 / tiling.depth() as f64),
             grouping_per_k,
+            dots_per_k: 0.0,
         }
     }
 
     /// The modelled time of a Gemv launch, in the unit of [`Self::tiled`]. A workgroup of `width` lanes shares the
     /// `K` values of `cols` output columns, so per `K` value a lane issues `1 / width` of the FMAs of its columns
     /// and reads their weight values and the activation value straight from global memory
-    /// ([`CostRatios::direct_value`]), with no LDS stage or barrier. The launch is `outputs / cols` workgroups.
+    /// ([`CostRatios::direct_value`]), with no LDS stage or barrier. The launch is `outputs / cols` workgroups. Each
+    /// dot product also costs what does not scale with `K` ([`CostRatios::gemv_dot`]): a lane's share of its
+    /// workgroup's `cols` dot products, over `K`.
     pub(super) fn gemv(gemv: GemvShape, caps: &poot_target::DeviceCaps) -> f64 {
         let ratios = caps.gemm_launch().calibrated.figures().cost;
         Self::gemv_terms(gemv, caps).modelled_time(ratios)
@@ -204,6 +215,7 @@ impl ContractionCost {
             occupancy: Self::fill(lanes, caps),
             rounds_per_k: None,
             grouping_per_k: 0.0,
+            dots_per_k: cols / width / gemv.k.max(1) as f64,
         }
     }
 

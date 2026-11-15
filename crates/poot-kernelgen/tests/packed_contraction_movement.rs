@@ -11,7 +11,10 @@
 use poot_kernel_ir::Ty;
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernel_ir::test_support::workgroups_covering;
-use poot_kernelgen::{KernelGenError, MovementOp, MovementSpec, Storage, UnitWindow, UpdateIndex};
+use poot_kernelgen::{
+    KernelGenError, Layout, MovementOp, MovementRead, MovementSpec, Storage, UnitWindow,
+    UpdateIndex,
+};
 
 /// A row-major tensor of lane values.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,7 +384,10 @@ fn bank(width: u32) -> Vec<Case> {
         cases.push(Case {
             name,
             out_shape: expected.shape.clone(),
-            op: MovementOp::Transpose { in_shape, perm },
+            op: MovementOp::Copy {
+                from: Layout::contiguous(&in_shape).permuted(&perm),
+                source: in_shape,
+            },
             inputs: vec![input],
             index: None,
             expected,
@@ -399,10 +405,9 @@ fn bank(width: u32) -> Vec<Case> {
         cases.push(Case {
             name,
             out_shape: expected.shape.clone(),
-            op: MovementOp::Slice {
-                in_shape,
-                axis,
-                start,
+            op: MovementOp::Copy {
+                from: Layout::contiguous(&in_shape).sliced(axis, start),
+                source: in_shape,
             },
             inputs: vec![input],
             index: None,
@@ -420,8 +425,11 @@ fn bank(width: u32) -> Vec<Case> {
         let expected = broadcast(&input, &out_shape);
         cases.push(Case {
             name,
-            out_shape,
-            op: MovementOp::Broadcast { in_shape },
+            out_shape: out_shape.clone(),
+            op: MovementOp::Copy {
+                from: Layout::contiguous(&in_shape).broadcast(&in_shape, &out_shape),
+                source: in_shape,
+            },
             inputs: vec![input],
             index: None,
             expected,
@@ -440,8 +448,11 @@ fn bank(width: u32) -> Vec<Case> {
         };
         cases.push(Case {
             name,
-            out_shape,
-            op: MovementOp::Reshape { in_shape },
+            out_shape: out_shape.clone(),
+            op: MovementOp::Copy {
+                from: Layout::contiguous(&out_shape),
+                source: in_shape,
+            },
             inputs: vec![input],
             index: None,
             expected,
@@ -508,7 +519,7 @@ fn bank(width: u32) -> Vec<Case> {
             out_shape: expected.shape.clone(),
             op: MovementOp::Concat {
                 axis,
-                in_shapes: shapes,
+                inputs: shapes.into_iter().map(MovementRead::contiguous).collect(),
             },
             inputs,
             index: None,
@@ -709,10 +720,9 @@ fn fp8_raw_bit_cases() -> Vec<RawBitCase> {
             gather(&table, 0, &[4], &[2, 0, 1, 2]),
         ),
         (
-            MovementOp::Slice {
-                in_shape: vec![3, 5],
-                axis: 1,
-                start: 1,
+            MovementOp::Copy {
+                source: vec![3, 5],
+                from: Layout::contiguous(&[3, 5]).sliced(1, 1),
             },
             vec![3, 3],
             None,
@@ -722,7 +732,7 @@ fn fp8_raw_bit_cases() -> Vec<RawBitCase> {
         (
             MovementOp::Concat {
                 axis: 1,
-                in_shapes: vec![vec![3, 5], vec![3, 5]],
+                inputs: vec![MovementRead::contiguous(vec![3, 5]); 2],
             },
             vec![3, 10],
             None,
@@ -839,7 +849,10 @@ fn malformed_requests_are_typed_refusals() {
         refuse(
             element.clone(),
             vec![0, 3],
-            MovementOp::Broadcast { in_shape: vec![3] }
+            MovementOp::Copy {
+                source: vec![3],
+                from: Layout::contiguous(&[3]).broadcast(&[3], &[2, 3]),
+            }
         ),
         KernelGenError::BelowMinimum { .. }
     ));
@@ -847,10 +860,9 @@ fn malformed_requests_are_typed_refusals() {
         refuse(
             element.clone(),
             vec![2, 3],
-            MovementOp::Slice {
-                in_shape: vec![2, 5],
-                axis: 1,
-                start: 4
+            MovementOp::Copy {
+                source: vec![2, 5],
+                from: Layout::contiguous(&[2, 5]).sliced(1, 4)
             }
         ),
         KernelGenError::ExceedsBound { .. }
@@ -859,12 +871,15 @@ fn malformed_requests_are_typed_refusals() {
         refuse(
             element.clone(),
             vec![2, 3],
-            MovementOp::Transpose {
-                in_shape: vec![3, 2],
-                perm: vec![1, 1]
+            MovementOp::Copy {
+                source: vec![3, 2],
+                from: Layout {
+                    strides: vec![1],
+                    offset: 0
+                }
             }
         ),
-        KernelGenError::Unsupported { .. }
+        KernelGenError::CountMismatch { .. }
     ));
     assert!(matches!(
         refuse(
@@ -884,7 +899,7 @@ fn malformed_requests_are_typed_refusals() {
             vec![2, 4],
             MovementOp::Concat {
                 axis: 1,
-                in_shapes: vec![vec![2, 3], vec![2, 3]]
+                inputs: vec![MovementRead::contiguous(vec![2, 3]); 2]
             }
         ),
         KernelGenError::NotEqualTo { .. }
@@ -893,8 +908,9 @@ fn malformed_requests_are_typed_refusals() {
         refuse(
             Storage::PackedRows { lane_bits: 4 },
             vec![2, 3],
-            MovementOp::Reshape {
-                in_shape: vec![3, 2]
+            MovementOp::Copy {
+                source: vec![3, 2],
+                from: Layout::contiguous(&[2, 3])
             }
         ),
         KernelGenError::Unsupported { .. }

@@ -691,7 +691,7 @@ fn i32_movement_carries_i32_whatever_consumes_it() {
     let broadcast_dtype = |choice: &KernelChoice| match choice {
         KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
             storage: kg::Storage::Elements { carrier },
-            op: kg::MovementOp::Broadcast { .. },
+            op: kg::MovementOp::Copy { .. },
             ..
         })) => carrier.clone(),
         other => panic!("a broadcast must be generated: {other:?}"),
@@ -1690,9 +1690,9 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
             &choice,
             KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
                 storage: kg::Storage::PackedRows { lane_bits: 8 },
-                op: kg::MovementOp::Concat { axis: 1, in_shapes },
+                op: kg::MovementOp::Concat { axis: 1, inputs },
                 ..
-            })) if in_shapes.len() == 3
+            })) if inputs.len() == 3
         ),
         "{choice:?}"
     );
@@ -3925,7 +3925,7 @@ fn a_collective_inside_a_stage_graph_is_refused_by_compile() {
 
 // --- spec 132 phase 1 (strided views) ---
 
-/// `a -(movement)-> t`, with `t` fed into `binary_add(t, t)` so `t`'s only consumer is strided-capable
+/// `a -(movement)-> t`, with `t` fed into `binary_add(t, t)` so `t`'s only consumer reads a layout
 /// and `compute_views` promotes it to a view. Returns the graph, `t`'s value id, and the movement eqn's
 /// index (callers pull its `OpKind` off `g.eqns`, matching what `compute_views`/`apply_movement` see).
 fn view_test_graph(
@@ -4082,8 +4082,8 @@ fn reshape_merging_across_a_stride_gap_keeps_the_slice_copy() {
 
 #[test]
 fn transpose_into_matmul_keeps_the_materialize_copy() {
-    // AS-002: a Transpose feeding a MatMul (a contraction kernel, not strided-capable) keeps its one
-    // materialize copy; MatMul is absent from `is_strided_capable`.
+    // AS-002: a Transpose feeding a MatMul (a contraction kernel, which reads flat) keeps its one
+    // materialize copy; `operand_demand` answers `Dense` for a MatMul operand.
     let bld = Builder::for_tests();
     let a = bld.constant("a", TensorType::f32(vec![4, 3])).unwrap();
     let t = bld.transpose(a, vec![1, 0]).unwrap(); // [3,4]
@@ -4133,7 +4133,7 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
     let views = compute_views(&g, Backend::SpirvVulkan);
     assert!(
         views.contains_key(&t.id()),
-        "t's only consumer (y_view's Binary) is strided-capable"
+        "t's only consumer (y_view's Binary) reads a layout"
     );
 
     let eqn_view = g.eqns().iter().find(|e| e.out == y_view.id()).unwrap();
@@ -4373,8 +4373,8 @@ fn dispatches(program: &Program) -> usize {
 #[test]
 fn transpose_then_slice_into_binary_add_composes_both_into_views() {
     // A Transpose feeding a Slice feeding only a Binary(Add). Phase 1's one-hop restriction promoted at
-    // most the Slice; the Transpose stayed a materialize copy because its consumer, the Slice, is not
-    // `is_strided_capable`. Phase 2 must promote both: the Slice is a view of a view, and the chain
+    // most the Slice; the Transpose stayed a materialize copy because its consumer, the Slice, was not
+    // a promoted view. Phase 2 must promote both: the Slice is a view of a view, and the chain
     // composes into one Layout per link, both relative to the original contiguous buffer.
     let bld = Builder::for_tests();
     let a = bld.constant("a", TensorType::f32(vec![3, 2, 4])).unwrap();
@@ -4388,7 +4388,7 @@ fn transpose_then_slice_into_binary_add_composes_both_into_views() {
     assert!(
         views.contains_key(&t_id),
         "the Transpose link must ALSO promote to a view now (chain composition) - phase 1 kept it \
-         as a materialize copy since its consumer (Slice) was never `is_strided_capable`"
+         as a materialize copy since its consumer (Slice) was not promoted"
     );
     assert!(
         views.contains_key(&s_id),
@@ -4421,7 +4421,7 @@ fn transpose_then_slice_into_binary_add_composes_both_into_views() {
 fn dispatch_count_planned_chain_drops_further_than_phase_1_one_hop() {
     // Same chain as above, as a direct phase-1-vs-phase-2 dispatch count comparison, so a regression to
     // one-hop composition is caught even if the strides assertions are weakened. Phase 1: the Transpose
-    // is a materialize copy (its consumer, Slice, isn't `is_strided_capable`) -> 1; the Slice still
+    // is a materialize copy (its consumer, Slice, was not promoted) -> 1; the Slice still
     // promotes as the last hop -> 0; Binary -> 1; total 2. Phase 2: both movement ops are free views;
     // total 1.
     const PHASE_1_ONE_HOP_DISPATCHES: usize = 2;

@@ -81,7 +81,7 @@ pub struct Capability {
     /// A strided (non-row-major) value operand can be read directly by a kernel body, with no
     /// materialize copy first (spec 132's `compute_views`). The AIE core has no view-capable kernel
     /// bodies today (R469-022): strided reads there still materialize. NVPTX's kernel bodies for every
-    /// `is_strided_capable` op kind (`poot-graph-plan/src/predicates.rs`) are the same backend-neutral
+    /// layout-reading op kind (`operand_demand` in `poot-graph-plan/src/predicates.rs`) are the same backend-neutral
     /// `poot-kernelgen` bodies wgpu/ROCm already read strided operands through, compiled for
     /// `Target::Nvptx` like any other kernel; `false` here just meant PTX paid an extra materialize copy
     /// for no codegen reason (R-546-9, card 549).

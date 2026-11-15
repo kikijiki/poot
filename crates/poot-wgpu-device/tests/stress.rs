@@ -1212,7 +1212,7 @@ fn wgpu_binary_broadcast_grid_over_65535_workgroups() {
 }
 
 /// Card 159 Inc 3 repro: a `Transpose` past the 65535-workgroup ceiling, feeding a `MatMul` consumer (so
-/// `compute_views` cannot promote it to a zero-dispatch view: a `MatMul` operand is not strided-capable, as with
+/// `compute_views` cannot promote it to a zero-dispatch view: a `MatMul` operand reads flat, as with
 /// the gemma4 K^T transpose before `Q @ K^T`). This is the op+shape that crashed the gemma4-dense batched
 /// decode step at `POOT_SLOTS=1`/`POOT_CAP=1024`, found by scanning the real optimized graph (the `Binary`
 /// mask add measures only 32768 elements at `Hq=32`; see `poot-graph-plan::is_elementwise_2d`). Shape:

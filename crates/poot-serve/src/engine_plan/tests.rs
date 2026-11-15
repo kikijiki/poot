@@ -836,6 +836,8 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// POOT-1564 plans a reshape of a view as a view and reads the conv window's taps from its parts, so the q/k/v and tap
 /// slices and the conv-kernel transposes leave the arena: `Activation` 970628 -> 937428, 485468 -> 468868
 /// and 243288 -> 234988 at four, two and one rows.
+/// POOT-1576 reads a movement chain's root through the chain's composed layout, so a link under a materialized tail
+/// stops materializing: at one row `Activation` 234988 -> 234960 (the four- and two-row peaks are set elsewhere).
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
 /// is no longer 5216 and this row goes red.
@@ -864,7 +866,7 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             1,
             64,
-            "Activation=234988 Input=82072 Meta=15564 State=3104 Weight=5216",
+            "Activation=234960 Input=82072 Meta=15564 State=3104 Weight=5216",
         ),
     ];
     let domain = candidates(&handle, &args);

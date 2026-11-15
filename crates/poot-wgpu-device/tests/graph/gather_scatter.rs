@@ -563,7 +563,9 @@ fn index_remap_layout_plan_selection() {
         assert!(
             matches!(
                 &spec.op,
-                MovementOp::Transpose { in_shape, perm } if in_shape == &[2, 3, 4] && perm == &[2, 0, 1]
+                MovementOp::Copy { source, from }
+                    if source == &[2, 3, 4]
+                        && *from == poot_kernelgen::Layout::contiguous(&[2, 3, 4]).permuted(&[2, 0, 1])
             ),
             "{backend:?}: {spec:?}"
         );
@@ -579,7 +581,9 @@ fn index_remap_layout_plan_selection() {
         assert!(
             matches!(
                 &spec.op,
-                MovementOp::Slice { in_shape, axis: 1, start: 1 } if in_shape == &[4, 5]
+                MovementOp::Copy { source, from }
+                    if source == &[4, 5]
+                        && *from == poot_kernelgen::Layout::contiguous(&[4, 5]).sliced(1, 1)
             ),
             "{backend:?}: {spec:?}"
         );
@@ -592,7 +596,12 @@ fn index_remap_layout_plan_selection() {
         );
         let spec = movement_of(&plan_, &choice_);
         assert!(
-            matches!(&spec.op, MovementOp::Broadcast { in_shape } if in_shape == &[3, 1]),
+            matches!(
+                &spec.op,
+                MovementOp::Copy { source, from }
+                    if source == &[3, 1]
+                        && *from == poot_kernelgen::Layout::contiguous(&[3, 1]).broadcast(&[3, 1], &[3, 4])
+            ),
             "{backend:?}: {spec:?}"
         );
     }

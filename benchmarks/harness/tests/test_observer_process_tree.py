@@ -152,6 +152,18 @@ def sampler_processes():
 
 
 class ObserverProcessTreeTests(unittest.TestCase):
+    def setUp(self):
+        # The observer leaves a signal alone when its disposition is ignored on entry (it must not turn an
+        # ignored SIGINT into a deferred one), and a launcher decides that: a job started with `&` in a
+        # non-interactive shell inherits SIGINT ignored, and the drivers inherit whatever this process has.
+        # Every test here is about the observer's own handling of these signals, so it starts from the
+        # defaults and does not depend on how it was launched.
+        for signum, default in (
+            (signal.SIGINT, signal.default_int_handler),
+            (signal.SIGTERM, signal.SIG_DFL),
+        ):
+            self.addCleanup(signal.signal, signum, signal.signal(signum, default))
+
     def observed_tree(self, mode, pid_file, timeout_s=UPPER_BOUND_S):
         """Observe a fixture process tree. Its own timeout is a bound, never reached; tests that need the
         timeout path wrap the call in time_out_once_ready."""

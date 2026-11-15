@@ -74,6 +74,7 @@ pub const PORTABLE_COST_RATIOS: CostRatios = CostRatios {
     direct_value: 7.6,
     fragment_round: None,
     group_scan: None,
+    gemv_dot: None,
 };
 
 /// The cost model's ratios on Strix Halo through HSA (ROCm), identified by `calibrate-launch` over every candidate
@@ -107,12 +108,33 @@ pub const STRIX_HALO_HSA_COST_RATIOS: CostRatios = CostRatios {
     direct_value: 13.4,
     fragment_round: Some(800.0),
     group_scan: Some(61.4),
+    gemv_dot: None,
 };
 
 /// The Gemv's direct value on the RTX PRO 6000 Blackwell Server (sm_120), identified by `calibrate-launch indexed` on
 /// that part (POOT-1490): the centre of the range in which the model's Gemv-versus-grouped choices are never slower
 /// than the retired 32-row switch, 11.9 to 16.8. It is not [`PORTABLE_COST_RATIOS`]'s 7.6, which lies below the range.
 pub const SM_120_DIRECT_VALUE_COST: f64 = 14.15;
+
+/// The Gemv's direct value and per-dot-product cost on the RTX 4090 (sm_89), identified together over the two
+/// `calibrate-launch` corpora of that part (POOT-1602 fit): the fragment corpus of POOT-1599
+/// (`benchmarks/calibration/ptx-sm89.tsv`, 551 rows) and the Gemv-versus-grouped corpus of POOT-1490
+/// (`ptx-sm89-indexed.tsv`, 88 cells). With no dot term no direct value lets both packed cells at 128 tokens of the
+/// fragment corpus (the IQ2_XS up projection, K 2560, where the Gemv is fastest, and the IQ4_NL down projection, K 640,
+/// where a narrowed tile is 1.46x faster than the Gemv) choose within 1.10 of their fastest schedule. With it, the grid
+/// of one octave in four over both figures, scored by the worst cell regret over both corpora and then the mean, is
+/// optimal on a ridge of six points (direct values 3.4 to 4.8, a lower one taking a dearer dot): worst 1.455 (a dense
+/// cell neither figure touches), mean 1.013 against 1.035 at the portable prior; these are the point nearest the
+/// ridge's centre. On the fragment corpus alone they score mean 1.083 against 1.099 at the prior, the up cell choosing
+/// the Gemv and the down cell the narrowed tile (1.09). `fit_fragment_cost.py --device sm89` recomputes them.
+pub const SM_89_COST_RATIOS: CostRatios = CostRatios {
+    lds_read: PORTABLE_COST_RATIOS.lds_read,
+    staged_value: PORTABLE_COST_RATIOS.staged_value,
+    direct_value: 4.0,
+    fragment_round: None,
+    group_scan: None,
+    gemv_dot: Some(2378.0),
+};
 
 /// The keys per staged block of the tiled attention schedule on Strix Halo, widest first. A 64-key block was
 /// measured 20-30% slower than a 32-key one on ROCm and wgpu and no faster on PTX (POOT-1402 bank sweep).
@@ -184,6 +206,12 @@ pub struct CostRatios {
     /// lanes each scan the row ids for their buckets), in FMA issues of one lane: a grouped contraction then pays
     /// the grouping before its first tile. `None` leaves the grouping unpriced.
     pub group_scan: Option<f64>,
+    /// On a device that identified it, what one Gemv dot product costs whatever its `K`, in FMA issues of one lane:
+    /// its weight row's stream start, its row's base and its fold and store (identified, not derived: the measured
+    /// Gemv costs about 1.3x its per-`K` price at a `K` of 512 to 640 against 2560, on two vendors and for one format
+    /// at both, POOT-1602). It is what makes a short-`K` Gemv lose to a tile its long-`K` twin beats. `None` leaves it
+    /// unpriced.
+    pub gemv_dot: Option<f64>,
 }
 
 /// The performance figures one device's launches were measured with. A figure here only ranks schedules that are
@@ -257,7 +285,19 @@ impl PerfCalibration {
             direct_value: SM_120_DIRECT_VALUE_COST,
             fragment_round: None,
             group_scan: None,
+            gemv_dot: None,
         },
+        attention_key_blocks: Self::PORTABLE.attention_key_blocks,
+        attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
+    };
+
+    /// The RTX 4090 (compute capability 8.9). Measured for the Gemv's direct value and per-dot-product cost
+    /// ([`SM_89_COST_RATIOS`], POOT-1602); every other figure is [`Self::PORTABLE`]'s, spelled out as borrowed.
+    pub const SM_89: Self = Self {
+        dense_gemv_cols: Self::PORTABLE.dense_gemv_cols,
+        packed_gemv: Self::PORTABLE.packed_gemv,
+        lds_gemv_width: Self::PORTABLE.lds_gemv_width,
+        cost: SM_89_COST_RATIOS,
         attention_key_blocks: Self::PORTABLE.attention_key_blocks,
         attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
@@ -273,6 +313,8 @@ pub enum MeasuredDevice {
     StrixHaloVulkan,
     /// The RTX PRO 6000 Blackwell Server (compute capability 12.0).
     Sm120,
+    /// The RTX 4090 (compute capability 8.9).
+    Sm89,
 }
 
 impl MeasuredDevice {
@@ -282,6 +324,7 @@ impl MeasuredDevice {
             Self::StrixHaloHsa => PerfCalibration::STRIX_HALO_HSA,
             Self::StrixHaloVulkan => PerfCalibration::STRIX_HALO_VULKAN,
             Self::Sm120 => PerfCalibration::SM_120,
+            Self::Sm89 => PerfCalibration::SM_89,
         }
     }
 }
@@ -306,6 +349,9 @@ impl Calibrated {
 
     /// The RTX PRO 6000 Blackwell's measured entry.
     pub const SM_120: Self = Self::Measured(MeasuredDevice::Sm120);
+
+    /// The RTX 4090's measured entry.
+    pub const SM_89: Self = Self::Measured(MeasuredDevice::Sm89);
 
     /// The figures the planner reads.
     pub const fn figures(self) -> PerfCalibration {
@@ -336,10 +382,10 @@ impl Calibrated {
 
     /// The entry of the CUDA device of this compute capability.
     pub fn of_cuda_compute_capability(major: u32, minor: u32) -> Self {
-        if (major, minor) == (12, 0) {
-            Self::SM_120
-        } else {
-            Self::Portable
+        match (major, minor) {
+            (12, 0) => Self::SM_120,
+            (8, 9) => Self::SM_89,
+            _ => Self::Portable,
         }
     }
 }
@@ -701,6 +747,16 @@ mod tests {
             source: "POOT-1490 calibrate-launch indexed on one RTX PRO 6000 Blackwell Server (sm_120, secure pod, 88 cells, 176 rows): the direct values at which the model's choices are never slower than the retired 32-row switch (within 5 %) and within 5 % of the best mean regret are 11.9 to 16.8; the geometric centre. Mean regret against the faster schedule 1.056 against the retired switch's 1.177. An RTX 4090 (sm_89) gave 7.6 to 11.9, so the figure moves between parts and this one is that part's; receipts/1490-cuda-sweep/",
         },
         Provenance {
+            name: "SM_89_DIRECT_VALUE_COST",
+            value: 4.0,
+            source: "POOT-1602 fit (fit_fragment_cost.py --device sm89) over both calibrate-launch corpora of one RTX 4090 (sm_89, secure pods): the POOT-1599 fragment corpus (551 rows: packed grouped IQ2_XS up and IQ4_NL down at 128, 512 and 2048 tokens and the dense cells, every tiling exact and narrow plus the Gemv; benchmarks/calibration/ptx-sm89.tsv) and the POOT-1490 indexed corpus (88 cells of the Gemv against the grouped tiling; ptx-sm89-indexed.tsv), jointly with the dot cost, the LDS read and staged value at the prior: the point nearest the centre of the six grid points that minimise the worst cell regret over both corpora and then the mean (1.455, a dense cell, and 1.013 against 1.035 at the prior's 7.6 with no dot term; no direct value above 5.7 is optimal, and without the dot term none lets both 128-token packed cells choose within 1.10)",
+        },
+        Provenance {
+            name: "SM_89_GEMV_DOT_COST",
+            value: 2378.0,
+            source: "POOT-1602, the same fit as SM_89_DIRECT_VALUE_COST: the K-independent FMA issues of one Gemv dot product at the ridge's centre point (optimal 1682 to 3364 at direct values 3.4 to 4.8). A least-squares fit of the Gemv rows alone gives the same order relative to the direct value on this part, gfx1151 and the gfx1151 Q4_K held-out corpus (242, 204 and 257 direct values per dot product, receipts/1602-gemv-dot/)",
+        },
+        Provenance {
             name: "STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST",
             value: 32.0,
             source: "POOT-1402 bank sweep: a 64-key block was 20-30% slower than a 32-key one on ROCm and wgpu (Strix Halo) and no faster on PTX",
@@ -800,6 +856,7 @@ mod tests {
             PerfCalibration::STRIX_HALO_HSA,
             PerfCalibration::STRIX_HALO_VULKAN,
             PerfCalibration::SM_120,
+            PerfCalibration::SM_89,
         ] {
             let PerfCalibration {
                 dense_gemv_cols,
@@ -883,10 +940,15 @@ mod tests {
                 .expect("gfx1151 through HSA identified the grouping scan"),
         );
         assert_eq!(
-            (portable.fragment_round, portable.group_scan),
-            (None, None),
-            "the prior identifies neither the fragment round nor the grouping"
+            (
+                portable.fragment_round,
+                portable.group_scan,
+                portable.gemv_dot
+            ),
+            (None, None, None),
+            "the prior identifies neither the fragment round, the grouping nor the dot cost"
         );
+        assert_eq!(hsa.gemv_dot, None, "gfx1151 identified no dot cost");
         assert_eq!(
             PerfCalibration::STRIX_HALO_VULKAN.cost,
             portable,
@@ -899,6 +961,29 @@ mod tests {
             (sm_120.lds_read, sm_120.staged_value),
             (portable.lds_read, portable.staged_value),
             "sm_120 borrows the prior's LDS read and staged value"
+        );
+        assert_eq!(sm_120.gemv_dot, None, "sm_120 identified no dot cost");
+        // sm_89 identified the direct value and the dot cost together; the tile ratios are the prior's.
+        let sm_89 = PerfCalibration::SM_89.cost;
+        assert_provenance("SM_89_DIRECT_VALUE_COST", sm_89.direct_value);
+        assert_provenance(
+            "SM_89_GEMV_DOT_COST",
+            sm_89.gemv_dot.expect("sm_89 identified the dot cost"),
+        );
+        assert_eq!(
+            (
+                sm_89.lds_read,
+                sm_89.staged_value,
+                sm_89.fragment_round,
+                sm_89.group_scan
+            ),
+            (portable.lds_read, portable.staged_value, None, None),
+            "sm_89 borrows the prior's tile ratios"
+        );
+        assert_eq!(
+            PerfCalibration::SM_89.packed_gemv,
+            PerfCalibration::PORTABLE.packed_gemv,
+            "sm_89 borrows the prior's packed Gemv figures"
         );
         assert_provenance("GFX11_MATRIX_FMA_RATE", GFX11_MATRIX_FMA_RATE);
         assert_provenance("SM80_MATRIX_FMA_RATE", SM80_MATRIX_FMA_RATE);
@@ -926,6 +1011,8 @@ mod tests {
             "STRIX_HALO_HSA_FRAGMENT_ROUND_COST",
             "STRIX_HALO_HSA_GROUP_SCAN_COST",
             "SM_120_DIRECT_VALUE_COST",
+            "SM_89_DIRECT_VALUE_COST",
+            "SM_89_GEMV_DOT_COST",
             "STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST",
             "STRIX_HALO_ATTENTION_KEY_BLOCK_NARROWEST",
             "GFX11_MATRIX_FMA_RATE",
@@ -948,7 +1035,7 @@ mod tests {
 
     /// A device's figures follow its identity, not its runtime family: Strix Halo is measured through HSA and
     /// through Vulkan, another AMD, an Intel or an NVIDIA Vulkan device is portable, and CUDA is measured on
-    /// sm_120 only. Mutation: key the Vulkan arm on the vendor alone; the discrete AMD card reads `Measured`.
+    /// sm_120 and sm_89 only (sm_86 shares no entry with sm_89). Mutation: key the Vulkan arm on the vendor alone; the discrete AMD card reads `Measured`.
     #[test]
     fn performance_figures_follow_device_identity() {
         assert_eq!(
@@ -974,7 +1061,11 @@ mod tests {
             Calibrated::of_cuda_compute_capability(12, 0),
             Calibrated::SM_120
         );
-        for (major, minor) in [(8, 0), (9, 0), (10, 0), (12, 1)] {
+        assert_eq!(
+            Calibrated::of_cuda_compute_capability(8, 9),
+            Calibrated::SM_89
+        );
+        for (major, minor) in [(8, 0), (8, 6), (9, 0), (10, 0), (12, 1)] {
             assert_eq!(
                 Calibrated::of_cuda_compute_capability(major, minor),
                 Calibrated::Portable,

@@ -847,9 +847,9 @@ mod tests {
             KernelRequest::Movement(MovementSpec::new(
                 Storage::Elements { carrier: Ty::F32 },
                 vec![2, 3],
-                MovementOp::Transpose {
-                    in_shape: vec![3, 2],
-                    perm,
+                MovementOp::Copy {
+                    source: vec![3, 2],
+                    from: poot_kernelgen::Layout::contiguous(&[3, 2]).permuted(&perm),
                 },
             ))
         };

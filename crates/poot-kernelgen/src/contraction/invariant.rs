@@ -145,6 +145,7 @@ fn cases() -> Vec<Case> {
                     name: format!("dense decode [1, {k}] x [{n}, {k}]^T w{bits}"),
                     gemv: Some(GemvShape {
                         outputs: n,
+                        k,
                         width: 128,
                         cols: 4,
                     }),
@@ -180,6 +181,7 @@ fn cases() -> Vec<Case> {
             for (k, n) in [(2048, 2048), (2560, 9728)] {
                 let gemv = (rows == 1).then_some(GemvShape {
                     outputs: n,
+                    k,
                     width: 128,
                     cols: 4,
                 });

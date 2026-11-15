@@ -461,10 +461,14 @@ fn indexed_terms(
     caps: &poot_target::DeviceCaps,
 ) -> Result<CostTerms, String> {
     match schedule {
-        Schedule::Gemv { width, cols, .. } => Ok(GemvShape {
+        // The planner's Gemv shape (`GemvLaunch::cost_shape`): a workgroup owns `cols` column groups of `rows` rows each.
+        Schedule::Gemv {
+            width, cols, rows, ..
+        } => Ok(GemvShape {
             outputs: m * n,
+            k,
             width,
-            cols,
+            cols: cols * rows.get(),
         }
         .cost_terms(caps)),
         other => {
@@ -630,21 +634,30 @@ fn parse_indexed_rows(text: &str) -> Result<Vec<IndexedRow>, String> {
                     .and_then(|v| v.parse::<f64>().ok())
                     .ok_or_else(|| format!("bad row {line:?}"))
             };
+            let cell = parse_cell(f.first().ok_or("empty row")?)?;
+            let rows = match f.get(1).copied() {
+                Some("gemv") => IndexedRows::Gemv,
+                Some("grouped") => IndexedRows::Grouped,
+                other => return Err(format!("bad rows {other:?} in {line:?}")),
+            };
+            let fma = number(3)?;
             Ok(IndexedRow {
-                cell: parse_cell(f.first().ok_or("empty row")?)?,
-                rows: match f.get(1).copied() {
-                    Some("gemv") => IndexedRows::Gemv,
-                    Some("grouped") => IndexedRows::Grouped,
-                    other => return Err(format!("bad rows {other:?} in {line:?}")),
-                },
+                cell,
+                rows,
                 device_us: number(2)?,
                 terms: CostTerms {
-                    fma: number(3)?,
+                    fma,
                     lds_reads: number(4)?,
                     staged_per_lane: number(5)?,
                     direct_per_lane: number(6)?,
                     rounding: number(7)?,
                     occupancy: number(8)?,
+                    // A Gemv lane's FMAs per `K` value are its share of its workgroup's dot products
+                    // (`ContractionCost::gemv_terms`), so the row's dots follow from them and the cell's `K`.
+                    dots_per_k: match rows {
+                        IndexedRows::Gemv => fma / cell.2.max(1) as f64,
+                        IndexedRows::Grouped => 0.0,
+                    },
                     ..CostTerms::default()
                 },
             })
@@ -1280,11 +1293,19 @@ where
     // The terms of the schedule that ran: a Gemv's, or the tiling's with its rows grouped at its own tile, and the
     // tiles it launches and the `K` rounds each runs (a Gemv has neither).
     let (terms, tiles, rounds, tile, lanes, depth) = match schedule {
-        Schedule::Gemv { width, cols, .. } => (
+        // The planner's Gemv shape (`GemvLaunch::cost_shape`): a workgroup owns `cols` column groups of `gemv_rows`
+        // rows each.
+        Schedule::Gemv {
+            width,
+            cols,
+            rows: gemv_rows,
+            ..
+        } => (
             GemvShape {
                 outputs: rows * dim("n"),
+                k: dim("k"),
                 width,
-                cols,
+                cols: cols * gemv_rows.get(),
             }
             .cost_terms(&caps),
             0,
@@ -1487,11 +1508,18 @@ where
     let contraction_us = dispatch_us(&measured, "contraction:dense")?
         .ok_or_else(|| format!("{text}: no dense contraction dispatch"))?;
     let (terms, tiles, rounds, tile, lanes, depth) = match (gemv.first(), tiled.first()) {
-        (Some(&Schedule::Gemv { width, cols, .. }), None) => (
+        // The planner's Gemv shape (`GemvLaunch::cost_shape`): a workgroup owns `cols` column groups of `rows` rows each.
+        (
+            Some(&Schedule::Gemv {
+                width, cols, rows, ..
+            }),
+            None,
+        ) => (
             GemvShape {
                 outputs: shape.0 * shape.2,
+                k: shape.1,
                 width,
-                cols,
+                cols: cols * rows.get(),
             }
             .cost_terms(&caps),
             0,

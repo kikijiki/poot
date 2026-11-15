@@ -14,8 +14,19 @@ and the cost-model terms of the schedule that ran. The model is `crates/poot-ker
     lane_step, scalar tiling, and fragment tiling over dense rows
         = fma + lds_read * lds_reads + (staged_value + rounding) * staged_per_lane
     lane_step, fragment tiling over rows grouped by expert = fma + fragment_round / depth      (no staging term)
-    lane_step, Gemv = fma + direct_value * direct_per_lane
+    lane_step, Gemv = fma + direct_value * direct_per_lane + gemv_dot * fma / K          (a lane's FMAs per `K`
+                      value are its share of its workgroup's dot products, so `fma / K` is its dots per `K` value)
     grouping = group_scan * scan_steps, scan_steps = 2 * ceil(buckets / 256) * rows     (once, not per lane)
+
+    python3 benchmarks/calibration/fit_fragment_cost.py --device sm89 [--check]  the direct value and the Gemv dot
+                                                                          cost of the RTX 4090 (POOT-1602)
+
+`--device sm89` fits the two Gemv figures of `SM_89_COST_RATIOS` over both corpora measured on an RTX 4090:
+`ptx-sm89.tsv` (the fragment corpus of POOT-1599, scalar model: no fragment round or grouping identified there) and
+`ptx-sm89-indexed.tsv` (the Gemv-versus-grouped corpus of POOT-1490), the LDS read and the staged value at the portable
+prior's. A grid of one octave in four over both figures, the standing objective (the worst cell regret over both
+corpora, then the mean), and among the optimal points the one nearest their centre in log space (the optimal set is a
+ridge along which a lower direct value takes a dearer dot; the centre moves least under a measurement shift).
 
 The unit `a` (microseconds per FMA issue per `K` value) is the least-squares scale of the contractions the scalar
 model prices (everything but the grouped fragment tilings) at the shipped ratios, by relative error. The corpus
@@ -35,6 +46,7 @@ Stdlib only; the grid and the least squares are small.
 """
 
 import collections
+import contextlib
 import math
 import re
 import sys
@@ -45,6 +57,8 @@ CALIBRATION_RS = HERE.parents[1] / "crates" / "poot-target" / "src" / "calibrati
 
 # The ratios the scalar model keeps on this device (calibration.rs, STRIX_HALO_HSA_COST_RATIOS).
 LDS_READ, STAGED_VALUE, DIRECT_VALUE = 9.88, 8.43, 13.4
+# gfx1151 identified no Gemv dot cost (calibration.rs: `gemv_dot: None`).
+GEMV_DOT = 0.0
 # The expert-grouping kernel (crates/poot-kernelgen/src/data_movement/expert_group.rs): 256 lanes, buckets strided.
 GROUP_LANES = 256
 GROUP_BUCKETS = 513
@@ -71,7 +85,7 @@ def load(path):
 
 def lane_step(row, fragment_round):
     if row["kind"] == "gemv":
-        return row["fma"] + DIRECT_VALUE * row["direct"]
+        return row["fma"] + DIRECT_VALUE * row["direct"] + GEMV_DOT * row["fma"] / row["k"]
     if row["kind"] == "fragment" and row["grouped"]:
         return row["fma"] + fragment_round / row["depth"]
     return row["fma"] + LDS_READ * row["lds"] + (STAGED_VALUE + row["rounding"]) * row["staged"]
@@ -182,8 +196,117 @@ def constants():
     return float(round_.group(1)), float(scan.group(1))
 
 
+def load_indexed(path):
+    """The Gemv-versus-grouped corpus (`calibrate-launch indexed`): `{cell: {"gemv": row, "grouped": row}}`."""
+    cells = collections.defaultdict(dict)
+    for line in Path(path).read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        f = line.split("\t")
+        k = float(f[0].split("x")[2])
+        cells[f[0]][f[1]] = dict(us=float(f[2]), fma=float(f[3]), lds=float(f[4]), staged=float(f[5]),
+                                 direct=float(f[6]), rounding=float(f[7]), occupancy=float(f[8]), k=k)
+    return {name: cell for name, cell in cells.items() if {"gemv", "grouped"} <= cell.keys()}
+
+
+def sm89_regrets(fragment, indexed, direct_value, gemv_dot):
+    """Every cell's regret over both RTX 4090 corpora under the scalar model at the portable LDS read and staged value
+    and these two Gemv figures."""
+    with ratios(SM89_PRIOR_LDS_READ, SM89_PRIOR_STAGED_VALUE, direct_value, gemv_dot):
+        regrets = [v[0] for v in regrets_of(fragment).values()]
+    for cell in indexed.values():
+        gemv, grouped = cell["gemv"], cell["grouped"]
+        cost = {
+            "gemv": gemv["occupancy"] * (gemv["fma"] + direct_value * gemv["direct"] + gemv_dot * gemv["fma"] / gemv["k"]),
+            "grouped": grouped["occupancy"]
+            * (grouped["fma"] + SM89_PRIOR_LDS_READ * grouped["lds"]
+               + (SM89_PRIOR_STAGED_VALUE + grouped["rounding"]) * grouped["staged"]),
+        }
+        chosen = "gemv" if cost["gemv"] <= cost["grouped"] else "grouped"
+        regrets.append(cell[chosen]["us"] / min(gemv["us"], grouped["us"]))
+    return regrets
+
+
+@contextlib.contextmanager
+def ratios(lds_read, staged_value, direct_value, gemv_dot):
+    """The scalar model's ratios set to these for the body, the module's own (gfx1151's) restored after."""
+    global LDS_READ, STAGED_VALUE, DIRECT_VALUE, GEMV_DOT
+    saved = LDS_READ, STAGED_VALUE, DIRECT_VALUE, GEMV_DOT
+    LDS_READ, STAGED_VALUE, DIRECT_VALUE, GEMV_DOT = lds_read, staged_value, direct_value, gemv_dot
+    try:
+        yield
+    finally:
+        LDS_READ, STAGED_VALUE, DIRECT_VALUE, GEMV_DOT = saved
+
+
+def regrets_of(rows):
+    """The scalar model's choice in every cell (no tiling priced as grouped: sm_89 identified neither the fragment
+    round nor the grouping)."""
+    return regrets(rows, scale([dict(r, grouped=False) for r in rows], 0.0), 0.0, 0.0, grouped=False)
+
+
+# The tile ratios sm_89 borrows from the portable prior (calibration.rs PORTABLE_COST_RATIOS).
+SM89_PRIOR_LDS_READ, SM89_PRIOR_STAGED_VALUE = 1.0, 8.0
+DIRECT_GRID = [2 ** (i / 4) for i in range(16)]
+DOT_GRID = [125 * 2 ** (i / 4) for i in range(29)]
+
+
+def fit_sm89(fragment, indexed):
+    scored = {}
+    for i, direct_value in enumerate(DIRECT_GRID):
+        for j, gemv_dot in enumerate(DOT_GRID):
+            r = sm89_regrets(fragment, indexed, direct_value, gemv_dot)
+            scored[(i, j)] = (round(max(r), 6), round(sum(r) / len(r), 6))
+    best = min(scored.values())
+    optimal = [key for key, value in scored.items() if value == best]
+    centre = [sum(math.log(DIRECT_GRID[i]) for i, _ in optimal) / len(optimal),
+              sum(math.log(DOT_GRID[j]) for _, j in optimal) / len(optimal)]
+    i, j = min(optimal, key=lambda key: (math.log(DIRECT_GRID[key[0]]) - centre[0]) ** 2
+               + (math.log(DOT_GRID[key[1]]) - centre[1]) ** 2)
+    return dict(direct_value=DIRECT_GRID[i], gemv_dot=DOT_GRID[j], worst=best[0], mean=best[1],
+                optimal=sorted((DIRECT_GRID[a], DOT_GRID[b]) for a, b in optimal))
+
+
+def sm89_constants():
+    block = re.search(r"pub const SM_89_COST_RATIOS: CostRatios = CostRatios \{(.*?)\};", CALIBRATION_RS.read_text(),
+                      re.S).group(1)
+    direct = re.search(r"direct_value: ([0-9.]+)", block)
+    dot = re.search(r"gemv_dot: Some\(([0-9.]+)\)", block)
+    return float(direct.group(1)), float(dot.group(1))
+
+
+def main_sm89(check):
+    fragment, indexed = load(HERE / "ptx-sm89.tsv"), load_indexed(HERE / "ptx-sm89-indexed.tsv")
+    result = fit_sm89(fragment, indexed)
+    print(f"{len(fragment)} fragment rows, {len(indexed)} indexed cells; direct_value {result['direct_value']:.2f},"
+          f" gemv_dot {result['gemv_dot']:.0f}; worst regret {result['worst']:.3f}, mean {result['mean']:.4f}")
+    print("optimal points: " + ", ".join(f"({d:.2f}, {c:.0f})" for d, c in result["optimal"]))
+    prior = sm89_regrets(fragment, indexed, 7.6, 0.0)
+    print(f"the portable prior (7.6, no dot term): worst {max(prior):.3f}, mean {sum(prior) / len(prior):.4f}")
+    with ratios(SM89_PRIOR_LDS_READ, SM89_PRIOR_STAGED_VALUE, result["direct_value"], result["gemv_dot"]):
+        cells = regrets_of(fragment)
+    for name, (regret, chosen, fastest) in sorted(cells.items()):
+        if name.startswith("packed"):
+            print(f"  {name:22s} {regret:.3f}  chose {chosen['precision']} {chosen['tile']} {chosen['step']:.0f} us,"
+                  f" fastest {fastest['precision']} {fastest['tile']} {fastest['step']:.0f} us")
+    if check:
+        have = sm89_constants()
+        want = (round(result["direct_value"], 1), float(round(result["gemv_dot"])))
+        if have != want:
+            print(f"FAIL: calibration.rs SM_89 has direct_value {have[0]} and gemv_dot {have[1]}, the fit gives {want}")
+            return 1
+        print("calibration.rs SM_89 agrees with the fit")
+    return 0
+
+
 def main(argv):
     check = "--check" in argv
+    if "--device" in argv:
+        device = argv[argv.index("--device") + 1]
+        if device != "sm89":
+            print(f"no fit for device {device!r}")
+            return 2
+        return main_sm89(check)
     paths = [a for a in argv if not a.startswith("--")]
     if "--heldout" in argv:
         corpus = load(HERE / "rocm-gfx1151.tsv")

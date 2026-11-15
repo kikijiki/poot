@@ -66,6 +66,13 @@ opt-level = 3
 [profile.dev.package.regex-syntax]
 opt-level = 3
 
+# Server startup plans every prepared entry twice (the capacity fit over recording devices, then the real
+# preparation), and graph planning at opt-level 0 costs ~0.17 s per entry on the dev box. On an RTX 4090 pod a
+# debug `poot-serve --draft-mtp 3` took 152 s to start against the served rows' 180 s budget; with the planner at
+# the speed the server runs it, 67 s (POOT-1600).
+[profile.dev.package.poot-graph-plan]
+opt-level = 3
+
 [workspace.package]
 edition = "2024"
 version = "0.0.0"

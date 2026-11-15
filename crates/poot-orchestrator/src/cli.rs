@@ -218,7 +218,9 @@ pub(crate) struct ExecArgs {
     /// stop waiting for capacity after this many minutes (default: wait for as long as it takes).
     #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) give_up_after_min: Option<u64>,
-    #[arg(long, default_value_t = 600)]
+    /// seconds to wait for a pod's SSH endpoint. The poot-bench image is ~34 GB, so a cold pull on a slow host takes
+    /// more than ten minutes.
+    #[arg(long, default_value_t = 1200)]
     pub(crate) provision_timeout_s: u64,
     #[arg(long, default_value_t = 600)]
     pub(crate) ssh_timeout_s: u64,

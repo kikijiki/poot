@@ -11,7 +11,7 @@ use poot_kernel_ir::test_support::{
     e4m3fn_encode_kernel, gemv_loop_kernel, matmul_kernel, square_kernel, vadd_loop_kernel,
 };
 use poot_kernel_ir::{Ty, fixtures};
-use poot_kernelgen::{MovementOp, MovementSpec, Storage, UpdateIndex};
+use poot_kernelgen::{Layout, MovementOp, MovementRead, MovementSpec, Storage, UpdateIndex};
 
 fn have(bin: &str) -> bool {
     Command::new(bin).arg("--version").output().is_ok()
@@ -253,8 +253,9 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
             packed_movement(
                 "e4m3fn_repack",
                 vec![2, 5],
-                MovementOp::Reshape {
-                    in_shape: vec![5, 2],
+                MovementOp::Copy {
+                    source: vec![5, 2],
+                    from: Layout::contiguous(&[2, 5]),
                 },
             ),
             "e4m3fn_repack",
@@ -263,9 +264,9 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
             packed_movement(
                 "e4m3fn_transpose",
                 vec![5, 2],
-                MovementOp::Transpose {
-                    in_shape: vec![2, 5],
-                    perm: vec![1, 0],
+                MovementOp::Copy {
+                    source: vec![2, 5],
+                    from: Layout::contiguous(&[2, 5]).permuted(&[1, 0]),
                 },
             ),
             "e4m3fn_transpose",
@@ -274,10 +275,9 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
             packed_movement(
                 "e4m3fn_slice",
                 vec![2, 3],
-                MovementOp::Slice {
-                    in_shape: vec![2, 5],
-                    axis: 1,
-                    start: 1,
+                MovementOp::Copy {
+                    source: vec![2, 5],
+                    from: Layout::contiguous(&[2, 5]).sliced(1, 1),
                 },
             ),
             "e4m3fn_slice",
@@ -288,7 +288,10 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
                 vec![2, 6, 3],
                 MovementOp::Concat {
                     axis: 1,
-                    in_shapes: vec![vec![2, 2, 3], vec![2, 1, 3], vec![2, 3, 3]],
+                    inputs: [vec![2, 2, 3], vec![2, 1, 3], vec![2, 3, 3]]
+                        .into_iter()
+                        .map(MovementRead::contiguous)
+                        .collect(),
                 },
             ),
             "e4m3fn_concat",
@@ -333,8 +336,9 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
             packed_movement(
                 "e4m3fn_broadcast",
                 vec![2, 3, 5],
-                MovementOp::Broadcast {
-                    in_shape: vec![2, 1, 5],
+                MovementOp::Copy {
+                    source: vec![2, 1, 5],
+                    from: Layout::contiguous(&[2, 1, 5]).broadcast(&[2, 1, 5], &[2, 3, 5]),
                 },
             ),
             "e4m3fn_broadcast",

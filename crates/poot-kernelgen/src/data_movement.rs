@@ -22,5 +22,5 @@ pub(crate) use expert_group::{expert_group, expert_group_lanes, expert_group_sca
 pub use generate::movement_body;
 pub(crate) use generate::{Buf, read_lane, write_packed_word};
 pub use rope::{rope, rope_dt};
-pub use spec::{MovementOp, MovementSpec, Storage, UnitWindow, UpdateIndex};
+pub use spec::{MovementOp, MovementRead, MovementSpec, Storage, UnitWindow, UpdateIndex};
 pub use topk::arg_top_k_dt;

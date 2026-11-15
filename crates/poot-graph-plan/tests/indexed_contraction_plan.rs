@@ -271,7 +271,7 @@ fn transposes(program: &Program) -> usize {
 /// POOT-646 SC-002: the checkpoint-order program plans one indexed contraction reading the stored `[E, N, K]`
 /// weight (`WeightLayout::Nk`) and no `transpose` dispatch, on every backend, at the Gemv and the register-tiled shapes.
 ///
-/// Mutation: drop the indexed arm of `is_strided_capable` (`predicates.rs`); the `Transpose` is materialized, a
+/// Mutation: drop the indexed arm of `operand_demand` (`predicates.rs`); the `Transpose` is materialized, a
 /// `transpose` dispatch appears, the request reads `Kn` and this row goes red.
 #[test]
 fn checkpoint_order_experts_plan_one_contraction_and_no_transpose() {
@@ -293,7 +293,7 @@ fn checkpoint_order_experts_plan_one_contraction_and_no_transpose() {
 /// POOT-646 guard: a transposed weight another consumer also reads is a real value, so the `Transpose` stays
 /// materialized and the contraction reads the plain `[E, K, N]` result of it.
 ///
-/// Mutation: in `compute_views`, promote when `any` consumer is strided-capable instead of `all`; the `Transpose`
+/// Mutation: in `compute_views`, promote when `any` reader's demand is not `Dense` instead of `all`; the `Transpose`
 /// becomes a view the `Reduce` then reads as a plain buffer, the `Transpose` dispatch disappears and this row
 /// goes red.
 #[test]
@@ -326,14 +326,16 @@ fn the_ekn_orientation_plans_the_plain_layout() {
     }
 }
 
-/// POOT-646: a weight view the indexed contraction cannot read is refused with the typed `OperandLayout`, never
-/// read as if it were a plain or a transposed stack. A `slice` of the stored `[E, N, K + 3]` weight before the
-/// transpose is a view with different strides than the exact `[E, N, K]` transpose.
+/// POOT-1576 SC-b5: a weight view the indexed contraction cannot read is copied, never refused and never read as if
+/// it were a plain or a transposed stack. A `slice` of the stored `[E, N, K + 3]` weight before the transpose has
+/// different strides than the exact `[E, N, K]` transpose, so `IndexedWeight` does not admit it: the slice is a
+/// view and the transpose is one copy that reads the stored weight through both, and the contraction reads the
+/// plain `[E, K, N]` result of it.
 ///
-/// Mutation: remove the `Err(OperandLayout)` arm of `weight_layout` (`planner/moe.rs`) by returning `Nk` for any
-/// view; the program compiles and this row goes red.
+/// Mutation: drop the `admits` test from the bar loop (`compute_views`); the transpose stays a view the
+/// contraction cannot read and `compile` fails with the invariant's `OperandLayout` refusal.
 #[test]
-fn a_sliced_then_transposed_weight_is_refused_by_layout() {
+fn an_unreadable_weight_view_is_copied_not_refused() {
     let b = Builder::for_tests();
     let x = b.constant("x", TensorType::f32(vec![5, K])).unwrap();
     let w = b
@@ -352,12 +354,24 @@ fn a_sliced_then_transposed_weight_is_refused_by_layout() {
         .unwrap();
     let g = b.finish(out).unwrap();
     for backend in backends() {
-        let error = compile(&g, &target(backend), &options())
-            .err()
-            .unwrap_or_else(|| panic!("{backend:?}: a strided weight view must be refused"));
-        assert!(
-            format!("{error:?}").contains("OperandLayout"),
-            "{backend:?}: {error:?}"
+        let program = compile(&g, &target(backend), &options())
+            .unwrap_or_else(|error| panic!("{backend:?}: the weight view is copied: {error:?}"));
+        assert_eq!(
+            transposes(&program),
+            1,
+            "{backend:?}: one copy materializes the weight"
+        );
+        let slices = program
+            .planned()
+            .filter(|(eqn, plan)| {
+                matches!(eqn.op, OpKind::Slice { .. }) && matches!(plan, Plan::Dispatches(_))
+            })
+            .count();
+        assert_eq!(slices, 0, "{backend:?}: the slice under the copy is a view");
+        assert_eq!(
+            indexed_request(&program).layout,
+            WeightLayout::Kn,
+            "{backend:?}"
         );
     }
 }
@@ -365,7 +379,7 @@ fn a_sliced_then_transposed_weight_is_refused_by_layout() {
 /// POOT-646: the routed gate weighting fuses into one `ContractionEpilogue { head: Indexed }` that reads the
 /// checkpoint-order `[E, N, K]` weight in place: no `transpose` dispatch, and the request's layout is `Nk`.
 ///
-/// Mutation: drop the `ContractionEpilogue` arm of `is_strided_capable` (`predicates.rs`); the `Transpose` is
+/// Mutation: drop the `ContractionEpilogue` arm of `operand_demand` (`predicates.rs`); the `Transpose` is
 /// materialized and this row goes red.
 #[test]
 fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {
@@ -565,7 +579,7 @@ fn bf16_checkpoint_order_shared(reader: SecondReader) -> Graph {
     let shared = match reader {
         SecondReader::Reduce => w_ekn,
         SecondReader::Cast => b.cast(w_ekn, DType::F32).unwrap(),
-        // A strided-capable elementwise reader: the view promotion would accept it were the dtype not a gate.
+        // A pointwise reader: the view promotion would accept it were the dtype not a gate.
         // A cast and an elementwise step over it fuse into one region that widens its BF16 input in-register,
         // reading it flat: the one reader that would take a BF16 view without refusing it.
         SecondReader::Fused => {
@@ -601,7 +615,7 @@ fn bf16_checkpoint_order_shared(reader: SecondReader) -> Graph {
 ///
 /// Mutation: force the BF16 admission in `compute_views` (`predicates.rs`) to `true`; the `Binary` reader's
 /// `Transpose` becomes a view, the contraction plans, and the refusal moves to the `Binary` (wgpu) or the fused
-/// epilogue (ROCm, PTX): the `Binary` rows go red. The other readers are not strided-capable, so they never promote
+/// epilogue (ROCm, PTX): the `Binary` rows go red. The other readers read flat (`Dense`), so they never promote
 /// the view and stay green.
 #[test]
 fn a_bf16_stack_transpose_with_a_second_reader_is_refused_on_every_backend() {

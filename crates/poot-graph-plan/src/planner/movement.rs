@@ -11,10 +11,13 @@ use super::{
     PlanError, Planned, Scalar, ValueId, fty_ty, numel, value_ids,
 };
 use crate::planner::{GraphTables, Layout, Lowering, OutputBuffer, StorageDtypes};
-use crate::predicates::{ELEMENTWISE_2D_WIDTH, is_elementwise_2d_in, scatter_update_plan};
+use crate::predicates::{
+    ELEMENTWISE_2D_WIDTH, compose_movement, is_elementwise_2d_in, scatter_update_plan,
+    view_source_shape,
+};
 use crate::refusal::Site;
 use crate::{Binding, Sink, Source};
-use poot_kernelgen::{MovementOp, MovementSpec, Storage, UpdateIndex};
+use poot_kernelgen::{MovementOp, MovementRead, MovementSpec, Storage, UpdateIndex};
 use poot_target::{AieTargetId, Backend, DeviceCaps};
 
 /// The storage a movement over values of `dtype` reads and writes: the packed byte rows of an E4M3FN
@@ -128,7 +131,8 @@ pub(super) fn plan(
         Some(ty) => spec.writing(ty.clone()),
         None => spec,
     };
-    // A packed payload is never read through a strided view: the layout has no row padding to stride over.
+    // A promoted movement is a view of its root (`compute_views`); a packed payload is never one: its rows are
+    // padded to a word, so no layout strides over them.
     let view = views.get(&eqn.out).filter(|_| !packed);
     // One thread per output buffer unit, folded onto a 2-D grid past the device's x-grid cap.
     let generate = |op: MovementOp| {
@@ -140,6 +144,22 @@ pub(super) fn plan(
             backend,
             caps,
         )
+    };
+    // The one copy that materializes a movement chain's tail: it reads the chain's root through the layout the
+    // chain composes to, from the input's own layout when the input is a view.
+    let copy = || {
+        let input = ids[0];
+        let in_shape = shape(input);
+        let in_layout = views
+            .get(&input)
+            .cloned()
+            .unwrap_or_else(|| Layout::contiguous(&in_shape));
+        let from = compose_movement(&eqn.op, &in_shape, &in_layout, out_shape)
+            .ok_or_else(|| site.refuse(Capability::OperandLayout { value: input }))?;
+        generate(MovementOp::Copy {
+            source: view_source_shape(g, views, input),
+            from,
+        })
     };
     // A packed E4M3FN payload has no zero-element form: refuse before the generator sees it.
     let refuse_zero = |empty: bool| {
@@ -161,15 +181,18 @@ pub(super) fn plan(
             {
                 Planned::alias(ids[0])
             } else {
-                generate(MovementOp::Reshape {
-                    in_shape: input_shape,
+                generate(MovementOp::Copy {
+                    source: input_shape,
+                    from: Layout::contiguous(out_shape),
                 })?
             }
         }
         // A reshape of a view is a view of the same buffer with the split or merged strides
-        // (`compute_views`); a reshape of a dense value is the buffer itself.
+        // (`compute_views`); a reshape of a dense value is the buffer itself. A reshape that is not promoted
+        // but reads a view (its value must be dense) is the one copy of the chain.
         OpKind::Reshape { .. } => match view {
             Some(layout) => Planned::view(ids[0], layout.clone()),
+            None if views.contains_key(&ids[0]) => copy()?,
             None => Planned::alias(ids[0]),
         },
         // A collective is a cut point between stage programs (`compile_staged` places the transfer between
@@ -210,59 +233,58 @@ pub(super) fn plan(
         OpKind::Transpose { perm } => {
             refuse_zero(out_shape.contains(&0))?;
             if let Some(layout) = view {
-                // spec 132 phase 1: `compute_views` already proved every consumer of this value is
-                // strided-capable (and this backend is SpirvVulkan): no dispatch, no materialize copy.
+                // spec 132 phase 1: `compute_views` already proved every consumer of this value reads a layout
+                // (and this backend is SpirvVulkan): no dispatch, no materialize copy.
                 Planned::view(ids[0], layout.clone())
             } else if packed && perm.iter().copied().eq(0..perm.len()) {
                 Planned::alias(ids[0])
             } else {
-                generate(MovementOp::Transpose {
-                    in_shape: shape(ids[0]),
-                    perm: perm.clone(),
-                })?
+                copy()?
             }
         }
         OpKind::Slice { axis, start, end } => {
             refuse_zero(out_shape.contains(&0))?;
-            let input_shape = shape(ids[0]);
             if let Some(layout) = view {
                 // spec 132 phase 1: see the Transpose view arm above.
                 Planned::view(ids[0], layout.clone())
-            } else if packed && *start == 0 && *end == input_shape[*axis] {
+            } else if packed && *start == 0 && *end == shape(ids[0])[*axis] {
                 Planned::alias(ids[0])
             } else {
-                generate(MovementOp::Slice {
-                    in_shape: input_shape,
-                    axis: *axis,
-                    start: *start,
-                })?
+                copy()?
             }
         }
         OpKind::Broadcast { .. } => {
             refuse_zero(out_shape.contains(&0))?;
-            let input_shape = shape(ids[0]);
             if let Some(layout) = view {
                 // spec 132 phase 1: see the Transpose view arm above.
                 Planned::view(ids[0], layout.clone())
-            } else if packed && input_shape == out_shape {
+            } else if packed && shape(ids[0]) == out_shape {
                 Planned::alias(ids[0])
             } else {
-                generate(MovementOp::Broadcast {
-                    in_shape: input_shape,
-                })?
+                copy()?
             }
         }
         OpKind::Concat { axis } => {
-            let in_shapes: Vec<Vec<usize>> = ids.iter().map(|&id| shape(id)).collect();
+            let inputs: Vec<MovementRead> = ids
+                .iter()
+                .map(|&id| MovementRead {
+                    shape: shape(id),
+                    source: view_source_shape(g, views, id),
+                    from: views
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| Layout::contiguous(&shape(id))),
+                })
+                .collect();
             refuse_zero(
-                out_shape.contains(&0) || in_shapes.iter().any(|shape| shape.contains(&0)),
+                out_shape.contains(&0) || inputs.iter().any(|input| input.shape.contains(&0)),
             )?;
             if packed && ids.len() == 1 {
                 Planned::alias(ids[0])
             } else {
                 generate(MovementOp::Concat {
                     axis: *axis,
-                    in_shapes,
+                    inputs,
                 })?
             }
         }

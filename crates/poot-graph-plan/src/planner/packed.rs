@@ -104,7 +104,7 @@ pub(super) fn dense_cost_shapes(
     let n = *out_shape.last()?;
     let tiled = dense_tiled_shape(precision, None, weight, (out_numel / n.max(1), k, n));
     let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, None, caps)
-        .map(|launch| launch.cost_shape(out_numel));
+        .map(|launch| launch.cost_shape(out_numel, k));
     Some((tiled, gemv))
 }
 

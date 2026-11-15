@@ -8,7 +8,7 @@
 //! measurements is the row stride.
 //!
 //! [`measure_strides`] runs the graph through any [`Executor`] built with detailed device timing and
-//! [`check_order`] asserts the order the channel model implies and [`report`] prints the fit; the device crates' tests call both.
+//! [`measure_until_ordered`] takes a measurement until [`check_order`] holds it, and [`report`] prints the fit; the device crates' tests call them.
 
 use std::time::Duration;
 
@@ -203,6 +203,31 @@ pub fn check_order(rates: &[StrideRates]) -> Result<(), String> {
     }
 }
 
+/// Attempts [`measure_until_ordered`] makes before it reports the order broken.
+pub const ORDER_ATTEMPTS: usize = 5;
+
+/// The first measurement from `measure` that holds the order, or every attempt's broken steps when
+/// `attempts` measurements in a row do not. The channel effect is a property of the device, so a real
+/// break (the probe not striding, a model that no longer holds) fails every attempt; what one attempt can
+/// lose to is another consumer sharing the GPU's DRAM bandwidth for the length of the measurement, which
+/// moves a median of nine runs below its floor at random (POOT-1498: ratio 1.13 against 1.2 for 4 channels
+/// over 2, on a GPU reading 11 to 20 percent busy with no poot work, the same commit passing alone). The
+/// floors stay as they are; only a measurement that fails them is taken again, a bounded number of times.
+pub fn measure_until_ordered(
+    mut measure: impl FnMut() -> Vec<StrideRates>,
+    attempts: usize,
+) -> Result<Vec<StrideRates>, String> {
+    let mut broken = Vec::new();
+    for attempt in 1..=attempts {
+        let rates = measure();
+        match check_order(&rates) {
+            Ok(()) => return Ok(rates),
+            Err(steps) => broken.push(format!("attempt {attempt} of {attempts}:\n{steps}")),
+        }
+    }
+    Err(broken.join("\n"))
+}
+
 /// The measured table with the channel model beside it: `min(c * r, ceiling)` with `r` the one-channel and
 /// `ceiling` the all-channel median. A report; nothing in it is asserted.
 pub fn report(rates: &[StrideRates]) -> String {
@@ -257,6 +282,55 @@ mod tests {
         let mut one = vec![12.1; 9];
         one[4] = 115.0;
         check_order(&model_rates(one)).expect("eight clean runs of nine hold the order");
+    }
+
+    /// A measurement taken while another consumer shared the GPU (4 channels over 2 at 1.13, below its
+    /// floor of 1.2) is taken again, and the clean measurement after it decides. Mutation: make
+    /// `measure_until_ordered` return the first attempt's `check_order` result; this goes red on
+    /// "attempt 1 of 5".
+    #[test]
+    fn a_measurement_lost_to_gpu_sharing_is_taken_again() {
+        let mut taken = 0;
+        let rates = measure_until_ordered(
+            || {
+                taken += 1;
+                let mut rates = model_rates(vec![12.1; 9]);
+                if taken == 1 {
+                    rates[2] = self::rates(4, vec![24.3; 9]);
+                }
+                rates
+            },
+            ORDER_ATTEMPTS,
+        )
+        .expect("the second measurement holds the order");
+        assert_eq!(taken, 2, "stops at the first measurement that holds");
+        assert_eq!(median_at(&rates, 4).median(), 39.6);
+    }
+
+    /// A broken order is not hidden by the retry: every attempt fails, the count is bounded and each attempt
+    /// is named. Mutation: loop `1..=attempts + 1`; this goes red on the attempt
+    /// count assertion.
+    #[test]
+    fn a_broken_order_fails_every_attempt() {
+        let mut taken = 0;
+        let broken = measure_until_ordered(
+            || {
+                taken += 1;
+                vec![
+                    rates(1, vec![40.0; 9]),
+                    rates(2, vec![40.0; 9]),
+                    rates(4, vec![40.0; 9]),
+                    rates(16, vec![40.0; 9]),
+                ]
+            },
+            ORDER_ATTEMPTS,
+        )
+        .expect_err("a flat read rate breaks the order in every attempt");
+        assert_eq!(taken, ORDER_ATTEMPTS);
+        assert!(
+            broken.contains("attempt 5 of 5"),
+            "names each attempt: {broken}"
+        );
     }
 
     /// The other side: when the one-channel stride reads as fast as the others in every run, the order is

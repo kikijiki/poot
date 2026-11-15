@@ -31,6 +31,9 @@ use poot_runtime_common::DeviceBackend;
 use poot_test_util::per_backend;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+/// A speculative server must be ready within two thirds of [`STARTUP_TIMEOUT`]: it plans every prepared entry
+/// twice, on a debug build, so a pod's slower CPU must not put the row a few seconds from its timeout (POOT-1600).
+const SPECULATIVE_STARTUP_MARGIN: Duration = Duration::from_secs(120);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// No end-of-sequence token is reachable, so every request runs to its length.
@@ -346,6 +349,8 @@ fn reference(
 struct Server {
     child: Child,
     addr: SocketAddr,
+    /// How long the child took to answer `/health`.
+    startup: Duration,
 }
 
 impl Drop for Server {
@@ -411,13 +416,19 @@ fn refused(dir: &Path, backend: &str, extra: &[String]) -> String {
 impl Server {
     fn spawn(dir: &Path, backend: &str, extra: &[String]) -> Self {
         let (child, addr) = command(dir, backend, extra, Stdio::inherit());
-        let mut server = Self { child, addr };
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        let started = Instant::now();
+        let mut server = Self {
+            child,
+            addr,
+            startup: Duration::ZERO,
+        };
+        let deadline = started + STARTUP_TIMEOUT;
         loop {
             if let Some(status) = server.child.try_wait().unwrap() {
                 panic!("poot-serve exited during startup: {status}");
             }
             if let Ok((200, _)) = server.request("GET", "/health", "") {
+                server.startup = started.elapsed();
                 return server;
             }
             assert!(Instant::now() < deadline, "poot-serve did not become ready");
@@ -815,7 +826,9 @@ per_backend!(
 /// belongs breaks that sum by one per round.
 ///
 /// Mutations: accept every draft in the driver's verification (the tokens diverge from `Off`); record
-/// `tokens.len()` instead of the driver's accepted count in the loop (the sum goes red).
+/// `tokens.len()` instead of the driver's accepted count in the loop (the sum goes red); drop the
+/// `poot-graph-plan` opt-level override from the workspace manifest (the debug server's startup passes the
+/// margin on this box's CPU and fails it on a pod's, see the receipt).
 fn served_speculative(choice: BackendChoice, draft: Draft) {
     let (backend, flag) = (backend_of(choice), flag_of(choice));
     // The MTP policy needs a family with an MTP program: the GLM-5.3-Flash fixture, which is also
@@ -850,6 +863,12 @@ fn served_speculative(choice: BackendChoice, draft: Draft) {
         }
     }
     let server = Server::spawn(&dir, flag, &args);
+    eprintln!("{flag} {draft:?}: ready after {:?}", server.startup);
+    assert!(
+        server.startup < SPECULATIVE_STARTUP_MARGIN,
+        "{flag} {draft:?}: startup took {:?}, past the {SPECULATIVE_STARTUP_MARGIN:?} margin of its {STARTUP_TIMEOUT:?} budget",
+        server.startup
+    );
     let served = server.complete(&greedy(&REPEATING_PROMPT));
     assert_eq!(
         text_of(&served),

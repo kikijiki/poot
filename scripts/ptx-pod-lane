@@ -17,7 +17,7 @@
 # four-way row, POOT_REQUIRE_PTX_2GPU=1) in place of the single-device lane, then its required-case gate; it excludes
 # the other modes. PTX_POD_MAX_PRICE then bounds the whole pod's hourly price.
 # --calibrate also ships the `calibrate_launch` example and runs `scripts/calibrate-launch ptx` (tilings, indexed, gemv) on
-# the pod before the device lane, and brings the raw rows and fitted entries back as calibrate/ (POOT-1490).
+# the pod before the device lane (--calibrate-modes "fragment dense" picks other modes), and brings the raw rows and fitted entries back as calibrate/ (POOT-1490).
 # --no-device-lane runs only the checkpoint rows (no `test-device-ptx`, kernelgen emit, ptx-check or gate).
 #
 # The pod has no `just`, cargo or python, so this driver builds everything here and ships it:
@@ -49,6 +49,7 @@ work=${PTX_POD_WORK:-target/ptx-pod-lane}
 disk_gb=${PTX_POD_DISK_GB:-40}
 passes=3
 calibrate=
+calibrate_modes='tilings indexed gemv'
 speed_model=
 two_gpu=
 bank_cases=()
@@ -63,6 +64,7 @@ while [ $# -gt 0 ]; do
     --checkpoint-filter) checkpoint_filter=$2; shift 2 ;;
     --speed) speed_model=$2; shift 2 ;;
     --calibrate) calibrate=1; shift ;;
+    --calibrate-modes) calibrate_modes=$2; shift 2 ;;
     --two-gpu) two_gpu=1; device_lane=; shift ;;
     --no-device-lane) device_lane=; shift ;;
     *) echo "usage: $0 [--bank-case ID]... [--passes N] [--models MANIFEST --checkpoint-filter FILTERSET] [--speed MODEL] [--no-device-lane]" >&2; exit 2 ;;
@@ -174,7 +176,10 @@ if [ -n "$models" ]; then
   uploads+=(--upload "$work/models.tar.gz:/root/models.tar.gz" --upload "$work/models.tsv:/root/models.tsv"
     --upload "$work/checkpoint-filter.txt:/root/checkpoint-filter.txt")
 fi
-if [ -n "$calibrate" ]; then uploads+=(--upload "$work/calibrate_launch:/root/calibrate_launch"); fi
+if [ -n "$calibrate" ]; then
+  printf '%s\n' "$calibrate_modes" > "$work/calibrate-modes"
+  uploads+=(--upload "$work/calibrate_launch:/root/calibrate_launch" --upload "$work/calibrate-modes:/root/calibrate-modes")
+fi
 if [ -n "$speed_model" ]; then
   printf '%s\n' "$speed_model" > "$work/speed-model"
   uploads+=(--upload "$work/poot-bench-runner:/root/poot-bench-runner" --upload "$work/speed-model:/root/speed-model")

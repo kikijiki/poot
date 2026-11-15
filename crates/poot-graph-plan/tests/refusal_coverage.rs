@@ -136,6 +136,39 @@ fn a_negative_literal_update_index_is_an_index_operand_refusal() {
     assert_eq!(refusal(&forged), Capability::IndexOperand);
 }
 
+/// POOT-1576: a movement that reads a view its layout cannot compose over is refused with the typed
+/// `OperandLayout`, never read as if the view were dense. `compute_views` never produces such a view (it bars the
+/// input of a reshape it cannot compose), so the view is the caller's: `plan_eqn_choice` takes the views map.
+/// `[4, 6]` transposed reads `[6, 4]` at strides `[1, 6]`, whose axes do not chain into one run of 24.
+///
+/// Mutation: plan the copy from `Layout::contiguous` of the input instead of refusing in `planner/movement.rs`:
+/// the reshape reads the wrong elements and this row goes red.
+#[test]
+fn a_reshape_that_cannot_compose_over_its_view_is_an_operand_layout_refusal() {
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 6])).unwrap();
+    let transposed = b.transpose(x, vec![1, 0]).unwrap();
+    let flat = b.reshape(transposed, vec![24]).unwrap();
+    let g = b.finish(flat).unwrap();
+    let views = HashMap::from([(
+        transposed.id(),
+        poot_kernelgen::Layout {
+            strides: vec![1, 6],
+            offset: 0,
+        },
+    )]);
+    let eqn = g.eqns().last().unwrap();
+    match plan_eqn_choice(&g, eqn, &wgpu(), &views, &roomy_body_limits(), None) {
+        Err(PlanError::Refused(refusal)) => assert_eq!(
+            refusal.missing,
+            Capability::OperandLayout {
+                value: transposed.id()
+            }
+        ),
+        other => panic!("expected the OperandLayout refusal, got {:?}", other.err()),
+    }
+}
+
 /// The block selection runs as one workgroup of `BLOCK_TOP_K_LANES` lanes: a device whose workgroup is
 /// smaller refuses with the lanes it needed and the limits it has, never a quadratic fallback.
 ///

@@ -624,7 +624,7 @@ fn routed_gate_weighting_fused_equals_the_oracle_bit_for_bit() {
 /// POOT-646: the routed gate weighting fused over checkpoint-order experts (`ContractionEpilogue { head: Indexed }`
 /// reading the `[E, N, K]` weight in place) equals the oracle `to_bits` (`E = 8`, a decode and a prefill shape).
 ///
-/// Mutation: drop the `ContractionEpilogue` arm of `is_strided_capable`; the transpose runs as a copy, the plan
+/// Mutation: drop the `ContractionEpilogue` arm of `operand_demand`; the transpose runs as a copy, the plan
 /// row goes red, and this one stays green (the value is the same, only the copy returns).
 #[test]
 fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {

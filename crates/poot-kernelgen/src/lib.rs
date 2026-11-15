@@ -84,8 +84,8 @@ pub use precision::{StagedTerms, activation_bits, dense_value_bits, stored_fragm
 //   tests; this crate's own `tests/`: they build one generator's body directly to compile, run or compare
 //   it, which is the generator under test rather than planning. None is a dispatch path.
 pub use data_movement::{
-    MovementOp, MovementSpec, Storage, UnitWindow, UpdateIndex, arg_top_k_dt, movement_body, rope,
-    rope_dt,
+    MovementOp, MovementRead, MovementSpec, Storage, UnitWindow, UpdateIndex, arg_top_k_dt,
+    movement_body, rope, rope_dt,
 };
 pub use elementwise::{cast_bf16_to_f32, cast_f16_to_f32, cast_f32_to_bf16, cast_f32_to_f16};
 pub use fp8::{e4m3fn_packed_to_f32, f32_to_e4m3fn_packed};
