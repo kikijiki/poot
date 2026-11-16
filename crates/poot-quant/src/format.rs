@@ -13,13 +13,13 @@
 //! ([`OperandRole`]):
 //!
 //! ```text
-//! w = (Scale * SubScale) * value(Codes, Zero) (+|-) (Min * SubMin)
+//! w = (Scale * SubScale) * (value(Codes, Zero) + Shift) (+|-) (Min * SubMin)
 //! ```
 //!
-//! A role a format does not have is absent from the formula (not multiplied by one): a dense F32
-//! weight is `w = value(Codes)`. The products are taken left to right in f32, which is the order
+//! A role a format does not have is absent from the formula (not multiplied by one, not added as
+//! zero): a dense F32 weight is `w = value(Codes)`. The products are taken left to right in f32, which is the order
 //! `ggml-quants.c` writes them (`d1 = d * sc; y = d1 * q - m1`), so the decoder reproduces the
-//! reference rounding. `value` is one of three [`ValueMap`]s:
+//! reference rounding; `value + Shift` is `dl * (grid[j] + delta)` of the `IQ1` formats. `value` is one of three [`ValueMap`]s:
 //!
 //! - [`ValueMap::Integer`]: the code as an integer, minus the `Zero` operand when the format has
 //!   one (`q - 8` for `Q4_0`, `q - (z + 1)` for GPTQ). Offsets such as `- 8` are part of the
@@ -27,7 +27,9 @@
 //! - [`ValueMap::Lattice`]: a table point looked up by the code, one lane of it picked by the
 //!   element's position, and, when the lattice has a sign rule, its sign taken from the `Signs`
 //!   operand. `IQ4_NL` and `IQ4_XS` are lattices of 16 one-lane points of f32 cells without signs;
-//!   `IQ2_XS`, `IQ3_XXS` and `IQ3_S` are lattices of four or eight byte lanes with signs.
+//!   `IQ1_S` and `IQ1_M` are lattices of eight 4-bit cells (`-1`, `0`, `1`) without signs, whose
+//!   `Shift` operand is the `+/-1/8` that follows the grid; the `IQ2` and `IQ3` formats are
+//!   lattices of four or eight byte lanes with signs.
 //! - [`ValueMap::Float`]: the code is a float (F32, F16, BF16, E4M3FN, E2M1).
 //!
 //! ## Two storage shapes
@@ -49,6 +51,13 @@
 //! A digit with stride 0 is a broadcast: the field does not change along that digit. That is how a
 //! per-sub-block operand is indexed by the element index: for `Q4_K`, `i = jh*128 + jl*32 + e`
 //! (`jh` 0..2, `jl` 0..4, `e` 0..32), and every scale digit has stride 0 over `e`.
+//!
+//! The digits above are one [`Segment`]: a layout is one or more of them, each covering the elements from its
+//! `first` to where the next begins, so a block whose elements are not one mixed-radix walk through its bits
+//! is stated as the stretches that each are. `TQ1_0` packs 160 of its 256 trits five to a byte over 32 bytes
+//! of `qs`, 80 five to a byte over the next 16, and the last 16 four to a byte over `qh`: three segments, each
+//! with its own digits. The lattice's lane map ([`crate::families::lattice::LaneMap`]) is the same kind of map
+//! from an element to the trit of its byte.
 //!
 //! ## Super-blocks with packed 6-bit sub-scales and mins
 //!
@@ -84,6 +93,9 @@
 //! | `Q6_K` | `d` f16 | i8 | u6 - 32 (`ql` + `qh`) | - | - | - |
 //! | `IQ4_NL` | `d` f16 | - | lattice, 1 lane | - | - | - |
 //! | `IQ4_XS` | `d` f16 | u6 - 32 | lattice, 1 lane | - | - | - |
+//! | `IQ1_S` | `d` f16 | u3 + 1/2, x 2 | u11 grid point, 8 lanes; shift `+/-1/8` | - | - | - |
+//! | `IQ1_M` | f16 in four nibbles | u3 + 1/2, x 2 | u11 grid point, 8 lanes; shift `+/-1/8` | - | - | - |
+//! | `TQ1_0` | `d` f16 | - | lattice of byte codes, 5 trit lanes (three stretches) | - | - | - |
 //! | `IQ2_XS` | `d` f16 | u4 + 1/2, x 1/4 | u9 grid point, 8 lanes | - | - | - |
 //! | `IQ3_XXS` | `d` f16 | u4 + 1/2, x 1/2 | u8 grid point, 4 lanes | - | - | - |
 //! | `IQ3_S` | `d` f16 | u4 + 1/2, x 2 | u9 grid point, 4 lanes | - | - | - |
@@ -172,6 +184,14 @@ pub enum WeightFormat {
     Iq4_Nl,
     /// GGUF `IQ4_XS` (ggml type 23): 256-value super-blocks of 4-bit codebook codes with 6-bit sub-block scales.
     Iq4_Xs,
+    /// GGUF `IQ1_S` (ggml type 19): 256-value super-blocks of 11-bit lattice points over eight values
+    /// each (eight low bits and three high bits stored apart), a 3-bit odd-integer scale and a
+    /// one-bit `+/-1/8` shift per 32 values.
+    Iq1_S,
+    /// GGUF `IQ1_M` (ggml type 29): 256-value super-blocks of 11-bit lattice points over eight values
+    /// each, 3-bit odd-integer scales per 16 values, a one-bit `+/-1/8` shift per eight values and an
+    /// f16 super-scale stored as the top nibbles of four scale words.
+    Iq1_M,
     /// GGUF `IQ2_XXS` (ggml type 16): 256-value super-blocks of 8-bit lattice points over eight values
     /// each, with the 7-bit sign patterns and a 4-bit half-step scale packed per 32 values.
     Iq2_Xxs,
@@ -189,6 +209,9 @@ pub enum WeightFormat {
     /// each (eight low bits and two high bits stored apart), 8-bit sign patterns and 4-bit half-step
     /// sub-block scales.
     Iq2_S,
+    /// GGUF `TQ1_0` (ggml type 34): 256-value ternary blocks of base-3 digits, five to a byte (1.6875 bits per
+    /// value), and one f16 scale, `y = (digit - 1) * d`.
+    Tq1_0,
     /// GGUF `TQ2_0` (ggml type 35): 256-value ternary blocks of 2-bit codes and one f16 scale,
     /// `y = (q - 1) * d`.
     Tq2_0,
@@ -265,6 +288,8 @@ pub enum OperandRole {
     SubMin,
     /// The sign pattern of a group of eight values ([`Lattice`]).
     Signs,
+    /// The term added to the value before the scales multiply it (`IQ1_S`'s `delta`).
+    Shift,
 }
 
 /// The operand of a planar format a source tensor supplies. A planar format has no `SubScale`, `Min`,
@@ -455,6 +480,12 @@ pub enum FieldEncoding {
         /// The power of two the half-step integer is multiplied by.
         exponent: i32,
     },
+    /// A one-bit field that is the sign of a power of two: `(-1)^b * 2^exponent` (`IQ1_S`'s
+    /// `delta = +/-0.125`, one bit per 32 or eight values). Exact in f32.
+    SignedPowerOfTwo {
+        /// The power of two whose sign the bit carries.
+        exponent: i32,
+    },
 }
 
 /// One digit of a [`BitLayout`]: its extent and the bit stride it contributes.
@@ -466,20 +497,22 @@ pub struct Digit {
     pub stride: u32,
 }
 
-/// A mixed-radix affine map from an in-block element index to a bit offset.
-///
-/// The index is split into [`Digit`]s, most significant first; the product of the extents is the
-/// block's value count. `bit(i) = base + sum(digit_n(i) * stride_n)`.
+/// A stretch of in-block elements `first..` over which a map from element index to a number is one mixed-radix
+/// affine map: the element `i - first` is split into [`Digit`]s, most significant first, and
+/// `value(i) = base + sum(digit_n(i - first) * stride_n)`. The most significant digit takes the remainder of
+/// its extent, so a lone digit of extent `e` repeats with period `e`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BitLayout {
-    /// Bit offset of element 0 from the start of the block.
+pub struct Segment {
+    /// The first in-block element the segment covers; it ends where the next segment begins.
+    pub first: u32,
+    /// The value of element `first`.
     pub base: u32,
-    /// The digits, most significant first; empty for a single-element layout.
+    /// The digits, most significant first; empty for a single-element segment.
     pub digits: &'static [Digit],
 }
 
-impl BitLayout {
-    /// The number of indices the layout covers (the product of its digit extents).
+impl Segment {
+    /// The number of elements the digits cover (the product of their extents).
     pub const fn extent(self) -> u32 {
         let mut extent = 1;
         let mut index = 0;
@@ -490,19 +523,94 @@ impl BitLayout {
         extent
     }
 
-    /// The bit offset of index `i`. `i` must be below [`Self::extent`].
-    pub const fn bit(self, i: u32) -> u32 {
-        let mut remaining = i;
-        let mut bit = self.base;
+    /// The value at in-block element `i`, which must not be below [`Self::first`].
+    pub const fn at(self, i: u32) -> u32 {
+        let mut remaining = i - self.first;
+        let mut value = self.base;
         let mut index = self.digits.len();
         while index > 0 {
             index -= 1;
             let digit = self.digits[index];
-            bit += (remaining % digit.extent) * digit.stride;
+            value += (remaining % digit.extent) * digit.stride;
             remaining /= digit.extent;
         }
-        bit
+        value
     }
+
+    /// The length of the runs over which the value does not move: the product of the trailing digits of stride
+    /// 0, or the whole segment when no digit has a stride.
+    const fn constant_run(self) -> u32 {
+        let mut run = 1;
+        let mut index = self.digits.len();
+        while index > 0 {
+            index -= 1;
+            if self.digits[index].stride != 0 {
+                return run;
+            }
+            run *= self.digits[index].extent;
+        }
+        run
+    }
+}
+
+/// The value at element `i` of the segments, which cover the block in order from element 0: the last
+/// segment that starts at or before `i` gives it.
+pub(crate) const fn segments_at(segments: &[Segment], i: u32) -> u32 {
+    let mut index = segments.len();
+    while index > 1 && segments[index - 1].first > i {
+        index -= 1;
+    }
+    segments[index - 1].at(i)
+}
+
+/// The elements the segments cover: they start at element 0 and each ends where the next begins, so the
+/// last one's end is the count.
+const fn segments_extent(segments: &[Segment]) -> u32 {
+    let last = segments[segments.len() - 1];
+    last.first + last.extent()
+}
+
+/// A piecewise mixed-radix affine map from an in-block element index to a bit offset: one or more
+/// [`Segment`]s, each affine over its own elements. Most layouts are one segment; `TQ1_0` is three, because
+/// ggml packs its 256 trits as 160 from `qs[0..32]`, 80 from `qs[32..48]` and 16 from `qh`, each stretch
+/// split into digits differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BitLayout {
+    /// The segments in element order; the first starts at element 0.
+    pub segments: &'static [Segment],
+}
+
+impl BitLayout {
+    /// The number of indices the layout covers: the end of its last segment.
+    pub const fn extent(self) -> u32 {
+        segments_extent(self.segments)
+    }
+
+    /// The bit offset of index `i`. `i` must be below [`Self::extent`].
+    pub const fn bit(self, i: u32) -> u32 {
+        segments_at(self.segments, i)
+    }
+
+    /// The length of the aligned runs over which the bit offset does not move: a run of `n` elements starting at
+    /// a multiple of `n` has one offset exactly when `n` divides this. Each segment bounds it by the trailing
+    /// digits that do not move the offset and by where the segment starts, so a run never straddles two
+    /// segments.
+    pub const fn constant_run(self) -> u32 {
+        let mut run = self.extent();
+        let mut index = 0;
+        while index < self.segments.len() {
+            let segment = self.segments[index];
+            run = gcd(run, segment.constant_run());
+            run = gcd(run, segment.first);
+            index += 1;
+        }
+        run
+    }
+}
+
+/// The greatest common divisor; `gcd(n, 0)` is `n`.
+const fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// `width` bits at the offset a [`BitLayout`] gives.
@@ -730,11 +838,14 @@ impl WeightFormat {
             Self::Q6_K => blocks::Q6_K,
             Self::Iq4_Nl => blocks::IQ4_NL,
             Self::Iq4_Xs => blocks::IQ4_XS,
+            Self::Iq1_S => blocks::IQ1_S,
+            Self::Iq1_M => blocks::IQ1_M,
             Self::Iq2_Xxs => blocks::IQ2_XXS,
             Self::Iq2_Xs => blocks::IQ2_XS,
             Self::Iq3_Xxs => blocks::IQ3_XXS,
             Self::Iq3_S => blocks::IQ3_S,
             Self::Iq2_S => blocks::IQ2_S,
+            Self::Tq1_0 => blocks::TQ1_0,
             Self::Tq2_0 => blocks::TQ2_0,
             Self::Mxfp4 => blocks::MXFP4,
             Self::E4m3PerChannel { scale } => planar::e4m3_per_channel(scale),

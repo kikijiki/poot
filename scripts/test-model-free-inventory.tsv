@@ -20,6 +20,7 @@ poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	roofline_t
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	roofline_tests::the_fit_producer_reads_the_last_result_line_of_each_file
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	roofline_tests::the_roofline_receipt_is_measured_only_for_a_measured_window_on_a_calibrated_device
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::a_curve_keeps_measured_points_but_a_first_point_failure_is_the_cells_failure
+poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::a_curve_point_workload_honours_the_prefill_chunk_limit
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::a_driver_refusal_is_a_recorded_refusal
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::a_load_failure_that_is_not_a_refusal_stays_an_error
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::a_model_the_loader_does_not_serve_is_a_recorded_refusal
@@ -30,6 +31,8 @@ poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::a_r
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::a_request_the_checkpoint_does_not_hold_fails_before_a_device_opens
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::a_window_reports_measured_milliseconds_or_the_typed_unknown
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::arguments_are_parsed_strictly
+poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::each_curve_iteration_times_the_prefill_alone_beside_its_decode_request
+poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::each_curve_point_opens_a_driver_sized_to_its_own_request
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::each_mode_prints_one_line_the_harness_turns_into_a_row
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::every_backend_runs_the_same_measure_protocol
 poot-bench-runner	poot-bench-runner::bin/poot-bench-runner	model-free	tests::median_and_stdev
@@ -888,6 +891,7 @@ poot-graph-plan	poot-graph-plan	model-free	packed_block_float::packed_lowering_t
 poot-graph-plan	poot-graph-plan	model-free	passes::fuse::tests::a_producer_read_outside_the_region_does_not_fuse
 poot-graph-plan	poot-graph-plan	model-free	passes::fuse::tests::a_producer_read_twice_inside_one_region_fuses
 poot-graph-plan	poot-graph-plan	model-free	passes::fuse::tests::recip_tanh_erf_fuse_into_one_region
+poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::a_device_indexed_gather_whose_rows_are_the_output_stays_on_the_device
 poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::a_gather_by_a_device_computed_index_is_a_device_site
 poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::a_sole_reader_dense_table_is_hosted_at_any_size
 poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::a_sole_reader_packed_table_is_hosted_at_any_size
@@ -1600,6 +1604,7 @@ poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::contraction_gemv
 poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::contraction_tiled_folded_grid_matches_reference_on_wgpu
 poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::contraction_tiled_matches_reference_aligned_and_ragged_on_wgpu
 poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged_on_wgpu
+poot-kernelgen	poot-kernelgen	device	packed::contraction_tests::runs_over_a_piecewise_layout_decode_like_the_reference_on_wgpu
 poot-kernelgen	poot-kernelgen	device	packed::planar_ptx_tests::contraction_gemv_matches_reference_for_every_planar_format_on_ptx
 poot-kernelgen	poot-kernelgen	device	packed::planar_ptx_tests::contraction_tiled_matches_reference_for_every_planar_format_on_ptx
 poot-kernelgen	poot-kernelgen	device	packed::planar_wgpu_tests::the_register_tiled_body_runs_256_lane_workgroups_on_radv
@@ -1620,6 +1625,7 @@ poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::contraction_wide_regist
 poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::packed_fragment_contractions_match_the_scalar_tiling_of_the_same_precision_on_rocm
 poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::row_gather_matches_decode_blocks_rows_on_rocm
 poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::row_gather_matches_decode_blocks_rows_on_rocm_kquant
+poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::runs_over_a_piecewise_layout_decode_like_the_reference_on_rocm
 poot-kernelgen	poot-kernelgen	device	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_on_wgpu
 poot-kernelgen	poot-kernelgen	device	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_on_wgpu_kquant
 poot-kernelgen	poot-kernelgen	device	precision::ptx_sweep::the_f16_conversion_decodes_every_finite_f16_as_the_integer_form_on_ptx
@@ -1703,10 +1709,13 @@ poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::every_format_gemv_is_bit_identical_after_static_alignment
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::rows_and_depth_do_not_change_a_rows_sum
+poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::runs_over_a_piecewise_layout_decode_like_the_reference
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_count_that_does_not_factor_over_the_digits_has_no_constant_offsets
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_field_of_four_pieces_decodes_in_the_emitted_kernel
+poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_piecewise_layout_shares_run_offsets_only_where_every_segment_agrees
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_run_moves_the_bit_offset_by_constants_over_the_digits
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_run_of_field_bits_equals_the_scalar_read_of_each_element
+poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::the_shift_formats_decode_in_the_emitted_kernel_as_the_plan_decodes
 poot-kernelgen	poot-kernelgen	model-free	packed::float_decode_tests::bf16_matches_scalar_on_the_admitted_domain
 poot-kernelgen	poot-kernelgen	model-free	packed::float_decode_tests::e2m1_matches_scalar_for_all_16_codes
 poot-kernelgen	poot-kernelgen	model-free	packed::float_decode_tests::e4m3fn_matches_scalar_on_the_admitted_domain
@@ -2007,10 +2016,18 @@ poot-l0-runtime	poot-l0-runtime	model-free	ffi::tests::a_missing_loader_is_a_typ
 poot-l0-runtime	poot-l0-runtime	model-free	ffi::tests::descriptor_layouts_match_ze_api_h
 poot-llm	poot-llm	checkpoint	driver::device_tests::checkpoint::a_gptq_checkpoint_loads_its_linears_packed_with_no_dense_copy
 poot-llm	poot-llm	checkpoint	driver::llamacpp_bisect_tests::checkpoint_rows::qwen2_5_0_5b_q8_0_follows_llamacpp_through_every_layer
+poot-llm	poot-llm	checkpoint	driver::llamacpp_iq1_tests::a_different_quantization_leaves_the_f16_gate_on_the_cpu_oracle
+poot-llm	poot-llm	checkpoint	driver::llamacpp_iq1_tests::iq1_m_follows_llamacpp_on_the_cpu_oracle
+poot-llm	poot-llm	checkpoint	driver::llamacpp_iq1_tests::iq1_m_matches_llamacpp_running_its_f16_dequantization_on_the_cpu_oracle
+poot-llm	poot-llm	checkpoint	driver::llamacpp_iq1_tests::iq1_s_follows_llamacpp_on_the_cpu_oracle
+poot-llm	poot-llm	checkpoint	driver::llamacpp_iq1_tests::iq1_s_matches_llamacpp_running_its_f16_dequantization_on_the_cpu_oracle
 poot-llm	poot-llm	checkpoint	driver::llamacpp_kl_tests::checkpoint_rows::one_perturbed_dequant_scale_exceeds_the_gate
 poot-llm	poot-llm	checkpoint	driver::llamacpp_kl_tests::checkpoint_rows::qwen2_5_0_5b_q4_k_m_follows_llamacpp
 poot-llm	poot-llm	checkpoint	driver::llamacpp_kl_tests::checkpoint_rows::qwen2_5_0_5b_q8_0_follows_llamacpp
 poot-llm	poot-llm	checkpoint	driver::llamacpp_kl_tests::checkpoint_rows::qwen3_0_6b_q8_0_follows_llamacpp
+poot-llm	poot-llm	checkpoint	driver::llamacpp_tq1_tests::a_different_quantization_leaves_the_f16_gate_on_the_cpu_oracle
+poot-llm	poot-llm	checkpoint	driver::llamacpp_tq1_tests::tq1_0_follows_llamacpp_on_the_cpu_oracle
+poot-llm	poot-llm	checkpoint	driver::llamacpp_tq1_tests::tq1_0_matches_llamacpp_running_its_f16_dequantization_on_the_cpu_oracle
 poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_bf16::llama_3_2_1b_instruct
 poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_bf16::qwen2_5_1_5b_q4_k_m
 poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_bf16::qwen3_0_6b
@@ -2169,6 +2186,8 @@ poot-llm	poot-llm	device	driver::device_tests::glm53_flash_mtp_chain_matches_the
 poot-llm	poot-llm	device	driver::device_tests::glm53_flash_mtp_chain_matches_the_reference_wgpu
 poot-llm	poot-llm	device	driver::device_tests::gpt_oss_first_step_matches_the_oracle_rocm
 poot-llm	poot-llm	device	driver::device_tests::gpt_oss_first_step_matches_the_oracle_wgpu
+poot-llm	poot-llm	device	driver::device_tests::gpt_oss_mxfp4_first_step_matches_the_oracle_rocm
+poot-llm	poot-llm	device	driver::device_tests::gpt_oss_mxfp4_first_step_matches_the_oracle_wgpu
 poot-llm	poot-llm	device	driver::device_tests::granitemoe_first_step_matches_the_oracle_rocm
 poot-llm	poot-llm	device	driver::device_tests::granitemoe_first_step_matches_the_oracle_wgpu
 poot-llm	poot-llm	device	driver::device_tests::greedy_ties_take_the_first_index_ptx
@@ -2523,6 +2542,7 @@ poot-llm	poot-llm	model-free	driver::device_tests::a_finetune_like_deepseek4_che
 poot-llm	poot-llm	model-free	driver::device_tests::a_finetune_like_glm53_flash_checkpoint_loads_through_model_handle_load
 poot-llm	poot-llm	model-free	driver::device_tests::a_finetune_like_minimax_checkpoint_loads_through_model_handle_load
 poot-llm	poot-llm	model-free	driver::device_tests::a_finetune_like_qwen35_checkpoint_loads_through_model_handle_load
+poot-llm	poot-llm	model-free	driver::device_tests::a_gpt_oss_mxfp4_checkpoint_loads_packed_and_equals_its_dense_dequantization
 poot-llm	poot-llm	model-free	driver::device_tests::a_vlm_directory_loads_with_its_tower_and_front_end
 poot-llm	poot-llm	model-free	driver::device_tests::an_hf_gemma3_checkpoint_encodes_with_its_mandatory_bos
 poot-llm	poot-llm	model-free	driver::device_tests::an_unreadable_or_malformed_config_is_attributed_to_its_path
@@ -2654,6 +2674,7 @@ poot-llm	poot-llm	model-free	driver::tests::a_pooled_driver_keeps_graphs_without
 poot-llm	poot-llm	model-free	driver::tests::a_prepared_set_replays_without_compiling
 poot-llm	poot-llm	model-free	driver::tests::a_recurrent_conversation_resumes_only_over_what_its_state_consumed
 poot-llm	poot-llm	model-free	driver::tests::a_refused_chat_template_fails_the_load_before_the_weights_are_read
+poot-llm	poot-llm	model-free	driver::tests::a_returned_executor_serves_a_driver_of_another_capacity
 poot-llm	poot-llm	model-free	driver::tests::a_sampled_request_binds_its_sampler_slots_and_discarded_steps_leave_the_stream_alone
 poot-llm	poot-llm	model-free	driver::tests::a_sink_that_stops_ends_the_run
 poot-llm	poot-llm	model-free	driver::tests::a_stop_string_ends_generation_without_decoding_past_it
@@ -3159,6 +3180,9 @@ poot-load	poot-load	model-free	plan::tests::a_job_whose_range_leaves_its_file_is
 poot-load	poot-load	model-free	safetensors::tests::quantized_linear_extents_are_checked
 poot-load	poot-load	model-free	safetensors::tests::shard_names_must_be_plain_file_names
 poot-load	poot-load	model-free	tests::an_hf_block_fp8_quantization_config_is_the_fp8_scheme
+poot-load	poot-load	model-free	tests::an_hf_mxfp4_quantization_config_is_the_mxfp4_scheme
+poot-load	poot-load	model-free	tests::an_ill_formed_mxfp4_stack_is_refused_naming_the_tensor
+poot-load	poot-load	model-free	tests::an_mxfp4_expert_stack_packs_per_expert_and_decodes_as_hf_does
 poot-load	poot-load	model-free	tests::awq_linear_packs_its_checkpoint_bytes_and_decodes_to_the_reference
 poot-load	poot-load	model-free	tests::block_fp8_linear_packs_and_refuses_a_nan_e8m0_scale
 poot-load	poot-load	model-free	tests::e4m3_weights_that_are_not_ple_table_shards_stay_refused
@@ -3174,6 +3198,8 @@ poot-load	poot-load	model-free	tests::ple_table_shards_under_a_shared_scale_load
 poot-load	poot-load	model-free	tests::safetensors_rejects_malformed_header_instead_of_panicking
 poot-load	poot-load::flash_next_dequant	model-free	dq1_every_stored_type_decodes_to_the_reference
 poot-load	poot-load::flash_next_dequant	model-free	dq4_tq2_0_real_blocks_decode_to_the_reference
+poot-load	poot-load::flash_next_dequant	model-free	dq5_iq1_real_blocks_decode_to_the_reference
+poot-load	poot-load::flash_next_dequant	model-free	dq6_tq1_0_real_blocks_decode_to_the_reference
 poot-load	poot-load::gguf_reader_rss	checkpoint	read_gguf_of_q4_k_m_maps_without_anonymous_copies
 poot-load	poot-load::gguf_reader_rss	checkpoint	read_gguf_of_q8_0_maps_without_anonymous_copies
 poot-load	poot-load::gguf_shards	model-free	sh1_each_tensor_reads_its_own_shards_bytes
@@ -3714,7 +3740,10 @@ poot-models	poot-models	model-free	components::router::tests::the_deepseek_route
 poot-models	poot-models	model-free	components::router::tests::the_projection_and_the_bias_change_the_routes
 poot-models	poot-models	model-free	components::router::tests::the_sigmoid_arm_equals_the_deepseek3_graph_reference
 poot-models	poot-models	model-free	components::router::tests::the_sqrt_softplus_arm_refuses_options_it_does_not_define
-poot-models	poot-models	model-free	components::sparse_top_k::tests::rank_counts_strictly_greater_entries_and_the_mask_keeps_rank_below_k
+poot-models	poot-models	model-free	components::sparse_top_k::tests::a_zero_k_is_refused
+poot-models	poot-models	model-free	components::sparse_top_k::tests::compile_ranks_the_selector_through_one_stable_rank_without_a_pairwise_value
+poot-models	poot-models	model-free	components::sparse_top_k::tests::non_finite_scores_have_a_defined_cut
+poot-models	poot-models	model-free	components::sparse_top_k::tests::the_mask_keeps_entries_with_fewer_than_k_strictly_greater
 poot-models	poot-models	model-free	components::standard::tests::a_carry_narrower_than_the_step_is_refused_before_tracing
 poot-models	poot-models	model-free	components::standard::tests::a_layer_with_biased_layer_norms_matches_an_f64_reference
 poot-models	poot-models	model-free	components::standard::tests::a_non_positive_scale_is_refused_by_field
@@ -4252,6 +4281,8 @@ poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_refused_delete
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_rerun_of_a_failed_request_continues_its_result_set
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_reused_pod_is_not_reprovisioned
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_run_has_no_cuda_floor_unless_told
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_run_records_the_digest_of_the_image_it_ran
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_run_whose_image_cannot_be_pinned_does_not_start
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_run_with_a_live_owner_is_not_resumed_and_its_pod_is_not_reaped
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_second_delete_after_signal_teardown_is_tolerated
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_second_exec_never_touches_the_first_execs_running_pod
@@ -4265,6 +4296,7 @@ poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_type_only_one_
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_warm_exec_pod_over_the_cap_is_not_reused
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_warm_pod_runpod_no_longer_lists_is_closed_without_a_delete
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_warm_pod_without_an_ssh_endpoint_is_distinguished_from_a_gone_one
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::an_exec_passes_the_image_digest_to_its_setup_and_command
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::an_image_label_sets_the_default_floor_and_the_flag_overrides_it
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::an_unreachable_looking_warm_pod_of_another_job_is_left_alone
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::an_unresponsive_warm_pod_is_not_probed_again_within_the_miss_window
@@ -4515,6 +4547,8 @@ poot-quant	poot-quant	model-free	blocks::tests::q6_k_block_decodes_to_the_ggml_r
 poot-quant	poot-quant	model-free	blocks::tests::q8_0_block_decodes_to_the_ggml_reference
 poot-quant	poot-quant	model-free	blocks::tests::the_eighth_sign_is_the_parity_of_the_stored_seven
 poot-quant	poot-quant	model-free	blocks::tests::the_lattice_tables_are_the_gguf_py_grids
+poot-quant	poot-quant	model-free	blocks::tests::the_tq1_0_table_is_ggmls_trit_arithmetic_and_inverts_its_encoder
+poot-quant	poot-quant	model-free	blocks::tests::tq1_0_blocks_decode_as_ggmls_loop_does
 poot-quant	poot-quant	model-free	content::tests::a_block_scan_reads_each_stored_float_once_per_block
 poot-quant	poot-quant	model-free	content::tests::a_planar_scan_reads_each_stored_float_once_and_skips_operands_without_a_pattern
 poot-quant	poot-quant	model-free	content::tests::every_block_format_refuses_a_non_finite_field_at_first_middle_and_last_block
@@ -4544,6 +4578,7 @@ poot-quant	poot-quant	model-free	planar::tests::gptq_act_order_decodes_to_the_au
 poot-quant	poot-quant	model-free	planar::tests::gptq_decodes_to_the_autogptq_reference
 poot-quant	poot-quant	model-free	planar::tests::row_concat_of_no_parts_is_refused
 poot-quant	poot-quant	model-free	planar::tests::row_concat_refuses_a_k_major_format
+poot-quant	poot-quant	model-free	scalar::tests::a_signed_power_of_two_is_the_sign_of_its_bit
 poot-quant	poot-quant	model-free	scalar::tests::bf16_to_f32_golden_table
 poot-quant	poot-quant	model-free	scalar::tests::e2m1_codes_are_the_ocp_values_with_negative_zero
 poot-quant	poot-quant	model-free	scalar::tests::e4m3fn_and_e8m0_edges_are_the_ocp_values
@@ -4873,6 +4908,7 @@ poot-serve	poot-serve::bin/poot-serve	model-free	engine_plan::tests::an_encoder_
 poot-serve	poot-serve::bin/poot-serve	model-free	engine_plan::tests::an_exact_per_device_capacity_admits_each_placement_at_its_smallest_candidate
 poot-serve	poot-serve::bin/poot-serve	model-free	engine_plan::tests::an_under_budget_device_is_refused_before_serving_naming_that_device
 poot-serve	poot-serve::bin/poot-serve	model-free	engine_plan::tests::an_unknown_budget_refuses_every_candidate
+poot-serve	poot-serve::bin/poot-serve	model-free	engine_plan::tests::each_entry_is_planned_once_per_startup
 poot-serve	poot-serve::bin/poot-serve	model-free	engine_plan::tests::every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weights
 poot-serve	poot-serve::bin/poot-serve	model-free	engine_plan::tests::health_is_503_starting_while_prepare_runs_and_200_serving_after
 poot-serve	poot-serve::bin/poot-serve	model-free	engine_plan::tests::live_allocations_are_admitted_against_the_budget_observed_after_prepare

@@ -179,5 +179,5 @@ fn every_quantized_format_decodes_its_fixture_like_llamacpp() {
         );
         formats += 1;
     }
-    assert_eq!(formats, 19, "the nineteen quantized GGUF formats");
+    assert_eq!(formats, 22, "the twenty-two quantized GGUF formats");
 }

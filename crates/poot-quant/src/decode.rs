@@ -14,7 +14,7 @@ use crate::format::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::format::{FieldEncoding, MinSign, ValueMap};
 #[cfg(any(test, feature = "test-support"))]
-use crate::scalar::{float_to_f32, half_step_to_f32};
+use crate::scalar::{float_to_f32, half_step_to_f32, signed_power_of_two_to_f32};
 
 /// Typed failures of the scalar decoder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,7 +240,9 @@ impl Raw {
                 let unused = 32 - self.width;
                 i64::from(((self.bits << unused) as i32) >> unused)
             }
-            FieldEncoding::Float(_) | FieldEncoding::HalfStep { .. } => {
+            FieldEncoding::Float(_)
+            | FieldEncoding::HalfStep { .. }
+            | FieldEncoding::SignedPowerOfTwo { .. } => {
                 unreachable!("descriptor tests: integer operands are ints")
             }
         }
@@ -250,9 +252,25 @@ impl Raw {
         match self.encoding {
             FieldEncoding::Float(format) => float_to_f32(format, self.bits),
             FieldEncoding::HalfStep { exponent } => half_step_to_f32(self.bits, exponent),
+            FieldEncoding::SignedPowerOfTwo { exponent } => {
+                signed_power_of_two_to_f32(self.bits, exponent)
+            }
             FieldEncoding::Unsigned { .. } | FieldEncoding::Signed => self.integer() as f32,
         }
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+/// The operands of one element's value formula, read.
+struct Terms {
+    /// `Scale * SubScale`.
+    scale: Option<f32>,
+    /// `Min * SubMin`.
+    min: Option<f32>,
+    /// `Shift`.
+    shift: Option<f32>,
+    /// The raw code.
+    code: Raw,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -267,7 +285,7 @@ impl Formula<'_> {
     fn parts(
         &self,
         operand: &mut impl FnMut(OperandRole) -> Result<Option<Raw>, DecodeError>,
-    ) -> Result<(Option<f32>, Option<f32>, Raw), DecodeError> {
+    ) -> Result<Terms, DecodeError> {
         let format = self.descriptor.format;
         let mut number = |role| -> Result<Option<f32>, DecodeError> {
             let Some(raw) = operand(role)? else {
@@ -281,11 +299,17 @@ impl Formula<'_> {
         };
         let scale = product(number(OperandRole::Scale)?, number(OperandRole::SubScale)?);
         let min = product(number(OperandRole::Min)?, number(OperandRole::SubMin)?);
+        let shift = number(OperandRole::Shift)?;
         let code = operand(OperandRole::Codes)?.ok_or(DecodeError::MissingTerm {
             format,
             role: OperandRole::Codes,
         })?;
-        Ok((scale, min, code))
+        Ok(Terms {
+            scale,
+            min,
+            shift,
+            code,
+        })
     }
 
     /// The value at in-block element `element`, which only a [`ValueMap::Lattice`] reads (its
@@ -295,7 +319,12 @@ impl Formula<'_> {
         element: usize,
         mut operand: impl FnMut(OperandRole) -> Result<Option<Raw>, DecodeError>,
     ) -> Result<f32, DecodeError> {
-        let (scale, min, code) = self.parts(&mut operand)?;
+        let Terms {
+            scale,
+            min,
+            shift,
+            code,
+        } = self.parts(&mut operand)?;
         let value = match self.descriptor.value {
             ValueMap::Integer => {
                 let zero = operand(OperandRole::Zero)?.map_or(0, Raw::integer);
@@ -326,7 +355,8 @@ impl Formula<'_> {
                 number
             }
         };
-        let scaled = scale.map_or(value, |scale| scale * value);
+        let shifted = shift.map_or(value, |shift| value + shift);
+        let scaled = scale.map_or(shifted, |scale| scale * shifted);
         Ok(match (min, self.descriptor.min_sign) {
             (Some(min), Some(MinSign::Add)) => scaled + min,
             (Some(min), Some(MinSign::Subtract)) => scaled - min,

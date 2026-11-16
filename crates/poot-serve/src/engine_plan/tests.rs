@@ -1393,6 +1393,45 @@ fn a_decoder_plans_its_embedding_pass_and_a_family_without_one_serves_generation
     );
 }
 
+/// POOT-1603 SC-001: each entry is planned once per startup. The fit plans the chosen candidate over recording
+/// devices, and the serving driver is built from the programs that planning compiled, so it compiles none of
+/// its own: every entry it adds is a replayed program, and the planning pass compiled exactly one program per
+/// entry. Mutation: make `Programs::replay` return `None` (the serving driver compiles again); the serving
+/// driver's compile count equals the entries it added and the row goes red.
+#[test]
+fn each_entry_is_planned_once_per_startup() {
+    for (label, handle) in [
+        ("a decoder", dense_model()),
+        (
+            "an encoder",
+            crate::tests::encoder_routes::encoder_handle(None),
+        ),
+    ] {
+        let (executor, add_entries) = probe(spirv_target(), 0);
+        let health = EngineHealth::starting();
+        let (result, _) = build_with(
+            &args(BackendChoice::Wgpu),
+            &handle,
+            executor,
+            roomy,
+            &health,
+        );
+        let Started { driver, .. } = result.unwrap_or_else(|error| panic!("{label}: {error}"));
+        let entries = add_entries.load(Ordering::SeqCst) as u64;
+        let stats = driver.stats();
+        assert!(entries > 1, "{label}: startup prepares several entries");
+        assert_eq!(stats.entries_added, entries, "{label}");
+        assert_eq!(
+            stats.replayed, entries,
+            "{label}: every entry's program came from the planning pass"
+        );
+        assert_eq!(
+            stats.compiles, 0,
+            "{label}: the serving driver compiled a program the planning pass had compiled"
+        );
+    }
+}
+
 /// POOT-1204 SC-004: `--rows` and `--max-seq` are the shapes the plan is fitted at, through the real
 /// parser and `engine_args`. A model with 1024 positions at `--rows 2 --max-seq 1024` is planned at
 /// exactly those shapes. Mutation: build `EngineArgs` from the defaults (hard-code 4 rows) in

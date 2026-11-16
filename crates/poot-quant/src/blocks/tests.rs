@@ -1,4 +1,6 @@
-use super::lattice::{IQ2S_LATTICE, IQ2XS_LATTICE, IQ2XXS_LATTICE, IQ3S_LATTICE, IQ3XXS_LATTICE};
+use super::lattice::{
+    IQ1S_LATTICE, IQ2S_LATTICE, IQ2XS_LATTICE, IQ2XXS_LATTICE, IQ3S_LATTICE, IQ3XXS_LATTICE,
+};
 use crate::families::lattice::{Lattice, SignRule};
 use crate::format::{Field, FieldEncoding, OperandRole, Storage, ValueMap, WeightFormat};
 use crate::grids::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID};
@@ -617,7 +619,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// The lattice tables are ggml's, entry for entry: their digests equal those of the grids
-/// `gguf-py` (`gguf/quants.py`, `grid` of `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS` and `IQ3_S`, unpacked
+/// `gguf-py` (`gguf/quants.py`, `grid` of `IQ1_S`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS` and `IQ3_S`, unpacked
 /// from `grid_hex`) builds, an independent copy of `ggml-common.h`'s `iq2xxs_grid`, `iq2xs_grid`,
 /// `iq2s_grid`, `iq3xxs_grid` and `iq3s_grid`. A single swapped or edited grid point changes the digest.
 /// Mutation: swap two entries of `IQ2XS_GRID`, `IQ2XXS_GRID` or `IQ2S_GRID`; the matching assertion goes red.
@@ -640,6 +642,9 @@ fn the_lattice_tables_are_the_gguf_py_grids() {
     assert_eq!(IQ2XS_LATTICE.points(), 512);
     assert_eq!(IQ2S_LATTICE.points(), 1024);
     assert_eq!(fnv1a(&cell_bytes(&IQ3S_LATTICE)), 0xfa37_020c_25b4_4829);
+    // `IQ1_S`'s points as `gguf-py`'s `IQ1_S.grid` (`-1, 0, 1` per cell), each cell plus one in a nibble.
+    assert_eq!(fnv1a(&cell_bytes(&IQ1S_LATTICE)), 0xdf33_d6de_af4e_7cbe);
+    assert_eq!(IQ1S_LATTICE.points(), 2048);
     assert_eq!(IQ3XXS_LATTICE.points(), 256);
     assert_eq!(IQ3S_LATTICE.points(), 512);
     // A grid point is a little-endian run of magnitude bytes, as ggml's `uint64_t` entries.
@@ -833,6 +838,123 @@ fn lattice_blocks_decode_as_ggml_loops_do() {
     }
 }
 
+/// `dequantize_row_tq1_0` of `ggml/src/ggml-quants.c`, loop for loop over the raw block: five trits to a byte
+/// along 32 bytes of `qs`, five along the next 16, four along the 4 bytes of `qh`, each `(((uint8_t)(q *
+/// 3^n)) * 3) >> 8`.
+fn ggml_dequantize_tq1_0(block: &[u8]) -> Vec<f32> {
+    assert_eq!(block.len(), 54);
+    let (qs, rest) = block.split_at(48);
+    let (qh, scale) = rest.split_at(4);
+    let d = crate::scalar::f16_to_f32(u16::from_le_bytes([scale[0], scale[1]]));
+    let pow3: [u8; 5] = [1, 3, 9, 27, 81];
+    let trit = |byte: u8, n: usize| {
+        let q = byte.wrapping_mul(pow3[n]);
+        (f32::from((u16::from(q) * 3) >> 8) - 1.0) * d
+    };
+    let mut y = Vec::new();
+    for n in 0..5 {
+        y.extend(qs[..32].iter().map(|&byte| trit(byte, n)));
+    }
+    for n in 0..5 {
+        y.extend(qs[32..].iter().map(|&byte| trit(byte, n)));
+    }
+    for n in 0..4 {
+        y.extend(qh.iter().map(|&byte| trit(byte, n)));
+    }
+    y
+}
+
+/// Random `TQ1_0` blocks (every byte value in `qs` and `qh`, every scale) decode, through the descriptor
+/// interpreter, to exactly what ggml's loop gives: the three stretches of the layout (160 values from
+/// `qs[0..32]`, 80 from `qs[32..48]`, 16 from `qh`) and the lane each reads are ggml's. Mutation: start the
+/// second segment of `TQ1_0`'s codes at element 128 instead of 160; red at element 128.
+#[test]
+fn tq1_0_blocks_decode_as_ggmls_loop_does() {
+    let descriptor = WeightFormat::Tq1_0.descriptor();
+    let mut state = 0x7101_u64;
+    for _ in 0..256 {
+        let mut block: Vec<u8> = (0..54)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        // A finite scale: keep the f16 exponent below all-ones.
+        block[53] &= 0x7b;
+        for (index, want) in ggml_dequantize_tq1_0(&block).into_iter().enumerate() {
+            let got = descriptor.decode_block_value(&block, index).unwrap();
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "Tq1_0 element {index}: {got:?} vs ggml {want:?}"
+            );
+        }
+    }
+}
+
+/// The `TQ1_0` table is ggml's trit arithmetic for every byte and digit, and it inverts ggml's encoder: the
+/// byte `quantize_row_tq1_0_ref` writes for five trits (`q = (q * 256 + 242) / 243` over their base-3 value;
+/// four trits over 81 for `qh`) reads back as those trits. Mutation: change one cell of `trit_words`; red
+/// naming the byte and digit.
+#[test]
+fn the_tq1_0_table_is_ggmls_trit_arithmetic_and_inverts_its_encoder() {
+    let lattice = match WeightFormat::Tq1_0.descriptor().value {
+        ValueMap::Lattice(lattice) => lattice,
+        _ => unreachable!("TQ1_0 is a lattice format"),
+    };
+    let trit = |byte: usize, lane: usize| lattice.cells.cell(byte * lattice.lanes + lane);
+    for byte in 0..256usize {
+        let mut power = 1u8;
+        for lane in 0..5 {
+            let q = (byte as u8).wrapping_mul(power);
+            assert_eq!(
+                trit(byte, lane),
+                (u32::from(q) * 3) >> 8,
+                "byte {byte} digit {lane}"
+            );
+            power = power.wrapping_mul(3);
+        }
+    }
+    for (digits, modulus) in [(5, 243usize), (4, 81)] {
+        for value in 0..modulus {
+            let trits: Vec<u32> = (0..digits)
+                .map(|n| (value / 3usize.pow((digits - 1 - n) as u32) % 3) as u32)
+                .collect();
+            // ggml's ceiling division: `(q * 256 + (modulus - 1)) / modulus`.
+            let byte = (value * 256).div_ceil(modulus);
+            for (n, &want) in trits.iter().enumerate() {
+                assert_eq!(
+                    trit(byte, n),
+                    want,
+                    "the byte {byte} ggml writes for trits {trits:?}, digit {n}"
+                );
+            }
+        }
+    }
+}
+
+/// The segments of a layout or lane map start at element 0, each begins where the one before ends, and the last
+/// one ends at the block's last element (the layouts' extents are checked against the block separately).
+fn assert_segments_tile_the_block(
+    format: WeightFormat,
+    what: &str,
+    segments: &[crate::format::Segment],
+) {
+    assert_eq!(
+        segments[0].first, 0,
+        "{format:?} {what}: starts at element 0"
+    );
+    for pair in segments.windows(2) {
+        assert_eq!(
+            pair[0].first + pair[0].extent(),
+            pair[1].first,
+            "{format:?} {what}: a segment ends where the next begins"
+        );
+    }
+}
+
 /// Every block descriptor is well formed: each piece's layout covers the block's values, stays
 /// inside the block, an integer value map has an integer `Codes` field, a lattice code indexes exactly
 /// its points, and a min sign exactly when there is a `Min` operand.
@@ -854,6 +976,7 @@ fn every_block_descriptor_is_well_formed() {
                     "{format:?} {} layout extent",
                     field.name
                 );
+                assert_segments_tile_the_block(format, field.name, piece.layout.segments);
                 let last = (0..layout.values as u32)
                     .map(|i| piece.layout.bit(i) + piece.width)
                     .max()
@@ -892,6 +1015,11 @@ fn every_block_descriptor_is_well_formed() {
                     cells.cells() % lattice.lanes,
                     0,
                     "{format:?} the table is whole points"
+                );
+                assert_segments_tile_the_block(format, "lane map", lattice.lane.segments);
+                assert!(
+                    (0..layout.values).all(|i| lattice.lane.lane(i) < lattice.lanes),
+                    "{format:?} an element reads a lane its points have"
                 );
                 assert_eq!(
                     1usize << codes.field.width(),

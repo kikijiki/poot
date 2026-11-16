@@ -74,6 +74,7 @@ poot-llm	driver::device_tests::glm53_flash_every_position_matches_the_reference_
 poot-llm	driver::device_tests::glm53_flash_first_step_matches_the_oracle_wgpu
 poot-llm	driver::device_tests::glm53_flash_mtp_chain_matches_the_reference_wgpu
 poot-llm	driver::device_tests::gpt_oss_first_step_matches_the_oracle_wgpu
+poot-llm	driver::device_tests::gpt_oss_mxfp4_first_step_matches_the_oracle_wgpu
 poot-llm	driver::device_tests::granitemoe_first_step_matches_the_oracle_wgpu
 poot-llm	driver::device_tests::greedy_ties_take_the_first_index_wgpu
 poot-llm	driver::device_tests::guided_requests_sample_inside_the_mask_wgpu

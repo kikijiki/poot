@@ -6,7 +6,7 @@ use std::collections::HashMap;
 /// today (specs 019-020).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct QuantConfig {
-    /// The scheme family: `"gptq"`, `"awq"`, `"compressed-tensors"` or `"fp8"`.
+    /// The scheme family: `"gptq"`, `"awq"`, `"compressed-tensors"`, `"fp8"` or `"mxfp4"`.
     pub quant_method: String,
     /// Weight bit width (`4` for GPTQ and AWQ).
     #[serde(default)]
@@ -58,6 +58,9 @@ pub enum QuantKind {
     Awq,
     /// FP8 E4M3, per-output-channel scale (compressed-tensors, float-quantized).
     Fp8,
+    /// HF `quant_method: "mxfp4"` (gpt-oss): per-expert `_blocks` (E2M1, two codes per byte) and
+    /// `_scales` (one E8M0 per 32 values) tensors.
+    Mxfp4,
 }
 
 /// A resolved, supported quantization scheme (the kind + its group size).

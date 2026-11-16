@@ -14,14 +14,14 @@ use crate::format::{
     BlockField, Field, FieldEncoding, FloatFormat, FormatDescriptor, MinSign, OperandRole, Storage,
     ValueMap, WeightFormat,
 };
-use crate::scalar::{float_to_f32, half_step_to_f32};
+use crate::scalar::{float_to_f32, half_step_to_f32, signed_power_of_two_to_f32};
 
 /// The largest block, plus zero padding so an 8-byte window never leaves the scratch.
 const MAX_BLOCK_BYTES: usize = 256;
 type Padded = [u8; MAX_BLOCK_BYTES + 8];
 
-/// At most this many distinct slots of one repeating factor per block.
-const MAX_SLOTS: usize = 16;
+/// At most this many distinct slots of one repeating factor per block (`IQ1_M`'s shift is one per eight values).
+const MAX_SLOTS: usize = 32;
 
 /// The most pieces one field concatenates (IQ1_M's f16 super-scale is four nibbles).
 const MAX_PIECES: usize = 4;
@@ -129,6 +129,9 @@ impl Reader {
             }
             FieldEncoding::Float(format) => float_to_f32(format, bits),
             FieldEncoding::HalfStep { exponent } => half_step_to_f32(bits, exponent),
+            FieldEncoding::SignedPowerOfTwo { exponent } => {
+                signed_power_of_two_to_f32(bits, exponent)
+            }
         }
     }
 
@@ -140,7 +143,9 @@ impl Reader {
                 let unused = 32 - self.width;
                 ((bits << unused) as i32) >> unused
             }
-            FieldEncoding::Float(_) | FieldEncoding::HalfStep { .. } => 0,
+            FieldEncoding::Float(_)
+            | FieldEncoding::HalfStep { .. }
+            | FieldEncoding::SignedPowerOfTwo { .. } => 0,
         }
     }
 }
@@ -185,7 +190,10 @@ impl<const N: usize> Factor<N> {
                 slot += 1;
             }
             if slot == factor.count {
-                assert!(factor.count < MAX_SLOTS, "at most 16 slots of one factor");
+                assert!(
+                    factor.count < MAX_SLOTS,
+                    "at most MAX_SLOTS slots of one factor"
+                );
                 factor.slots[slot] = pieces;
                 factor.count += 1;
             }
@@ -284,12 +292,12 @@ pub(crate) struct ConstPlan<const N: usize> {
     code_pieces: [Pieces; N],
     /// The `Signs` operand's bits at each element, for a [`ValueMap::Lattice`] format with a sign rule.
     sign_pieces: [Pieces; N],
-    /// `Scale`, `SubScale`, `Min`, `SubMin`.
-    factors: [Factor<N>; 4],
+    /// `Scale`, `SubScale`, `Min`, `SubMin`, `Shift`.
+    factors: [Factor<N>; 5],
 }
 
 /// Per-block factor slot values.
-type Slots = [[f32; MAX_SLOTS]; 4];
+type Slots = [[f32; MAX_SLOTS]; 5];
 
 impl<const N: usize> ConstPlan<N> {
     pub(crate) const fn compile(descriptor: FormatDescriptor) -> Self {
@@ -330,6 +338,7 @@ impl<const N: usize> ConstPlan<N> {
             Factor::compile(layout.const_field(OperandRole::SubScale)),
             Factor::compile(layout.const_field(OperandRole::Min)),
             Factor::compile(layout.const_field(OperandRole::SubMin)),
+            Factor::compile(layout.const_field(OperandRole::Shift)),
         ];
         Self {
             format: descriptor.format,
@@ -360,9 +369,10 @@ impl<const N: usize> ConstPlan<N> {
         Ok(())
     }
 
-    /// `(Scale * SubScale, Min * SubMin)` of element `index`, multiplied left to right.
+    /// `(Scale * SubScale, Min * SubMin, Shift)` of element `index`, the products left to right; the shift is
+    /// `None` for a format without one.
     #[inline(always)]
-    fn scale_and_min(&self, slots: &Slots, index: usize) -> (f32, f32) {
+    fn scale_min_shift(&self, slots: &Slots, index: usize) -> (f32, f32, Option<f32>) {
         let factor = |which: usize| {
             let factor = &self.factors[which];
             factor.present.then(|| slots[which][factor.slot_of[index]])
@@ -372,14 +382,18 @@ impl<const N: usize> ConstPlan<N> {
             (Some(value), None) | (None, Some(value)) => value,
             (None, None) => 1.0,
         };
-        (product(factor(0), factor(1)), product(factor(2), factor(3)))
+        (
+            product(factor(0), factor(1)),
+            product(factor(2), factor(3)),
+            factor(4),
+        )
     }
 
     /// Decode a run of whole blocks into `out`.
     #[inline(always)]
     pub(crate) fn decode_blocks(&self, bytes: &[u8], out: &mut [f32]) -> Result<(), DecodeError> {
         let mut padded: Padded = [0; MAX_BLOCK_BYTES + 8];
-        let mut slots: Slots = [[0.0; MAX_SLOTS]; 4];
+        let mut slots: Slots = [[0.0; MAX_SLOTS]; 5];
         for (block, out) in bytes
             .chunks_exact(self.bytes)
             .zip(out.as_chunks_mut::<N>().0.iter_mut())
@@ -415,8 +429,9 @@ impl<const N: usize> ConstPlan<N> {
                 }
                 ValueMap::Float => self.codes.number(bits),
             };
-            let (scale, min) = self.scale_and_min(slots, index);
-            let scaled = if has_scale { scale * decoded } else { decoded };
+            let (scale, min, shift) = self.scale_min_shift(slots, index);
+            let shifted = shift.map_or(decoded, |shift| decoded + shift);
+            let scaled = if has_scale { scale * shifted } else { shifted };
             out[index] = match self.min_sign {
                 None => scaled,
                 Some(MinSign::Add) => scaled + min,
@@ -453,11 +468,14 @@ macro_rules! with_plan {
             WeightFormat::Q5_K => arm!(blocks::Q5_K, blocks::QK_K),
             WeightFormat::Q6_K => arm!(blocks::Q6_K, blocks::QK_K),
             WeightFormat::Iq4_Xs => arm!(blocks::IQ4_XS, blocks::QK_K),
+            WeightFormat::Iq1_S => arm!(blocks::IQ1_S, blocks::QK_K),
+            WeightFormat::Iq1_M => arm!(blocks::IQ1_M, blocks::QK_K),
             WeightFormat::Iq2_Xxs => arm!(blocks::IQ2_XXS, blocks::QK_K),
             WeightFormat::Iq2_Xs => arm!(blocks::IQ2_XS, blocks::QK_K),
             WeightFormat::Iq3_Xxs => arm!(blocks::IQ3_XXS, blocks::QK_K),
             WeightFormat::Iq3_S => arm!(blocks::IQ3_S, blocks::QK_K),
             WeightFormat::Iq2_S => arm!(blocks::IQ2_S, blocks::QK_K),
+            WeightFormat::Tq1_0 => arm!(blocks::TQ1_0, blocks::QK_K),
             WeightFormat::Tq2_0 => arm!(blocks::TQ2_0, blocks::QK_K),
             WeightFormat::F32 | WeightFormat::F16 | WeightFormat::Bf16 => $otherwise,
             WeightFormat::E4m3PerChannel { .. }

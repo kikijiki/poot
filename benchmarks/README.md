@@ -218,7 +218,10 @@ fails the cell) beside the dtype it computes in. These (but not the sha, which a
 a cell's comparable identity, with a `--diagnostic` run's `profiled` flag. A diagnostic run times the device and is stored
 under `results/diagnostics/`, apart from the committed results; it is where time goes, never throughput. An
 external tool's row names the version it reports (`framework_version`); the pod image's digest is
-`POOT_BENCH_IMAGE_DIGEST` in `env.json`. `harness/tests/test_benchmark_identity.py` holds every committed row to
+`image_digest` in `env.json`: the orchestrator pins the image tag to a digest, creates the pod from it and passes it to the sweep as
+`POOT_BENCH_IMAGE_DIGEST` (`orchestrator exec` exports it to its setup and command, `pod/qwen38-27b/pod-sweep.sh` records it
+in `env.txt`, and `pod/qwen38-27b/ingest.py` refuses a sweep without it). `bench compare-committed` exits 2 for a committed set from an NVIDIA host without one, apart from the sets
+listed in `known-null-image-digest.txt` (recorded before the digest was captured; the list is closed). `harness/tests/test_benchmark_identity.py` holds every committed row to
 this.
 
 ## Quick start

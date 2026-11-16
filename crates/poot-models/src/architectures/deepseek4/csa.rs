@@ -22,7 +22,7 @@ use super::hca::{
 };
 use super::sliding::{Compressed, Local, rotate_tail};
 use crate::components::linear::{Weight, WeightError, linear};
-use crate::components::sparse_top_k::{keep_top_k_mask, pairwise_rank};
+use crate::components::sparse_top_k::keep_top_k_mask;
 use crate::components::standard::Step;
 use crate::model::{ParamBlock, TraceError, WiringError};
 
@@ -100,8 +100,7 @@ fn select_top_k(
     readable: Traced,
     topk: usize,
 ) -> Result<Traced, TraceError> {
-    let rank = pairwise_rank(b, b.binary(BinOp::Add, scores, readable)?)?;
-    let keep = keep_top_k_mask(b, rank, topk)?;
+    let keep = keep_top_k_mask(b, b.binary(BinOp::Add, scores, readable)?, topk)?;
     let dropped = b.binary_scalar(
         BinOp::Mul,
         b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0))?,

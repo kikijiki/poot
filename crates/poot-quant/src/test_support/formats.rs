@@ -13,7 +13,7 @@ use std::num::NonZeroUsize;
 use crate::format::{GroupMap, ScaleEncoding, Storage, WeightFormat};
 
 /// Every format a GGUF file stores and poot reads, in ggml type order (`ggml.h` `ggml_type`).
-pub const GGUF_FORMATS: [WeightFormat; 22] = [
+pub const GGUF_FORMATS: [WeightFormat; 25] = [
     WeightFormat::F32,
     WeightFormat::F16,
     WeightFormat::Q4_0,
@@ -29,11 +29,14 @@ pub const GGUF_FORMATS: [WeightFormat; 22] = [
     WeightFormat::Iq2_Xxs,
     WeightFormat::Iq2_Xs,
     WeightFormat::Iq3_Xxs,
+    WeightFormat::Iq1_S,
     WeightFormat::Iq4_Nl,
     WeightFormat::Iq3_S,
     WeightFormat::Iq2_S,
     WeightFormat::Iq4_Xs,
+    WeightFormat::Iq1_M,
     WeightFormat::Bf16,
+    WeightFormat::Tq1_0,
     WeightFormat::Tq2_0,
     WeightFormat::Mxfp4,
 ];
@@ -126,11 +129,14 @@ mod tests {
             WeightFormat::Q6_K => 12,
             WeightFormat::Iq4_Nl => 13,
             WeightFormat::Iq4_Xs => 14,
+            WeightFormat::Iq1_S => 27,
+            WeightFormat::Iq1_M => 28,
             WeightFormat::Iq2_Xxs => 15,
             WeightFormat::Iq2_Xs => 16,
             WeightFormat::Iq3_Xxs => 17,
             WeightFormat::Iq3_S => 18,
             WeightFormat::Iq2_S => 19,
+            WeightFormat::Tq1_0 => 29,
             WeightFormat::Tq2_0 => 20,
             WeightFormat::Mxfp4 => 21,
             WeightFormat::E4m3PerChannel { .. } => 22,
@@ -153,7 +159,7 @@ mod tests {
             all.iter().map(|&format| variant_position(format)).collect();
         assert_eq!(
             positions,
-            (0..27).collect::<BTreeSet<usize>>(),
+            (0..30).collect::<BTreeSet<usize>>(),
             "a variant is missing from GGUF_FORMATS and SAFETENSORS_FORMATS"
         );
         for (index, format) in all.iter().enumerate() {

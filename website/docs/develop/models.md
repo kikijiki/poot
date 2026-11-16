@@ -11,7 +11,7 @@ poot traces model forwards into a primitive graph and runs them on its own kerne
 ## Checkpoint formats
 
 - **Safetensors**: a Hugging Face directory (`config.json`, `tokenizer.json`, the weight files). Dense, GPTQ, AWQ and FP8 layouts load. Quantized projections stay packed as stored, and dense BF16/F16 weights stay BF16/F16.
-- **GGUF**: one file, or a split set named by any of its `-0000N-of-0000M.gguf` shards, with the config and tokenizer embedded. K-quant, IQ and ternary (`TQ2_0`) tensor types stay packed. A tensor of a type poot has no format for is refused by tensor name and type.
+- **GGUF**: one file, or a split set named by any of its `-0000N-of-0000M.gguf` shards, with the config and tokenizer embedded. K-quant, IQ and ternary (`TQ1_0`, `TQ2_0`) tensor types stay packed. A tensor of a type poot has no format for is refused by tensor name and type.
 
 The checkpoint's config decides the family: `ModelHandle::load` resolves it through the model registry. A family the registry does not know is a typed refusal. A config value a family cannot trace (an unsupported scaling mode, per-layer input embeddings) is refused with an unsupported-config error that names it. Layer, expert and head counts come from the config.
 

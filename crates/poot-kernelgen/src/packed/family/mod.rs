@@ -36,11 +36,13 @@ pub(super) struct Codes {
 
 /// Where an element sits in its block. `known` is `Some((r, m))` when `index % m == r` is known at
 /// emission (element `j` of a run of `count`: `(j, count)`), which lets a family fold the lane
-/// arithmetic that depends on the position to constants.
+/// arithmetic that depends on the position to constants. `lane` is the element's lane when the run's
+/// lanes were computed once for all its elements ([`Family::emit_run_lanes`]).
 #[derive(Clone, Copy)]
 pub(super) struct Position {
     pub(super) index: Local,
     pub(super) known: Option<(usize, usize)>,
+    pub(super) lane: Option<Local>,
 }
 
 impl Family {
@@ -84,6 +86,22 @@ impl Family {
         match self {
             Self::Integer | Self::Float(_) => Vec::new(),
             Self::Lattice(lattice) => lattice::tables(lattice),
+        }
+    }
+
+    /// The lane of each element of the aligned run of `count` elements from in-block index `first`, when the family
+    /// reads one that is not a constant of the position and the run's lanes follow from its first element's by
+    /// offsets (a lattice whose lane map is piecewise); `None` when [`Self::emit_value`] finds each element's lane
+    /// itself.
+    pub(super) fn emit_run_lanes(
+        &self,
+        e: &mut Emit,
+        first: Local,
+        count: usize,
+    ) -> Option<Vec<Local>> {
+        match self {
+            Self::Integer | Self::Float(_) => None,
+            Self::Lattice(lattice) => lattice::emit_run_lanes(e, lattice, first, count),
         }
     }
 

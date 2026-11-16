@@ -12,6 +12,9 @@
 //! - `--mode decode-curve`: for each `--isl-list` length, a synthesized context of exactly that size is
 //!   filled in one batched prefill and `--osl` tokens are decoded with EOS ignored, timing every token. The
 //!   raw per-iteration samples (ttft, e2e, inter-token gaps) go out for the harness to aggregate.
+//!   Each ISL runs on a driver sized to its own request (`isl + osl`), as llama-bench sizes each test's
+//!   context (`n_ctx = n_prompt + n_gen + n_depth`): the prefill is timed from an empty cache (TTFT), and
+//!   the decode window runs from that cache at depth ISL (the gaps after the first token).
 //!
 //! `--backend ptx|rocm|wgpu` picks the executor the driver opens; the measure loop never branches on it.
 //! `--gguf <path>` (or a `.gguf` `--model-dir`) loads the quant-resident weights; that decode exists on
@@ -50,14 +53,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use serde_json::{json, Value};
 
-use poot_executor::DetailedTiming;
+use poot_executor::{DetailedTiming, Executor};
 use poot_llm::driver::capacity::{chunk_candidates, fit_prefill_chunk, Observation};
 use poot_llm::driver::error::DriverError;
 use poot_llm::driver::MatmulPrecision;
 use poot_llm::driver::{
     open_executor, open_timed_executor, BackendChoice, Driver, DriverOptions, DriverStats,
     GenerateRequest, Head, Layout, ModelHandle, PhaseTiming, PreparedSetLimits, Serving,
-    ServingShapes, State, Warm,
+    ServingShapes, Warm,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::KvDtype;
@@ -430,6 +433,13 @@ trait Generate {
         on_token: &mut dyn FnMut(&str),
     ) -> anyhow::Result<()>;
 
+    /// Size the engine for `workload`: room for exactly its longest request, and its entries prepared. A
+    /// workload the engine is already open for costs nothing.
+    fn open_workload(&mut self, workload: &Workload) -> anyhow::Result<()>;
+
+    /// The prefill chunk of the longest workload opened so far, in tokens.
+    fn prefill_chunk(&self) -> usize;
+
     /// Drop what a profiled executor recorded so far (compiles and cache fills before the timed window).
     fn reset_profile(&mut self);
 
@@ -597,26 +607,105 @@ fn roofline_receipt(engine: &dyn Generate, before: PhaseTiming) -> Value {
     }
 }
 
+/// What one driver is opened for: the requests of one measured workload, which sizes the driver the way
+/// llama-bench sizes a context (`n_ctx = n_prompt + n_gen + n_depth`, one per test): its KV holds exactly
+/// the longest request the workload makes, and its prefill chunk is the workload's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Workload {
+    /// The KV capacity: the longest request, prompt plus generated tokens.
+    capacity: NonZeroUsize,
+    /// The prefill chunk wanted: the whole prompt for `--prefill`, one token for token by token, the whole
+    /// context (or the `--prefill-chunk` limit) for a curve point.
+    wanted: NonZeroUsize,
+    /// Whether the device may shrink `wanted` to a chunk its plan fits.
+    shrinkable: bool,
+    /// The prompt lengths whose entries are compiled and added before the first timed token.
+    prompts: Vec<usize>,
+}
+
+impl Workload {
+    /// The single scenario: one prompt of `prompt` tokens and `config.gen_tokens` generated.
+    fn single(config: &Config, prompt: usize) -> anyhow::Result<Self> {
+        Ok(Self {
+            capacity: NonZeroUsize::new(prompt + config.gen_tokens)
+                .context("the longest request is empty")?,
+            wanted: NonZeroUsize::new(if config.prefill { prompt } else { 1 })
+                .context("a prefill chunk holds a token")?,
+            shrinkable: config.prefill,
+            prompts: vec![prompt],
+        })
+    }
+
+    /// One decode-curve point: `isl` tokens of context at depth, then `config.osl` generated.
+    fn curve_point(config: &Config, isl: usize) -> anyhow::Result<Self> {
+        Ok(Self {
+            capacity: NonZeroUsize::new(isl + config.osl)
+                .context("the longest request is empty")?,
+            wanted: NonZeroUsize::new(curve_prefill_chunk(config.prefill_chunk, isl))
+                .context("a prefill chunk holds a token")?,
+            shrinkable: config.prefill_chunk.is_none(),
+            prompts: vec![isl],
+        })
+    }
+}
+
 /// The driver engine on one backend (Card 734): [`Driver::generate`] behind the same [`Generate`] seam, so
-/// the measure loop never branches on the engine. One `Driver` serves the whole cell: its KV holds the
-/// longest request the cell's mode makes, and its prefill chunk is that mode's (the whole prompt for
-/// `--prefill`, one token for token by token, the longest context for decode-curve, where a shorter
-/// context plans as the descending powers of two its chunk plan admits). A second `Driver` would open a
-/// second executor after dropping the first, which the ROCm runtime does not survive in one process.
+/// the measure loop never branches on the engine. A `Driver` holds one KV capacity, so the cell opens one
+/// per [`Workload`]: a decode-curve point gets a driver of capacity `isl + osl`, not one of the largest
+/// point's. The executor opens once and is handed from driver to driver ([`Driver::into_executor`]): the
+/// ROCm runtime does not survive a second executor after dropping the first in one process.
 struct DriverCell {
     handle: Arc<ModelHandle>,
-    driver: Driver<Serving>,
-    /// The driver's counters before `Driver::prepare` ran.
+    recipe: DriverRecipe,
+    /// The executor between drivers; `None` while a driver holds it (or after a driver failed to open).
+    executor: Option<Box<dyn Executor>>,
+    open: Option<OpenDriver>,
+    /// The counters of the cell before its first `Driver::prepare` ran.
     initial: PreparationCounters,
+    /// What the drivers handed back already counted.
+    retired: Retired,
+    /// The capacity and prefill chunk of the longest workload opened so far: the chunk the cell reports.
+    reported: Option<(NonZeroUsize, NonZeroUsize)>,
     /// The executor's timing snapshot when `reset_profile` last ran: the start of the profiled window.
     mark: Option<poot_profile::Mark>,
     /// The decode phases of every generation so far, as the driver timed them.
     decode: PhaseTiming,
 }
 
-/// The preparation layers the driver and its executor count.
-fn driver_counters<S: State>(driver: &Driver<S>) -> PreparationCounters {
-    counters_from(&driver.stats(), driver.executor_stats().recordings)
+/// What every driver of a cell is built with, whatever its workload.
+#[derive(Clone, Copy)]
+struct DriverRecipe {
+    kv_dtype: Option<KvDtype>,
+    matmul_precision: Option<MatmulPrecision>,
+    check_ranges: bool,
+    roofline: bool,
+}
+
+/// The driver a cell has open and what it was opened for.
+struct OpenDriver {
+    driver: Driver<Serving>,
+    workload: Workload,
+}
+
+/// The driver counters of drivers the cell has handed their executor back from: a cell's counters run on
+/// across its drivers, so a window that spans two of them reads one monotonic count.
+#[derive(Clone, Copy, Debug, Default)]
+struct Retired {
+    compiles: u64,
+    entries_added: u64,
+    steps: u64,
+    host_picks: u64,
+}
+
+impl Retired {
+    fn plus(self, stats: &DriverStats) -> Self {
+        Self {
+            compiles: self.compiles + stats.compiles,
+            entries_added: self.entries_added + stats.entries_added,
+            steps: self.steps + stats.steps,
+            host_picks: self.host_picks + stats.host_picks,
+        }
+    }
 }
 
 /// Each driver stat in its own layer: programs compiled are the plan, entries added are the entries, and
@@ -656,6 +745,122 @@ fn driver_options(
 }
 
 impl DriverCell {
+    /// The executor's counters, whichever of the cell and its driver holds the executor.
+    fn executor_stats(&self) -> Option<poot_executor::ExecutorStats> {
+        match (&self.open, &self.executor) {
+            (Some(open), _) => Some(open.driver.executor_stats()),
+            (None, Some(executor)) => Some(executor.stats()),
+            (None, None) => None,
+        }
+    }
+
+    /// The driver counters of every driver the cell opened, handed back or live.
+    fn total_stats(&self) -> DriverStats {
+        let live = self
+            .open
+            .as_ref()
+            .map(|open| open.driver.stats())
+            .unwrap_or_default();
+        let total = self.retired.plus(&live);
+        DriverStats {
+            compiles: total.compiles,
+            entries_added: total.entries_added,
+            steps: total.steps,
+            host_picks: total.host_picks,
+            ..DriverStats::default()
+        }
+    }
+
+    /// Open a driver for `workload` on the cell's executor and prepare its entries: the prefill chunk is the
+    /// workload's when its plan fits the device, else the largest smaller one that does, chosen on the plan
+    /// before the driver allocates. A workload no chunk fits names its largest allocations and the shortfall
+    /// instead of failing as a late device out-of-memory. The chunk is part of the workload: the row states it.
+    fn open_driver_for(&mut self, workload: Workload) -> anyhow::Result<()> {
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.workload == workload)
+        {
+            return Ok(());
+        }
+        if let Some(open) = self.open.take() {
+            self.retired = self.retired.plus(&open.driver.stats());
+            self.executor = Some(
+                open.driver
+                    .into_executor()
+                    .context("release the previous driver's executor")?,
+            );
+        }
+        let executor = self
+            .executor
+            .as_ref()
+            .context("the cell has no executor to open a driver on")?;
+        let options = driver_options(
+            workload.capacity,
+            workload.wanted.get(),
+            self.recipe.kv_dtype,
+            self.recipe.matmul_precision,
+        )?
+        .with_range_check(self.recipe.check_ranges);
+        // Every entry the workload's prompts plan to is compiled and added before the first timed token.
+        let shapes = ServingShapes {
+            layout: Layout::Contiguous,
+            rows: &[NonZeroUsize::MIN],
+            heads: &[Head::GREEDY],
+            warm: Warm::Prompts(&workload.prompts),
+            windows: &[],
+            adapters: &[],
+            chain: None,
+        };
+        let candidates = if workload.shrinkable {
+            chunk_candidates(workload.wanted, self.handle.config().prefill_granule)
+        } else {
+            vec![workload.wanted]
+        };
+        let fitted = fit_prefill_chunk(
+            &self.handle,
+            &executor.target_set(),
+            executor.device_options(options.prefill.limits),
+            || Observation::of(&**executor),
+            &options,
+            &shapes,
+            &candidates,
+        )
+        .context("fit the prefill chunk to the device")?;
+        if fitted.chunk != workload.wanted {
+            eprintln!(
+                "poot-bench: prefill chunk {} does not fit the device; running with {}",
+                workload.wanted, fitted.chunk
+            );
+        }
+        let options = DriverOptions {
+            prefill_chunk: fitted.chunk,
+            ..options
+        };
+        let executor = self.executor.take().expect("checked above");
+        let driver =
+            Driver::new(Arc::clone(&self.handle), executor, options).context("open the driver")?;
+        let driver = if self.recipe.roofline {
+            driver.with_phase_timing()
+        } else {
+            driver
+        };
+        self.initial = counters_from(&self.total_stats(), driver.executor_stats().recordings);
+        let driver = driver
+            .prepare(&shapes)
+            .map_err(DriverError::from)
+            .context("prepare the driver")?;
+        // The cell reports the chunk of its longest workload, the one that holds the longest prompt whole.
+        if self
+            .reported
+            .is_none_or(|(capacity, _)| workload.capacity >= capacity)
+        {
+            self.reported = Some((workload.capacity, fitted.chunk));
+        }
+        self.open = Some(OpenDriver { driver, workload });
+        Ok(())
+    }
+
     fn run(
         &mut self,
         prompt: &[u32],
@@ -670,7 +875,12 @@ impl DriverCell {
             stops: Vec::new(),
             ignore_eos,
         };
-        let generation = self.driver.generate(request, &mut |_: u32, piece: &str| {
+        let driver = &mut self
+            .open
+            .as_mut()
+            .context("no workload is open on the cell")?
+            .driver;
+        let generation = driver.generate(request, &mut |_: u32, piece: &str| {
             on_token(piece);
             GenerationControl::Continue(())
         })?;
@@ -706,13 +916,21 @@ impl Generate for DriverCell {
         self.run(&tokens, max_new, false, on_token)
     }
 
+    fn open_workload(&mut self, workload: &Workload) -> anyhow::Result<()> {
+        self.open_driver_for(workload.clone())
+    }
+
+    fn prefill_chunk(&self) -> usize {
+        self.reported.map_or(1, |(_, chunk)| chunk.get())
+    }
+
     fn reset_profile(&mut self) {
-        self.mark = Some(self.driver.executor_stats().timing.mark());
+        self.mark = self.executor_stats().map(|stats| stats.timing.mark());
     }
 
     fn profile_report(&self, tokens: usize, wall: Duration) -> Option<Profile> {
         let mark = self.mark.as_ref()?;
-        let timing = self.driver.executor_stats().timing;
+        let timing = self.executor_stats()?.timing;
         let entries = timing.entries_with_activity_since(mark);
         let window = poot_profile::Report::window(&timing, mark, &entries);
         Some(Profile {
@@ -726,11 +944,11 @@ impl Generate for DriverCell {
     }
 
     fn ceiling(&self) -> Option<Ceiling> {
-        self.driver.ceiling()
+        self.open.as_ref()?.driver.ceiling()
     }
 
     fn memory_classes(&self) -> Option<Value> {
-        Some(memory_classes(&self.driver.executor_stats().memory))
+        Some(memory_classes(&self.executor_stats()?.memory))
     }
 
     fn engine(&self) -> Engine {
@@ -738,11 +956,14 @@ impl Generate for DriverCell {
     }
 
     fn steps(&self) -> u64 {
-        self.driver.stats().steps
+        self.total_stats().steps
     }
 
     fn counters(&self) -> PreparationCounters {
-        driver_counters(&self.driver)
+        counters_from(
+            &self.total_stats(),
+            self.executor_stats().map_or(0, |stats| stats.recordings),
+        )
     }
 
     fn initial_counters(&self) -> PreparationCounters {
@@ -750,11 +971,12 @@ impl Generate for DriverCell {
     }
 
     fn engine_receipt(&self) -> Option<Value> {
-        let stats = self.driver.stats();
-        let executor = self.driver.executor_stats();
+        let stats = self.total_stats();
+        let executor = self.executor_stats()?;
+        let open = self.open.as_ref().map(|open| &open.driver);
         Some(json!({
-            "prepared_entries": self.driver.prepared_entries(),
-            "retained_bytes": self.driver.retained_bytes(),
+            "prepared_entries": open.map_or(0, Driver::prepared_entries),
+            "retained_bytes": open.map_or(0, Driver::retained_bytes),
             "compiles": stats.compiles,
             "steps": stats.steps,
             "host_picks": stats.host_picks,
@@ -887,9 +1109,24 @@ fn checkpoint_digest(store: &WeightStore) -> anyhow::Result<String> {
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
-/// The driver engine over a loaded registered family: size every driver's KV to the longest request the
-/// mode makes, and name what the cell ran on: the store's precision, the adapter and driver version the
-/// executor reports, and the checkpoint's digest.
+/// The first workload a mode measures: the cell opens its driver for it while it opens, so loading the
+/// weights is part of opening and not of the first measured request.
+fn first_workload(config: &Config, handle: &ModelHandle) -> anyhow::Result<Workload> {
+    match config.mode {
+        Mode::Single => {
+            let prompt = handle.text().encode(&single_prompt(config)?)?.len();
+            Workload::single(config, prompt)
+        }
+        Mode::DecodeCurve => {
+            let isl = config.isl_list.first().copied().unwrap_or(0);
+            Workload::curve_point(config, isl)
+        }
+    }
+}
+
+/// The driver engine over a loaded registered family: open the executor and the driver of the mode's first
+/// workload ([`DriverCell`] opens the rest), and name what the cell ran on: the store's precision, the
+/// adapter and driver version the executor reports, and the checkpoint's digest.
 fn open_driver(
     config: &Config,
     handle: ModelHandle,
@@ -899,126 +1136,54 @@ fn open_driver(
     // Before an executor opens: a request the checkpoint does not hold needs no device.
     let precision = ensure_store_holds(&config.precision, handle.store())?;
     let checkpoint_digest = checkpoint_digest(handle.store())?;
-    let backend = config.backend;
-    // The chunk each prompt prefills in when it fits the device (the whole longest prompt, or the chunk the
-    // caller named), and whether the device may shrink it to fit.
-    let (longest, wanted, shrinkable, prompts) = match config.mode {
-        Mode::Single => {
-            let prompt = handle.text().encode(&single_prompt(config)?)?.len();
-            (
-                prompt + config.gen_tokens,
-                if config.prefill { prompt } else { 1 },
-                config.prefill,
-                vec![prompt],
-            )
-        }
-        Mode::DecodeCurve => {
-            let isl = config.isl_list.iter().max().copied().unwrap_or(0);
-            (
-                isl + config.osl,
-                curve_prefill_chunk(config.prefill_chunk, isl),
-                config.prefill_chunk.is_none(),
-                config.isl_list.clone(),
-            )
-        }
-    };
-    let wanted = NonZeroUsize::new(wanted).context("a prefill chunk holds a token")?;
-    let capacity = NonZeroUsize::new(longest).context("the longest request is empty")?;
+    let first = first_workload(config, &handle)?;
     let executor = if config.profile {
-        open_timed_executor(backend, DetailedTiming::default_diagnostic())
+        open_timed_executor(config.backend, DetailedTiming::default_diagnostic())
     } else {
-        open_executor(backend)
+        open_executor(config.backend)
     }
     .context("open the executor")?;
     let device = executor
         .device_identity()
         .context("the device cannot name its adapter and driver")?;
-    let options = driver_options(
-        capacity,
-        wanted.get(),
-        config.kv_dtype,
-        config.matmul_precision,
-    )?
-    .with_range_check(config.check_ranges);
-    // Every entry the cell's prompts plan to is compiled and added before the first timed token.
-    let shapes = ServingShapes {
-        layout: Layout::Contiguous,
-        rows: &[NonZeroUsize::MIN],
-        heads: &[Head::GREEDY],
-        warm: Warm::Prompts(&prompts),
-        windows: &[],
-        adapters: &[],
-        chain: None,
-    };
-    // The prefill chunk is the one the cell asks for when its plan fits the device, else the largest smaller
-    // one that does, chosen on the plan before the driver allocates. A cell no chunk fits names its
-    // largest allocations and the shortfall instead of failing as a late device out-of-memory. The chunk
-    // is part of the workload: the row states it.
-    let candidates = if shrinkable {
-        chunk_candidates(wanted, handle.config().prefill_granule)
-    } else {
-        vec![wanted]
-    };
-    let fitted = fit_prefill_chunk(
-        &handle,
-        &executor.target_set(),
-        executor.device_options(options.prefill.limits),
-        || Observation::of(&*executor),
-        &options,
-        &shapes,
-        &candidates,
-    )
-    .context("fit the prefill chunk to the device")?;
-    if fitted.chunk != wanted {
-        eprintln!(
-            "poot-bench: prefill chunk {} does not fit the device; running with {}",
-            wanted, fitted.chunk
-        );
-    }
-    let prefill_chunk = fitted.chunk;
-    let options = DriverOptions {
-        prefill_chunk,
-        ..options
-    };
-    let driver = Driver::new(Arc::clone(&handle), executor, options).context("open the driver")?;
-    let driver = if config.roofline {
-        driver.with_phase_timing()
-    } else {
-        driver
-    };
-    let initial = driver_counters(&driver);
-    let kv_dtype = driver.kv_dtype();
-    let matmul_precision = driver.matmul_precision();
-    let check_ranges = driver.range_check();
-    let driver = driver
-        .prepare(&shapes)
-        .map_err(DriverError::from)
-        .context("prepare the driver")?;
-    Ok((
-        Box::new(DriverCell {
-            handle,
-            driver,
-            initial,
-            mark: None,
-            decode: PhaseTiming::default(),
-        }),
-        Resolved {
-            family: family.to_string(),
-            precision,
-            adapter: device.adapter,
-            driver_version: device.driver,
-            checkpoint_digest,
-            prefill_chunk: prefill_chunk.get(),
-            kv_dtype,
-            matmul_precision,
-            check_ranges,
+    let mut cell = DriverCell {
+        handle,
+        recipe: DriverRecipe {
+            kv_dtype: config.kv_dtype,
+            matmul_precision: config.matmul_precision,
+            check_ranges: config.check_ranges,
+            roofline: config.roofline,
         },
-    ))
+        executor: Some(executor),
+        open: None,
+        initial: PreparationCounters::default(),
+        retired: Retired::default(),
+        reported: None,
+        mark: None,
+        decode: PhaseTiming::default(),
+    };
+    cell.open_driver_for(first)?;
+    let driver = &cell
+        .open
+        .as_ref()
+        .expect("the first workload is open")
+        .driver;
+    let resolved = Resolved {
+        family: family.to_string(),
+        precision,
+        adapter: device.adapter,
+        driver_version: device.driver,
+        checkpoint_digest,
+        kv_dtype: driver.kv_dtype(),
+        matmul_precision: driver.matmul_precision(),
+        check_ranges: driver.range_check(),
+    };
+    Ok((Box::new(cell), resolved))
 }
 
 /// What an opened cell ran on, as the opened driver reports it rather than as the request named it: the
 /// registry family the checkpoint resolved to, the precision its store holds, the adapter and driver version
-/// of the device, the digest of the weights it loaded, the prefill chunk the cell fitted to the device and the
+/// of the device, the digest of the weights it loaded and the
 /// KV cache dtype the driver resolved.
 struct Resolved {
     family: String,
@@ -1026,7 +1191,6 @@ struct Resolved {
     adapter: String,
     driver_version: String,
     checkpoint_digest: String,
-    prefill_chunk: usize,
     kv_dtype: KvDtype,
     matmul_precision: MatmulPrecision,
     check_ranges: bool,
@@ -1349,7 +1513,7 @@ fn measure(
     line["adapter"] = json!(resolved.adapter);
     line["driver_version"] = json!(resolved.driver_version);
     line["checkpoint_digest"] = json!(resolved.checkpoint_digest);
-    line["prefill_chunk"] = json!(resolved.prefill_chunk);
+    line["prefill_chunk"] = json!(engine.prefill_chunk());
     line["kv_dtype"] = json!(resolved.kv_dtype.as_str());
     line["matmul_precision"] = json!(resolved.matmul_precision.as_str());
     line["check_ranges"] = json!(resolved.check_ranges);
@@ -1432,11 +1596,16 @@ fn measure_single(
         })
     };
 
+    let workload = Workload::single(config, engine.encode(&prompt)?.len())?;
     let mut warmup_runs = Vec::new();
     let passes = probe.passes();
     for pass in 0..passes {
         if pass + 1 == passes {
             probe.begin(&*engine);
+        }
+        // Inside the first window: a cold cell's preparation is counted, and nothing before the window opens.
+        if pass == 0 {
+            engine.open_workload(&workload)?;
         }
         for w in 0..config.warmup {
             warmup_runs.push(run_once(engine)?.receipt());
@@ -1517,19 +1686,36 @@ fn measure_isl(
     probe: &mut PreparationProbe,
 ) -> anyhow::Result<Value> {
     let context: Vec<u32> = (0..isl).map(|i| base[i % base.len()]).collect();
-    let run_once = |engine: &mut dyn Generate| {
-        timed_request(engine, |engine, on_token| {
+    // One iteration is two requests on an empty cache each (a finished request releases its sequence):
+    // the prefill alone (llama-bench `-p ISL -n 0`: the context, one token out) and the decode window
+    // (`-p 0 -n OSL -d ISL`: the context filled, then `osl` tokens). The iteration the harness reads is the
+    // decode request, whole, so its `ttft_ms` and gaps are one consistent request window; the prefill-only
+    // request is carried beside it as `prefill_only`, for the harness's raw record and no aggregate.
+    let run_once = |engine: &mut dyn Generate| -> anyhow::Result<Value> {
+        let prefill = timed_request(engine, |engine, on_token| {
+            engine.generate_context(&context, 1, on_token)
+        })?;
+        let decode = timed_request(engine, |engine, on_token| {
             engine.generate_context(&context, config.osl, on_token)
-        })
+        })?;
+        let mut receipt = decode.receipt();
+        receipt["prefill_only"] = prefill.receipt();
+        Ok(receipt)
     };
+    // One driver per point, sized to this point's longest request (`isl + osl`), as llama-bench sizes the
+    // context of each of its tests.
+    let workload = Workload::curve_point(config, isl)?;
     let mut warmup_runs = Vec::new();
     let passes = probe.passes();
     for pass in 0..passes {
         if pass + 1 == passes {
             probe.begin(&*engine);
         }
+        if pass == 0 {
+            engine.open_workload(&workload)?;
+        }
         for _ in 0..config.warmup {
-            warmup_runs.push(run_once(engine)?.receipt());
+            warmup_runs.push(run_once(engine)?);
         }
     }
     probe.prepared(&*engine);
@@ -1546,8 +1732,7 @@ fn measure_isl(
     let timed_start = Instant::now();
     let mut iters = Vec::with_capacity(config.iters);
     for _ in 0..config.iters {
-        let run = run_once(engine)?;
-        iters.push(run.receipt());
+        iters.push(run_once(engine)?);
     }
     probe.repeated(&*engine);
     let roofline = config
@@ -1805,7 +1990,6 @@ mod stub_cell {
             adapter: "stub adapter".to_string(),
             driver_version: "stub driver 1.0".to_string(),
             checkpoint_digest: format!("blake3:{}", "0".repeat(64)),
-            prefill_chunk: 4,
             kv_dtype: poot_models::model::KvDtype::DEFAULT,
             matmul_precision: poot_llm::driver::MatmulPrecision::DEFAULT,
             check_ranges: false,
@@ -1844,6 +2028,9 @@ mod tests {
         steps: std::cell::Cell<u64>,
         /// What `counters` reports, advanced by `advance_counters`.
         counters: std::cell::Cell<PreparationCounters>,
+        /// Every workload the loop asked the engine to open, in order (an open of the same workload twice
+        /// in a row is one entry, as the real cell keeps its driver).
+        opened: RefCell<Vec<Workload>>,
     }
 
     impl Stub {
@@ -1855,6 +2042,7 @@ mod tests {
                 error: || anyhow::anyhow!("stub failure"),
                 steps: std::cell::Cell::new(0),
                 counters: std::cell::Cell::new(PreparationCounters::default()),
+                opened: RefCell::new(Vec::new()),
             }
         }
 
@@ -1868,6 +2056,18 @@ mod tests {
     }
 
     impl Generate for Stub {
+        fn open_workload(&mut self, workload: &Workload) -> anyhow::Result<()> {
+            let mut opened = self.opened.borrow_mut();
+            if opened.last() != Some(workload) {
+                opened.push(workload.clone());
+            }
+            Ok(())
+        }
+
+        fn prefill_chunk(&self) -> usize {
+            4
+        }
+
         fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
             Ok((0..text.split_whitespace().count() as u32).collect())
         }
@@ -2082,7 +2282,11 @@ mod tests {
             let line = measure(&curve, &mut stub, &resolved("stub_family")).unwrap();
             let mut expected = Vec::new();
             for isl in [8, 16, 32] {
-                expected.extend(context_events(2 + 3, isl, 5));
+                // Each iteration: the prefill-only request, then the decode request.
+                for _ in 0..2 + 3 {
+                    expected.extend(context_events(1, isl, 1));
+                    expected.extend(context_events(1, isl, 5));
+                }
             }
             assert_eq!(*stub.events.borrow(), expected, "{label}: curve protocol");
             assert_eq!(line["backend"], label);
@@ -2101,6 +2305,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// POOT-1391: a decode-curve point is measured on a driver sized to its own longest request, `isl + osl`,
+    /// as llama-bench sizes each test's context (`n_ctx = n_prompt + n_gen + n_depth`, llama-bench.cpp), and
+    /// not on one sized to the largest point. The warmup and timed runs of a point all run on that one
+    /// workload. Mutation: size every point's workload from the largest ISL (`Workload::curve_point` reading
+    /// `config.isl_list.iter().max()`); red: the first point opens capacity 37, not 13.
+    #[test]
+    fn each_curve_point_opens_a_driver_sized_to_its_own_request() {
+        let curve = config(&[
+            "--mode",
+            "decode-curve",
+            "--isl-list",
+            "8,16,32",
+            "--osl",
+            "5",
+            "--warmup",
+            "1",
+            "--iters",
+            "2",
+        ]);
+        let mut stub = Stub::new();
+        measure(&curve, &mut stub, &resolved("stub_family")).unwrap();
+        let capacities: Vec<usize> = stub
+            .opened
+            .borrow()
+            .iter()
+            .map(|workload| workload.capacity.get())
+            .collect();
+        assert_eq!(capacities, [13, 21, 37], "one driver per point, isl + osl");
+        for workload in stub.opened.borrow().iter() {
+            assert_eq!(workload.prompts.len(), 1, "a point prepares its own prompt");
+            assert_eq!(
+                workload.wanted.get(),
+                workload.prompts[0],
+                "a point prefills its context whole"
+            );
+        }
+    }
+
+    /// POOT-1391: every curve iteration carries the prefill alone (`prefill_only`: the context, one token out,
+    /// llama-bench `-p ISL -n 0`) beside the decode request the harness reads, which still holds its `osl`
+    /// tokens with `ttft_ms` as its own first-token boundary. The warmup runs carry both too. Mutation: ask the
+    /// prefill-only request for `config.osl` tokens; red: it delivers 5 tokens, not 1.
+    #[test]
+    fn each_curve_iteration_times_the_prefill_alone_beside_its_decode_request() {
+        let curve = config(&[
+            "--mode",
+            "decode-curve",
+            "--isl-list",
+            "8",
+            "--osl",
+            "5",
+            "--warmup",
+            "1",
+            "--iters",
+            "2",
+        ]);
+        let mut stub = Stub::new();
+        let line = measure(&curve, &mut stub, &resolved("stub_family")).unwrap();
+        let point = &line["curve"][0];
+        let runs: Vec<&Value> = point["warmup_runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(point["iters"].as_array().unwrap())
+            .collect();
+        assert_eq!(runs.len(), 3);
+        for run in runs {
+            assert_eq!(
+                run["prefill_only"]["tokens"], 1,
+                "the prefill alone delivers one token"
+            );
+            assert_eq!(run["prefill_only"]["itl_ms"].as_array().unwrap().len(), 0);
+            assert_eq!(run["tokens"], 5, "the decode request keeps its osl tokens");
+            assert_eq!(
+                run["ttft_ms"], run["first_token_ms"],
+                "the iteration's ttft is its own decode request's first-token boundary"
+            );
+        }
+    }
+
+    /// The `--prefill-chunk` limit bounds every point's wanted chunk, and a bounded chunk is not shrinkable.
+    #[test]
+    fn a_curve_point_workload_honours_the_prefill_chunk_limit() {
+        let bounded = config(&[
+            "--mode",
+            "decode-curve",
+            "--isl-list",
+            "8,32",
+            "--osl",
+            "5",
+            "--prefill-chunk",
+            "16",
+        ]);
+        let short = Workload::curve_point(&bounded, 8).unwrap();
+        let long = Workload::curve_point(&bounded, 32).unwrap();
+        assert_eq!((short.wanted.get(), long.wanted.get()), (8, 16));
+        assert!(!short.shrinkable && !long.shrinkable);
     }
 
     /// `line` as a release runner would print it. These tests run in a dev-profile binary, which the harness's
@@ -2520,6 +2823,12 @@ mod tests {
     fn a_panic_at_one_isl_is_that_isls_caveat() {
         struct Panics;
         impl Generate for Panics {
+            fn open_workload(&mut self, _: &Workload) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn prefill_chunk(&self) -> usize {
+                1
+            }
             fn encode(&self, _: &str) -> anyhow::Result<Vec<u32>> {
                 Ok(vec![1, 2])
             }
@@ -2835,6 +3144,12 @@ mod preparation_tests {
     }
 
     impl Generate for Counting {
+        fn open_workload(&mut self, _: &Workload) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn prefill_chunk(&self) -> usize {
+            1
+        }
         fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
             Ok((0..text.split_whitespace().count() as u32).collect())
         }
@@ -3093,6 +3408,12 @@ mod roofline_tests {
     }
 
     impl Generate for Timed {
+        fn open_workload(&mut self, _: &Workload) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn prefill_chunk(&self) -> usize {
+            1
+        }
         fn encode(&self, _text: &str) -> anyhow::Result<Vec<u32>> {
             unreachable!("the roofline receipt reads the decode window only")
         }

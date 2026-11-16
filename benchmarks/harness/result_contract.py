@@ -2,6 +2,7 @@
 
 import math
 import re
+from pathlib import Path
 from typing import TypeGuard
 
 try:
@@ -454,6 +455,30 @@ def committed_row_errors(row):
     if row.get("profiled"):
         errors.append("profiled: a device-timed run is a diagnostic, stored under results/diagnostics/")
     return errors
+
+
+IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+IMAGE_DIGEST_ALLOW_LIST = Path(__file__).resolve().parent.parent / "known-null-image-digest.txt"
+
+
+def known_null_image_digest_sets(path=IMAGE_DIGEST_ALLOW_LIST):
+    """The committed sets recorded before the image digest reached `env.json`: one set name per line, `#` comments."""
+    lines = (line.strip() for line in Path(path).read_text().splitlines())
+    return {line for line in lines if line and not line.startswith("#")}
+
+
+def committed_env_errors(env, name, exempt):
+    """Why a committed set's `env.json` does not tie its results to an image, or an empty list. A run on an NVIDIA
+    host (one that reported a driver) ran in the pod image, so it states that image's `sha256:` digest; the sets
+    recorded before the digest was captured are `exempt` (the allow-list names their set) and held to nothing here."""
+    if exempt or not env.get("gpu_driver"):
+        return []
+    digest = env.get("image_digest")
+    if digest is None:
+        return [f"{name}: env.json has no image_digest: the results cannot be tied to the image that ran them"]
+    if not isinstance(digest, str) or not IMAGE_DIGEST.fullmatch(digest):
+        return [f"{name}: env.json image_digest {digest!r} is not a sha256:<64 hex> digest"]
+    return []
 
 
 def _validate_curve_result(result, scenario, claim, framework):

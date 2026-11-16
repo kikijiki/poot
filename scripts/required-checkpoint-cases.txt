@@ -5,6 +5,9 @@
 # `--lane-filter <lane>` prints the filterset), and the `checkpoint*` lanes set POOT_REQUIRE_MODELS=1, so a
 # model missing from the models directory fails the row instead of skipping it. The llamacpp_longrope_tests rows
 # also need the F16 GGUFs of Phi-4-mini and Phi-3.5-mini in the models directory: scripts/make-f16-ggufs.sh.
+# The llamacpp_iq1_tests rows need the IQ1_S and IQ1_M GGUFs of Qwen2.5-0.5B-Instruct and their f16 copies:
+# scripts/make-iq1-checkpoints.sh. The llamacpp_tq1_tests rows need the TQ1_0 and Q4_0 GGUFs of TriLM 1.1B and their f16
+# copies: scripts/make-tq1-checkpoint.sh.
 # scripts/check-lane-coverage.py (`just test-lane-coverage`) fails when an inventory row of class `checkpoint`
 # is in no lane, when an `#[ignore]`d test is in no lane's list (here or in scripts/required-device-cases/), and
 # when a row here names no test.
@@ -20,11 +23,19 @@
 # and `checkpoint-large-<backend>` lists in scripts/required-device-cases/, which the required-case gate reads.
 checkpoint	poot-llm	driver::device_tests::checkpoint::a_gptq_checkpoint_loads_its_linears_packed_with_no_dense_copy
 checkpoint	poot-llm	driver::llamacpp_bisect_tests::checkpoint_rows::qwen2_5_0_5b_q8_0_follows_llamacpp_through_every_layer
+checkpoint	poot-llm	driver::llamacpp_iq1_tests::a_different_quantization_leaves_the_f16_gate_on_the_cpu_oracle
+checkpoint	poot-llm	driver::llamacpp_iq1_tests::iq1_m_follows_llamacpp_on_the_cpu_oracle
+checkpoint	poot-llm	driver::llamacpp_iq1_tests::iq1_m_matches_llamacpp_running_its_f16_dequantization_on_the_cpu_oracle
+checkpoint	poot-llm	driver::llamacpp_iq1_tests::iq1_s_follows_llamacpp_on_the_cpu_oracle
+checkpoint	poot-llm	driver::llamacpp_iq1_tests::iq1_s_matches_llamacpp_running_its_f16_dequantization_on_the_cpu_oracle
 checkpoint	poot-llm	driver::llamacpp_kl_tests::checkpoint_rows::one_perturbed_dequant_scale_exceeds_the_gate
 checkpoint	poot-llm	driver::llamacpp_kl_tests::checkpoint_rows::qwen2_5_0_5b_q4_k_m_follows_llamacpp
 checkpoint	poot-llm	driver::llamacpp_kl_tests::checkpoint_rows::qwen2_5_0_5b_q8_0_follows_llamacpp
 checkpoint	poot-llm	driver::llamacpp_kl_tests::checkpoint_rows::qwen3_0_6b_q8_0_follows_llamacpp
 checkpoint	poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_short_window_follows_llamacpp
+checkpoint	poot-llm	driver::llamacpp_tq1_tests::a_different_quantization_leaves_the_f16_gate_on_the_cpu_oracle
+checkpoint	poot-llm	driver::llamacpp_tq1_tests::tq1_0_follows_llamacpp_on_the_cpu_oracle
+checkpoint	poot-llm	driver::llamacpp_tq1_tests::tq1_0_matches_llamacpp_running_its_f16_dequantization_on_the_cpu_oracle
 checkpoint	poot-llm	driver::text_checkpoint_tests::chat_template_checkpoints::multi_turn_tool_conversation_renders
 checkpoint	poot-llm	driver::text_checkpoint_tests::chat_template_checkpoints::real_qwen_template_renders_with_role_markers
 checkpoint	poot-llm	driver::text_checkpoint_tests::chat_template_checkpoints::tools_render_into_the_qwen_prompt_and_none_is_unchanged

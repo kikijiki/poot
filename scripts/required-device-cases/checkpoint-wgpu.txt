@@ -60,6 +60,10 @@ poot-llm	driver::device_tests::checkpoint::smollm2_gguf_coherent::wgpu
 poot-llm	driver::device_tests::checkpoint::smollm3_coherent::wgpu
 poot-llm	driver::device_tests::checkpoint::smollm3_gguf_oracle::wgpu
 poot-llm	driver::device_tests::checkpoint::tinyllama_coherent::wgpu
+poot-llm	driver::llamacpp_iq1_tests::iq1_m_follows_llamacpp_on_wgpu
+poot-llm	driver::llamacpp_iq1_tests::iq1_s_follows_llamacpp_on_wgpu
+poot-llm	driver::llamacpp_tq1_tests::tq1_0_follows_llamacpp_on_wgpu
+poot-llm	driver::llamacpp_tq1_tests::tq1_0_matches_llamacpp_running_its_f16_dequantization_on_wgpu
 poot-llm	driver::narrow_gate_tests::wgpu_f16::gemma_3_1b_it
 poot-llm	driver::narrow_gate_tests::wgpu_f16::llama_3_2_1b_instruct
 poot-llm	driver::narrow_gate_tests::wgpu_f16::qwen2_5_1_5b_q4_k_m

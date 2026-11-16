@@ -468,8 +468,8 @@ fn parse_header(bytes: &[u8], in_set: bool) -> Result<ParsedHeader, LoadError> {
 /// Every ggml tensor type id a GGUF file can name (0..=39, ggml.h's `ggml_type`), mapped to the
 /// [`WeightFormat`] poot reads it as, or `None` when poot has no packed or dense representation for
 /// it: a ggml id ggml itself no longer assigns (a removed legacy variant, e.g. `Q4_2`), or a real
-/// ggml scheme with no packed path in `poot-quant` (the activation formats `Q8_1` and `Q8_K`, the IQ1
-/// grid formats, `TQ1_0`, or a plain integer/`F64` tensor type). A quantized tensor of a `None` type is
+/// ggml scheme with no packed path in `poot-quant` (the activation formats `Q8_1` and `Q8_K`, or a plain
+/// integer/`F64` tensor type). A quantized tensor of a `None` type is
 /// refused by name at load ([`refusal_of`]), never loaded dense silently (ADR-0103 decision 2). Pinned
 /// by a literal table (card 543 SC-004): every entry is written out, not derived, so it can be checked
 /// against `ggml.h` line by line.
@@ -494,7 +494,7 @@ pub fn weight_format_of(ggml_type: u32) -> Option<WeightFormat> {
         Some(WeightFormat::Iq2_Xxs), // 16 GGML_TYPE_IQ2_XXS
         Some(WeightFormat::Iq2_Xs),  // 17 GGML_TYPE_IQ2_XS
         Some(WeightFormat::Iq3_Xxs), // 18 GGML_TYPE_IQ3_XXS
-        None,                        // 19 GGML_TYPE_IQ1_S (no packed path)
+        Some(WeightFormat::Iq1_S),   // 19 GGML_TYPE_IQ1_S
         Some(WeightFormat::Iq4_Nl),  // 20 GGML_TYPE_IQ4_NL
         Some(WeightFormat::Iq3_S),   // 21 GGML_TYPE_IQ3_S
         Some(WeightFormat::Iq2_S),   // 22 GGML_TYPE_IQ2_S
@@ -504,12 +504,12 @@ pub fn weight_format_of(ggml_type: u32) -> Option<WeightFormat> {
         None,                        // 26 GGML_TYPE_I32 (not a weight format)
         None,                        // 27 GGML_TYPE_I64 (not a weight format)
         None,                        // 28 GGML_TYPE_F64 (not a weight format)
-        None,                        // 29 GGML_TYPE_IQ1_M (no packed path)
+        Some(WeightFormat::Iq1_M),   // 29 GGML_TYPE_IQ1_M
         Some(WeightFormat::Bf16),    // 30 GGML_TYPE_BF16
         None,                        // 31 GGML_TYPE_Q4_0_4_4 (removed)
         None,                        // 32 GGML_TYPE_Q4_0_4_8 (removed)
         None,                        // 33 GGML_TYPE_Q4_0_8_8 (removed)
-        None,                        // 34 GGML_TYPE_TQ1_0 (no packed path)
+        Some(WeightFormat::Tq1_0),   // 34 GGML_TYPE_TQ1_0
         Some(WeightFormat::Tq2_0),   // 35 GGML_TYPE_TQ2_0
         None,                        // 36 GGML_TYPE_IQ4_NL_4_4 (removed)
         None,                        // 37 GGML_TYPE_IQ4_NL_4_8 (removed)

@@ -21,7 +21,7 @@ use super::linear::{Weight, WeightError, linear};
 use super::mla::Selection;
 use super::norm::{NormParams, norm};
 use super::rope::{RopeParams, apply_rope, rope_rows};
-use super::sparse_top_k::{keep_top_k_mask, pairwise_rank};
+use super::sparse_top_k::keep_top_k_mask;
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
 use crate::model::TraceError;
@@ -161,7 +161,7 @@ pub fn dsa_select(
 ) -> Result<Traced, TraceError> {
     let scores = dsa_scores(b, step, layer, x, sel.qr, w, p)?;
     let ranked = b.binary(BinOp::Add, scores, sel.mask)?;
-    let keep = keep_top_k_mask(b, pairwise_rank(b, ranked)?, p.topk)?; // 1.0 kept, 0.0 dropped
+    let keep = keep_top_k_mask(b, ranked, p.topk)?; // 1.0 kept, 0.0 dropped
     let drop = b.binary_scalar(
         BinOp::Mul,
         b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0))?,

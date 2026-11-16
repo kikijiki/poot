@@ -427,13 +427,17 @@ pub fn pack_quantized_linears(
         QuantKind::Gptq => ValidatedScheme::Gptq(nonzero_group_size()?),
         QuantKind::Awq => ValidatedScheme::Awq(nonzero_group_size()?),
         QuantKind::Fp8 => ValidatedScheme::Fp8,
+        // Not a linear-per-prefix scheme: one stacked tensor pair holds every expert.
+        QuantKind::Mxfp4 => return pack_mxfp4_experts(store),
     };
     // One prefix per linear (a set: a checkpoint naming both FP8 scale spellings is refused below).
     let prefixes: std::collections::BTreeSet<String> = store
         .keys()
-        .filter_map(|key| match scheme.kind {
-            QuantKind::Gptq | QuantKind::Awq => key.as_str().strip_suffix(".qweight"),
-            QuantKind::Fp8 => {
+        .filter_map(|key| match validated_scheme {
+            ValidatedScheme::Gptq(_) | ValidatedScheme::Awq(_) => {
+                key.as_str().strip_suffix(".qweight")
+            }
+            ValidatedScheme::Fp8 => {
                 let key = key.as_str();
                 key.strip_suffix(".weight_scale")
                     .or_else(|| key.strip_suffix(".weight_scale_inv"))
@@ -641,6 +645,122 @@ pub fn pack_quantized_linears(
             })?;
         consumed.extend(parts.iter().map(|suffix| format!("{prefix}{suffix}")));
         packed.push((format!("{prefix}.weight"), payload));
+    }
+    let mut builder = WeightStore::builder();
+    for (key, entry) in store.iter() {
+        if !consumed.contains(key.as_str()) {
+            builder.insert(key.clone(), entry.clone())?;
+        }
+    }
+    for (key, payload) in packed {
+        builder.insert(key, WeightEntry::Packed(Arc::new(payload)))?;
+    }
+    Ok(builder.build())
+}
+
+/// The HF `quant_method: "mxfp4"` stacks of `store` (openai/gpt-oss-20b) as per-expert packed linears.
+///
+/// A stack `{stem}` is two tensors: `{stem}_blocks` (U8 `[experts, out, G, 16]`, two E2M1 codes per byte,
+/// even K in the low nibble) and `{stem}_scales` (U8 `[experts, out, G]`, one E8M0 per 32 values), so
+/// `K = 32 * G`. Per expert those bytes are, unchanged, the codes `[out, K/2]` and scales `[out, G]` that
+/// `WeightFormat::E2m1Row32` describes: expert `e` becomes the packed owner `{stem}.{e}` over zero-copy
+/// slices of the checkpoint tensors, the per-expert keys a packed expert stack is read from. Nothing is
+/// decoded here. Every other entry passes through unchanged.
+fn pack_mxfp4_experts(store: &WeightStore) -> Result<WeightStore, LoadError> {
+    use poot_quant::format::{PlanarRole, WeightFormat};
+    use poot_quant::{PackedPayload, PackedWeight, SourceRole};
+
+    const BLOCKS: &str = "_blocks";
+    const SCALES: &str = "_scales";
+    /// Packed bytes of one 32-value block: two E2M1 codes per byte.
+    const BLOCK_BYTES: usize = 16;
+    /// Values one E8M0 scale covers.
+    const BLOCK_VALUES: usize = 32;
+
+    let layout = |tensor: &str, reason: String| LoadError::QuantizedLinearLayout {
+        tensor: tensor.to_string(),
+        reason,
+    };
+    let u8_tensor = |name: &str| -> Result<&DenseWeight, LoadError> {
+        match store.get(name) {
+            Some(WeightEntry::Dense(dense)) if dense.dtype() == DType::U8 => Ok(dense),
+            Some(WeightEntry::Dense(dense)) => Err(layout(
+                name,
+                format!("stored {:?}, expected U8", dense.dtype()),
+            )),
+            _ => Err(layout(name, "missing".to_string())),
+        }
+    };
+    // A stack is named by either of its two tensors; naming one without the other is refused.
+    let stems: std::collections::BTreeSet<&str> = store
+        .keys()
+        .filter_map(|key| {
+            let key = key.as_str();
+            key.strip_suffix(BLOCKS)
+                .or_else(|| key.strip_suffix(SCALES))
+        })
+        .collect();
+    let mut consumed: HashSet<String> = HashSet::new();
+    let mut packed: Vec<(String, PackedPayload)> = Vec::new();
+    for stem in stems {
+        let (blocks_name, scales_name) = (format!("{stem}{BLOCKS}"), format!("{stem}{SCALES}"));
+        let blocks = u8_tensor(&blocks_name)?;
+        let scales = u8_tensor(&scales_name)?;
+        let [experts, out, groups, BLOCK_BYTES] = blocks.shape()[..] else {
+            return Err(layout(
+                &blocks_name,
+                format!(
+                    "shape {:?}, expected [experts, out, K/32, {BLOCK_BYTES}]",
+                    blocks.shape()
+                ),
+            ));
+        };
+        if scales.shape() != [experts, out, groups] {
+            return Err(layout(
+                &scales_name,
+                format!(
+                    "shape {:?}, expected [{experts}, {out}, {groups}]",
+                    scales.shape()
+                ),
+            ));
+        }
+        let k = groups.checked_mul(BLOCK_VALUES).ok_or_else(|| {
+            layout(
+                &blocks_name,
+                format!("K/32 extent {groups} times 32 overflows usize"),
+            )
+        })?;
+        // The extents multiplied to the stored lengths already (the header was checked against the
+        // data), so per-expert sizes divide them exactly.
+        let codes_bytes = blocks.bytes().len() / experts.max(1);
+        let scale_bytes = scales.bytes().len() / experts.max(1);
+        let payload = |e: usize| -> Result<PackedPayload, LoadError> {
+            let slice_of = |tensor: &str, bytes: &StoredBytes, each: usize| {
+                bytes
+                    .slice(e * each..(e + 1) * each)
+                    .map_err(|error| layout(tensor, error.to_string()))
+            };
+            let sources = vec![
+                (
+                    SourceRole::Planar(PlanarRole::Codes),
+                    slice_of(&blocks_name, blocks.bytes(), codes_bytes)?,
+                ),
+                (
+                    SourceRole::Planar(PlanarRole::Scale),
+                    slice_of(&scales_name, scales.bytes(), scale_bytes)?,
+                ),
+            ];
+            PackedWeight::try_new(WeightFormat::E2m1Row32, [out, k])
+                .and_then(|weight| PackedPayload::try_new_deferred(weight, sources))
+                .map_err(|source| LoadError::QuantizedLinearPayload {
+                    linear: format!("{stem}.{e}"),
+                    source,
+                })
+        };
+        for e in 0..experts {
+            packed.push((format!("{stem}.{e}"), payload(e)?));
+        }
+        consumed.extend([blocks_name, scales_name]);
     }
     let mut builder = WeightStore::builder();
     for (key, entry) in store.iter() {

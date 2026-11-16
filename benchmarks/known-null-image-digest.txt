@@ -1,0 +1,32 @@
+# Committed run sets recorded before the pod's image digest reached env.json (POOT-1355). Each ran on an NVIDIA
+# host and states no image_digest, so no result in it can be tied to the image it ran; `bench compare-committed`
+# accepts exactly these. The list is closed: a new set without a digest is an error, never an entry here.
+2026-10-23-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-135322
+2026-10-24-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-091516
+2026-10-24-rtx-pro-6000-blackwell-server-edition-qwen3-4b-090426
+2026-10-24-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-075810
+2026-10-24-rtx-pro-6000-blackwell-workstation-edition-qwen3-0-6b-073455
+2026-10-24-rtx-pro-6000-blackwell-workstation-edition-qwen3-4b-073455
+2026-10-24-rtx-pro-6000-blackwell-workstation-edition-qwen3-4b-q4km-073455
+2026-10-26-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-143238
+2026-10-26-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-153650
+2026-10-26-rtx-pro-6000-blackwell-server-edition-qwen3-4b-143238
+2026-10-26-rtx-pro-6000-blackwell-server-edition-qwen3-4b-q4km-143238
+2026-10-26-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-143238
+2026-10-26-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-143238
+2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828
+2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116
+2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-130041
+2026-11-06-rtx-pro-6000-blackwell-workstation-edition-qwen3-4b-120227
+2026-11-06-rtx-pro-6000-blackwell-workstation-edition-qwen3-4b-q4km-120227
+2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-182912
+2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152
+2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-q4km-224152
+2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-205555
+2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-205555
+2026-11-10-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-213631
+2026-11-10-rtx-pro-6000-blackwell-server-edition-qwen3-4b-q4km-210735
+2026-11-10-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-211336
+2026-11-10-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-212417
+2026-11-10-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-211807
+2026-11-11-rtx-pro-6000-blackwell-server-edition-qwen3-4b-005553

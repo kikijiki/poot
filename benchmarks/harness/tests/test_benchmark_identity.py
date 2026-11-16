@@ -20,9 +20,11 @@ import results_root  # noqa: E402
 from result_contract import (  # noqa: E402
     BUILD_IDENTITY_FIELDS,
     MEASUREMENT_IDENTITY_FIELDS,
+    committed_env_errors,
     committed_row_errors,
+    known_null_image_digest_sets,
 )
-from runner_fixtures import POOT_IDENTITY, run_fixture_runner, valid_single  # noqa: E402
+from runner_fixtures import POOT_IDENTITY, run_fixture_runner, valid_curve, valid_single  # noqa: E402
 from test_benchmark_compare import BASELINE, repeats, result_row  # noqa: E402
 from test_benchmark_manifest import refusing_runner, run_poot_cell  # noqa: E402
 
@@ -124,6 +126,72 @@ class EnvironmentTests(unittest.TestCase):
         with mock.patch.dict(os.environ):
             os.environ.pop("POOT_BENCH_IMAGE_DIGEST", None)
             self.assertIsNone(bench.capture_env("manifest.toml")["image_digest"])
+
+
+IMAGE = "sha256:" + "ab" * 32
+NVIDIA_ENV = {"captured_at_utc": "2026-11-15T00:00:00+00:00", "gpu_driver": "595.91.07"}
+
+
+class ImageDigestTests(unittest.TestCase):
+    def test_an_nvidia_run_without_its_image_digest_is_not_attributable(self):
+        errors = committed_env_errors(NVIDIA_ENV | {"image_digest": None}, "run-r1", exempt=False)
+
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("run-r1: env.json has no image_digest", errors[0])
+
+    def test_the_digest_is_a_sha256_reference(self):
+        self.assertEqual(committed_env_errors(NVIDIA_ENV | {"image_digest": IMAGE}, "run-r1", exempt=False), [])
+        errors = committed_env_errors(NVIDIA_ENV | {"image_digest": "latest"}, "run-r1", exempt=False)
+        self.assertIn("is not a sha256:<64 hex> digest", errors[0])
+
+    def test_a_run_outside_the_pod_image_states_none(self):
+        self.assertEqual(committed_env_errors({"gpu_driver": None, "image_digest": None}, "local-r1", exempt=False), [])
+
+    def test_the_allow_list_names_sets_and_only_sets(self):
+        listed = known_null_image_digest_sets()
+
+        self.assertTrue(listed)
+        self.assertTrue(all(not name.endswith(tuple(f"-r{n}" for n in range(10))) for name in listed), "set names, not run directories")
+
+
+class PodIngestTests(unittest.TestCase):
+    """`benchmarks/pod/qwen38-27b/ingest.py` turns a pod sweep into a snapshot; the `env.json` it writes is held to
+    the same image-digest rule as every committed set."""
+
+    INGEST = bench.BENCH_ROOT / "pod" / "qwen38-27b" / "ingest.py"
+
+    def ingest(self, env_lines):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        sweep = tmp / "sweep"
+        (sweep / "raw").mkdir(parents=True)
+        (sweep / "raw" / "poot_curve.json").write_text(json.dumps(valid_curve()))
+        (sweep / "env.txt").write_text("\n".join(["gpu_name=NVIDIA H100", "driver=595.91.07", "image_cuda=Cuda compilation tools, release 13.0", *env_lines]) + "\n")
+        (sweep / "phases.tsv").write_text("phase\trc\twall\tvram\npoot_curve\t0\t1\t100\n")
+        for name in ("summary.tsv", "commands.tsv", "model-revisions.txt"):
+            (sweep / name).write_text("")
+        snapshot = tmp / "snapshot"
+        done = subprocess.run(
+            [sys.executable, "-I", str(self.INGEST), str(sweep), str(snapshot), "--run-id", "r", "--model", "m",
+             "--captured-at", "2026-11-15T00:00:00+00:00"],
+            capture_output=True, text=True, check=False,
+        )
+        return done, snapshot
+
+    def test_the_snapshot_names_the_image_the_sweep_ran_in(self):
+        done, snapshot = self.ingest([f"image_digest={IMAGE}"])
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        env = json.loads((snapshot / "env.json").read_text())
+        self.assertEqual(env["image_digest"], IMAGE)
+        self.assertEqual(committed_env_errors(env, "snapshot", exempt=False), [])
+
+    def test_a_sweep_that_recorded_no_image_digest_is_not_ingested(self):
+        done, snapshot = self.ingest([])
+
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("no sha256 image_digest", done.stderr)
+        self.assertFalse(snapshot.exists())
 
 
 class DiagnosticRunTests(unittest.TestCase):
@@ -313,6 +381,21 @@ class BenchCompareRecipeTests(unittest.TestCase):
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn(receipts.WITHIN_NOISE, done.stdout)
+
+    def test_a_new_nvidia_set_without_its_image_digest_cannot_be_verified(self):
+        # The production path: `just bench-compare` over a results directory whose set ran on an NVIDIA host and
+        # recorded no image digest. A set that states its digest passes; the same set without it exits 2.
+        results = self.fixture_results()
+        envs = sorted(results.glob("*/env.json"))
+        for env in envs:
+            env.write_text(json.dumps(NVIDIA_ENV | {"image_digest": IMAGE}))
+        self.assertEqual(self.recipe(results).returncode, 0)
+
+        envs[0].write_text(json.dumps(NVIDIA_ENV))
+        done = self.recipe(results)
+
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn(f"unattributable: {envs[0].parent.name}: env.json has no image_digest", done.stderr)
 
     def test_a_twenty_percent_regression_in_the_candidate_exits_non_zero(self):
         results = self.fixture_results()

@@ -10,7 +10,7 @@
 use poot_kernel_ir::{BinOp, ConstantTableDecl, Local, Rvalue, Ty};
 use poot_quant::format::{
     BitLayout, BlockLayout, Field, FieldEncoding, FormatDescriptor, MinSign, OperandRole, Piece,
-    Storage, WeightFormat,
+    Segment, Storage, WeightFormat,
 };
 
 use super::family::{Codes, Family, Position};
@@ -36,8 +36,11 @@ pub(crate) struct DecodePlan {
     min: Option<Field>,
     sub_min: Option<Field>,
     family: Family,
-    /// The fields the family reads besides `Codes` ([`Family::operands`]), in that order.
+    /// The fields read per element besides `Codes`: the family's ([`Family::operands`]), in that order, then
+    /// `Shift` when the format has one.
     extras: Vec<Field>,
+    /// The `Shift` field, which is the last of [`Self::extras`] when the format has one.
+    shift: Option<Field>,
     min_sign: Option<MinSign>,
 }
 
@@ -58,7 +61,7 @@ impl DecodePlan {
             format,
             "a float value map over a Codes field that is not float-encoded",
         ))?;
-        let extras = family
+        let mut extras = family
             .operands()
             .iter()
             .map(|&role| {
@@ -68,6 +71,8 @@ impl DecodePlan {
                     .ok_or(reject(format, "a value family's operand is missing"))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let shift = layout.field(OperandRole::Shift).map(|f| f.field);
+        extras.extend(shift);
         Ok(Self {
             layout,
             codes: codes.field,
@@ -77,6 +82,7 @@ impl DecodePlan {
             sub_min: layout.field(OperandRole::SubMin).map(|f| f.field),
             family,
             extras,
+            shift,
             min_sign: descriptor.min_sign,
         })
     }
@@ -106,26 +112,15 @@ impl DecodePlan {
     /// the same, so one [`Factors`] serves every element of a run of `n` elements starting at a
     /// multiple of `n` whenever `n` divides this (card 653's Gemv runs). Per factor piece it is the
     /// product of the least-significant digits that do not move the bit address (a piece whose
-    /// digits all have stride 0, or that has none, covers the whole block); the minimum over every
-    /// factor piece, or the whole block when the format has no factor.
+    /// digits all have stride 0, or that has none, covers the whole block), kept inside one segment
+    /// ([`BitLayout::constant_run`]); the minimum over every factor piece, or the whole block when the format has
+    /// no factor.
     pub(crate) fn factor_run(&self) -> usize {
         [self.scale, self.sub_scale, self.min, self.sub_min]
             .into_iter()
             .flatten()
             .flat_map(|field| field.pieces.iter())
-            .map(|piece| {
-                let digits = piece.layout.digits;
-                if digits.iter().all(|digit| digit.stride == 0) {
-                    self.layout.values
-                } else {
-                    digits
-                        .iter()
-                        .rev()
-                        .take_while(|digit| digit.stride == 0)
-                        .map(|digit| digit.extent as usize)
-                        .product()
-                }
-            })
+            .map(|piece| piece.layout.constant_run() as usize)
             .min()
             .unwrap_or(self.layout.values)
     }
@@ -135,27 +130,30 @@ impl DecodePlan {
         bin(e, Ty::Usize, BinOp::Mul, copy(block), cu(block_bits))
     }
 
-    /// `layout.bit(i)` (see `format::BitLayout`), emitted for a runtime `i`: the affine mixed-radix
+    /// `layout.bit(i)` (see `format::BitLayout`), emitted for a runtime `i`: each segment's affine mixed-radix
     /// digit decomposition, least-significant digit first (the array is declared most-significant
-    /// first, so this walks it in reverse - the same order `BitLayout::bit`'s own loop takes).
+    /// first, so this walks it in reverse - the same order `BitLayout::bit`'s own loop takes), and, for a layout
+    /// of several segments, the one `i` falls in ([`emit_piecewise`]).
     fn emit_bit_layout(&self, e: &mut Emit, base: Local, layout: &BitLayout, i: Local) -> Local {
-        let mut bit = bin(
-            e,
-            Ty::Usize,
-            BinOp::Add,
-            copy(base),
-            cu(layout.base as usize),
-        );
-        let mut remaining = i;
-        for digit in layout.digits.iter().rev() {
-            let extent = digit.extent as usize;
-            let stride = digit.stride as usize;
-            let this_digit = bin(e, Ty::Usize, BinOp::Rem, copy(remaining), cu(extent));
-            let contribution = bin(e, Ty::Usize, BinOp::Mul, copy(this_digit), cu(stride));
-            bit = bin(e, Ty::Usize, BinOp::Add, copy(bit), copy(contribution));
-            remaining = bin(e, Ty::Usize, BinOp::Div, copy(remaining), cu(extent));
-        }
-        bit
+        emit_piecewise(e, layout.segments, i, |e, segment, relative| {
+            let mut bit = bin(
+                e,
+                Ty::Usize,
+                BinOp::Add,
+                copy(base),
+                cu(segment.base as usize),
+            );
+            let mut remaining = relative;
+            for digit in segment.digits.iter().rev() {
+                let extent = digit.extent as usize;
+                let stride = digit.stride as usize;
+                let this_digit = bin(e, Ty::Usize, BinOp::Rem, copy(remaining), cu(extent));
+                let contribution = bin(e, Ty::Usize, BinOp::Mul, copy(this_digit), cu(stride));
+                bit = bin(e, Ty::Usize, BinOp::Add, copy(bit), copy(contribution));
+                remaining = bin(e, Ty::Usize, BinOp::Div, copy(remaining), cu(extent));
+            }
+            bit
+        })
     }
 
     /// `field`'s raw bits at in-block index `i` (a broadcast field, no digits, ignores `i`): every
@@ -192,14 +190,7 @@ impl DecodePlan {
         for piece in field.pieces {
             let bit = self.emit_bit_layout(e, block_bit, &piece.layout, i);
             let piece_bits = read(e, bit, piece);
-            bits = Some(match bits {
-                None => piece_bits,
-                // Low bits first (`format::Field` docs): a piece shifts up by the widths below it.
-                Some(low) => {
-                    let shifted = bin(e, Ty::U32, BinOp::Shl, copy(piece_bits), c32(below));
-                    bin(e, Ty::U32, BinOp::BitOr, copy(low), copy(shifted))
-                }
-            });
+            bits = Some(append_piece(e, bits, piece_bits, below));
             below += piece.width;
         }
         bits.expect("a field has at least one piece")
@@ -335,6 +326,7 @@ impl DecodePlan {
             .iter()
             .map(|field| take_field(e, field))
             .collect();
+        let lanes = self.family.emit_run_lanes(e, first, count);
         (0..count)
             .map(|j| {
                 let index = bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j));
@@ -346,6 +338,7 @@ impl DecodePlan {
                     Position {
                         index,
                         known: Some((j, count)),
+                        lane: lanes.as_ref().map(|lanes| lanes[j]),
                     },
                 )
             })
@@ -400,6 +393,9 @@ impl DecodePlan {
     ) -> Vec<Local> {
         let Some(pieces) = field_run_deltas(field, count) else {
             let block_bit = block_bit.expect("a field read element by element has its block's bit");
+            if let Some(offsets) = piecewise_field_offsets(field, count) {
+                return self.read_piecewise_run(e, src, block_bit, (field, first, count), &offsets);
+            }
             return (0..count)
                 .map(|j| {
                     let i = bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j));
@@ -429,6 +425,45 @@ impl DecodePlan {
                     below += piece.width;
                 }
                 bits
+            })
+            .collect()
+    }
+
+    /// `field`'s raw bits for the `count` indices `first + j` of a run in a block at bit `block_bit`, when its layouts
+    /// are piecewise and each segment moves the run by constant offsets, though not the same ones in every
+    /// segment (`offsets`: [`piecewise_field_offsets`]): each piece's first bit is addressed once, the segment the run
+    /// is in is selected once ([`emit_segment_offsets`]), and every element reads at that bit plus its offset, where
+    /// [`Self::emit_field_bits`] would address each element through every segment of every layout.
+    fn read_piecewise_run(
+        &self,
+        e: &mut Emit,
+        src: Source,
+        block_bit: Local,
+        run: (&Field, Local, usize),
+        offsets: &[Vec<Vec<usize>>],
+    ) -> Vec<Local> {
+        let (field, first, count) = run;
+        let addressed: Vec<(Local, Vec<RunOffset>)> = field
+            .pieces
+            .iter()
+            .zip(offsets)
+            .map(|(piece, offsets)| {
+                let first_bit = self.emit_bit_layout(e, block_bit, &piece.layout, first);
+                let run_offsets = emit_segment_offsets(e, piece.layout.segments, first, offsets);
+                (first_bit, run_offsets)
+            })
+            .collect();
+        (0..count)
+            .map(|j| {
+                let mut bits: Option<Local> = None;
+                let mut below = 0;
+                for (piece, (first_bit, run_offsets)) in field.pieces.iter().zip(&addressed) {
+                    let bit = run_offsets[j].after(e, *first_bit);
+                    let piece_bits = src.read_bits(e, bit, piece.width);
+                    bits = Some(append_piece(e, bits, piece_bits, below));
+                    below += piece.width;
+                }
+                bits.expect("a field has at least one piece")
             })
             .collect()
     }
@@ -498,6 +533,7 @@ impl DecodePlan {
             Position {
                 index: i,
                 known: None,
+                lane: None,
             },
         )
     }
@@ -516,7 +552,21 @@ impl DecodePlan {
             bits: coded_bits,
             field: self.codes,
         };
-        let value = self.family.emit_value(e, codes, extra_bits, at);
+        let (family_bits, shift_bits) =
+            extra_bits.split_at(extra_bits.len() - usize::from(self.shift.is_some()));
+        let value = self.family.emit_value(e, codes, family_bits, at);
+        // `value + Shift` before the scale multiplies it (`dl * (grid + delta)`): the sum is exact, and the
+        // product that follows takes it as a sum, so no backend can fuse the two into one rounding.
+        let value = match (shift_bits, self.shift) {
+            ([bits], Some(field)) => {
+                let shift = emit_encoded_number(e, field.encoding, field.width(), *bits);
+                e.let_(
+                    Ty::F32,
+                    Rvalue::BinaryOp(BinOp::Add, copy(value), copy(shift)),
+                )
+            }
+            _ => value,
+        };
         let scaled = match factors.scale {
             Some(scale) => e.let_(
                 Ty::F32,
@@ -539,16 +589,42 @@ impl DecodePlan {
 }
 
 /// The bit offset of element `j` of an aligned run of `count` elements from the offset of the run's first
-/// element, for each `j`: `Some` when `layout`'s digits (least significant first) split the run cleanly, either
-/// a digit whose extent `count` divides, where `j` moves that digit alone, or a digit whose extent divides what
-/// is left of `count`, which `j` fills before the next digit moves. The run starts at a multiple of `count`, so
-/// no carry leaves the digits consumed. `None` when `count` does not factor over the digits (a three-element
-/// run over a power-of-two layout).
+/// element, for each `j`: `Some` when every segment of `layout` gives the same offsets
+/// ([`segment_run_offsets`]). `None` when `count` does not factor over the digits (a three-element run over a
+/// power-of-two layout), a run could straddle two segments, or the segments move a run differently, which
+/// [`DecodePlan::extract_field_run`] then reads element by element.
 fn run_deltas(layout: &BitLayout, count: usize) -> Option<Vec<usize>> {
+    let by_segment = segment_run_offsets(layout.segments, count)?;
+    let (first, rest) = by_segment.split_first()?;
+    rest.iter()
+        .all(|deltas| deltas == first)
+        .then(|| first.clone())
+}
+
+/// The offset of element `j` of an aligned run of `count` elements from the run's first element, for each `j`, in
+/// each segment of a piecewise map: `Some` when every segment starts on a multiple of `count` (no run straddles two)
+/// and its digits split the run cleanly ([`segment_run_deltas`]). The segments need not agree: an aligned run lies
+/// in one of them, which [`emit_segment_offsets`] picks once per run.
+pub(super) fn segment_run_offsets(segments: &[Segment], count: usize) -> Option<Vec<Vec<usize>>> {
+    segments
+        .iter()
+        .map(|segment| {
+            (segment.first as usize)
+                .is_multiple_of(count)
+                .then(|| segment_run_deltas(segment, count))
+                .flatten()
+        })
+        .collect()
+}
+
+/// [`run_deltas`] of one segment: a digit whose extent `count` divides, where `j` moves that digit alone, or a
+/// digit whose extent divides what is left of `count`, which `j` fills before the next digit moves. The run
+/// starts at a multiple of `count`, so no carry leaves the digits consumed.
+fn segment_run_deltas(segment: &Segment, count: usize) -> Option<Vec<usize>> {
     let mut deltas = vec![0usize; count];
     let mut remaining = count;
     let mut below = 1usize;
-    for digit in layout.digits.iter().rev() {
+    for digit in segment.digits.iter().rev() {
         if remaining == 1 {
             break;
         }
@@ -582,6 +658,24 @@ fn field_run_deltas(field: &Field, count: usize) -> Option<Vec<Vec<usize>>> {
         .pieces
         .iter()
         .map(|piece| run_deltas(&piece.layout, count))
+        .collect()
+}
+
+/// The offsets of each piece of `field` over a run of `count`, per segment ([`segment_run_offsets`]), for a field
+/// with a piecewise piece: `Some` when every piece's segments each move the run by constants. The pieces of a field
+/// whose layouts are each one segment never take this path.
+fn piecewise_field_offsets(field: &Field, count: usize) -> Option<Vec<Vec<Vec<usize>>>> {
+    if field
+        .pieces
+        .iter()
+        .all(|piece| piece.layout.segments.len() == 1)
+    {
+        return None;
+    }
+    field
+        .pieces
+        .iter()
+        .map(|piece| segment_run_offsets(piece.layout.segments, count))
         .collect()
 }
 
@@ -744,6 +838,137 @@ fn combine_product(e: &mut Emit, lhs: Option<Local>, rhs: Option<Local>) -> Opti
     }
 }
 
+/// One element's offset from the first element of an aligned run, in a piecewise map: the same in every segment,
+/// or the constant of the segment the run falls in.
+#[derive(Clone, Copy)]
+pub(super) enum RunOffset {
+    /// The offset every segment gives.
+    Fixed(usize),
+    /// The offset of the segment the run's first element is in, selected at run time.
+    Chosen(Local),
+}
+
+impl RunOffset {
+    /// `base` plus the offset, for a `base` at the run's first element.
+    pub(super) fn after(self, e: &mut Emit, base: Local) -> Local {
+        match self {
+            Self::Fixed(0) => base,
+            Self::Fixed(offset) => bin(e, Ty::Usize, BinOp::Add, copy(base), cu(offset)),
+            Self::Chosen(offset) => bin(e, Ty::Usize, BinOp::Add, copy(base), copy(offset)),
+        }
+    }
+}
+
+/// The offsets of an aligned run's elements from its first element `first`, in a piecewise map whose segments move
+/// a run by `offsets[segment][j]` ([`segment_run_offsets`]): the offset itself where every segment agrees, else the
+/// segment's constant selected by comparing `first` with where each later segment starts ([`emit_piecewise`]'s
+/// selection, made once for the run's elements and not for each of them).
+pub(super) fn emit_segment_offsets(
+    e: &mut Emit,
+    segments: &[Segment],
+    first: Local,
+    offsets: &[Vec<usize>],
+) -> Vec<RunOffset> {
+    let count = offsets[0].len();
+    let agrees = |j: usize| offsets.iter().all(|segment| segment[j] == offsets[0][j]);
+    let before_segment: Vec<Local> = if (0..count).all(agrees) {
+        Vec::new()
+    } else {
+        segments[1..]
+            .iter()
+            .map(|later| {
+                bin(
+                    e,
+                    Ty::Bool,
+                    BinOp::Lt,
+                    copy(first),
+                    cu(later.first as usize),
+                )
+            })
+            .collect()
+    };
+    (0..count)
+        .map(|j| {
+            if agrees(j) {
+                return RunOffset::Fixed(offsets[0][j]);
+            }
+            let last = offsets.len() - 1;
+            let mut chosen = cu(offsets[last][j]);
+            let mut local = None;
+            for segment in (0..last).rev() {
+                let picked = e.let_(
+                    Ty::Usize,
+                    Rvalue::Select {
+                        condition: copy(before_segment[segment]),
+                        if_true: cu(offsets[segment][j]),
+                        if_false: chosen,
+                    },
+                );
+                chosen = copy(picked);
+                local = Some(picked);
+            }
+            RunOffset::Chosen(local.expect("segments that disagree are at least two"))
+        })
+        .collect()
+}
+
+/// A piecewise map's value at in-block index `i` (`Ty::Usize`): `value(e, segment, relative)` emits one
+/// segment's value for the index relative to the segment's first element, and the segment `i` falls in is
+/// selected by comparing `i` with where each later segment starts. A map of one segment, which starts at element
+/// 0, is `value` over `i` itself: no subtraction, no comparison.
+pub(super) fn emit_piecewise(
+    e: &mut Emit,
+    segments: &[Segment],
+    i: Local,
+    mut value: impl FnMut(&mut Emit, &Segment, Local) -> Local,
+) -> Local {
+    let mut chosen: Option<Local> = None;
+    // An element belongs to the last segment that starts at or before it, so build the selection from the end.
+    for (index, segment) in segments.iter().enumerate().rev() {
+        let relative = if segment.first == 0 {
+            i
+        } else {
+            // Wraps for an element before the segment, which the selection never takes.
+            bin(
+                e,
+                Ty::Usize,
+                BinOp::Sub,
+                copy(i),
+                cu(segment.first as usize),
+            )
+        };
+        let here = value(e, segment, relative);
+        chosen = Some(match chosen {
+            None => here,
+            Some(later) => {
+                let next_first = segments[index + 1].first as usize;
+                let before_next = bin(e, Ty::Bool, BinOp::Lt, copy(i), cu(next_first));
+                e.let_(
+                    Ty::Usize,
+                    Rvalue::Select {
+                        condition: copy(before_next),
+                        if_true: copy(here),
+                        if_false: copy(later),
+                    },
+                )
+            }
+        });
+    }
+    chosen.expect("format tests: a map has at least one segment")
+}
+
+/// The bits of a field read so far (`low`, `below` bits wide) with the next piece's bits above them: low bits first
+/// (`format::Field` docs), a piece shifts up by the widths below it.
+fn append_piece(e: &mut Emit, low: Option<Local>, piece_bits: Local, below: u32) -> Local {
+    match low {
+        None => piece_bits,
+        Some(low) => {
+            let shifted = bin(e, Ty::U32, BinOp::Shl, copy(piece_bits), c32(below));
+            bin(e, Ty::U32, BinOp::BitOr, copy(low), copy(shifted))
+        }
+    }
+}
+
 /// A plain number (never the `Codes` field's value family) from its raw bits: `Unsigned`/`Signed`
 /// through an `i32`/f32 cast, `Float` through [`emit_float_decode`].
 pub(super) fn emit_encoded_number(
@@ -803,6 +1028,25 @@ pub(super) fn emit_encoded_number(
             )
         }
         FieldEncoding::Float(format) => emit_float_decode(e, format, bits),
+        FieldEncoding::SignedPowerOfTwo { exponent } => {
+            // `(-1)^bits * 2^exponent` as the float with that sign bit and exponent
+            // (`scalar::signed_power_of_two_to_f32`).
+            let sign = bin(e, Ty::U32, BinOp::Shl, copy(bits), c32(31));
+            let pattern = bin(
+                e,
+                Ty::U32,
+                BinOp::BitOr,
+                copy(sign),
+                c32(((127 + exponent) as u32) << 23),
+            );
+            e.let_(
+                Ty::F32,
+                Rvalue::Bitcast {
+                    to: Ty::F32,
+                    operand: copy(pattern),
+                },
+            )
+        }
         FieldEncoding::HalfStep { exponent } => {
             // `(bits + 1/2) * 2^exponent`, both steps exact (`scalar::half_step_to_f32`).
             let signed = e.let_(
@@ -844,7 +1088,7 @@ mod tests {
     use poot_kernel_ir::interp::{Buffer, run};
     use poot_kernel_ir::test_support::workgroups_covering;
     use poot_kernel_ir::{BasicBlock, Body, Terminator};
-    use poot_quant::format::{Digit, Piece};
+    use poot_quant::format::{Digit, Piece, Segment};
 
     use super::*;
     use crate::helpers::{Alloc, elem, ld, local, slice_dtype, slice_f32};
@@ -855,25 +1099,37 @@ mod tests {
 
     /// Six elements, 5 bits apart: a count of 3 or 6 factors over the digit, a count of 4 does not.
     const SIX: BitLayout = BitLayout {
-        base: 3,
-        digits: &[digit(6, 5)],
+        segments: &[Segment {
+            first: 0,
+            base: 3,
+            digits: &[digit(6, 5)],
+        }],
     };
     /// A lattice-style broadcast: the eight lanes of a group share one offset (stride 0), groups 9 bits apart.
     const GROUPS: BitLayout = BitLayout {
-        base: 1,
-        digits: &[digit(4, 9), digit(8, 0)],
+        segments: &[Segment {
+            first: 0,
+            base: 1,
+            digits: &[digit(4, 9), digit(8, 0)],
+        }],
     };
     /// Two digits the run crosses: four elements 6 bits apart, then 24 bits per group of four.
     const NESTED: BitLayout = BitLayout {
-        base: 0,
-        digits: &[digit(4, 24), digit(4, 6)],
+        segments: &[Segment {
+            first: 0,
+            base: 0,
+            digits: &[digit(4, 24), digit(4, 6)],
+        }],
     };
 
     /// Sixteen elements 3 bits apart: with 6-bit values one of them (bit 27) reaches exactly one bit into the
     /// next window.
     const DENSE: BitLayout = BitLayout {
-        base: 5,
-        digits: &[digit(16, 3)],
+        segments: &[Segment {
+            first: 0,
+            base: 5,
+            digits: &[digit(16, 3)],
+        }],
     };
 
     #[test]
@@ -887,6 +1143,50 @@ mod tests {
             Some(vec![0, 6, 12, 18, 24, 30, 36, 42])
         );
         assert_eq!(run_deltas(&NESTED, 2), Some(vec![0, 6]));
+    }
+
+    /// `TQ1_0`'s codes: 160 bytes-per-trit-lane elements 8 bits apart in 32 bytes, 80 in 16, 16 in 4, over three
+    /// segments with their own digits.
+    const THREE_STRETCHES: BitLayout = BitLayout {
+        segments: &[
+            Segment {
+                first: 0,
+                base: 0,
+                digits: &[digit(5, 0), digit(32, 8)],
+            },
+            Segment {
+                first: 160,
+                base: 256,
+                digits: &[digit(5, 0), digit(16, 8)],
+            },
+            Segment {
+                first: 240,
+                base: 384,
+                digits: &[digit(4, 0), digit(4, 8)],
+            },
+        ],
+    };
+
+    /// A piecewise layout has shared run offsets only where every segment moves a run alike and no run straddles
+    /// two: runs of 4 are 8 bits apart in all three stretches, runs of 8 are not (the last stretch has four
+    /// bytes to a row), and a run of 32 would start at 240 mid-run.
+    #[test]
+    fn a_piecewise_layout_shares_run_offsets_only_where_every_segment_agrees() {
+        assert_eq!(
+            run_deltas(&THREE_STRETCHES, 4),
+            Some(vec![0, 8, 16, 24]),
+            "every stretch steps a byte per element"
+        );
+        assert_eq!(
+            run_deltas(&THREE_STRETCHES, 8),
+            None,
+            "the last stretch wraps after four"
+        );
+        assert_eq!(
+            run_deltas(&THREE_STRETCHES, 32),
+            None,
+            "a run starting at 240 straddles"
+        );
     }
 
     /// A count that neither divides nor is divided by the digit it meets does not factor: `None`, so the caller
@@ -1124,6 +1424,76 @@ mod tests {
                 .map(f32::to_bits)
                 .collect();
             assert_eq!(got, want, "runs of {count}");
+        }
+    }
+
+    /// POOT-1541 SC-1 (kernel side): `IQ1_S` and `IQ1_M`, whose value is `scale * (grid + shift)` with the shift a
+    /// one-bit `+/-1/8` field read per 32 or per eight values, decode in the emitted KIR as
+    /// `poot_quant::plan::decode_blocks` does, bit for bit: element by element (`emit_value`) and as runs of 8, 16
+    /// (a run the factors and windows are shared over) and 32 (one that is not: `IQ1_M`'s scale changes every 16).
+    /// Mutation: emit `value - shift`, or drop the shift field from `DecodePlan::of`'s extras; both formats go
+    /// red naming the run length.
+    #[test]
+    fn the_shift_formats_decode_in_the_emitted_kernel_as_the_plan_decodes() {
+        use poot_quant::test_support::packed::every_field_blocks;
+
+        let blocks = 4;
+        for format in [WeightFormat::Iq1_S, WeightFormat::Iq1_M] {
+            let descriptor = format.descriptor();
+            let Storage::Blocks(layout) = descriptor.storage else {
+                unreachable!("a GGUF block format")
+            };
+            let bytes = &every_field_blocks(format)[..blocks * layout.bytes];
+            let mut want = vec![0.0f32; blocks * layout.values];
+            poot_quant::plan::decode_blocks(format, bytes, &mut want).unwrap();
+            let want: Vec<u32> = want.into_iter().map(f32::to_bits).collect();
+            let plan = DecodePlan::of(&descriptor).unwrap();
+            let k_total = blocks * layout.values;
+            for count in [1, 8, 16, 32] {
+                let mut al = Alloc::new(vec![
+                    ld(Ty::Unit, false),
+                    ld(slice_dtype(Ty::U32, false), false),
+                    ld(slice_f32(true), true),
+                ]);
+                let (words, out) = (local(1), local(2));
+                let mut e = Emit::new(&mut al);
+                let source = Source::plain(words);
+                let row = e.let_(Ty::Usize, Rvalue::Use(cu(0)));
+                let total = e.let_(Ty::Usize, Rvalue::Use(cu(k_total)));
+                for first in (0..k_total).step_by(count) {
+                    let values = if count == 1 {
+                        let block = e.let_(Ty::Usize, Rvalue::Use(cu(first / layout.values)));
+                        let element = e.let_(Ty::Usize, Rvalue::Use(cu(first % layout.values)));
+                        let factors = plan.emit_factors(&mut e, source, block, element);
+                        vec![plan.emit_value(&mut e, source, block, element, &factors)]
+                    } else {
+                        let k0 = e.let_(Ty::Usize, Rvalue::Use(cu(first)));
+                        plan.emit_run(&mut e, source, row, k0, count, total)
+                    };
+                    for (j, value) in values.into_iter().enumerate() {
+                        let at = e.let_(Ty::Usize, Rvalue::Use(cu(first + j)));
+                        e.assign(elem(out, at), Rvalue::Use(copy(value)));
+                    }
+                }
+                let block = BasicBlock {
+                    statements: e.take(),
+                    terminator: Terminator::Return,
+                };
+                let mut body = Body::new("shifted", 2, al.locals, vec![block]);
+                body.constant_tables = plan.constant_tables();
+                let mut buffers = [
+                    Buffer::from_u32s(&super::super::fixtures::pack_words(bytes)),
+                    Buffer::from_f32s(&vec![0.0; k_total]),
+                ];
+                run(&body, workgroups_covering(&body, 1), &mut buffers).unwrap();
+                let got: Vec<u32> = buffers[1]
+                    .to_f32s()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect();
+                assert_eq!(got, want, "{format:?} runs of {count}");
+            }
         }
     }
 }

@@ -14,7 +14,7 @@
 
 use crate::format::{
     BitLayout, BlockField, BlockLayout, Digit, Field, FieldEncoding, FloatFormat, FormatDescriptor,
-    OperandRole, Piece, Storage, ValueMap, WeightFormat,
+    OperandRole, Piece, Segment, Storage, ValueMap, WeightFormat,
 };
 use crate::scalar::f16_to_f32;
 
@@ -27,21 +27,27 @@ const ELEMENT_BITS: &[Digit] = &[Digit {
     stride: 1,
 }];
 
-const fn scale_nibble(word: u32) -> Piece {
+const fn scale_nibble<const WORD: u32>() -> Piece {
     Piece {
         layout: BitLayout {
-            base: 16 * word + 12,
-            digits: BROADCAST,
+            segments: &[Segment {
+                first: 0,
+                base: 16 * WORD + 12,
+                digits: BROADCAST,
+            }],
         },
         width: 4,
     }
 }
 
-const fn code_plane(plane: u32) -> Piece {
+const fn code_plane<const PLANE: u32>() -> Piece {
     Piece {
         layout: BitLayout {
-            base: 64 + 32 * plane,
-            digits: ELEMENT_BITS,
+            segments: &[Segment {
+                first: 0,
+                base: 64 + 32 * PLANE,
+                digits: ELEMENT_BITS,
+            }],
         },
         width: 1,
     }
@@ -60,10 +66,10 @@ pub const FOUR_PIECE: FormatDescriptor = FormatDescriptor {
                 name: "d (four nibbles)",
                 field: Field {
                     pieces: &[
-                        scale_nibble(0),
-                        scale_nibble(1),
-                        scale_nibble(2),
-                        scale_nibble(3),
+                        scale_nibble::<0>(),
+                        scale_nibble::<1>(),
+                        scale_nibble::<2>(),
+                        scale_nibble::<3>(),
                     ],
                     encoding: FieldEncoding::Float(FloatFormat::F16),
                 },
@@ -72,7 +78,12 @@ pub const FOUR_PIECE: FormatDescriptor = FormatDescriptor {
                 role: OperandRole::Codes,
                 name: "qs (four bit planes)",
                 field: Field {
-                    pieces: &[code_plane(0), code_plane(1), code_plane(2), code_plane(3)],
+                    pieces: &[
+                        code_plane::<0>(),
+                        code_plane::<1>(),
+                        code_plane::<2>(),
+                        code_plane::<3>(),
+                    ],
                     encoding: FieldEncoding::Unsigned { offset: -8 },
                 },
             },

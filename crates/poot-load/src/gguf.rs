@@ -964,7 +964,7 @@ mod tests {
     /// mapping id 7 (Q5_1) to `Some(WeightFormat::Q5_0)` in the `weight_format_of` table makes this
     /// row's `assert_eq!` fail (`Some(Q5_0) != Some(Q5_1)`) - the acceptance mutation the card names
     /// ("map Q5_1 to Q5_0") shows up here, not in `read_gguf_refuses_...` (that row is about an id
-    /// with no packed path at all, e.g. IQ1_S).
+    /// with no packed path at all, e.g. a removed type).
     #[test]
     fn weight_format_of_matches_the_pinned_ggml_type_table() {
         let mapped: &[(u32, WeightFormat)] = &[
@@ -983,20 +983,21 @@ mod tests {
             (16, WeightFormat::Iq2_Xxs),
             (17, WeightFormat::Iq2_Xs),
             (18, WeightFormat::Iq3_Xxs),
+            (19, WeightFormat::Iq1_S),
             (20, WeightFormat::Iq4_Nl),
             (21, WeightFormat::Iq3_S),
             (22, WeightFormat::Iq2_S),
             (23, WeightFormat::Iq4_Xs),
+            (29, WeightFormat::Iq1_M),
             (30, WeightFormat::Bf16),
+            (34, WeightFormat::Tq1_0),
             (35, WeightFormat::Tq2_0),
             (39, WeightFormat::Mxfp4),
         ];
         for &(id, format) in mapped {
             assert_eq!(weight_format_of(id), Some(format), "ggml type {id}");
         }
-        let unmapped: &[u32] = &[
-            4, 5, 9, 15, 19, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 36, 37, 38,
-        ];
+        let unmapped: &[u32] = &[4, 5, 9, 15, 24, 25, 26, 27, 28, 31, 32, 33, 36, 37, 38];
         for &id in unmapped {
             assert_eq!(weight_format_of(id), None, "ggml type {id}");
         }
@@ -1112,23 +1113,28 @@ mod tests {
         assert_eq!(store.total_stored_bytes(), data.len());
     }
 
-    /// Card 543 SC-003/SC-004 (refusal): a scheme with no packed path (`IQ1_S`, ggml id 19) is refused
-    /// by name, naming the tensor - never loaded dense silently.
+    /// Card 543 SC-003/SC-004 (refusal): a scheme with no packed path (ggml's removed `Q4_0_4_4`, id 31) is
+    /// refused by name, naming the tensor - never loaded dense silently.
     #[test]
     fn read_gguf_refuses_a_scheme_with_no_packed_path_by_name() {
-        const GGML_IQ1_S: u32 = 19;
+        const GGML_Q4_0_4_4: u32 = 31;
         let bytes = write_gguf(
             &[],
-            &[("blk.0.attn_v.weight", vec![256], GGML_IQ1_S, vec![0u8; 50])],
+            &[(
+                "blk.0.attn_v.weight",
+                vec![256],
+                GGML_Q4_0_4_4,
+                vec![0u8; 144],
+            )],
         );
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let error = read_gguf(&index, &IdentityNames).expect_err("must refuse IQ1_S");
+        let error = read_gguf(&index, &IdentityNames).expect_err("must refuse Q4_0_4_4");
         match error {
             LoadError::UnsupportedGgufType { tensor, ggml_type } => {
                 assert_eq!(tensor, "blk.0.attn_v.weight");
-                assert_eq!(ggml_type, GGML_IQ1_S);
+                assert_eq!(ggml_type, GGML_Q4_0_4_4);
             }
             other => panic!("expected UnsupportedGgufType, got {other:?}"),
         }

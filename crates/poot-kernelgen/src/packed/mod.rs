@@ -599,9 +599,7 @@ mod float_shift_tests {
 /// implementation so every op's test compares against the identical oracle input shape.
 #[cfg(test)]
 mod fixtures {
-    use poot_quant::format::{
-        BlockLayout, FieldEncoding, FloatFormat, OperandRole, Storage, ValueMap, WeightFormat,
-    };
+    use poot_quant::format::{BlockLayout, OperandRole, Storage, ValueMap, WeightFormat};
     use poot_quant::test_support::formats::GGUF_FORMATS;
 
     use crate::contraction::{RunLength, Schedule, TileSize};
@@ -777,6 +775,35 @@ mod fixtures {
             .collect()
     }
 
+    /// The GGUF block formats with a piecewise layout: a field read through a layout of several segments, or a
+    /// lattice whose lane map has several. From the shared format list, by what the descriptor says.
+    pub(super) fn piecewise() -> Vec<WeightFormat> {
+        GGUF_FORMATS
+            .into_iter()
+            .filter(|format| {
+                let descriptor = format.descriptor();
+                let in_layout = matches!(descriptor.storage, Storage::Blocks(layout)
+                    if layout.fields.iter().flat_map(|field| field.field.pieces).any(|piece| piece.layout.segments.len() > 1));
+                let in_lane_map = matches!(descriptor.value, ValueMap::Lattice(lattice) if lattice.lane.segments.len() > 1);
+                in_layout || in_lane_map
+            })
+            .collect()
+    }
+
+    /// The Gemv schedules a piecewise format's runs are checked under: runs of 4, which every segment moves alike,
+    /// and of 8 and 16, which they do not (`TQ1_0`'s last stretch has four bytes to a row where the others have 32 and
+    /// 16).
+    pub(super) fn piecewise_run_schedules() -> [Schedule; 3] {
+        [4, 8, 16].map(|unroll| Schedule::Gemv {
+            width: 32,
+            cols: 2,
+            unroll,
+            activation: crate::GemvActivation::Scalar,
+            rows: crate::GemvRows::ONE,
+            depth: crate::LoadDepth::ONE,
+        })
+    }
+
     /// The GGUF block formats of `values` values per block, in ggml order.
     fn gguf_blocks_of(values: usize) -> Vec<WeightFormat> {
         GGUF_FORMATS
@@ -799,35 +826,6 @@ mod fixtures {
                 state as u8
             })
             .collect()
-    }
-
-    /// Force every block's `Scale`/`Min` field into the admitted (non-NaN) domain: xorshift bytes
-    /// otherwise land on E8M0 `0xff` or an F16 infinity/NaN roughly one seed in a few hundred, which
-    /// `poot_quant::plan::decode_blocks` (correctly) refuses. Codes never need this: none of the
-    /// block-32 formats' codes fields can encode a NaN (E2M1 has none; the rest are integers).
-    pub(super) fn sanitize_factors(format: WeightFormat, block: &mut [u8]) {
-        let Storage::Blocks(layout) = format.descriptor().storage else {
-            unreachable!()
-        };
-        for role in [OperandRole::Scale, OperandRole::Min] {
-            let Some(field) = layout.field(role) else {
-                continue;
-            };
-            let bit = field.field.pieces[0].layout.bit(0);
-            assert_eq!(bit % 8, 0, "{format:?} {role:?} must be byte-aligned");
-            let byte0 = (bit / 8) as usize;
-            match field.field.encoding {
-                FieldEncoding::Float(FloatFormat::F16) => {
-                    // Clear the top exponent bit: exponent <= 0b01111, never 0x1f (inf/NaN).
-                    block[byte0 + 1] &= !0x40;
-                }
-                FieldEncoding::Float(FloatFormat::E8m0) => {
-                    // 0xff is the only non-admitted byte, so clamping below it is exact.
-                    block[byte0] = block[byte0].min(0xfe);
-                }
-                _ => {}
-            }
-        }
     }
 
     /// Native source bytes as zero-filled `u32` words plus one zero guard word (D9): the transport
@@ -863,7 +861,7 @@ mod fixtures {
             0x9e37_79b9_7f4a_7c15u64.wrapping_add(seed),
         );
         for block in bytes.chunks_mut(layout.bytes) {
-            sanitize_factors(format, block);
+            poot_quant::test_support::packed::sanitize_block_factors(layout, block);
         }
         let mut expected = vec![0.0f32; out_rows * k];
         poot_quant::plan::decode_blocks(format, &bytes, &mut expected)
@@ -1697,8 +1695,8 @@ mod contraction_tests {
 
     use super::fixtures::{
         DEVICE_ROWS_AND_DEPTH, GEMV_SCHEDULES, assert_close, block32, contraction_fixture,
-        device_rows_and_depth_formats, kquant, pack_words, register_tiled, schedule_tag,
-        with_rows_and_depth,
+        device_rows_and_depth_formats, kquant, pack_words, piecewise, piecewise_run_schedules,
+        register_tiled, schedule_tag, with_rows_and_depth,
     };
     use super::kernel::packed_contraction;
     use crate::contraction::{RegisterTiling, Schedule};
@@ -2011,6 +2009,26 @@ mod contraction_tests {
     fn contraction_gemv_matches_reference_blocks_1_and_2() {
         for format in block32() {
             for schedule in GEMV_SCHEDULES {
+                run_case(format, schedule, 1, 1, 11);
+                run_case(format, schedule, 2, 1, 5);
+            }
+        }
+    }
+
+    /// POOT-1542: a format whose layout or lane map is piecewise decodes like the reference under the runs the
+    /// planner plans over it. Runs of 4 give every segment the same offsets and share their windows; runs of 8
+    /// and 16 do not (the last stretch of `TQ1_0` has four bytes to a row where the others have 32 and 16), so the
+    /// emitter addresses the run's first element once, selects the segment it is in once, and reads each element at
+    /// that segment's constant offset, and takes the run's lanes the same way. A block of 256 holds all three
+    /// stretches of `TQ1_0`, a run of 8 or 16 in each.
+    /// Mutation: in `emit_segment_offsets` use the last segment's offsets for every segment; every row of 8 and 16 goes
+    /// red naming `Tq1_0`.
+    #[test]
+    fn runs_over_a_piecewise_layout_decode_like_the_reference() {
+        let formats = piecewise();
+        assert!(!formats.is_empty(), "a piecewise format is listed");
+        for format in formats {
+            for schedule in piecewise_run_schedules() {
                 run_case(format, schedule, 1, 1, 11);
                 run_case(format, schedule, 2, 1, 5);
             }
@@ -2679,6 +2697,28 @@ mod contraction_tests {
         }
     }
 
+    /// POOT-1542 (device tier 2): the piecewise formats' runs of 4, 8 and 16 on the local wgpu (SPIR-V/RADV) device, the
+    /// counterpart of `runs_over_a_piecewise_layout_decode_like_the_reference`.
+    #[test]
+    fn runs_over_a_piecewise_layout_decode_like_the_reference_on_wgpu() {
+        let ctx = match poot_wgpu_runtime::Context::new() {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
+                return;
+            }
+        };
+        for format in piecewise() {
+            for schedule in piecewise_run_schedules() {
+                run_wgpu_case(&ctx, format, schedule, 1, 1, 11);
+                run_wgpu_case(&ctx, format, schedule, 2, 1, 5);
+            }
+        }
+    }
+
     /// SC-002 (card 542b, device tier 2): `Contraction` `Schedule::RegisterTiled` for every block-32 and
     /// K-quant format on the local wgpu (SPIR-V/RADV) device - the real-hardware counterpart of
     /// `contraction_tiled_matches_reference_aligned_and_ragged` (`blocks == 1` only; see its doc).
@@ -3069,7 +3109,8 @@ mod rocm_tests {
     use super::fixtures::{
         DEVICE_ROWS_AND_DEPTH, GEMV_SCHEDULES, GatherCase, assert_close, block32,
         contraction_fixture, device_rows_and_depth_formats, fixture, kquant, kquant_gather_cases,
-        pack_words, register_tiled, schedule_tag, with_rows_and_depth,
+        pack_words, piecewise, piecewise_run_schedules, register_tiled, schedule_tag,
+        with_rows_and_depth,
     };
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
     use crate::contraction::Schedule;
@@ -3499,6 +3540,23 @@ mod rocm_tests {
         };
         for format in kquant() {
             for schedule in GEMV_SCHEDULES {
+                run_contraction_case(&ctx, format, schedule, 1, 1, 11);
+                run_contraction_case(&ctx, format, schedule, 2, 1, 5);
+            }
+        }
+    }
+
+    /// POOT-1542 (device tier 2): the piecewise formats' runs of 4, 8 and 16 on real ROCm/HSA hardware, the counterpart of
+    /// `runs_over_a_piecewise_layout_decode_like_the_reference`.
+    #[test]
+    fn runs_over_a_piecewise_layout_decode_like_the_reference_on_rocm() {
+        let Some(ctx) =
+            open_or_skip("runs_over_a_piecewise_layout_decode_like_the_reference_on_rocm")
+        else {
+            return;
+        };
+        for format in piecewise() {
+            for schedule in piecewise_run_schedules() {
                 run_contraction_case(&ctx, format, schedule, 1, 1, 11);
                 run_contraction_case(&ctx, format, schedule, 2, 1, 5);
             }

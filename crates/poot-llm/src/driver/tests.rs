@@ -1241,6 +1241,56 @@ fn every_traced_step_stores_the_kv_dtype_the_driver_resolved() {
     }
 }
 
+/// POOT-1391: a driver hands its executor back unloaded, and a driver of another capacity opens on it and
+/// serves the same request: the way one process measures several capacities when the runtime cannot open a
+/// second executor (ROCm). An executor that refuses the unload is the answer, not an executor handed back
+/// with the weights still loaded. Mutation: drop the `unload` loop in `Driver::into_executor`; the refusal
+/// half then gets an executor where it expects `ExecError`.
+#[test]
+fn a_returned_executor_serves_a_driver_of_another_capacity() {
+    let script = || {
+        logits_script(vec![
+            favoring(1),
+            favoring(2),
+            favoring(3),
+            favoring(1),
+            favoring(2),
+            favoring(3),
+        ])
+    };
+    let mut first = build_rig(RigOptions::default(), script()).unwrap().serve();
+    let before = run(&mut first, request(&[5, 6], 3, Sampler::greedy())).unwrap();
+    assert_eq!(before.tokens, [1, 2, 3]);
+    let handle = Arc::clone(&first.driver.handle);
+    let options = DriverOptions {
+        capacity: nz(first.driver.settings.options.capacity.get() * 2),
+        ..first.driver.settings.options.clone()
+    };
+    let executor = first.driver.into_executor().unwrap();
+    let mut second = Rig {
+        driver: Driver::new(handle, executor, options)
+            .unwrap()
+            .serve(Layout::Contiguous),
+        world: first.world,
+    };
+    let after = run(&mut second, request(&[5, 6], 3, Sampler::greedy())).unwrap();
+    assert_eq!(
+        after.tokens,
+        [1, 2, 3],
+        "the second capacity decodes the same request"
+    );
+
+    let refusing = build_rig(RigOptions::default(), script()).unwrap().serve();
+    refusing.world.borrow_mut().fail_unload = true;
+    assert!(
+        matches!(
+            refusing.driver.into_executor().err(),
+            Some(DriverError::Device(_))
+        ),
+        "a refused unload is the driver's error"
+    );
+}
+
 /// SC-002 (EOS): the model's end-of-sequence token ends the run and is not part of the output; no
 /// step runs after it. Mutation: treat EOS as an ordinary token (skip the `is_eos` break); the run
 /// then continues to `max_new` and the tokens hold the EOS id.

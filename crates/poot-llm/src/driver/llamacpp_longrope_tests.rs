@@ -121,14 +121,14 @@ const PHI_3_5_MINI: (Checkpoint, Checkpoint) = (
 
 /// poot's CPU oracle over teacher-forced windows: one traced, packed-bound prefill with logits at every row,
 /// its weights built once, only the step slots replaced per window.
-struct OracleForced {
+pub(super) struct OracleForced {
     graph: Graph,
     inputs: HashMap<ValueId, Value>,
     n_ctx: usize,
 }
 
 impl OracleForced {
-    fn new(handle: &ModelHandle, first_window: &[i32]) -> Self {
+    pub(super) fn new(handle: &ModelHandle, first_window: &[i32]) -> Self {
         let n_ctx = first_window.len();
         let model = handle.model();
         let n = NonZeroUsize::new(n_ctx).unwrap();
@@ -147,7 +147,7 @@ impl OracleForced {
     }
 
     /// The logits of every position of `window`, `[n_ctx, n_vocab]` row-major.
-    fn logits(&mut self, window: &[i32]) -> Vec<f32> {
+    pub(super) fn logits(&mut self, window: &[i32]) -> Vec<f32> {
         assert_eq!(window.len(), self.n_ctx);
         self.inputs.extend(slot_inputs(&self.graph, window));
         eval(&self.graph, &self.inputs, EvalOptions::default())

@@ -1,6 +1,6 @@
 //! The float families' descriptors: the dense float formats as one-value blocks, and MXFP4.
 
-use super::{HALVES_32, WHOLE_32, blocks, piece};
+use super::{HALVES_32, WHOLE_32, blocks};
 use crate::format::{FieldEncoding, FloatFormat, FormatDescriptor, ValueMap, WeightFormat};
 
 /// A dense float: a one-value block holding the value itself.
@@ -15,7 +15,7 @@ macro_rules! dense {
                     Codes,
                     "value",
                     FieldEncoding::Float(FloatFormat::$float),
-                    [piece(0, &[], FloatFormat::$float.bits())]
+                    [piece!(0, &[], FloatFormat::$float.bits())]
                 )],
             ),
             value: ValueMap::Float,
@@ -40,13 +40,13 @@ pub(crate) const MXFP4: FormatDescriptor = FormatDescriptor {
                 Scale,
                 "e",
                 FieldEncoding::Float(FloatFormat::E8m0),
-                [piece(0, WHOLE_32, 8)]
+                [piece!(0, WHOLE_32, 8)]
             ),
             field!(
                 Codes,
                 "qs",
                 FieldEncoding::Float(FloatFormat::E2m1),
-                [piece(8, HALVES_32, 4)]
+                [piece!(8, HALVES_32, 4)]
             ),
         ],
     ),

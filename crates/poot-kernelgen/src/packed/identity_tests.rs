@@ -25,6 +25,16 @@
 //! Extended for POOT-1540 (`Iq2_Xxs`, `Iq2_S`, `Tq2_0`): 39 rows inserted in list order and none changed, so every
 //! earlier format emits the same kernel. The new formats are a descriptor and a table; no emitter changed.
 //!
+//! Extended for POOT-1541 (`Iq1_S`, `Iq1_M`; the `Shift` operand): 26 rows inserted in list order and none changed (the
+//! other 416 rows are byte-identical to the table before the change), so a format without a `Shift` emits the kernel it
+//! did. The shift is one more field a run reads and one add before the scale multiplies; it is emitted only for a
+//! descriptor that has the operand.
+//!
+//! Extended for POOT-1542 (`Tq1_0`; piecewise layouts and a lane map): 13 rows inserted in list order and none changed (the
+//! other 442 rows are byte-identical to the table before the change). `BitLayout` and the lattice's `LaneMap` are now
+//! lists of segments, and a layout of one segment emits the code it did: the selection among segments and the
+//! per-run offsets exist only for a descriptor with more than one.
+//!
 //! Re-recorded a third time for POOT-1561 (float shift decode, planar run sharing): 77 of 377 rows changed.
 //! The Gemv bodies of nine planar formats (`gemv0` to `gemv3`, `gemv0_indexed`, `gemv1_indexed`, `gemv_vec4` of the
 //! six E4M3 formats, E2M1 row-32, contiguous GPTQ and AWQ; 63 rows) decode their scale once per run

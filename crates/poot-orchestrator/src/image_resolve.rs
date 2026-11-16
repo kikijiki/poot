@@ -172,6 +172,23 @@ pub(crate) fn image_ref_by_digest(
     Ok(format!("{registry}/{repo}@{digest}"))
 }
 
+/// The `sha256:<64 hex>` digest a pinned image reference (`repo@sha256:...`, what [`pin_image`] returns) names. A tag
+/// reference names no digest: the image it resolves to can change, so it is an error here.
+pub(crate) fn pinned_digest(image: &str) -> Result<&str, ImageResolveError> {
+    let (_, digest) = image
+        .rsplit_once('@')
+        .ok_or_else(|| ImageResolveError::InvalidRef {
+            image: image.to_owned(),
+            reason: "not pinned to a digest".to_owned(),
+        })?;
+    if !digest.starts_with("sha256:") || digest.len() != "sha256:".len() + 64 {
+        return Err(ImageResolveError::InvalidDigest {
+            value: digest.to_owned(),
+        });
+    }
+    Ok(digest)
+}
+
 /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."` challenge.
 pub(crate) fn parse_bearer_challenge(header: &str) -> Result<BearerChallenge, ImageResolveError> {
     let invalid = |detail: &str| ImageResolveError::Unauthorized {

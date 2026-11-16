@@ -52,6 +52,7 @@ pub mod oneshot;
 pub mod open;
 pub mod placement;
 pub mod prefix_cache;
+mod programs;
 mod reorder;
 mod sequences;
 pub use reorder::RowGraphError;
@@ -73,9 +74,13 @@ mod hidden_carry_tests;
 #[cfg(test)]
 mod llamacpp_bisect_tests;
 #[cfg(test)]
+mod llamacpp_iq1_tests;
+#[cfg(test)]
 mod llamacpp_kl_tests;
 #[cfg(test)]
 mod llamacpp_longrope_tests;
+#[cfg(test)]
+mod llamacpp_tq1_tests;
 #[cfg(test)]
 mod narrow_gate_tests;
 #[cfg(test)]
@@ -130,6 +135,7 @@ pub use oneshot::{ChatOptions, ChatSession, OneShotError, Sampling, TextRequest,
 pub use open::{BackendChoice, open_executor, open_group, open_timed_executor};
 use placement::{Placed, Placement};
 pub use prefix_cache::{PrefixOutcome, PrefixSkip};
+pub use programs::PlannedPrograms;
 pub use speculate::{
     DraftPolicy, NotSpeculated, PassTiming, PositionAcceptance, RollbackTiming, RowSpeculation,
     SpeculationCaps, SpeculationStats, StepTime,
@@ -513,6 +519,8 @@ impl<F: FnMut(u32, &str) -> GenerationControl> TokenSink for F {
 pub struct DriverStats {
     /// Programs compiled (cold preparations; a refused one counts, a warm replay never does).
     pub compiles: u64,
+    /// Programs taken from a planning pass instead of compiled ([`PlannedPrograms`]).
+    pub replayed: u64,
     /// The compiler each stage of every compiled program planned with (POOT-1505,
     /// [`poot_graph_plan::Program::register_feedback`]), in compile order: `None` for a stage the register model
     /// planned alone. A receipt reads it to say whether its plans had the device compiler's feedback.
@@ -1129,6 +1137,21 @@ impl<S: State> Driver<S> {
         Ok(())
     }
 
+    /// End the driver and give its executor back with every executable the driver loaded unloaded: the
+    /// device keeps none of this driver's weights, entries or KV, so a driver of another capacity can open
+    /// on the same executor. A caller that measures several capacities in one process needs this, because
+    /// a ROCm runtime does not survive opening a second executor after dropping the first.
+    pub fn into_executor(mut self) -> Result<Box<dyn Executor>, DriverError> {
+        let mut exes = vec![self.runtime.exe];
+        exes.extend(self.speculation.draft.iter().map(|draft| draft.exe));
+        exes.extend(self.runtime.adapter_exes.values().copied());
+        exes.extend(self.runtime.encode_exes.values().copied());
+        for exe in exes {
+            self.runtime.executor.unload(exe)?;
+        }
+        Ok(self.runtime.executor)
+    }
+
     /// The answer to a failed run of the one-row surface: `error` itself, after the executables were
     /// reset when it left one needing it (a device failure, a fault, a rejected validation packet, a refused host sync or an
     /// executable already refusing steps) and nothing else depends on their state. Open sequences
@@ -1328,7 +1351,17 @@ impl<S: State> Driver<S> {
                 vec![key.shape.rows.get()],
             ));
         }
-        let program = self.compile(&graph, self.formats_of(key.role), &compile)?;
+        let program = match self.ledger.programs.replay(&key) {
+            Some(program) => {
+                self.stats.replayed += 1;
+                program
+            }
+            None => {
+                self.stats.compiles += 1;
+                Arc::new(self.compile(&graph, self.formats_of(key.role), &compile)?)
+            }
+        };
+        self.ledger.programs.record(key, &program);
         // A stage split keeps the inputs a stage uses: a slot of the traced graph no stage reads is not
         // one a step binds.
         slots.retain(|slot| program.takes_input(&slot.key));
@@ -1406,10 +1439,9 @@ impl<S: State> Driver<S> {
         })
     }
 
-    /// Count the compile of `program` and check what retaining it would hold against the limits.
+    /// Record the compilers `program` planned with and check what retaining it would hold against the limits.
     /// Nothing is recorded until [`Self::add_entry`].
     fn admit(&mut self, program: &StagedProgram) -> Result<Reservation, DriverError> {
-        self.stats.compiles += 1;
         self.stats.planned_with.extend(
             program
                 .stages()

@@ -1,18 +1,20 @@
-//! The lattice family ([`poot_quant::families::lattice`]): `sign * cell[code * lanes + i % lanes]`.
+//! The lattice family ([`poot_quant::families::lattice`]): `sign * cell[code * lanes + lane(i)]`.
 //!
 //! The cells are one constant table ([`VALUE_TABLE`]) of `u32` words, `32 / width` cells to a word. A
 //! one-lane lattice indexes its cells by the code. A multi-lane lattice reads the word of the code's
-//! point and then the lane's cell inside it; the lane is `i % lanes`, an emission-time constant when the
-//! run the element belongs to fixes it. The cell's bits become a number through the table's encoding;
+//! point and then the lane's cell inside it; the lane is the descriptor's [`LaneMap`] of `i`, an
+//! emission-time constant when the run the element belongs to fixes it. The cell's bits become a number through the table's encoding;
 //! a sign rule flips the sign bit of the float by the lane's bit of the group's sign pattern.
 
 use poot_kernel_ir::{BinOp, ConstantTableDecl, Local, Rvalue, Ty};
-use poot_quant::families::lattice::{Lattice, SignRule};
+use poot_quant::families::lattice::{LaneMap, Lattice, SignRule};
 use poot_quant::format::{FieldEncoding, OperandRole};
 
 use super::Position;
 use crate::emit::{Emit, bin, c32, copy, cu};
-use crate::packed::decode_plan::emit_encoded_number;
+use crate::packed::decode_plan::{
+    emit_encoded_number, emit_piecewise, emit_segment_offsets, segment_run_offsets,
+};
 use crate::packed::float_decode::emit_float_decode;
 
 /// The one constant table a lattice kernel declares: the lattice's cell words, read as table 0.
@@ -79,15 +81,17 @@ fn emit_single_lane_cell(e: &mut Emit, lattice: &Lattice, code: Local) -> Local 
     read_cell(e, word_index, shift, width)
 }
 
-/// The bits of cell `i % lanes` of point `code` of a multi-lane lattice.
+/// The bits of cell `lane(i)` of point `code` of a multi-lane lattice.
 fn emit_lane_cell(e: &mut Emit, lattice: &Lattice, code: Local, at: Position) -> Local {
     let width = lattice.cells.width;
     let per_word = (32 / width) as usize;
     let words_per_point = lattice.lanes * width as usize / 32;
-    let (lane_word, shift) = match constant_mod(at, lattice.lanes) {
+    let (lane_word, shift) = match at.known.and_then(|known| lattice.lane.fixed_by(known)) {
         Some(lane) => (cu(lane / per_word), c32((lane % per_word) as u32 * width)),
         None => {
-            let lane = bin(e, Ty::Usize, BinOp::Rem, copy(at.index), cu(lattice.lanes));
+            let lane = at
+                .lane
+                .unwrap_or_else(|| emit_lane(e, lattice.lane, at.index));
             let lane_word = bin(e, Ty::Usize, BinOp::Div, copy(lane), cu(per_word));
             let lane_cell = bin(e, Ty::Usize, BinOp::Rem, copy(lane), cu(per_word));
             (copy(lane_word), shift_of(e, copy(lane_cell), width))
@@ -109,6 +113,75 @@ fn emit_lane_cell(e: &mut Emit, lattice: &Lattice, code: Local, at: Position) ->
     );
     let word_index = bin(e, Ty::Usize, BinOp::Add, copy(point_word), lane_word);
     read_cell(e, word_index, shift, width)
+}
+
+/// The lanes of the aligned run of `count` elements from `first`, for a lattice whose lane map is piecewise: the lane
+/// of the first element once, and the offsets of the others from it, which the segment the run is in decides
+/// ([`emit_segment_offsets`]). `None` for a map of one segment, whose lane is a constant of the position wherever
+/// the run fixes it and is emitted for each element otherwise, and for a map whose segments do not move a run by
+/// constants.
+pub(super) fn emit_run_lanes(
+    e: &mut Emit,
+    lattice: &Lattice,
+    first: Local,
+    count: usize,
+) -> Option<Vec<Local>> {
+    let segments = lattice.lane.segments;
+    if lattice.lanes == 1 || segments.len() == 1 {
+        return None;
+    }
+    let offsets = segment_run_offsets(segments, count)?;
+    let first_lane = emit_lane(e, lattice.lane, first);
+    Some(
+        emit_segment_offsets(e, segments, first, &offsets)
+            .into_iter()
+            .map(|offset| offset.after(e, first_lane))
+            .collect(),
+    )
+}
+
+/// The lane of element `index` at run time: each segment of the map is the sum of its digits' contributions
+/// (a digit that does not move the lane contributes nothing and is not emitted; a stride of one is the digit
+/// itself), and the segment `index` falls in is selected ([`emit_piecewise`]). A lane that cycles is `index %
+/// lanes`.
+fn emit_lane(e: &mut Emit, lane_map: LaneMap, index: Local) -> Local {
+    emit_piecewise(e, lane_map.segments, index, |e, segment, relative| {
+        let mut lane: Option<Local> = None;
+        let mut remaining = relative;
+        // Digits above the most significant one that moves the lane add nothing, so nothing is emitted for them.
+        let first_moving = segment.digits.iter().position(|digit| digit.stride != 0);
+        for (position, digit) in segment.digits.iter().enumerate().rev() {
+            if first_moving.is_none_or(|first| position < first) {
+                break;
+            }
+            let extent = digit.extent as usize;
+            if digit.stride != 0 {
+                let this_digit = bin(e, Ty::Usize, BinOp::Rem, copy(remaining), cu(extent));
+                let contribution = match digit.stride {
+                    1 => this_digit,
+                    stride => bin(
+                        e,
+                        Ty::Usize,
+                        BinOp::Mul,
+                        copy(this_digit),
+                        cu(stride as usize),
+                    ),
+                };
+                lane = Some(match lane {
+                    None => contribution,
+                    Some(sum) => bin(e, Ty::Usize, BinOp::Add, copy(sum), copy(contribution)),
+                });
+            }
+            if Some(position) != first_moving {
+                remaining = bin(e, Ty::Usize, BinOp::Div, copy(remaining), cu(extent));
+            }
+        }
+        match (lane, segment.base) {
+            (Some(lane), 0) => lane,
+            (Some(lane), base) => bin(e, Ty::Usize, BinOp::Add, copy(lane), cu(base as usize)),
+            (None, base) => e.let_(Ty::Usize, Rvalue::Use(cu(base as usize))),
+        }
+    })
 }
 
 /// `cell * width` as a `u32` shift amount, for a runtime cell index within its word.
@@ -165,7 +238,9 @@ fn emit_cell_number(e: &mut Emit, lattice: &Lattice, bits: Local) -> Local {
             emit_encoded_number(e, encoding, lattice.cells.width, bits)
         }
         FieldEncoding::Float(format) => emit_float_decode(e, format, bits),
-        FieldEncoding::Signed | FieldEncoding::HalfStep { .. } => {
+        FieldEncoding::Signed
+        | FieldEncoding::HalfStep { .. }
+        | FieldEncoding::SignedPowerOfTwo { .. } => {
             unreachable!("format tests: a cell is an unsigned integer or a float")
         }
     }

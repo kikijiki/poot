@@ -81,9 +81,13 @@ poot-kernelgen	packed::contraction_tests::contraction_tiled_matches_reference_bl
 poot-kernelgen	packed::contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged_on_wgpu	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::every_format_gemv_is_bit_identical_after_static_alignment	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::rows_and_depth_do_not_change_a_rows_sum	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::runs_over_a_piecewise_layout_decode_like_the_reference	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::runs_over_a_piecewise_layout_decode_like_the_reference_on_wgpu	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::decode_plan::tests::a_count_that_does_not_factor_over_the_digits_has_no_constant_offsets	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::decode_plan::tests::a_piecewise_layout_shares_run_offsets_only_where_every_segment_agrees	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::decode_plan::tests::a_run_moves_the_bit_offset_by_constants_over_the_digits	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::decode_plan::tests::a_run_of_field_bits_equals_the_scalar_read_of_each_element	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::decode_plan::tests::the_shift_formats_decode_in_the_emitted_kernel_as_the_plan_decodes	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::float_decode_tests::bf16_matches_scalar_on_the_admitted_domain	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::float_decode_tests::e2m1_matches_scalar_for_all_16_codes	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::float_decode_tests::e4m3fn_matches_scalar_on_the_admitted_domain	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -114,6 +118,7 @@ poot-kernelgen	packed::rocm_tests::contraction_tiled_matches_reference_aligned_a
 poot-kernelgen	packed::rocm_tests::contraction_tiled_matches_reference_block_diagonal_ragged_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::rocm_tests::row_gather_matches_decode_blocks_rows_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::rocm_tests::row_gather_matches_decode_blocks_rows_on_rocm_kquant	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::rocm_tests::runs_over_a_piecewise_layout_decode_like_the_reference_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::row_gather_index_width_tests::the_row_gather_offset_chain_is_64_bit_where_the_backend_is	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::row_gather_tests::row_gather_addresses_a_block_past_u32_bits_at_its_true_word	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::row_gather_tests::row_gather_bodies_compile_for_amdgcn	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case

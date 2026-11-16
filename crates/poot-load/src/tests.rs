@@ -822,3 +822,173 @@ fn malformed_quantized_linears_are_refused_by_tensor_name() {
             if first == "l.weight_scale" && second == "l.weight_scale_inv"
     ));
 }
+
+/// HF's MXFP4 value of `code` (`FP4_VALUES` in transformers' `integrations/mxfp4.py`) times its block's
+/// scale `2^(scale - 127)`, stated here from that file and not through `poot_quant`.
+fn hf_mxfp4_value(code: u8, scale: u8) -> f32 {
+    const FP4_VALUES: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    FP4_VALUES[usize::from(code)] * 2f32.powi(i32::from(scale) - 127)
+}
+
+/// The `quantization_config` of `openai/gpt-oss-20b` names the MXFP4 scheme. Mutation: drop the `"mxfp4"`
+/// arm of `QuantConfig::scheme`; the config is refused as an unknown `quant_method` and the row goes red.
+#[test]
+fn an_hf_mxfp4_quantization_config_is_the_mxfp4_scheme() {
+    let config = serde_json::json!({
+        "quantization_config": {
+            "modules_to_not_convert": ["model.layers.*.self_attn", "lm_head"],
+            "quant_method": "mxfp4",
+        }
+    });
+    let scheme = crate::config::quant_scheme(&config)
+        .unwrap()
+        .expect("a quantization_config names a scheme");
+    assert_eq!(scheme.kind, QuantKind::Mxfp4);
+}
+
+/// An MXFP4 expert stack (`{stem}_blocks` `[E, out, K/32, 16]`, `{stem}_scales` `[E, out, K/32]`) becomes
+/// one packed owner per expert, `{stem}.{e}`, that decodes to HF's own dequantization of the same bytes
+/// (even K in the low nibble, `2^(scale - 127)` per 32 values); the two source tensors are consumed and
+/// every other tensor passes through. Mutation: swap the nibbles in the format's codes (`E2m1Row32`'s
+/// `LaneOrder`), or slice every expert's codes from offset 0; an expert row decodes to the wrong value.
+#[test]
+fn an_mxfp4_expert_stack_packs_per_expert_and_decodes_as_hf_does() {
+    let (experts, out, groups) = (3usize, 5usize, 2usize);
+    let k = groups * 32;
+    let mut state = 0x2545_f491u32;
+    let mut next = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 24) as u8
+    };
+    let blocks: Vec<u8> = (0..experts * out * groups * 16).map(|_| next()).collect();
+    // Scales around 1.0, and one block at each end of the exponent range that fits an f32 product.
+    let scales: Vec<u8> = (0..experts * out * groups)
+        .map(|i| match i {
+            0 => 1,
+            1 => 254,
+            _ => 118 + next() % 12,
+        })
+        .collect();
+    let store = store_of(vec![
+        (
+            "l.mlp.experts.gate_up_proj_blocks",
+            DType::U8,
+            vec![experts, out, groups, 16],
+            blocks.clone(),
+        ),
+        (
+            "l.mlp.experts.gate_up_proj_scales",
+            DType::U8,
+            vec![experts, out, groups],
+            scales.clone(),
+        ),
+        (
+            "l.mlp.experts.gate_up_proj_bias",
+            DType::BF16,
+            vec![experts, out],
+            vec![0; experts * out * 2],
+        ),
+    ]);
+    let mxfp4 = QuantScheme {
+        kind: QuantKind::Mxfp4,
+        group_size: 0,
+    };
+    let packed = pack_quantized_linears(&store, mxfp4).unwrap();
+    let mut keys: Vec<&str> = packed.keys().map(|key| key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "l.mlp.experts.gate_up_proj.0",
+            "l.mlp.experts.gate_up_proj.1",
+            "l.mlp.experts.gate_up_proj.2",
+            "l.mlp.experts.gate_up_proj_bias",
+        ]
+    );
+    for expert in 0..experts {
+        let payload = match packed.get(&format!("l.mlp.experts.gate_up_proj.{expert}")) {
+            Some(WeightEntry::Packed(payload)) => payload.clone(),
+            other => panic!("expert {expert} is not packed: {other:?}"),
+        };
+        assert_eq!(
+            payload.weight().format(),
+            poot_quant::format::WeightFormat::E2m1Row32
+        );
+        assert_eq!(payload.weight().shape(), [out, k]);
+        for row in 0..out {
+            let got = decoded_row(&payload, row);
+            for (col, got) in got.iter().enumerate() {
+                let byte = blocks[((expert * out + row) * groups * 16) + col / 2];
+                let code = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                let scale = scales[(expert * out + row) * groups + col / 32];
+                let want = hf_mxfp4_value(code, scale);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "expert {expert} row {row} col {col}: code {code:#x} scale {scale}"
+                );
+            }
+        }
+    }
+}
+
+/// Every way an MXFP4 stack can fail to be one is refused naming the tensor: a blocks tensor with no
+/// scales (and the reverse), a non-U8 scales tensor, a scales shape that is not blocks' with the 16
+/// byte axis dropped, and a blocks tensor that is not `[E, out, K/32, 16]`. Mutation: drop the shape
+/// comparison on `scales` in `pack_mxfp4_experts`; the third row packs and goes red.
+#[test]
+fn an_ill_formed_mxfp4_stack_is_refused_naming_the_tensor() {
+    let mxfp4 = QuantScheme {
+        kind: QuantKind::Mxfp4,
+        group_size: 0,
+    };
+    let blocks = |shape: Vec<usize>| {
+        let bytes = shape.iter().product();
+        ("s_blocks", DType::U8, shape, vec![0u8; bytes])
+    };
+    let scales = |dtype: DType, shape: Vec<usize>| {
+        let bytes = shape.iter().product::<usize>() * dtype.byte_size();
+        ("s_scales", dtype, shape, vec![0u8; bytes])
+    };
+    let cases: Vec<(&str, Vec<_>, &str)> = vec![
+        ("no scales", vec![blocks(vec![2, 3, 1, 16])], "s_scales"),
+        (
+            "no blocks",
+            vec![scales(DType::U8, vec![2, 3, 1])],
+            "s_blocks",
+        ),
+        (
+            "scales not U8",
+            vec![
+                blocks(vec![2, 3, 1, 16]),
+                scales(DType::BF16, vec![2, 3, 1]),
+            ],
+            "s_scales",
+        ),
+        (
+            "scales shape",
+            vec![blocks(vec![2, 3, 1, 16]), scales(DType::U8, vec![2, 3, 2])],
+            "s_scales",
+        ),
+        (
+            "blocks rank",
+            vec![blocks(vec![2, 3, 16]), scales(DType::U8, vec![2, 3])],
+            "s_blocks",
+        ),
+        (
+            "blocks byte axis",
+            vec![blocks(vec![2, 3, 1, 8]), scales(DType::U8, vec![2, 3, 1])],
+            "s_blocks",
+        ),
+    ];
+    for (what, tensors, refused) in cases {
+        match pack_quantized_linears(&store_of(tensors), mxfp4) {
+            Err(LoadError::QuantizedLinearLayout { tensor, .. }) => {
+                assert_eq!(tensor, refused, "{what}")
+            }
+            other => panic!("{what}: expected a typed layout refusal, got {other:?}"),
+        }
+    }
+}

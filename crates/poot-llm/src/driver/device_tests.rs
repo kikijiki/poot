@@ -1889,6 +1889,246 @@ fn a_block_fp8_qwen35_checkpoint_loads_packed_through_model_handle_load() {
     assert_eq!(handles, packed, "every packed projection is mapped packed");
 }
 
+/// The gpt-oss fixture written twice as an HF checkpoint: `openai/gpt-oss-20b`'s MXFP4 way (every expert
+/// stack as `{stack}_blocks` `[E, out, K/32, 16]` and `{stack}_scales` `[E, out, K/32]`, a
+/// `quantization_config` naming `quant_method: "mxfp4"`), and with the same values dequantized into the
+/// bf16 `[E, K, out]` stacks of the dense checkpoint. Returns both directories and the written
+/// `(blocks, scales)` bytes of each stack by its name.
+struct GptOssPair {
+    mxfp4: poot_test_util::UniqueTempPath,
+    dense: poot_test_util::UniqueTempPath,
+    written: Vec<(String, Vec<u8>, Vec<u8>)>,
+}
+
+fn gpt_oss_mxfp4_pair() -> GptOssPair {
+    /// E2M1 values by code (OCP MX v1.0).
+    const E2M1: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "gpt_oss")
+        .unwrap();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(NO_EOS);
+    let mut dense_config = config.clone();
+    config["quantization_config"] = serde_json::json!({
+        "modules_to_not_convert": ["model.layers.*.self_attn", "model.layers.*.mlp.router", "lm_head"],
+        "quant_method": "mxfp4",
+    });
+    dense_config["eos_token_id"] = serde_json::json!(NO_EOS);
+    let mut state = 0x9e37_79b9u32;
+    let mut next = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 24) as u8
+    };
+    let (mut mxfp4, mut dense, mut written) = (Vec::new(), Vec::new(), Vec::new());
+    for (key, weight) in fixture.store.iter() {
+        let WeightEntry::Dense(stored) = weight else {
+            panic!("the fixture is dense")
+        };
+        let dtype = match stored.dtype() {
+            poot_tensor::DType::BF16 => "BF16",
+            poot_tensor::DType::F32 => "F32",
+            poot_tensor::DType::I64 => "I64",
+            other => panic!("the fixture stores {other:?}"),
+        };
+        let name = key.as_str();
+        let archived = |bytes: Vec<u8>, shape: Vec<usize>, dtype, name: &str| ArchiveTensor {
+            name: name.to_string(),
+            dtype,
+            shape,
+            bytes,
+        };
+        if !(name.ends_with(".mlp.experts.gate_up_proj")
+            || name.ends_with(".mlp.experts.down_proj"))
+        {
+            let same = archived(
+                stored.bytes().as_slice().to_vec(),
+                stored.shape().to_vec(),
+                dtype,
+                name,
+            );
+            dense.push(archived(
+                same.bytes.clone(),
+                same.shape.clone(),
+                dtype,
+                name,
+            ));
+            mxfp4.push(same);
+            continue;
+        }
+        // The bf16 stack is `[E, K, out]`; the MXFP4 one is `[E, out, K]` in blocks of 32.
+        let [experts, k, out] = stored.shape()[..] else {
+            panic!("an expert stack is [E, K, out]")
+        };
+        let groups = k / 32;
+        let blocks: Vec<u8> = (0..experts * out * groups * 16).map(|_| next()).collect();
+        let scales: Vec<u8> = (0..experts * out * groups)
+            .map(|_| 124 + next() % 4)
+            .collect();
+        let mut values = vec![0u8; experts * k * out * 2];
+        for e in 0..experts {
+            for o in 0..out {
+                for col in 0..k {
+                    let byte = blocks[(e * out + o) * groups * 16 + col / 2];
+                    let code = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                    let scale = scales[(e * out + o) * groups + col / 32];
+                    let value = E2M1[usize::from(code)] * 2f32.powi(i32::from(scale) - 127);
+                    let bf16 = (value.to_bits() >> 16) as u16;
+                    assert_eq!(
+                        f32::from_bits(u32::from(bf16) << 16),
+                        value,
+                        "exact in bf16"
+                    );
+                    let at = ((e * k + col) * out + o) * 2;
+                    values[at..at + 2].copy_from_slice(&bf16.to_le_bytes());
+                }
+            }
+        }
+        dense.push(archived(values, stored.shape().to_vec(), "BF16", name));
+        mxfp4.push(archived(
+            blocks.clone(),
+            vec![experts, out, groups, 16],
+            "U8",
+            &format!("{name}_blocks"),
+        ));
+        mxfp4.push(archived(
+            scales.clone(),
+            vec![experts, out, groups],
+            "U8",
+            &format!("{name}_scales"),
+        ));
+        written.push((name.to_string(), blocks, scales));
+    }
+    GptOssPair {
+        mxfp4: write_hf_checkpoint("gpt_oss_mxfp4", &config, &mxfp4),
+        dense: write_hf_checkpoint("gpt_oss_mxfp4_dense", &dense_config, &dense),
+        written,
+    }
+}
+
+/// `openai/gpt-oss-20b` stores its experts as MXFP4 `_blocks` and `_scales`: `ModelHandle::load` of such a
+/// checkpoint maps every expert stack as per-expert packed owners, `E2m1Row32`, over exactly the bytes
+/// written (none decoded), and its model's first-step log-probabilities equal the same values stored as
+/// dense bf16 stacks. Mutation: drop the `"mxfp4"` arm of `QuantConfig::scheme`; the load is refused as an
+/// unknown `quant_method`. Mutation: in `ExpertProjection::new` keep `p.orientation` for a packed stack;
+/// the stack's shape check fails (`[E, K, out]` against `[E, out, K]` owners).
+#[test]
+fn a_gpt_oss_mxfp4_checkpoint_loads_packed_and_equals_its_dense_dequantization() {
+    use poot_quant::format::WeightFormat;
+    use poot_quant::{PlanarRole, SourceRole};
+    use poot_weights::HandleFormat;
+    let registry = Registry::builtin().unwrap();
+    let pair = gpt_oss_mxfp4_pair();
+    let options = crate::driver::LoadOptions::default();
+    let packed = ModelHandle::load(&pair.mxfp4, &registry, &options).unwrap();
+    let dense = ModelHandle::load(&pair.dense, &registry, &options).unwrap();
+    assert_eq!(packed.config().family.as_str(), "gpt_oss");
+    assert_eq!(pair.written.len(), 4, "two layers, two stacks each");
+    for (name, blocks, scales) in &pair.written {
+        let experts = 8;
+        let (each_blocks, each_scales) = (blocks.len() / experts, scales.len() / experts);
+        for e in 0..experts {
+            let Some(WeightEntry::Packed(got)) = packed.store().get(&format!("{name}.{e}")) else {
+                panic!("{name}.{e} did not load packed");
+            };
+            assert_eq!(got.weight().format(), WeightFormat::E2m1Row32);
+            assert_eq!(
+                got.bytes(SourceRole::Planar(PlanarRole::Codes)),
+                &blocks[e * each_blocks..(e + 1) * each_blocks],
+                "{name}.{e}: codes are stored as written"
+            );
+            assert_eq!(
+                got.bytes(SourceRole::Planar(PlanarRole::Scale)),
+                &scales[e * each_scales..(e + 1) * each_scales],
+                "{name}.{e}: scales are stored as written"
+            );
+        }
+    }
+    let stacks = packed
+        .model()
+        .weights()
+        .iter()
+        .filter(|(_, _, h)| matches!(h.format, HandleFormat::Packed(_)))
+        .count();
+    assert_eq!(stacks, 4, "every expert stack is mapped packed");
+    let (got, want) = (
+        oracle_top5(&packed, &PROMPT, CAPACITY),
+        oracle_top5(&dense, &PROMPT, CAPACITY),
+    );
+    assert_eq!(
+        got.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+        want.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+        "the five most likely tokens"
+    );
+    for ((token, got), (_, want)) in got.iter().zip(&want) {
+        assert!(
+            (got - want).abs() <= 1e-4,
+            "token {token}: packed log-probability {got}, dense {want}"
+        );
+    }
+}
+
+/// The MXFP4 checkpoint's first generated token and top-five log-probabilities on a device equal the
+/// oracle's over the same graph (token ids exact, log-probabilities within `1e-3`): the planned
+/// `E2m1Row32` expert stacks run through the device's indexed packed contraction. What the values mean is
+/// pinned by the dense-equivalence row above, not here (oracle and device read one descriptor).
+fn gpt_oss_mxfp4_first_step_matches_the_oracle(choice: BackendChoice) {
+    let registry = Registry::builtin().unwrap();
+    let pair = gpt_oss_mxfp4_pair();
+    let handle = Arc::new(
+        ModelHandle::load(
+            &pair.mxfp4,
+            &registry,
+            &crate::driver::LoadOptions::default(),
+        )
+        .unwrap(),
+    );
+    let want = oracle_top5(&handle, &PROMPT, CAPACITY);
+    let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
+        return;
+    };
+    let generated = driver
+        .generate(
+            GenerateRequest {
+                prompt: PROMPT.to_vec(),
+                max_new: 1,
+                sampler: Sampler::greedy().with_logprobs(5),
+                stops: Vec::new(),
+                ignore_eos: false,
+            },
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap();
+    assert_eq!(generated.tokens, [want[0].0], "first token on {choice:?}");
+    let got = &generated.logprobs[0].top;
+    assert_eq!(
+        got.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+        want.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+        "the five most likely tokens on {choice:?}"
+    );
+    for ((token, got), (_, want)) in got.iter().zip(&want) {
+        assert!(
+            (f64::from(*got) - want).abs() <= 1e-3,
+            "token {token} on {choice:?}: log-probability {got}, the oracle gives {want}"
+        );
+    }
+}
+
+#[test]
+fn gpt_oss_mxfp4_first_step_matches_the_oracle_wgpu() {
+    gpt_oss_mxfp4_first_step_matches_the_oracle(BackendChoice::Wgpu);
+}
+
+#[test]
+fn gpt_oss_mxfp4_first_step_matches_the_oracle_rocm() {
+    gpt_oss_mxfp4_first_step_matches_the_oracle(BackendChoice::Rocm);
+}
+
 /// Gemma is trained with a mandatory BOS: an HF gemma3 checkpoint's prompts encode with its BOS id
 /// first (the fixture config names 1), as the pre-driver loader did; a family without one (qwen2) encodes
 /// the prompt as the tokenizer does. Mutation: drop gemma3's `prompt_bos` (`None`); the gemma3 encode

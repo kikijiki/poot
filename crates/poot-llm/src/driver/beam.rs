@@ -342,6 +342,7 @@ impl<S: State> Driver<S> {
             .map_err(|error| Unsupported::RowGraph(Box::new(error)))?;
         let slots = bind::resolve_passes(&graph, ProgramId::STEP)?;
         let output = graph.aval(graph.result()).shape.clone();
+        self.stats.compiles += 1;
         let program = self.compile(
             &graph,
             &self.runtime.formats,

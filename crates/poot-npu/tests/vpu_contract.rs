@@ -118,8 +118,10 @@ fn a_vendor_compile_failure_is_a_typed_error_with_the_compilers_log() {
 
 /// A dispatch that is not the loaded graph's ABI is refused by the device before anything is recorded: a launch
 /// of another domain, an invocation of another artifact, a wrong argument count, a buffer of another storage, a
-/// wrong element count, a buffer too short. The honest dispatch then still runs and returns the sum, so the
-/// refusals changed nothing.
+/// wrong element count. The honest dispatch then still runs and returns the sum, so the refusals changed nothing.
+///
+/// Whether a buffer holds the element count a dispatch asserts is not the device's question: the engine bounds it
+/// by `buffer_elems` for every backend (`poot_executor::DispatchError::ArgExceedsBuffer`).
 ///
 /// Mutation: drop `check_invocation` in `VpuDevice::dispatch`; the invocation row accepts a foreign digest.
 #[test]
@@ -139,7 +141,6 @@ fn a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs() {
     let a = alloc(&mut device, f16, N);
     let b = alloc(&mut device, f16, N);
     let out = alloc(&mut device, f16, N);
-    let short = alloc(&mut device, f16, N - 1);
     let wide = alloc(&mut device, BufferStorage::f32(), N);
     let honest = LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest));
     let arg = |buffer, elems| Arg { buffer, elems };
@@ -197,10 +198,6 @@ fn a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs() {
     assert!(matches!(
         dispatch(honest, &two, arg(&out, N - 1)),
         Err(VpuError::Bindings { reason, .. }) if reason.contains("argument 2 is 16 elements, the dispatch binds 15")
-    ));
-    assert!(matches!(
-        dispatch(honest, &two, arg(&short, N)),
-        Err(VpuError::Bindings { reason, .. }) if reason.contains("needs 32 bytes, the bound buffer holds 30")
     ));
 
     // The honest dispatch runs after all of those.

@@ -193,6 +193,19 @@ Iq3_Xxs | register_tiled_indexed | ad0f3e9f6b7d6c60
 Iq3_Xxs | register_tiled_narrow_f16 | 2db736fe92bbc88b
 Iq3_Xxs | fragment_tiled_split_bf16 | 6ddedef982558cad
 Iq3_Xxs | run_sharing | FactorRun { factor_run: 32 } 4 bits
+Iq1_S | row_gather | a96a4c4ed80583c0
+Iq1_S | gemv0 | 03291482334307bb
+Iq1_S | gemv1 | f26c0d595f4f6804
+Iq1_S | gemv2 | 0aa7fed2382c5009
+Iq1_S | gemv3 | 1543bb454ddacd61
+Iq1_S | gemv0_indexed | 0a7711f273dd5169
+Iq1_S | gemv1_indexed | 7a6f5e219453426f
+Iq1_S | gemv_vec4 | 99108e532a87bf0b
+Iq1_S | register_tiled | 54f80d1a152fe4d5
+Iq1_S | register_tiled_indexed | b33010fb35099a91
+Iq1_S | register_tiled_narrow_f16 | 58a63b744fb72507
+Iq1_S | fragment_tiled_split_bf16 | 2555c6efa121f39b
+Iq1_S | run_sharing | FactorRun { factor_run: 32 } 2 bits
 Iq4_Nl | row_gather | c76dc043544e1b16
 Iq4_Nl | gemv0 | b6345b4ff1b5414e
 Iq4_Nl | gemv1 | 0b65864677640f2e
@@ -245,6 +258,19 @@ Iq4_Xs | register_tiled_indexed | f2a0b71280ee3a4d
 Iq4_Xs | register_tiled_narrow_f16 | 977d71e0507fb6e7
 Iq4_Xs | fragment_tiled_split_bf16 | 0c135b4ee77d160e
 Iq4_Xs | run_sharing | FactorRun { factor_run: 32 } 5 bits
+Iq1_M | row_gather | 47191ee9ce90346a
+Iq1_M | gemv0 | 468743f775cf778b
+Iq1_M | gemv1 | caa8805b249d0f8d
+Iq1_M | gemv2 | ef357a8e393d0068
+Iq1_M | gemv3 | f1ef92192690021e
+Iq1_M | gemv0_indexed | b0aa6f878ab1fc74
+Iq1_M | gemv1_indexed | 45dd59b74fa1e37d
+Iq1_M | gemv_vec4 | fbbc70f76ef16098
+Iq1_M | register_tiled | 87df3c80764ca607
+Iq1_M | register_tiled_indexed | f34fbe23b5d45ac1
+Iq1_M | register_tiled_narrow_f16 | 5821451a02b36e3f
+Iq1_M | fragment_tiled_split_bf16 | 7413cb6fd5e2f11b
+Iq1_M | run_sharing | FactorRun { factor_run: 16 } 2 bits
 Bf16 | row_gather | 715e096dd33d3bb9
 Bf16 | gemv0 | 946c194d97f73d60
 Bf16 | gemv1 | 927e3be7ea197263
@@ -258,6 +284,19 @@ Bf16 | register_tiled_indexed | 112e94a0ecd671ca
 Bf16 | register_tiled_narrow_f16 | 4ae85a8dfd2c5c0b
 Bf16 | fragment_tiled_split_bf16 | 9da91ad471a6a3ab
 Bf16 | run_sharing | FactorRun { factor_run: 1 } 16 bits
+Tq1_0 | row_gather | e0c387a7db0f091c
+Tq1_0 | gemv0 | be922eb95dde23d8
+Tq1_0 | gemv1 | f422c369834e9f59
+Tq1_0 | gemv2 | 4b07605391862ec2
+Tq1_0 | gemv3 | 9d2d08cf179d4cb9
+Tq1_0 | gemv0_indexed | d510ed5709088eb1
+Tq1_0 | gemv1_indexed | e8e4fb5ab8547b06
+Tq1_0 | gemv_vec4 | 6d05320465bb7b47
+Tq1_0 | register_tiled | 90dab29b6857b054
+Tq1_0 | register_tiled_indexed | 8d80eafd6f66ada1
+Tq1_0 | register_tiled_narrow_f16 | 554b1f1e8d4be7d0
+Tq1_0 | fragment_tiled_split_bf16 | fa3649049ab09cdd
+Tq1_0 | run_sharing | FactorRun { factor_run: 256 } 2 bits
 Tq2_0 | row_gather | 991dbeb6d9a77e18
 Tq2_0 | gemv0 | 773ae53233627241
 Tq2_0 | gemv1 | 66439ef17f210071

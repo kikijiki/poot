@@ -73,8 +73,14 @@ impl QuantConfig {
                     group_size,
                 })
             }
+            // HF `quant_method: "mxfp4"` (openai/gpt-oss-20b): `_blocks` and `_scales` tensors; the block of
+            // 32 is the format descriptor's, so the config carries nothing else to validate.
+            "mxfp4" => Ok(QuantScheme {
+                kind: QuantKind::Mxfp4,
+                group_size,
+            }),
             other => Err(LoadError::SafeTensors(format!(
-                "unsupported quant_method {other:?} (gptq, awq, compressed-tensors, fp8 today)"
+                "unsupported quant_method {other:?} (gptq, awq, compressed-tensors, fp8, mxfp4 today)"
             ))),
         }
     }

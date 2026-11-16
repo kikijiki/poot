@@ -33,7 +33,7 @@ use poot_llm::driver::error::{DriverError, Unsupported};
 use poot_llm::driver::placement::{BalanceError, LayerBytes, Placement, balance_layers};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverCaps, DriverOptions, EncodeShapes, Head, Layout,
-    ModelHandle, PoolShape, PreparedSetLimits, Serving, ServingShapes, Warm,
+    ModelHandle, PlannedPrograms, PoolShape, PreparedSetLimits, Serving, ServingShapes, Warm,
 };
 use poot_models::io::ModelSchema;
 use poot_models::model::KvDtype;
@@ -552,12 +552,7 @@ pub(crate) enum Opened {
 pub(crate) trait Group {
     fn executor(&self) -> &dyn Executor;
 
-    fn driver(
-        self: Box<Self>,
-        handle: Arc<ModelHandle>,
-        options: DriverOptions,
-        placement: Placement,
-    ) -> Result<Driver, DriverError>;
+    fn driver(self: Box<Self>, plan: PlannedPrograms) -> Result<Driver, DriverError>;
 }
 
 /// A coordinator over devices of one kind.
@@ -568,13 +563,8 @@ impl<D: Device + Collectives + 'static> Group for Coordinated<D> {
         &self.0
     }
 
-    fn driver(
-        self: Box<Self>,
-        handle: Arc<ModelHandle>,
-        options: DriverOptions,
-        placement: Placement,
-    ) -> Result<Driver, DriverError> {
-        Driver::placed(handle, self.0, options, placement)
+    fn driver(self: Box<Self>, plan: PlannedPrograms) -> Result<Driver, DriverError> {
+        Driver::placed_from_plan(self.0, plan)
     }
 }
 
@@ -592,15 +582,11 @@ impl Launch {
         }
     }
 
-    fn driver(
-        self,
-        handle: Arc<ModelHandle>,
-        options: DriverOptions,
-        placement: Placement,
-    ) -> Result<Driver, DriverError> {
+    /// The serving driver, built from the programs planning compiled for the chosen candidate.
+    fn driver(self, plan: PlannedPrograms) -> Result<Driver, DriverError> {
         match self {
-            Launch::One(executor) => Driver::new(handle, executor, options),
-            Launch::Group(group) => group.driver(handle, options, placement),
+            Launch::One(executor) => Driver::from_plan(executor, plan),
+            Launch::Group(group) => group.driver(plan),
         }
     }
 }
@@ -769,6 +755,9 @@ fn fit_and_prepare(
     let mut planning_weight_bytes_read = 0u64;
     let mut planning_kernels_resolved = 0u64;
     let planning_started = Instant::now();
+    // The programs of the candidate planned last: the search stops at the first candidate that fits, so the
+    // chosen one is the last it planned, and each earlier candidate's are dropped as the next is planned.
+    let mut compiled: Option<(Candidate, PlannedPrograms)> = None;
     let fit = poot_llm::driver::capacity::fit(
         &domain(workload.rows(), workload.max_seq()),
         |candidate| {
@@ -784,18 +773,22 @@ fn fit_and_prepare(
             .with_range_check(args.check_ranges);
             let encode = encode_shapes_of(candidate);
             match workload {
-                Workload::Generate { .. } => planner.plan_workload(
+                Workload::Generate { .. } => planner.plan_workload_keeping(
                     options,
                     Some((&shapes_of(candidate, &rows), carried.as_slice())),
                     Some((&encode, EncodeNeed::IfTraced)),
                 ),
-                Workload::Encode { .. } => {
-                    planner.plan_workload(options, None, Some((&encode, EncodeNeed::Required)))
-                }
+                Workload::Encode { .. } => planner.plan_workload_keeping(
+                    options,
+                    None,
+                    Some((&encode, EncodeNeed::Required)),
+                ),
             }
-            .inspect(|planned| {
+            .map(|(planned, programs)| {
                 planning_weight_bytes_read += planned.weight_bytes_read;
                 planning_kernels_resolved += planned.kernels_resolved;
+                compiled = Some((*candidate, programs));
+                planned
             })
             .map_err(PlanFailure::Fatal)
         },
@@ -823,21 +816,14 @@ fn fit_and_prepare(
                 .map_err(|error| StartupError::Admission(error.into()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut driver = launch.driver(
-        Arc::clone(handle),
-        driver_options(
-            handle,
-            workload.fitted(&chosen),
-            args.draft.clone(),
-            args.kv_dtype,
-            args.matmul_precision,
-        )
-        .with_range_check(args.check_ranges),
-        placement.clone(),
-    )?;
-    if let Some(slots) = args.expert_pool {
-        driver = driver.with_expert_pool(slots)?;
-    }
+    // The serving driver is built from what the chosen candidate's planning compiled: its own options, placement
+    // and expert pool, and its programs, so no entry is compiled twice (POOT-1603).
+    let (planned_for, plan) = compiled.expect("the fit planned the candidate it chose");
+    debug_assert_eq!(
+        planned_for, chosen,
+        "the fit chose the candidate planned last"
+    );
+    let driver = launch.driver(plan)?;
     let rows = [chosen.rows];
     let prepare_started = Instant::now();
     let driver = match workload {
@@ -868,8 +854,8 @@ fn fit_and_prepare(
             driver
         }
     };
-    // The two startup phases compile the same entries, the first over recording devices and the second
-    // over the real one, so each costs what the other does (POOT-1600).
+    // Planning compiles each entry over recording devices; the real prepare adds the entries from those programs
+    // and compiles none (POOT-1603), so the second phase is entry loading and weight upload alone.
     tracing::info!(
         planning_secs = planning.as_secs_f64(),
         prepare_secs = prepare_started.elapsed().as_secs_f64(),

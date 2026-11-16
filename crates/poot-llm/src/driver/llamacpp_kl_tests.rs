@@ -506,6 +506,18 @@ impl Drop for TeacherForced {
 /// The reference's tokens, scored by `llama-perplexity` on `model` and `corpus`, written to `out`. `None`
 /// (after saying why) when the binary is not on `PATH`.
 pub(super) fn run_reference(model: &Path, corpus: &Path, n_ctx: usize, out: &Path) -> Option<()> {
+    run_reference_at(LLAMA_CPP_COMMIT, model, corpus, n_ctx, out)
+}
+
+/// [`run_reference`] against the `llama-perplexity` of `commit`, for a row whose gate was measured against a
+/// different llama.cpp than the one the other rows pin.
+pub(super) fn run_reference_at(
+    commit: &str,
+    model: &Path,
+    corpus: &Path,
+    n_ctx: usize,
+    out: &Path,
+) -> Option<()> {
     let version = match Command::new("llama-perplexity").arg("--version").output() {
         Ok(output) => output,
         Err(error) => {
@@ -518,8 +530,8 @@ pub(super) fn run_reference(model: &Path, corpus: &Path, n_ctx: usize, out: &Pat
     let version = String::from_utf8_lossy(&version.stderr).into_owned()
         + &String::from_utf8_lossy(&version.stdout);
     assert!(
-        version.contains(&format!("commit {LLAMA_CPP_COMMIT}")),
-        "llama-perplexity is not the pinned llama.cpp commit {LLAMA_CPP_COMMIT}: {version}; re-measure the gates"
+        version.contains(&format!("commit {commit}")),
+        "llama-perplexity is not the pinned llama.cpp commit {commit}: {version}; re-measure the gates"
     );
     let run = Command::new("llama-perplexity")
         .arg("-m")

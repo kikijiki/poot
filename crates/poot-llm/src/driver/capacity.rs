@@ -39,7 +39,9 @@ use poot_target::BufferStorage;
 
 use super::error::DriverError;
 use super::placement::{Placed, Placement};
-use super::{Driver, DriverOptions, EncodeShapes, ModelHandle, ServingShapes, State};
+use super::{
+    Driver, DriverOptions, EncodeShapes, ModelHandle, PlannedPrograms, ServingShapes, State,
+};
 
 /// One owner of device bytes: an allocation with an identity. Two records naming the same `(device, id)`
 /// are the same allocation (a shared weight, a shared state), whatever number of entries reference it.
@@ -471,6 +473,9 @@ pub struct Planned {
     /// The device and the compiler of each planned stage ([`super::DriverStats::planned_with`]): the device's
     /// compiler when the planner was given its facts, `None` for a stage planned by the register model alone.
     pub planned_with: Vec<(DeviceId, Option<poot_target::KernelCompiler>)>,
+    /// Programs the planning driver compiled (POOT-1603): one per prepared entry, the count the serving driver
+    /// no longer compiles when it is built from this candidate's [`PlannedPrograms`].
+    pub compiles: u64,
 }
 
 /// A candidate the plan step could not produce a footprint for.
@@ -908,14 +913,27 @@ impl Planner {
         self.plan_workload(options, Some((shapes, carried)), None)
     }
 
-    /// Plan one driver that serves `serving` and encodes `encode`: both preparations run on the same
-    /// recorded driver, so one footprint covers them. [`Planner::plan`] is the generation-only case.
+    /// [`Planner::plan`] for a workload, keeping nothing of the programs it compiled.
     pub fn plan_workload(
         &self,
         options: DriverOptions,
         serving: Option<(&ServingShapes<'_>, &[InputId])>,
         encode: Option<(&EncodeShapes, EncodeNeed)>,
     ) -> Result<Planned, PlanError> {
+        self.plan_workload_keeping(options, serving, encode)
+            .map(|(planned, _)| planned)
+    }
+
+    /// Plan one driver that serves `serving` and encodes `encode`: both preparations run on the same
+    /// recorded driver, so one footprint covers them. [`Planner::plan`] is the generation-only case. The
+    /// programs the planning compiled come back with the footprint, as the record the serving driver of this
+    /// candidate is built from ([`Driver::from_plan`]).
+    pub fn plan_workload_keeping(
+        &self,
+        options: DriverOptions,
+        serving: Option<(&ServingShapes<'_>, &[InputId])>,
+        encode: Option<(&EncodeShapes, EncodeNeed)>,
+    ) -> Result<(Planned, PlannedPrograms), PlanError> {
         match serving {
             Some((shapes, carried)) => self.plan_with(options, |driver| {
                 let mut driver = driver.prepare(shapes)?;
@@ -942,7 +960,7 @@ impl Planner {
         &self,
         options: DriverOptions,
         prepare: impl FnOnce(Driver) -> Result<Driver<S>, DriverError>,
-    ) -> Result<Planned, PlanError> {
+    ) -> Result<(Planned, PlannedPrograms), PlanError> {
         let records: Records = Arc::default();
         let counters: Vec<(DeviceId, MemoryCounters)> = self
             .placed
@@ -997,7 +1015,7 @@ impl Planner {
         if let Some(slots) = self.pool {
             driver = driver.with_expert_pool(slots)?;
         }
-        let driver = prepare(driver)?;
+        let driver = prepare(driver.recording())?;
         let mut footprint = Footprint::new();
         for record in records.lock().expect("planning records").iter() {
             if record.live {
@@ -1014,20 +1032,25 @@ impl Planner {
             }
         }
         let stats = driver.executor_stats();
-        let planned_with = driver.stats().planned_with;
-        drop(driver);
+        let driver_stats = driver.stats();
+        let (planned_with, compiles) = (driver_stats.planned_with, driver_stats.compiles);
+        let programs = driver.into_programs(self.placed.placement().clone(), self.pool);
         let residue = counters
             .iter()
             .map(|(device, counters)| (*device, counters.total_live_bytes()))
             .filter(|&(_, held)| held != 0)
             .collect();
-        Ok(Planned {
-            weight_bytes_read: stats.weight_bytes_read,
-            kernels_resolved: stats.kernels_resolved,
-            planned_with,
-            footprint,
-            residue,
-        })
+        Ok((
+            Planned {
+                weight_bytes_read: stats.weight_bytes_read,
+                kernels_resolved: stats.kernels_resolved,
+                planned_with,
+                compiles,
+                footprint,
+                residue,
+            },
+            programs,
+        ))
     }
 }
 
@@ -1378,6 +1401,7 @@ mod tests {
                     weight_bytes_read: 0,
                     kernels_resolved: 0,
                     planned_with: Vec::new(),
+                    compiles: 0,
                 })
             },
             || budget.clone(),
@@ -1490,6 +1514,7 @@ mod tests {
             weight_bytes_read: 0,
             kernels_resolved: 0,
             planned_with: Vec::new(),
+            compiles: 0,
         }
     }
 

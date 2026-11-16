@@ -185,6 +185,12 @@ pub(crate) fn host_gather_tables(
             (Storage::Device, _) if producer.contains_key(&index) => IndexKind::Device,
             _ => continue,
         };
+        // The host copies a device-indexed site's rows at a sync right before the first equation that reads
+        // them. Rows no equation reads (the gather's output is the graph's output) have no such point, so the
+        // gather stays on the device.
+        if matches!(source, IndexKind::Device) && !readers.contains_key(&eqn.out) {
+            continue;
+        }
         // The rows are floats: an index table (a hash router's I32 words) is no embedding.
         if g.aval(eqn.out).dtype.class() != DTypeClass::Arithmetic {
             continue;
@@ -488,7 +494,9 @@ mod tests {
             })
             .collect();
         let table = b.packed_dequant(&sources, descriptor).unwrap();
-        let mut out = b.gather(table, 0, ids).unwrap();
+        // A model reads the gathered rows: a device-indexed site is cut right before that reader.
+        let rows = b.gather(table, 0, ids).unwrap();
+        let mut out = b.unary(poot_graph_ir::UnOp::Neg, rows).unwrap();
         if tied_head {
             let x = b.reshape(out, vec![2, 160]).unwrap();
             out = b
@@ -632,6 +640,32 @@ mod tests {
                 .iter()
                 .any(|e| e.out == boundary.0 && matches!(e.op, OpKind::Binary(BinOp::Add))),
             "the index producer stays in the graph"
+        );
+    }
+
+    /// A gather by a device-computed index whose rows no equation reads (they are the graph's output) has no
+    /// equation to cut the program before, so it is not hosted: the gather and its table stay in the graph.
+    ///
+    /// Mutation: drop the `readers.contains_key(&eqn.out)` check in the candidate scan; the gather is hosted
+    /// and the first assertion goes red (`no site`).
+    #[test]
+    fn a_device_indexed_gather_whose_rows_are_the_output_stays_on_the_device() {
+        let b = Builder::for_tests();
+        let ids = b.iota_i32(4).unwrap();
+        let table = b
+            .weight(WeightRef::whole(EMBED), TensorType::f32(vec![6, 4]))
+            .unwrap();
+        let rows = b.gather(table, 0, ids).unwrap();
+        let g = b.finish(rows).unwrap();
+        let hosted = host_gather_tables(&g, &poot_weights::WeightAliases::none()).unwrap();
+        assert!(hosted.sites.is_empty(), "no site");
+        assert!(
+            hosted
+                .graph
+                .eqns()
+                .iter()
+                .any(|e| matches!(e.op, OpKind::Gather { .. })),
+            "the gather stays in the graph"
         );
     }
 

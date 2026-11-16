@@ -66,6 +66,8 @@ try:
         CURVE_KIND,
         MEASUREMENT_IDENTITY_FIELDS,
         ResultValidationError,
+        committed_env_errors,
+        known_null_image_digest_sets,
         runner_refusal,
         timing_claim,
         validate_runner_result,
@@ -85,6 +87,8 @@ except ImportError:  # direct `python harness/bench.py` execution
         CURVE_KIND,
         MEASUREMENT_IDENTITY_FIELDS,
         ResultValidationError,
+        committed_env_errors,
+        known_null_image_digest_sets,
         runner_refusal,
         timing_claim,
         validate_runner_result,
@@ -959,7 +963,24 @@ def cmd_compare_committed(args):
             cells, known_unverified.load(args.known_unverified or (None if args.results_dir else known_unverified.committed_path())),
             lambda key: _compare_cell(key, None, None, policy))
     print(render_compare(baseline_dirs, candidate_dirs, cells))
-    return compare_exit_code(cells)
+    code = compare_exit_code(cells)
+    env_errors = committed_set_env_errors(results_dir)
+    for error in env_errors:
+        print(f"unattributable: {error}", file=sys.stderr)
+    return code or (2 if env_errors else 0)
+
+
+def committed_set_env_errors(results_dir):
+    """Why a committed run directory is not tied to the image that ran it: each `env.json` is held to
+    `committed_env_errors`, apart from the sets the allow-list names."""
+    known_null = known_null_image_digest_sets()
+    errors = []
+    for name, dirs in committed_sets(results_dir).items():
+        for run_dir in dirs:
+            env_path = run_dir / "env.json"
+            env = json.loads(env_path.read_text()) if env_path.exists() else {}
+            errors += committed_env_errors(env, run_dir.name, name in known_null)
+    return errors
 
 
 def _without_error_only_cells(cells, rows):

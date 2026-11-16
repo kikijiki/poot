@@ -20,7 +20,7 @@ from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parents[2] / "harness"
 sys.path.insert(0, str(HARNESS))
-from result_contract import validate_runner_result  # noqa: E402
+from result_contract import IMAGE_DIGEST, validate_runner_result  # noqa: E402
 
 
 def read_env(path):
@@ -56,6 +56,12 @@ def main():
 
     timing = json.loads((sweep / "raw" / "poot_curve.json").read_text())
     env = read_env(sweep / "env.txt")
+    # The pod's sweep records the digest of the image it ran in (`orchestrator exec` exports it): a snapshot that
+    # cannot name its image is refused, as `bench compare-committed` refuses a committed set without one.
+    image_digest = env.get("image_digest", "")
+    if not IMAGE_DIGEST.fullmatch(image_digest):
+        sys.exit(f"ingest: {sweep / 'env.txt'} has no sha256 image_digest (got {image_digest!r}): the sweep did not "
+                 "run under `orchestrator exec`, so its results cannot be tied to an image")
     scenario = {"id": "decode-curve", "kind": "decode-curve",
                 "isl": [p["isl"] for p in timing["curve"]], "osl": timing["osl"]}
     prepared = validate_runner_result(timing, framework="poot", precision=timing["precision"], scenario=scenario,
@@ -88,6 +94,7 @@ def main():
         "gpu_name": env.get("gpu_name"), "gpu_driver": env.get("driver"),
         "gpu_memory_total": f"{env.get('gpu_mem_mib')} MiB", "cuda_version": env.get("image_cuda") or driver_cuda(sweep, env),
         "host_kernel": env.get("kernel"), "cpu": f"{env.get('host_cpus')} vCPU, {env.get('host_mem_gib')} GiB host RAM",
+        "image_digest": image_digest,
         "harness_version": "pod-sweep (benchmarks/pod/qwen38-27b), not bench.py run",
         "poot_git_sha": timing.get("build_sha"), "backend": "ptx (nvptx, cudarc driver)",
         "checkpoint": "Qwen/Qwen3.8-27B-FP8 (FP8 weights as stored; --precision bf16 labels the compute dtype)",

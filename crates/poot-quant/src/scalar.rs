@@ -139,6 +139,16 @@ pub const fn half_step_to_f32(bits: u32, exponent: i32) -> f32 {
     (bits as f32 + 0.5) * f32::from_bits(((127 + exponent) as u32) << 23)
 }
 
+/// `(-1)^bits * 2^exponent`, the value of a one-bit [`crate::format::FieldEncoding::SignedPowerOfTwo`] field.
+pub const fn signed_power_of_two_to_f32(bits: u32, exponent: i32) -> f32 {
+    assert!(bits <= 1, "a one-bit field");
+    assert!(
+        -126 <= exponent && exponent <= 127,
+        "a normal f32 power of two"
+    );
+    f32::from_bits((bits << 31) | (((127 + exponent) as u32) << 23))
+}
+
 /// Decode `bits` (the low [`FloatFormat::bits`] bits) of a stored float.
 pub const fn float_to_f32(format: FloatFormat, bits: u32) -> f32 {
     match format {
@@ -154,6 +164,20 @@ pub const fn float_to_f32(format: FloatFormat, bits: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-bit shift field is `(-1)^bit * 2^exponent`, exact: ggml's `IQ1S_DELTA` is `+/-0.125`, and the sign
+    /// bit of the result is the stored bit. Mutation: return `+2^exponent` for bit 1; the second assertion fails
+    /// with `left: 0.125, right: -0.125`.
+    #[test]
+    fn a_signed_power_of_two_is_the_sign_of_its_bit() {
+        assert_eq!(signed_power_of_two_to_f32(0, -3), 0.125);
+        assert_eq!(signed_power_of_two_to_f32(1, -3), -0.125);
+        assert_eq!(
+            signed_power_of_two_to_f32(1, 2).to_bits(),
+            (-4.0f32).to_bits()
+        );
+        assert_eq!(signed_power_of_two_to_f32(0, 0), 1.0);
+    }
 
     /// One f16 ulp in `[1, 2)`.
     const ULP_1: f32 = 1.0 / 1024.0;

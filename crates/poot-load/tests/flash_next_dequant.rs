@@ -34,6 +34,8 @@ use poot_load::gguf::weight_format_of;
 
 const SAMPLES: &str = include_str!("data/flash_next_dequant_samples.tsv");
 const TQ2_0_SAMPLES: &str = include_str!("data/bitnet_tq2_0_dequant_samples.tsv");
+const IQ1_SAMPLES: &str = include_str!("data/iq1_dequant_samples.tsv");
+const TQ1_0_SAMPLES: &str = include_str!("data/trilm_tq1_0_dequant_samples.tsv");
 
 fn unhex(hex: &str) -> Vec<u8> {
     (0..hex.len() / 2)
@@ -162,6 +164,63 @@ fn dq4_tq2_0_real_blocks_decode_to_the_reference() {
         {
             panic!(
                 "{} (ggml type 35) at byte {}: value {at} decodes to {} ({:#010x}), the reference says {} ({:#010x})",
+                sample.tensor,
+                sample.offset,
+                got[at],
+                got[at].to_bits(),
+                sample.expected[at],
+                sample.expected[at].to_bits()
+            );
+        }
+    }
+}
+
+/// POOT-1541 SC-4: real `IQ1_S` and `IQ1_M` blocks, three runs of four of `blk.11.ffn_down.weight` of the
+/// Qwen2.5-0.5B-Instruct IQ1_S and IQ1_M GGUFs (`data/iq1_dequant_samples.tsv`), decode to the values llama.cpp's
+/// `to_float` gives them, bit for bit. (Every IQ1 tensor of both files, 183 million values, was compared the same
+/// way in the card's receipt.) Mutation: change the shift's exponent in `blocks/lattice.rs` from -3 to -2; red
+/// on the first row of each type.
+#[test]
+fn dq5_iq1_real_blocks_decode_to_the_reference() {
+    let samples = samples(IQ1_SAMPLES);
+    assert_eq!(samples.len(), 6);
+    for sample in &samples {
+        assert!(matches!(sample.ggml_type, 19 | 29), "{}", sample.tensor);
+        let got = decode(sample);
+        assert_eq!(got.len(), sample.expected.len(), "{}", sample.tensor);
+        if let Some(at) = (0..got.len()).find(|&i| got[i].to_bits() != sample.expected[i].to_bits())
+        {
+            panic!(
+                "{} (ggml type {}) at byte {}: value {at} decodes to {} ({:#010x}), the reference says {} ({:#010x})",
+                sample.tensor,
+                sample.ggml_type,
+                sample.offset,
+                got[at],
+                got[at].to_bits(),
+                sample.expected[at],
+                sample.expected[at].to_bits()
+            );
+        }
+    }
+}
+
+/// POOT-1542 SC-5: real `TQ1_0` blocks, three runs of four of `blk.11.ffn_down.weight` of the TriLM 1.1B `TQ1_0`
+/// GGUF (`data/trilm_tq1_0_dequant_samples.tsv`), decode to the values llama.cpp b9190's `to_float` gives them, bit
+/// for bit. (Every `TQ1_0` tensor of the file, 168 of them, was compared the same way in the card's receipt.)
+/// Mutation: move the second segment of `TQ1_0`'s codes in `blocks/lattice.rs` from element 160 to 128; red on the
+/// first row, at value 128.
+#[test]
+fn dq6_tq1_0_real_blocks_decode_to_the_reference() {
+    let samples = samples(TQ1_0_SAMPLES);
+    assert_eq!(samples.len(), 3);
+    for sample in &samples {
+        assert_eq!(sample.ggml_type, 34, "{}", sample.tensor);
+        let got = decode(sample);
+        assert_eq!(got.len(), sample.expected.len(), "{}", sample.tensor);
+        if let Some(at) = (0..got.len()).find(|&i| got[i].to_bits() != sample.expected[i].to_bits())
+        {
+            panic!(
+                "{} (ggml type 34) at byte {}: value {at} decodes to {} ({:#010x}), the reference says {} ({:#010x})",
                 sample.tensor,
                 sample.offset,
                 got[at],

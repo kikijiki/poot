@@ -52,6 +52,9 @@ pub(super) struct PreparedLedger {
     pub(super) caps: Option<DriverCaps>,
     /// The token-row shapes `prepare_encode` admitted; `None` for a driver that serves none.
     pub(super) encode_shapes: Option<EncodeShapes>,
+    /// Where each entry's compiled program comes from: compiled, or taken from a planning pass
+    /// ([`super::programs`]).
+    pub(super) programs: super::programs::Programs,
 }
 
 impl PreparedLedger {

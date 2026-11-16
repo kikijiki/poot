@@ -1,7 +1,7 @@
 //! The K-quants: 256-value super-blocks of integer codes with packed sub-block scales and mins, and
 //! `TQ2_0`, the 256-value ternary block of one scale.
 
-use super::{HALF, QK_K, UNSIGNED, WHOLE_QK_K, blocks, digit, piece};
+use super::{HALF, QK_K, UNSIGNED, WHOLE_QK_K, blocks, digit};
 use crate::format::{FieldEncoding, FormatDescriptor, MinSign, ValueMap, WeightFormat};
 
 /// `Q2_K` (ggml type 10): `[scales u8[16]][qs u8[64]][d f16][dmin f16]`, 84 bytes per 256.
@@ -14,25 +14,25 @@ pub(crate) const Q2_K: FormatDescriptor = FormatDescriptor {
         QK_K,
         84,
         &[
-            field!(Scale, "d", HALF, [piece(640, WHOLE_QK_K, 16)]),
-            field!(Min, "dmin", HALF, [piece(656, WHOLE_QK_K, 16)]),
+            field!(Scale, "d", HALF, [piece!(640, WHOLE_QK_K, 16)]),
+            field!(Min, "dmin", HALF, [piece!(656, WHOLE_QK_K, 16)]),
             field!(
                 SubScale,
                 "scales",
                 UNSIGNED,
-                [piece(0, &[digit(16, 8), digit(16, 0)], 4)]
+                [piece!(0, &[digit(16, 8), digit(16, 0)], 4)]
             ),
             field!(
                 SubMin,
                 "scales",
                 UNSIGNED,
-                [piece(4, &[digit(16, 8), digit(16, 0)], 4)]
+                [piece!(4, &[digit(16, 8), digit(16, 0)], 4)]
             ),
             field!(
                 Codes,
                 "qs",
                 UNSIGNED,
-                [piece(
+                [piece!(
                     128,
                     &[digit(2, 256), digit(4, 2), digit(2, 128), digit(16, 8)],
                     2
@@ -56,18 +56,18 @@ pub(crate) const Q3_K: FormatDescriptor = FormatDescriptor {
         QK_K,
         110,
         &[
-            field!(Scale, "d", HALF, [piece(864, WHOLE_QK_K, 16)]),
+            field!(Scale, "d", HALF, [piece!(864, WHOLE_QK_K, 16)]),
             field!(
                 SubScale,
                 "scales",
                 FieldEncoding::Unsigned { offset: -32 },
                 [
-                    piece(
+                    piece!(
                         768,
                         &[digit(2, 4), digit(4, 16), digit(2, 8), digit(16, 0)],
                         4
                     ),
-                    piece(
+                    piece!(
                         832,
                         &[
                             digit(2, 4),
@@ -85,12 +85,12 @@ pub(crate) const Q3_K: FormatDescriptor = FormatDescriptor {
                 "qs+hmask",
                 FieldEncoding::Unsigned { offset: -4 },
                 [
-                    piece(
+                    piece!(
                         256,
                         &[digit(2, 256), digit(4, 2), digit(2, 128), digit(16, 8)],
                         2
                     ),
-                    piece(
+                    piece!(
                         0,
                         &[digit(2, 4), digit(4, 1), digit(2, 128), digit(16, 8)],
                         1
@@ -113,8 +113,8 @@ macro_rules! k4_sub_scales {
                 "scales",
                 UNSIGNED,
                 [
-                    piece($base, &[digit(2, 64), digit(4, 8), digit(32, 0)], 4),
-                    piece($base + 4, &[digit(2, 2), digit(4, 8), digit(32, 0)], 2),
+                    piece!($base, &[digit(2, 64), digit(4, 8), digit(32, 0)], 4),
+                    piece!($base + 4, &[digit(2, 2), digit(4, 8), digit(32, 0)], 2),
                 ]
             ),
             field!(
@@ -122,8 +122,8 @@ macro_rules! k4_sub_scales {
                 "scales",
                 UNSIGNED,
                 [
-                    piece($base + 32, &[digit(2, 36), digit(4, 8), digit(32, 0)], 4),
-                    piece($base + 36, &[digit(2, 2), digit(4, 8), digit(32, 0)], 2),
+                    piece!($base + 32, &[digit(2, 36), digit(4, 8), digit(32, 0)], 4),
+                    piece!($base + 36, &[digit(2, 2), digit(4, 8), digit(32, 0)], 2),
                 ]
             ),
         ]
@@ -141,15 +141,15 @@ pub(crate) const Q4_K: FormatDescriptor = FormatDescriptor {
         QK_K,
         144,
         &[
-            field!(Scale, "d", HALF, [piece(0, WHOLE_QK_K, 16)]),
-            field!(Min, "dmin", HALF, [piece(16, WHOLE_QK_K, 16)]),
+            field!(Scale, "d", HALF, [piece!(0, WHOLE_QK_K, 16)]),
+            field!(Min, "dmin", HALF, [piece!(16, WHOLE_QK_K, 16)]),
             K4_SUB_SCALES[0],
             K4_SUB_SCALES[1],
             field!(
                 Codes,
                 "qs",
                 UNSIGNED,
-                [piece(128, &[digit(4, 256), digit(2, 4), digit(32, 8)], 4)]
+                [piece!(128, &[digit(4, 256), digit(2, 4), digit(32, 8)], 4)]
             ),
         ],
     ),
@@ -166,8 +166,8 @@ pub(crate) const Q5_K: FormatDescriptor = FormatDescriptor {
         QK_K,
         176,
         &[
-            field!(Scale, "d", HALF, [piece(0, WHOLE_QK_K, 16)]),
-            field!(Min, "dmin", HALF, [piece(16, WHOLE_QK_K, 16)]),
+            field!(Scale, "d", HALF, [piece!(0, WHOLE_QK_K, 16)]),
+            field!(Min, "dmin", HALF, [piece!(16, WHOLE_QK_K, 16)]),
             K4_SUB_SCALES[0],
             K4_SUB_SCALES[1],
             field!(
@@ -175,8 +175,8 @@ pub(crate) const Q5_K: FormatDescriptor = FormatDescriptor {
                 "qs+qh",
                 UNSIGNED,
                 [
-                    piece(384, &[digit(4, 256), digit(2, 4), digit(32, 8)], 4),
-                    piece(128, &[digit(4, 2), digit(2, 1), digit(32, 8)], 1),
+                    piece!(384, &[digit(4, 256), digit(2, 4), digit(32, 8)], 4),
+                    piece!(128, &[digit(4, 2), digit(2, 1), digit(32, 8)], 1),
                 ]
             ),
         ],
@@ -195,12 +195,12 @@ pub(crate) const Q6_K: FormatDescriptor = FormatDescriptor {
         QK_K,
         210,
         &[
-            field!(Scale, "d", HALF, [piece(1664, WHOLE_QK_K, 16)]),
+            field!(Scale, "d", HALF, [piece!(1664, WHOLE_QK_K, 16)]),
             field!(
                 SubScale,
                 "scales",
                 FieldEncoding::Signed,
-                [piece(
+                [piece!(
                     1536,
                     &[digit(2, 64), digit(4, 16), digit(2, 8), digit(16, 0)],
                     8
@@ -211,12 +211,12 @@ pub(crate) const Q6_K: FormatDescriptor = FormatDescriptor {
                 "ql+qh",
                 FieldEncoding::Unsigned { offset: -32 },
                 [
-                    piece(
+                    piece!(
                         0,
                         &[digit(2, 512), digit(2, 4), digit(2, 256), digit(32, 8)],
                         4
                     ),
-                    piece(
+                    piece!(
                         1024,
                         &[digit(2, 256), digit(2, 4), digit(2, 2), digit(32, 8)],
                         2
@@ -238,12 +238,12 @@ pub(crate) const TQ2_0: FormatDescriptor = FormatDescriptor {
         QK_K,
         66,
         &[
-            field!(Scale, "d", HALF, [piece(512, WHOLE_QK_K, 16)]),
+            field!(Scale, "d", HALF, [piece!(512, WHOLE_QK_K, 16)]),
             field!(
                 Codes,
                 "qs",
                 FieldEncoding::Unsigned { offset: -1 },
-                [piece(0, &[digit(2, 256), digit(4, 2), digit(32, 8)], 2)]
+                [piece!(0, &[digit(2, 256), digit(4, 2), digit(32, 8)], 2)]
             ),
         ],
     ),

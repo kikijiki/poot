@@ -16,7 +16,7 @@
 //! blocks, so there is no packed arm here.
 
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
-use poot_weights::{ExpertProj, MoeRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{ExpertProj, MoeRole, WeightId, WeightMap, WeightRole, WeightView};
 
 use super::ffn::{Glu, glu};
 use super::linear::{Weight, WeightError, linear};
@@ -254,7 +254,13 @@ impl ExpertProjection {
     ) -> Result<Self, WeightError> {
         let experts = p.experts();
         let id = |role| WeightId::layer(layer, WeightRole::Moe(role));
-        let shape = match p.orientation {
+        // A packed stack is `experts` owners of `[out, K]` each, whatever layout a dense stack of the
+        // same checkpoint family uses (gpt-oss: bf16 `[E, K, out]`, MXFP4 blocks `[E, out, K/32, 16]`).
+        let orientation = match map.view(id(MoeRole::Stack(proj))) {
+            Some(WeightView::ExpertStack(_)) => Orientation::OutIn,
+            _ => p.orientation,
+        };
+        let shape = match orientation {
             Orientation::OutIn => vec![experts, out, k],
             Orientation::InOut => vec![experts, k, out],
         };
@@ -265,7 +271,7 @@ impl ExpertProjection {
             .transpose()?;
         Ok(Self {
             weight,
-            orientation: p.orientation,
+            orientation,
             bias,
             out,
         })

@@ -3,8 +3,8 @@
 //! bit pattern of every field is exercised.
 
 use crate::format::{
-    FieldEncoding, FloatFormat, GroupMap, OperandRole, PlanarRole, ScaleEncoding, Storage,
-    WeightFormat,
+    BlockLayout, FieldEncoding, FloatFormat, GroupMap, OperandRole, PlanarRole, ScaleEncoding,
+    Storage, WeightFormat,
 };
 use crate::{PackedPayload, PackedWeight, SourceRole, StoredBytes};
 
@@ -36,6 +36,49 @@ fn sanitize_float(value: &mut [u8], float: FloatFormat) {
     }
 }
 
+/// Force the `Scale` and `Min` floats of one block into the admitted (finite) domain: random bytes land on an F16
+/// infinity or NaN or on E8M0 `0xff` roughly one block in a few hundred, which a payload refuses. A factor is one
+/// value for the whole block, so it is read and rewritten at element 0, through however many pieces it has
+/// (`IQ1_M`'s f16 scale is four). The codes are never touched: none can encode a non-finite value.
+pub fn sanitize_block_factors(layout: BlockLayout, block: &mut [u8]) {
+    for role in [OperandRole::Scale, OperandRole::Min] {
+        let Some(field) = layout.field(role) else {
+            continue;
+        };
+        if let FieldEncoding::Float(float) = field.field.encoding {
+            let bits = read_field_bits(block, &field.field, 0);
+            write_field_bits(block, &field.field, 0, sanitized_bits(float, bits));
+        }
+    }
+}
+
+/// `bits` of a stored `float`, moved to the nearest admitted pattern: the top exponent bit cleared, E8M0's NaN
+/// byte lowered, E4M3's NaN mantissa cleared.
+fn sanitized_bits(float: FloatFormat, bits: u32) -> u32 {
+    match float {
+        FloatFormat::F16 | FloatFormat::Bf16 => bits & !0x4000,
+        FloatFormat::E4m3Fn if bits & 0x7f == 0x7f => bits & !0x01,
+        FloatFormat::E8m0 => bits.min(0xfe),
+        FloatFormat::F32 => bits & !0x4000_0000,
+        FloatFormat::E4m3Fn | FloatFormat::E2m1 => bits,
+    }
+}
+
+/// The raw bits of `field` at in-block element `index`: its pieces, low bits first ([`write_field_bits`]'s inverse).
+fn read_field_bits(block: &[u8], field: &crate::format::Field, index: u32) -> u32 {
+    let mut value = 0u32;
+    let mut below = 0;
+    for piece in field.pieces {
+        let start = piece.layout.bit(index) as usize;
+        for bit in 0..piece.width as usize {
+            let (byte, shift) = ((start + bit) / 8, (start + bit) % 8);
+            value |= u32::from((block[byte] >> shift) & 1) << (below + bit);
+        }
+        below += piece.width as usize;
+    }
+    value
+}
+
 /// An admitted-domain payload of `format` at `[out, K]` `shape`: random codes, sanitized float
 /// factors, and (act-order GPTQ) an in-range group index.
 pub fn random_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> PackedPayload {
@@ -52,15 +95,7 @@ pub fn random_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> Pac
                 (Storage::Blocks(layout), SourceRole::Blocks) => {
                     let mut bytes = random_bytes(weight.source_bytes(role), seed);
                     for block in bytes.chunks_mut(layout.bytes) {
-                        for field_role in [OperandRole::Scale, OperandRole::Min] {
-                            let Some(field) = layout.field(field_role) else {
-                                continue;
-                            };
-                            if let FieldEncoding::Float(float) = field.field.encoding {
-                                let byte = (field.field.pieces[0].layout.bit(0) / 8) as usize;
-                                sanitize_float(&mut block[byte..], float);
-                            }
-                        }
+                        sanitize_block_factors(layout, block);
                     }
                     bytes
                 }
@@ -272,7 +307,10 @@ fn field_values(field: &crate::format::BlockField) -> Vec<u32> {
                 unreachable!("no block format stores a {float:?} factor")
             }
         },
-        FieldEncoding::Unsigned { .. } | FieldEncoding::Signed | FieldEncoding::HalfStep { .. } => {
+        FieldEncoding::Unsigned { .. }
+        | FieldEncoding::Signed
+        | FieldEncoding::HalfStep { .. }
+        | FieldEncoding::SignedPowerOfTwo { .. } => {
             assert!(width <= 16, "a {width}-bit integer field is not swept");
             (0..1u32 << width).collect()
         }

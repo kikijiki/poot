@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::decode::DecodeError;
 use crate::format::{
-    BlockLayout, FieldEncoding, FloatFormat, FormatDescriptor, NonFinite, OperandRole,
+    BlockField, BlockLayout, FieldEncoding, FloatFormat, FormatDescriptor, NonFinite, OperandRole,
     PlanarOperand, Storage, WeightFormat,
 };
 
@@ -35,6 +35,19 @@ fn load(bytes: &[u8], at: usize, width: usize) -> u32 {
     }
 }
 
+/// The bits of a float stored in `pieces`, low bits first.
+fn gather(block: &[u8], pieces: &[Gathered]) -> u32 {
+    let mut bits = 0;
+    let mut below = 0;
+    for piece in pieces {
+        for at in piece.bit..piece.bit + piece.width as usize {
+            bits |= u32::from(block[at / 8] >> (at % 8) & 1) << below;
+            below += 1;
+        }
+    }
+    bits
+}
+
 /// One stored float of a block, at a fixed byte offset; `element` is the first in-block element
 /// whose value it is.
 #[derive(Clone, Copy, Debug)]
@@ -43,13 +56,28 @@ struct Read {
     element: usize,
 }
 
+/// One piece of a float stored in several: `width` bits at bit `bit` of the block.
+#[derive(Clone, Copy, Debug)]
+struct Gathered {
+    bit: usize,
+    width: u32,
+}
+
+/// Where the stored floats of a field sit in one block.
+#[derive(Clone, Debug)]
+enum Stored {
+    /// Whole, byte-aligned floats of `width` bytes: the distinct ones of the block, by first element.
+    Whole { width: usize, reads: Vec<Read> },
+    /// One float for the whole block, assembled from several pieces low bits first (`IQ1_M`'s f16
+    /// super-scale, the top nibbles of four words); `element` is its first element, 0.
+    Pieced { pieces: Vec<Gathered> },
+}
+
 #[derive(Clone, Debug)]
 struct CheckedField {
     role: OperandRole,
-    width: usize,
     non_finite: NonFinite,
-    /// The distinct stored floats of this field in one block, by first element.
-    reads: Vec<Read>,
+    stored: Stored,
 }
 
 /// The content check of a block format: per field with a non-finite pattern, the distinct stored
@@ -139,7 +167,12 @@ impl FormatDescriptor {
             };
             let width = float_width(float);
             let [piece] = block_field.field.pieces else {
-                return Err(unsupported(self, block_field.role));
+                checked.push(CheckedField {
+                    role: block_field.role,
+                    non_finite,
+                    stored: self.pieced_float(block_field, float, bytes, values)?,
+                });
+                continue;
             };
             if piece.width != float.bits() {
                 return Err(unsupported(self, block_field.role));
@@ -160,9 +193,8 @@ impl FormatDescriptor {
             }
             checked.push(CheckedField {
                 role: block_field.role,
-                width,
                 non_finite,
-                reads,
+                stored: Stored::Whole { width, reads },
             });
         }
         Ok(BlockContentCheck {
@@ -170,6 +202,37 @@ impl FormatDescriptor {
             values,
             fields: checked,
         })
+    }
+
+    /// The pieces of a float `field` stored in several, which must hold one value for the whole block (every
+    /// element reads the same bits) and add up to the float's width.
+    fn pieced_float(
+        &self,
+        field: &BlockField,
+        float: FloatFormat,
+        bytes: usize,
+        values: usize,
+    ) -> Result<Stored, DecodeError> {
+        let unsupported = || unsupported(self, field.role);
+        if field.field.width() != float.bits() {
+            return Err(unsupported());
+        }
+        let pieces = field
+            .field
+            .pieces
+            .iter()
+            .map(|piece| {
+                let bit = piece.layout.bit(0) as usize;
+                let whole_block =
+                    (1..values).all(|element| piece.layout.bit(element as u32) as usize == bit);
+                (whole_block && bit + piece.width as usize <= bytes * 8).then_some(Gathered {
+                    bit,
+                    width: piece.width,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(unsupported)?;
+        Ok(Stored::Pieced { pieces })
     }
 
     /// Compile the content check of a planar operand, or `None` when no stored element can be
@@ -224,13 +287,23 @@ impl BlockContentCheck {
     ) -> Option<(OperandRole, usize)> {
         for (block_index, block) in bytes.chunks_exact(self.block_bytes).enumerate() {
             for field in &self.fields {
-                for read in &field.reads {
-                    tally.float_read();
-                    if field
-                        .non_finite
-                        .matches(load(block, read.byte, field.width))
-                    {
-                        return Some((field.role, block_index * self.values + read.element));
+                match &field.stored {
+                    Stored::Whole { width, reads } => {
+                        for read in reads {
+                            tally.float_read();
+                            if field.non_finite.matches(load(block, read.byte, *width)) {
+                                return Some((
+                                    field.role,
+                                    block_index * self.values + read.element,
+                                ));
+                            }
+                        }
+                    }
+                    Stored::Pieced { pieces } => {
+                        tally.float_read();
+                        if field.non_finite.matches(gather(block, pieces)) {
+                            return Some((field.role, block_index * self.values));
+                        }
                     }
                 }
             }
@@ -339,11 +412,44 @@ mod tests {
         bytes[at..at + width].copy_from_slice(&pattern.to_le_bytes()[..width]);
     }
 
-    /// The first in-block element whose field bits start at `bit`, found by walking the layout.
-    fn first_element_at(layout: crate::format::BitLayout, values: usize, bit: u32) -> usize {
-        (0..values)
-            .find(|&i| layout.bit(i as u32) == bit)
-            .expect("the bit belongs to some element")
+    /// `pattern` written into the bits of `field` at in-block element `element` of the block at byte `block_at`:
+    /// its pieces take the bits low first, each at the offset its own layout gives.
+    fn plant_field(
+        bytes: &mut [u8],
+        block_at: usize,
+        field: &crate::format::Field,
+        element: u32,
+        pattern: u32,
+    ) {
+        let mut below = 0;
+        for piece in field.pieces {
+            let start = block_at * 8 + piece.layout.bit(element) as usize;
+            for bit in 0..piece.width as usize {
+                let at = start + bit;
+                let value = (pattern >> (below + bit) & 1) as u8;
+                bytes[at / 8] = bytes[at / 8] & !(1 << (at % 8)) | value << (at % 8);
+            }
+            below += piece.width as usize;
+        }
+    }
+
+    /// The distinct stored positions of `field` in a block, each with the first element that reads it: elements
+    /// whose pieces all sit at the same bits share one.
+    fn stored_positions(field: &crate::format::Field, values: usize) -> Vec<u32> {
+        let mut seen: Vec<Vec<u32>> = Vec::new();
+        let mut first = Vec::new();
+        for element in 0..values as u32 {
+            let bits: Vec<u32> = field
+                .pieces
+                .iter()
+                .map(|piece| piece.layout.bit(element))
+                .collect();
+            if !seen.contains(&bits) {
+                seen.push(bits);
+                first.push(element);
+            }
+        }
+        first
     }
 
     /// SC-002 (blocks): every `Float` field with a non-finite pattern of every block format, at the
@@ -368,26 +474,19 @@ mod tests {
                     continue;
                 };
                 for pattern in non_finite_patterns(float) {
-                    let width = float.bits() as usize / 8;
-                    let piece = field.field.pieces[0];
                     // Plant at every distinct stored position of the field, one block at a time.
-                    let positions: BTreeSet<u32> = (0..layout.values as u32)
-                        .map(|i| piece.layout.bit(i))
-                        .collect();
+                    let positions = stored_positions(&field.field, layout.values);
                     for block in [0, BLOCKS / 2, BLOCKS - 1] {
-                        for &bit in &positions {
+                        for &element in &positions {
                             let mut bytes = vec![0u8; layout.bytes * BLOCKS];
-                            plant(
+                            plant_field(
                                 &mut bytes,
-                                block * layout.bytes + bit as usize / 8,
-                                width,
+                                block * layout.bytes,
+                                &field.field,
+                                element,
                                 pattern,
                             );
-                            let expected = (
-                                field.role,
-                                block * layout.values
-                                    + first_element_at(piece.layout, layout.values, bit),
-                            );
+                            let expected = (field.role, block * layout.values + element as usize);
                             let check = descriptor.block_content_check().unwrap();
                             assert_eq!(
                                 check.first_non_finite(&bytes, &mut ()),

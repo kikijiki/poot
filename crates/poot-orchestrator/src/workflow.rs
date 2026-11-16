@@ -22,7 +22,7 @@ use crate::heal::{
 };
 use crate::hf;
 use crate::image_resolve::{
-    DigestResolver, ImageLabels, RegistryV2Resolver, image_min_cuda, pin_image,
+    DigestResolver, ImageLabels, RegistryV2Resolver, image_min_cuda, pin_image, pinned_digest,
 };
 use crate::logging::{list_logs, log, logs_dir, read_log_tail, run_streaming, set_log_sink};
 use crate::manifest::{Model, parse_manifest_models, select_models};
@@ -415,7 +415,7 @@ pub(crate) fn cmd_exec(db: &Db, state_db: &str, a: ExecArgs) -> Result<()> {
         }
     }
     let resolver = RegistryV2Resolver::new()?;
-    let ExecPod { pod_id, host, port } = acquire_exec_pod(
+    let pod = acquire_exec_pod(
         db,
         &rp,
         &resolver,
@@ -432,8 +432,8 @@ pub(crate) fn cmd_exec(db: &Db, state_db: &str, a: ExecArgs) -> Result<()> {
         &env,
         PROVISION_POLL_INTERVAL,
     )?;
-    let remote = ssh::Endpoint::new(host, port, ssh_key, scratch.known_hosts());
-    exec_on_pod(db, &rp, &remote, &a, &run_id, &logpath, &pod_id)
+    let remote = ssh::Endpoint::new(pod.host.clone(), pod.port, ssh_key, scratch.known_hosts());
+    exec_on_pod(db, &rp, &remote, &a, &run_id, &logpath, &pod)
 }
 
 /// Run `teardown` when the process gets SIGINT or SIGTERM, then `then`. The handler runs on its own
@@ -486,14 +486,15 @@ fn exec_on_pod<P: PodApi + ?Sized, R: Remote + ?Sized>(
     a: &ExecArgs,
     run_id: &str,
     logpath: &Path,
-    pod_id: &str,
+    pod: &ExecPod,
 ) -> Result<()> {
+    let pod_id = pod.pod_id.as_str();
     // Run the body, capturing the result so the pod is always torn down (unless --keep).
     // `Ok(bool)` means the command ran over SSH (so the pod's control plane is healthy) and the bool is
     // its exit status; `Err` is a transport/environment failure (`wait_ssh`, `scp_up`, a failed
     // remote step, the `--max-cmd` timeout) before the command's result was known, i.e. a possibly
     // half-broken pod. Card 407.
-    let result = exec_body(remote, a, logpath);
+    let result = exec_body(remote, a, logpath, &pod.image_digest);
 
     // Cap on keep-warm minutes after a non-zero exit: callers are likelier to abandon a red run than
     // come back and adopt the pod. An unmeasured guess (card 407).
@@ -613,7 +614,12 @@ fn sweep_pod_ttl(a: &RunArgs, models: usize) -> Duration {
 
 /// The remote half of `exec`. Setup and `--cmd` share one `--max-cmd` budget; the steps before it have a
 /// fixed one. Returns whether `--cmd` exited zero.
-fn exec_body<R: Remote + ?Sized>(remote: &R, a: &ExecArgs, logpath: &Path) -> Result<bool> {
+fn exec_body<R: Remote + ?Sized>(
+    remote: &R,
+    a: &ExecArgs,
+    logpath: &Path,
+    image_digest: &str,
+) -> Result<bool> {
     ready_pod(remote, Duration::from_secs(a.ssh_timeout_s), pod_ttl(a))?;
     if let Some(bin) = &a.bin {
         let base = std::path::Path::new(bin)
@@ -640,13 +646,23 @@ fn exec_body<R: Remote + ?Sized>(remote: &R, a: &ExecArgs, logpath: &Path) -> Re
     let deadline = Instant::now() + a.max_cmd;
     if let Some(setup) = &a.setup {
         log(format!("setup: {setup}"));
-        let out = remote_checked(remote, setup, deadline, "setup")?;
+        let out = remote_checked(
+            remote,
+            &with_image_digest(image_digest, setup),
+            deadline,
+            "setup",
+        )?;
         if !out.trim().is_empty() {
             log(out);
         }
     }
     log(format!("exec: {} (at most {:?})", a.cmd, a.max_cmd));
-    let run = remote_run(remote, &a.cmd, deadline, "command")?;
+    let run = remote_run(
+        remote,
+        &with_image_digest(image_digest, &a.cmd),
+        deadline,
+        "command",
+    )?;
     // Raw stdout goes to our stdout (callers parse the JSON last line) and verbatim into the run log.
     print!("{}", run.stdout);
     if !run.stderr.trim().is_empty() {
@@ -660,6 +676,12 @@ fn exec_body<R: Remote + ?Sized>(remote: &R, a: &ExecArgs, logpath: &Path) -> Re
     }
     // A non-zero exit is reported through the bool, not `Err`, to stay distinct from transport failures.
     Ok(run.ok())
+}
+
+/// `cmd` run with the digest of the image the pod runs in `POOT_BENCH_IMAGE_DIGEST`: the ssh shell drops the
+/// container's environment, so a result the command records can name its image only if the command is given it.
+fn with_image_digest(image_digest: &str, cmd: &str) -> String {
+    format!("export POOT_BENCH_IMAGE_DIGEST={image_digest}; {cmd}")
 }
 
 /// How a kept-warm pod is probed before `exec` adopts it.
@@ -793,6 +815,7 @@ fn adopt_warm_pod<P: PodApi + ?Sized>(
                         pod_id: w.pod_id,
                         host: w.host,
                         port: w.port,
+                        image_digest: pinned_digest(image)?.to_string(),
                     }));
                 }
                 log(format!("warm pod {} changed before adoption", w.pod_id));
@@ -833,6 +856,8 @@ struct ExecPod {
     pod_id: String,
     host: String,
     port: u16,
+    /// The `sha256:` digest of the image the pod runs.
+    image_digest: String,
 }
 
 /// Everything `exec` does before it has a pod to run on: pin the image, record the run, then adopt a
@@ -947,7 +972,12 @@ fn acquire_exec_pod<P: PodApi + ?Sized>(
     db.assign_pod(&pod_id, run_id).ok();
     db.set_status(run_id, "running").ok();
     log(format!("endpoint up: {host}:{port} (pod {pod_id})"));
-    Ok(ExecPod { pod_id, host, port })
+    Ok(ExecPod {
+        pod_id,
+        host,
+        port,
+        image_digest: pinned_digest(&image)?.to_string(),
+    })
 }
 
 /// Delete an `exec` pod, then record the run's final status. If the API refuses the delete the run row
@@ -1259,6 +1289,9 @@ pub(crate) fn cmd_run(db: Db, state_db: String, a: RunArgs) -> Result<()> {
         return Ok(());
     }
 
+    // The image is pinned to a digest before any run row or pod exists: the pod is created from the digest and the
+    // sweep records it in `env.json`, so a result names the image it ran.
+    let a = pin_run_image(&RegistryV2Resolver::new()?, a)?;
     let key = runpod_api_key()?;
     let rp = RunPod::new(key.clone())?;
     // Reap orphans from a previous dead run (also finalizes killed exec rows).
@@ -1601,6 +1634,16 @@ fn extension_set(results: &Path, set: &str, models: &[Model]) -> Result<String> 
         }
     }
     Ok(set.to_string())
+}
+
+/// `a` with its image tag resolved to the digest reference the pods are created from and the run records, so a tag
+/// that moves mid-run cannot change the image.
+fn pin_run_image(resolver: &dyn DigestResolver, mut a: RunArgs) -> Result<RunArgs> {
+    let image = pin_image(resolver, &a.image)
+        .with_context(|| format!("pin image {} to a digest", a.image))?;
+    log(format!("image {} pinned to {image}", a.image));
+    a.image = image;
+    Ok(a)
 }
 
 /// The run a `run` command line asks for, under `id`.
@@ -3049,10 +3092,12 @@ fn gather_pass(ep: &dyn gather::PodFiles, dirs: &[String]) -> Result<Gathered> {
     })
 }
 
-/// The shell command that sweeps one model on the pod. Provenance is not passed in: the poot runner embeds its
-/// own build sha at build time and reports it, with its backend, on every result row.
+/// The shell command that sweeps one model on the pod. The poot runner embeds its own build sha at build time and
+/// reports it, with its backend, on every result row; the image the pod runs is not visible to the harness, so
+/// its `sha256:` digest is passed in and lands in `env.json`.
 /// `POD_PATH` restores uv, the poot bin and cuda that the ssh shell drops.
 fn sweep_command(
+    image_digest: &str,
     models_root: &str,
     model: &str,
     run_id: &str,
@@ -3068,7 +3113,7 @@ fn sweep_command(
         format!(" --skip-repeats {}", list.join(","))
     };
     format!(
-        "{POD_PATH} cd /opt/benchmarks && MODELS_DIR={models_root} POOT_BENCH_POOT_BIN=/root/poot-bench-runner \
+        "{POD_PATH} cd /opt/benchmarks && MODELS_DIR={models_root} POOT_BENCH_IMAGE_DIGEST={image_digest} POOT_BENCH_POOT_BIN=/root/poot-bench-runner \
          ./run-sweep.sh --model {model} --scenario {scenario} --run-id {run_id} --repeats {repeats}{skip} --skip-unsupported"
     )
 }
@@ -3107,6 +3152,12 @@ fn sweep(
     watch: &Watch<'_>,
 ) -> Result<()> {
     let (pod_id, cursor) = (watch.pod_id, watch.cursor);
+    let image_digest = pinned_digest(&run.image).with_context(|| {
+        format!(
+            "run {} names an image that is not pinned to a digest",
+            run.id
+        )
+    })?;
     for m in models {
         cursor.set(Some(&m.id), "sweep");
         let st = db.model_state(&run.id, &m.id)?;
@@ -3149,6 +3200,7 @@ fn sweep(
             if !running {
                 log(format!("=== sweep: {} (tmux {sess}) ===", m.id));
                 let cmd = sweep_command(
+                    image_digest,
                     a.models_root(),
                     &m.id,
                     &base,
@@ -5490,6 +5542,15 @@ mod tests {
         }
     }
 
+    fn fake_exec_pod() -> ExecPod {
+        ExecPod {
+            pod_id: "pod-1".into(),
+            host: String::new(),
+            port: 0,
+            image_digest: DIGEST.into(),
+        }
+    }
+
     /// A tracked exec run on `pod-1`, in a fresh in-memory state DB and a cloud that holds the pod.
     fn exec_on_fake_pod(a: &ExecArgs, remote: &LocalPod) -> (Result<()>, Db, FakePods) {
         let db = Db::open(":memory:").unwrap();
@@ -5498,7 +5559,7 @@ mod tests {
         let cloud = FakePods::default();
         cloud.seed("pod-1", "poot-orch-x-exec-1-a1", true);
         let logpath = unique_temp_dir("log").join("exec-1.log");
-        let result = exec_on_pod(&db, &cloud, remote, a, "exec-1", &logpath, "pod-1");
+        let result = exec_on_pod(&db, &cloud, remote, a, "exec-1", &logpath, &fake_exec_pod());
         (result, db, cloud)
     }
 
@@ -5545,6 +5606,19 @@ mod tests {
         );
     }
 
+    /// An exec's setup and command see the digest of the image the pod runs in `POOT_BENCH_IMAGE_DIGEST`, so a
+    /// result they record names its image. Both commands fail unless the variable holds the digest. Mutation:
+    /// `with_image_digest` returns `cmd` unchanged and this goes red (`command exited non-zero`).
+    #[test]
+    fn an_exec_passes_the_image_digest_to_its_setup_and_command() {
+        let check = format!("test \"$POOT_BENCH_IMAGE_DIGEST\" = {DIGEST}");
+        let a = exec_args_with(&["--setup", &check, "--cmd", &check]);
+
+        let (result, _db, _cloud) = exec_on_fake_pod(&a, &LocalPod::new(0));
+
+        result.unwrap();
+    }
+
     /// SC-005: a patch step that fails fails the exec, and the command never runs. Chaining the steps
     /// with `;` lets the trailing `chmod` succeed and this goes red. The control shows the same exec
     /// running its command once the patch succeeds.
@@ -5560,7 +5634,7 @@ mod tests {
         let err = format!("{:#}", result.unwrap_err());
         assert!(err.contains("binary patch failed (rc=3)"), "{err}");
         assert!(
-            !broken.commands().iter().any(|c| c == "echo ran"),
+            !broken.commands().iter().any(|c| c.ends_with("echo ran")),
             "the command must not run on an unpatched binary: {:?}",
             broken.commands()
         );
@@ -5568,7 +5642,7 @@ mod tests {
         let sound = LocalPod::new(0);
         let (result, _db, _cloud) = exec_on_fake_pod(&a, &sound);
         result.unwrap();
-        assert!(sound.commands().iter().any(|c| c == "echo ran"));
+        assert!(sound.commands().iter().any(|c| c.ends_with("echo ran")));
     }
 
     /// A pod and a DB shared with the signal handler thread.
@@ -5629,11 +5703,11 @@ mod tests {
                 let db = Db::open(&state_db).unwrap();
                 let a = exec_args_with(&["--cmd", "sleep 20", "--max-cmd", "60s"]);
                 let logpath = unique_temp_dir("log").join("exec-1.log");
-                let _ = exec_on_pod(&db, &pods, &*pod, &a, "exec-1", &logpath, "pod-1");
+                let _ = exec_on_pod(&db, &pods, &*pod, &a, "exec-1", &logpath, &fake_exec_pod());
             })
         };
         let started = Instant::now();
-        while !pod.commands().iter().any(|c| c == "sleep 20") {
+        while !pod.commands().iter().any(|c| c.ends_with("sleep 20")) {
             assert!(
                 started.elapsed() < Duration::from_secs(10),
                 "exec never reached its command"
@@ -5761,11 +5835,58 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// SC-001: `run` pins its image tag to a digest before any run row or pod exists; the run records the digest
+    /// reference, the pods are created from it, and the sweep command exports its digest, so the `env.json` the
+    /// sweep writes names the image that ran. Mutation: `pin_run_image` returns `a` unpinned, or `sweep_command`
+    /// drops `POOT_BENCH_IMAGE_DIGEST`, and this goes red. `sweep` refuses a run whose image is still a tag.
+    #[test]
+    fn a_run_records_the_digest_of_the_image_it_ran() {
+        let registry = MockRegistry::resolving_to(DIGEST);
+        let args = pin_run_image(&registry, run_args(&[])).unwrap();
+        let by_digest = format!("ghcr.io/kikijiki/poot-bench@{DIGEST}");
+        assert_eq!(args.image, by_digest);
+        assert_eq!(
+            registry.asked.borrow().as_slice(),
+            ["ghcr.io/kikijiki/poot-bench:latest"]
+        );
+
+        let run = requested_run(&args, &[], "abc", "run-1".into());
+        assert_eq!(run.image, by_digest);
+
+        let cmd = sweep_command(
+            pinned_digest(&run.image).unwrap(),
+            "/root/models",
+            "qwen3-0.6b",
+            "run-1-qwen3-0.6b",
+            "decode-curve",
+            1,
+            &[],
+        );
+        assert!(
+            cmd.contains(&format!("POOT_BENCH_IMAGE_DIGEST={DIGEST} ")),
+            "{cmd}"
+        );
+    }
+
+    /// A tag the registry refuses to resolve ends the run before it starts, and a run whose image is a tag
+    /// names no digest to record.
+    #[test]
+    fn a_run_whose_image_cannot_be_pinned_does_not_start() {
+        let Err(err) = pin_run_image(&MockRegistry::refusing(), run_args(&[])) else {
+            panic!("a refused tag must not pin");
+        };
+        assert!(format!("{err:#}").contains("denied"), "{err:#}");
+
+        let err = pinned_digest("ghcr.io/kikijiki/poot-bench:latest").unwrap_err();
+        assert!(err.to_string().contains("not pinned"), "{err}");
+    }
+
     /// SC-001: the sweep command names the model, scenario and repeats, and exports neither provenance variable:
     /// the row's `build_sha` (embedded in the runner at build time) is the one provenance.
     #[test]
     fn the_sweep_command_passes_the_cell_and_repeats_and_exports_no_provenance() {
         let cmd = sweep_command(
+            DIGEST,
             "/root/models",
             "qwen3-0.6b",
             "run-1-qwen3-0.6b",
@@ -5993,6 +6114,7 @@ frameworks.llamacpp = { support = true, precision = "f16" }
         let dirs = run.model_snapshot_dirs(&format!("{set}-dense"));
         let present = gather::repeats_present(&results, &dirs);
         let cmd = sweep_command(
+            DIGEST,
             "/root/models",
             "dense",
             &format!("{set}-dense"),
@@ -6034,6 +6156,7 @@ frameworks.llamacpp = { support = true, precision = "f16" }
 
         let present = gather::repeats_present(&results, &dirs);
         let cmd = sweep_command(
+            DIGEST,
             "/root/models",
             "qwen3-0.6b",
             "run-1000-qwen3-0.6b",
