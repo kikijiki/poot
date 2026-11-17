@@ -36,6 +36,7 @@ members = [
     "crates/poot-ptx-device",
     "crates/poot-npu",
     "crates/poot-npu-artifacts",
+    "crates/poot-npu-rows",
     "crates/pootc",
     "crates/poot-kernel-attr",
     "crates/poot-kernel-intrinsics",

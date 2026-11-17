@@ -117,6 +117,15 @@ pub enum NpuRegionRefusal {
         /// What the target lacks for it.
         missing: Capability,
     },
+    /// The step's width (its position slot's element count: rows times tokens) is not one the device was configured
+    /// to prepare. One vendor compile serves one width, so a width nobody configured is refused before any compile.
+    #[error("a step of width {width} is not one of the widths the device prepares: {configured:?}")]
+    StepWidth {
+        /// The step's width.
+        width: usize,
+        /// The widths the device is configured for.
+        configured: poot_target::StepWidths,
+    },
     /// A region argument has a dtype the device does not carry.
     #[error("{value} ({dtype}) cannot be a region argument: {gap}")]
     Argument {

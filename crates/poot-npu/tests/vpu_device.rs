@@ -839,3 +839,99 @@ fn a_cached_blob_the_driver_rejects_is_recompiled_and_replaced() {
     assert_eq!(run_scale_shift_with_cache(&dir).unwrap(), (0, 1));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A step graph of `width` token rows: the position slot (declared below a 256-position cache, as the model
+/// tracers declare it) cast to F16 and added to an F16 activation. The position slot is what makes it a model step
+/// with a width; the activation is its data.
+fn step_of_width(width: usize) -> Fixture {
+    let b = Builder::for_tests();
+    let pos = b
+        .slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![1, width], DType::I32),
+            poot_graph_ir::IndexRange::below(256).unwrap(),
+        )
+        .unwrap();
+    let x = b
+        .slot_named(Slot::Activation, "x", f16(&[1, width]))
+        .unwrap();
+    let positions = b.cast(pos, DType::F16).unwrap();
+    let out = b.binary(BinOp::Add, positions, x).unwrap();
+    let graph = b.finish(out).unwrap();
+    let mut step = x_step("x", &[1, width], |i| (i % 3) as f32);
+    step.push(poot_eval::test_support::StepFixture {
+        key: poot_graph_ir::SlotKey::new(Slot::Pos, None),
+        tensor: poot_tensor::HostTensor::i32(
+            vec![1, width],
+            (0..width as i32).map(|p| p + 5).collect(),
+        ),
+    });
+    Fixture {
+        name: "step_of_width",
+        graph,
+        store: store(&[]),
+        steps: vec![step],
+    }
+}
+
+/// POOT-1278 SC-003: the widths the operator configured are the only widths the device prepares. A device opened
+/// for a step width of 128 plans a 128-token step, compiles it once and runs it; a step of 64 is a typed
+/// `StepWidth` refusal naming the width and the configured set, raised by the planner, so the vendor compiler
+/// never ran for it (the compile counter stays at the one compile of the accepted width, and a refused step alone
+/// leaves it at zero).
+///
+/// Mutation: in `plan_vpu_region` accept any width; the 64-token step plans, the vendor compiler runs for it and the
+/// row sees a compile where it expects a refusal.
+#[test]
+fn a_step_of_a_width_the_operator_did_not_configure_is_refused_before_any_vendor_compile() {
+    use poot_executor::Executor;
+    use poot_graph_plan::multi_device::topology::DeviceId;
+    use poot_graph_plan::staged::{
+        DevicePlacement, ExpertPlacement, Partition, StagedCompileError, TargetSet, compile_staged,
+    };
+    use poot_graph_plan::{CompileError, CompileLimits, PlanError};
+    let configured = poot_target::StepWidths::new([128]).unwrap();
+    let Some(mut npu) = vpu_common::npu_with(poot_npu::VpuConfig {
+        step_widths: configured,
+        ..poot_npu::VpuConfig::default()
+    }) else {
+        return;
+    };
+    let target = npu.engine.device().target();
+    // The refused width first: no compile happened and none can have.
+    let refused = step_of_width(64);
+    let error = compile_staged(
+        &refused.graph,
+        &TargetSet::single(DeviceId(0), target),
+        &Partition {
+            experts: ExpertPlacement::AllResident,
+            devices: DevicePlacement::Single(DeviceId(0)),
+        },
+        &npu.engine.compile_options(CompileLimits::STANDARD),
+    );
+    match &error {
+        Err(StagedCompileError::Compile(CompileError::Plan(plan))) => assert!(
+            matches!(
+                &**plan,
+                PlanError::StepWidth { width: 64, configured: got } if *got == configured
+            ),
+            "{plan:?}"
+        ),
+        Err(other) => panic!("expected the step-width refusal, got {other:?}"),
+        Ok(_) => panic!("a 64-token step planned on a device configured for {configured:?}"),
+    }
+    assert_eq!(
+        npu.engine.device().compiles(),
+        0,
+        "no vendor compile for the refused width"
+    );
+    // The configured width plans, compiles once and runs.
+    let accepted = step_of_width(128);
+    poot_executor_parity::run_outputs(&mut npu.engine, target, &accepted)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        npu.engine.device().compiles(),
+        1,
+        "the 128-token step is one vendor compile"
+    );
+}

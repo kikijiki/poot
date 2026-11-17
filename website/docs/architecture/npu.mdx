@@ -93,6 +93,8 @@ Intel NPUs have no public core ISA, so a program's artifact is one **graph** bui
 1. The planner lowers each equation to the OpenVINO opset op with the same semantics. Nothing is recognized as a composite.
 2. `poot-npu` serializes the program as OpenVINO IR; `VpuDevice` has the driver build the blob and runs it through Level Zero.
 3. Values read only inside the graph stay inside it. Arguments (weights, activations, state, results) live in host memory.
+4. A model step has static shapes, so one compile serves one width. The widths a device prepares (powers of two, such as 128)
+   are configured when it is opened; a step of another width is a typed refusal before the vendor compiler runs.
 
 Lowered ops: `add`, `subtract`, `multiply`, `divide`, `maximum`, `greater-equal`, `exp`, `negative`, `sqrt`, `reduce-sum`,
 `reduce-max`, `matmul`, `gather`, `reshape`, `transpose`, `broadcast`, `slice`, `concat`, `convert`, `iota` (a constant range)
@@ -108,7 +110,12 @@ device records a numerical contract (a normwise error bound measured against the
 2. The whole graph computes in FP16.
 3. Each F32 result gets a `Cast` back on exit.
 
-The contract bounds the graph as a whole, and the program's numerics class is `NarrowStorage`, the loosest tolerance.
+The contract bounds the graph as a whole against its F32 evaluation, and the program's numerics class is `NarrowStorage`, the
+loosest tolerance. The FP16 types of the narrowed graph describe the region's interface, not every interior value: the interior
+precision of a narrowed region is the vendor compiler's, at a compiler version the device tests pin, so a vendor bump forces
+those tests to be re-validated rather than silently moving the reference. Two measured figures are recorded: 5e-3 for fragments
+(a block's MLP and attention core) and, for a whole 24-layer Qwen2.5-0.5B step, a worst error of 1.9e-2 against the F32 oracle
+(tested to 4e-2).
 
 | Case | Outcome |
 | --- | --- |
@@ -129,7 +136,8 @@ The contract holds only for values FP16 can hold, so F32 magnitudes are limited 
 
 NaN weights and inputs are refused. An input of 65504 runs; 65520 (which rounds to infinity) is refused; a sum of in-range
 inputs that exceeds the range is refused as a result. An additive literal (an add or subtract operand) with a recorded contract
-saturates to +-65504, a mask sentinel acting as infinity. Multiplicative use stays refused, infinite literals stay infinite,
+saturates to +-65504, a mask sentinel acting as infinity. Multiplicative use stays refused, except the scale of an attention
+mask (a factor that comparisons alone fix to -1, 0 or 1, whose product is 0 or the sentinel). Infinite literals stay infinite,
 and NaN literals are refused.
 
 ### Blob cache
@@ -146,13 +154,18 @@ Verified on an Intel Core Ultra (Lunar Lake) NPU, driver and compiler 1.38.0:
   CPU oracle bit for bit on integer-valued inputs and within FP16 tolerance for `exp`, `div` and `sqrt`. The sign of a zero is
   not promised (`neg` of `+0` is `+0`).
 - **One compiled graph and one replay per step**, however many equations.
+- **A model's prompt step runs.** Qwen2.5-0.5B (its F16 GGUF, 24 layers) takes two consecutive 128-token chunks of one prompt,
+  the second writing its KV at positions 128 to 255 over what the first wrote. Against the F32 CPU oracle the worst KV state
+  is within 2e-2 and the last position's logits within 1e-2 of the tensor's largest value, and the greedy token agrees. This
+  is a test of the device, not a serving path.
 - **Arguments are checked** against the program's (names, order, direction, extents, precision) before anything runs.
 
-Refused with a typed capability (no model runs on the Intel NPU; performance is not a goal):
+Refused with a typed capability (performance is not a goal):
 
 - `log`, `recip` and other unary ops.
 - BF16 arithmetic, and F32 arithmetic with no recorded contract.
-- Converts through BF16 or an integer; integer to float is `IntegerToFloat`, since FP16 holds integers exactly only to 2048.
+- Converts through BF16 or an integer; integer to float is `IntegerToFloat`, since FP16 holds integers exactly only to 2048,
+  unless the graph declares the integer inside that range (a position declared below a short cache is).
 - Softmax, attention and collectives.
 - A layer the vendor compiler rejects, with the compiler's log.
 

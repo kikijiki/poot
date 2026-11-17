@@ -24,6 +24,7 @@ mod kernel_compiler;
 mod matrix;
 pub mod memory;
 mod register_file;
+mod step_widths;
 pub mod storage;
 pub mod vpu;
 pub use access::ArgAccess;
@@ -35,6 +36,7 @@ pub use matrix::{
 };
 pub use memory::{LinkCost, MemoryDomain, MemoryTopology, ShareMechanism, ShareMechanisms};
 pub use register_file::{RegisterBudget, RegisterFile};
+pub use step_widths::{NotAPowerOfTwo, StepWidths};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout, ViewError};
 pub use vpu::{NarrowingContract, VendorCompilerId, VpuCaps, VpuTargetId};
 

@@ -98,6 +98,8 @@ const RANKS: &[(&str, u8)] = &[
     // 11: models; 12: the driver; 13: products
     ("poot-models", 11),
     ("poot-llm", 12),
+    // 12: the device rows that need the model crate and an NPU device together (no lower crate may hold both)
+    ("poot-npu-rows", 12),
     ("poot-serve", 13),
     ("poot-bench-runner", 13),
 ];

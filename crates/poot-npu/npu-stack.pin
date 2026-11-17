@@ -1,0 +1,12 @@
+# The Intel NPU user-mode stack the narrowed-region reference was validated against (POOT-1620).
+#
+# The NarrowingContract's interior precision is the vendor compiler's, so the compiler is part of the evidence:
+# a vendor bump must force a re-validation of the whole-step rows, never silently move the reference.
+#
+#   release   the pinned upstream release (flake.nix `npuUserMode.version`: driver and compiler are one release).
+#             `tests/npu_stack_pin.rs` (model-free) fails when it differs from the flake.
+#   compiler  the driver compiler's (major.minor) `vclGetVersion` ABI that release reports through
+#             `zeDeviceGetGraphProperties2`: the one version identity the stack exposes at run time.
+#             The real-device row `poot-npu-rows/tests/vpu_qwen_prompt.rs` fails when the device reports another.
+release 1.38.0.20260910
+compiler 8.3

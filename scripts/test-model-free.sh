@@ -63,6 +63,7 @@ readonly gate_policy=(
   "poot-l0-runtime|host|"
   "poot-npu|host|"
   "poot-npu-artifacts|host|"
+  "poot-npu-rows|excluded|every test dispatches on the Intel NPU"
   "poot-llm|reviewed|"
   "poot-load|reviewed|"
   "poot-models|reviewed|"

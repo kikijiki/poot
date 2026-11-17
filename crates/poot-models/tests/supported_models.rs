@@ -689,6 +689,7 @@ fn xdna2_target() -> Target {
                 host_input_streams: Queried::Known(16),
                 host_output_streams: Queried::Known(16),
             },
+            step_widths: poot_target::StepWidths::NONE,
         },
     })
 }

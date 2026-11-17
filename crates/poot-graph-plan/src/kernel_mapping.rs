@@ -641,6 +641,7 @@ mod tests {
                 host_input_streams: poot_target::Queried::Unknown,
                 host_output_streams: poot_target::Queried::Unknown,
             },
+            step_widths: poot_target::StepWidths::NONE,
         };
         match finalize_aie(
             &grid,

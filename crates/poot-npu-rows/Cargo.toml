@@ -1,0 +1,30 @@
+[package]
+name = "poot-npu-rows"
+description = "Device rows that run a real model's step on the Intel NPU: they need the model crate and the NPU device together, which no lower crate may (dependency ranks)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Every row dispatches on the Intel NPU, so the package is outside the default model-free lane (it is `excluded`
+# in `scripts/test-model-free.sh`): its `poot-npu/vpu` edge then never unifies into that lane's builds. It runs in
+# `just test-device-vpu`.
+[dev-dependencies]
+poot-eval = { workspace = true, features = ["test-support"] }
+poot-executor.workspace = true
+poot-graph-ir.workspace = true
+poot-graph-plan.workspace = true
+poot-load.workspace = true
+poot-models = { workspace = true, features = ["test-support"] }
+poot-npu = { workspace = true, features = ["vpu", "test-support"] }
+poot-quant.workspace = true
+poot-runtime-common = { workspace = true, features = ["test-support"] }
+poot-target.workspace = true
+poot-tensor.workspace = true
+poot-test-util.workspace = true
+
+[lints]
+workspace = true

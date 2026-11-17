@@ -449,7 +449,7 @@ ptx_selection := '(' + ptx_single_device_rows + ') & not (' + ptx_multi_device_s
 kernels_package_selection := '(package(pootc) | package(poot-kernelgen))'
 ptx_named_rows := 'test(/_on_ptx(_kquant)?$/)'
 kernels_selection := kernels_package_selection + ' & not ' + ptx_named_rows
-npu_selection := 'package(poot-npu)'
+npu_selection := 'package(poot-npu) | package(poot-npu-rows)'
 
 # poot-bench-runner is a binary with no library target, so its host tests (inventory rows of the `isolated` policy,
 # class model-free) run in `test-bench-runner`.
@@ -544,7 +544,8 @@ test-device-vpu:
     scripts/check-required-cases.py begin vpu {{results}}/device-vpu/results.xml
     status=0; \
     nix develop .#npu-intel -c scripts/with-required-backend.sh POOT_REQUIRE_INTEL_NPU \
-        {{nextest}} --profile device-vpu -p poot-npu --features vpu --test-threads=1 -E '{{npu_selection}}' || status=$?; \
+        env POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --profile device-vpu -p poot-npu -p poot-npu-rows --features poot-npu/vpu --test-threads=1 -E '{{npu_selection}}' || status=$?; \
     scripts/check-required-cases.py check vpu {{results}}/device-vpu/results.xml || status=$?; \
     exit $status
 

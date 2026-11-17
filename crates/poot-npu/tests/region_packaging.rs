@@ -35,6 +35,7 @@ fn caps() -> AieCaps {
             host_input_streams: Queried::Known(16),
             host_output_streams: Queried::Known(16),
         },
+        step_widths: poot_target::StepWidths::NONE,
     }
 }
 
@@ -324,6 +325,7 @@ fn an_intel_npu_target_packages_the_whole_graph_as_one_region() {
             compiler: Queried::Known(VendorCompilerId { major: 8, minor: 3 }),
             memory_budget_bytes: Queried::Unknown,
             narrowing: None,
+            step_widths: poot_target::StepWidths::NONE,
         },
     });
     let program = compile(

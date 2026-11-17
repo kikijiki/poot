@@ -53,6 +53,15 @@ pub enum PlanError {
         /// The NPU the program was to be compiled for.
         target: poot_target::TargetId,
     },
+    /// The program is a model step of a width the NPU was not configured to prepare. One vendor compile serves one
+    /// width, so the compile refuses any other before it plans anything.
+    #[error("a step of width {width} is not one of the widths the NPU prepares: {configured:?}")]
+    StepWidth {
+        /// The step's width: its position slot's element count.
+        width: usize,
+        /// The widths the device is configured for.
+        configured: poot_target::StepWidths,
+    },
     /// The op is valid but a static shape it depends on violates its precondition (e.g. an `ArgTopK`
     /// whose rank operand is 0-D). A caller-triggerable shape mismatch is a typed error, not a panic.
     #[error("bad shape for planning: {0}")]

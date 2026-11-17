@@ -1626,6 +1626,9 @@ fn npu_region_error(
         NpuRegionRefusal::Argument { value, dtype, gap } => {
             PlanError::UnrepresentableValue { value, dtype, gap }
         }
+        NpuRegionRefusal::StepWidth { width, configured } => {
+            PlanError::StepWidth { width, configured }
+        }
     }
 }
 

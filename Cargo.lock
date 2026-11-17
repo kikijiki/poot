@@ -2101,6 +2101,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "poot-npu-rows"
+version = "0.0.0"
+dependencies = [
+ "poot-eval",
+ "poot-executor",
+ "poot-graph-ir",
+ "poot-graph-plan",
+ "poot-load",
+ "poot-models",
+ "poot-npu",
+ "poot-quant",
+ "poot-runtime-common",
+ "poot-target",
+ "poot-tensor",
+ "poot-test-util",
+]
+
+[[package]]
 name = "poot-orchestrator"
 version = "0.1.0"
 dependencies = [

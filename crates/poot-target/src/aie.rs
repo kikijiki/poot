@@ -102,6 +102,9 @@ pub struct AieCaps {
     pub memory_budget_bytes: Queried<u64>,
     /// What one region artifact (one xclbin, one hardware context) may hold.
     pub region: RegionLimits,
+    /// The widths of a model step the device prepares region artifacts for. The AMD device states its own
+    /// when it can run a wide step (POOT-1282); until then it is the empty set.
+    pub step_widths: crate::StepWidths,
 }
 
 /// The bounds of one region artifact: how many planned equations a partition can run at once and how many

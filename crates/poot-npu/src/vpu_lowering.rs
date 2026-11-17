@@ -12,7 +12,9 @@
 //! graph narrows it silently. Poot makes that step its own: when the target records a
 //! [`NarrowingContract`](poot_target::NarrowingContract), [`narrow_to_device_precision`] rewrites the graph over F16
 //! values with a `Cast` to F16 at each F32 region input and one back to F32 at each F32 result, and the
-//! contract bounds the error of the region as a whole (interior values are not converted op by op). The
+//! contract bounds the error of the region as a whole against its F32 evaluation (interior values are not
+//! converted op by op: the graph's F16 types describe the region's interface, and the interior precision is the
+//! vendor compiler's at the pinned version, see `NarrowingContract`). The
 //! casts are graph equations, so the program's published numerics class carries the narrowing. With no contract an F32 equation is refused
 //! with [`Capability::NarrowingContract`], and BF16 or F64 arithmetic, which no contract covers, with
 //! [`Capability::Arithmetic`]. Data movement is bit exact in any width the device carries.
@@ -22,7 +24,8 @@ use std::collections::{HashMap, HashSet};
 use crate::{VpuElem, VpuInput, VpuNode, VpuOp, VpuRegion, VpuScalar, VpuTensor, VpuValue};
 use poot_graph_ir::op::{BinOp, RedOp, UnOp};
 use poot_graph_ir::{
-    EditError, Eqn, Graph, OpKind, Operand, Scalar, Storage, TensorType, ValueId, ValueMeta,
+    EditError, Eqn, Graph, IndexRange, OpKind, Operand, Scalar, Slot, Storage, TensorType, ValueId,
+    ValueMeta,
 };
 use poot_graph_plan::{Capability, NpuRegionRefusal, Region, StorageGap};
 use poot_target::{VpuCaps, VpuTargetId};
@@ -110,6 +113,13 @@ fn computes(caps: &VpuCaps, dtype: DType) -> Result<(), Capability> {
 
 /// The largest integer below which every integer is exact in FP16 (11 significand bits).
 const F16_EXACT_INTEGERS: u32 = 2048;
+
+/// The integers FP16 holds exactly, `[-2048, 2048]`: the range a declared integer must be inside for its
+/// conversion to FP16 to be exact.
+fn f16_exact_integers() -> IndexRange {
+    let limit = i64::from(F16_EXACT_INTEGERS);
+    IndexRange::new(-limit, limit + 1).expect("a non-empty range of i32 words")
+}
 
 /// One operand of a lowered equation: a value, or a scalar constant the region defines for it.
 pub(crate) enum LoweredOperand {
@@ -250,14 +260,25 @@ pub(crate) fn lower_eqn(g: &Graph, eqn: &Eqn, caps: &VpuCaps) -> Result<Lowered,
         OpClass::Convert => {
             // F16 <-> F32 only: a conversion through an integer or BF16 changes the value. Inside a narrowed
             // region both sides are F16 and the conversion is the identity the contract already covers. An
-            // integer source is refused with its reason: FP16 holds integers exactly only up to 2048 and the
-            // value of an index or position is not bounded by anything the planner reads.
+            // integer source is refused with its reason unless the graph declares a range for it inside FP16's
+            // exact integers (`[-2048, 2048]`): a position slot is declared below the cache capacity, which makes
+            // the cast exact, and a value with no declared range is not bounded by anything the planner reads.
             let source = operand_dtype(&eqn.inputs[0]);
+            let exact = match &eqn.inputs[0] {
+                Operand::Value(id) => g
+                    .meta(*id)
+                    .range()
+                    .is_some_and(|r| r.within(&f16_exact_integers())),
+                Operand::Lit(_) => false,
+            };
             if source == DType::I32 && out.dtype == DType::F16 {
-                return Err(Capability::IntegerToFloat {
-                    to: out.dtype,
-                    exact_limit: F16_EXACT_INTEGERS,
-                });
+                if !exact {
+                    return Err(Capability::IntegerToFloat {
+                        to: out.dtype,
+                        exact_limit: F16_EXACT_INTEGERS,
+                    });
+                }
+                return movement(op);
             }
             let float = |dtype| matches!(dtype, DType::F16 | DType::F32);
             if !float(operand_dtype(&eqn.inputs[0])) || !float(out.dtype) {
@@ -390,6 +411,7 @@ fn unsupported(op: &OpKind) -> Capability {
 ///
 /// # Errors
 ///
+/// [`NpuRegionRefusal::StepWidth`] for a step of a width the device is not configured for,
 /// [`NpuRegionRefusal::Eqn`] for the first equation the table refuses, or [`NpuRegionRefusal::Argument`] when a
 /// region argument has a dtype the device does not carry.
 pub(crate) fn plan_vpu_region(
@@ -398,6 +420,19 @@ pub(crate) fn plan_vpu_region(
     caps: &VpuCaps,
 ) -> Result<VpuRegion, NpuRegionRefusal> {
     let g = graph;
+    // A model step has one width, the elements of its position slot (one position per token row; the token slot
+    // may be gone, a hosted embedding gather consumes it); the device compiles one artifact per configured width
+    // and refuses any other before it lowers anything. A graph with no position slot is not a model step and has
+    // no width.
+    if let Some(&(positions, _)) = graph.slots().iter().find(|&&(_, slot)| slot == Slot::Pos) {
+        let width = graph.aval(positions).shape.iter().product::<usize>();
+        if !caps.step_widths.contains(width) {
+            return Err(NpuRegionRefusal::StepWidth {
+                width,
+                configured: caps.step_widths,
+            });
+        }
+    }
     let lowered = graph
         .eqns()
         .iter()
@@ -495,6 +530,7 @@ pub(crate) fn narrow_to_device_precision(
         .filter(|id| narrowed.contains(id))
         .collect();
 
+    let producers: HashMap<ValueId, &Eqn> = graph.eqns().iter().map(|eqn| (eqn.out, eqn)).collect();
     let mut edit = graph.edit();
     let mut eqns = Vec::with_capacity(graph.eqns().len());
     let mut entries: HashMap<ValueId, ValueId> = HashMap::new();
@@ -527,8 +563,18 @@ pub(crate) fn narrow_to_device_precision(
         if narrowed.contains(&eqn.out) {
             // A finite literal of an additive equation past the contract's range is a mask sentinel acting as
             // an infinity: it saturates to the range's edge. A multiplicative use would change the result
-            // (`x * 1e9` is not `x * 65504`), so it stays and the planner refuses it.
-            if matches!(eqn.op, OpKind::Binary(BinOp::Add | BinOp::Sub)) {
+            // (`x * 1e9` is not `x * 65504`), so it stays and the planner refuses it, unless the other factor is a
+            // mask factor (comparisons and literals alone fix it to -1, 0 or 1): then the product is exactly 0 or
+            // the sentinel `+-L`, the same infinity-acting value, and it saturates like the additive one.
+            let additive = matches!(eqn.op, OpKind::Binary(BinOp::Add | BinOp::Sub));
+            let mask_scale = matches!(eqn.op, OpKind::Binary(BinOp::Mul))
+                && matches!(
+                    eqn.inputs.as_slice(),
+                    [Operand::Value(factor), Operand::Lit(_)] | [Operand::Lit(_), Operand::Value(factor)]
+                        if flag_values(&producers, *factor)
+                            .is_some_and(|values| values.iter().all(|v| [-1.0, 0.0, 1.0].contains(v)))
+                );
+            if additive || mask_scale {
                 for operand in &mut eqn.inputs {
                     if let Operand::Lit(Scalar::F32(value)) = operand
                         && value.is_finite()
@@ -565,6 +611,44 @@ pub(crate) fn narrow_to_device_precision(
     *edit.eqns_mut() = eqns;
     edit.remap_results(|value| exits.get(&value).copied().unwrap_or(value));
     edit.commit()
+}
+
+/// The values `id` can take when comparisons and literals alone determine it, or `None` when anything else
+/// (an input, a weight, a computed tensor) can reach it: a comparison is 0 or 1, a literal shifts or scales
+/// the set, a product of two such values takes the products, a float conversion keeps it. At most four values.
+fn flag_values(producers: &HashMap<ValueId, &Eqn>, id: ValueId) -> Option<Vec<f32>> {
+    let eqn = producers.get(&id)?;
+    let values = match (&eqn.op, eqn.inputs.as_slice()) {
+        (OpKind::Binary(BinOp::Ge), _) => vec![0.0, 1.0],
+        (OpKind::Cast { .. }, [Operand::Value(source)]) => flag_values(producers, *source)?,
+        (
+            OpKind::Binary(op @ (BinOp::Sub | BinOp::Mul)),
+            [Operand::Value(source), Operand::Lit(Scalar::F32(literal))],
+        ) => flag_values(producers, *source)?
+            .into_iter()
+            .map(|v| {
+                if *op == BinOp::Sub {
+                    v - literal
+                } else {
+                    v * literal
+                }
+            })
+            .collect(),
+        (OpKind::Binary(BinOp::Mul), [Operand::Value(a), Operand::Value(b)]) => {
+            let (a, b) = (flag_values(producers, *a)?, flag_values(producers, *b)?);
+            a.iter()
+                .flat_map(|x| b.iter().map(move |y| x * y))
+                .collect()
+        }
+        _ => return None,
+    };
+    let mut distinct: Vec<f32> = Vec::new();
+    for v in values {
+        if !distinct.contains(&v) {
+            distinct.push(v);
+        }
+    }
+    (distinct.len() <= 4).then_some(distinct)
 }
 
 /// The region argument for value `id`, typed as the graph stores it.
@@ -610,6 +694,7 @@ mod tests {
             compiler: Queried::Known(VendorCompilerId { major: 7, minor: 5 }),
             memory_budget_bytes: Queried::Unknown,
             narrowing: None,
+            step_widths: poot_target::StepWidths::NONE,
         }
     }
 
@@ -980,6 +1065,90 @@ mod tests {
                 refusal(narrowed_region(&g, &narrowing_caps())).missing,
                 Capability::NarrowingRange { dtype: DType::F32 },
                 "{op:?}"
+            );
+        }
+    }
+
+    /// A multiplicative literal past FP16's range saturates exactly when the other factor is a mask factor (comparisons
+    /// and literals alone fix it to -1, 0 or 1), because then the product is 0 or the sentinel: the causal mask's
+    /// `((x >= y) - 1) * 1e9` plans with its `1e9` at FP16's largest value, while the same literal on a factor
+    /// that data decides (`x`, or `x >= y` times a weight) stays refused.
+    /// Mutation: make `flag_values` return `None` for a `Sub`; the mask's scale is refused as `NarrowingRange`.
+    /// Mutation: have `flag_values` read a value with no producing equation (an input) as `[1.0]`; the
+    /// data-dependent factor plans and the row sees a region where it expects a refusal.
+    #[test]
+    fn a_mask_scale_saturates_but_a_data_dependent_factor_does_not() {
+        let scaled = |build: fn(&Builder, Traced, Traced) -> Traced| {
+            let g = graph_of(|b| {
+                let x = b.constant("x", f(DType::F32, &[4])).unwrap();
+                let y = b.constant("y", f(DType::F32, &[4])).unwrap();
+                let factor = build(b, x, y);
+                b.binary_scalar(BinOp::Mul, factor, Scalar::F32(1.0e9))
+                    .unwrap()
+            });
+            narrowed_region(&g, &narrowing_caps())
+        };
+        let mask = scaled(|b, x, y| {
+            let visible = b.binary(BinOp::Ge, x, y).unwrap();
+            b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0))
+                .unwrap()
+        })
+        .unwrap();
+        let sentinel = mask
+            .nodes
+            .iter()
+            .filter_map(|node| match node.op {
+                VpuOp::Scalar(scalar) => Some(scalar),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            sentinel.contains(&crate::VpuScalar::F16(0x7BFF)),
+            "{sentinel:?}"
+        );
+        for data in [
+            scaled(|_, x, _| x),
+            scaled(|b, x, y| {
+                let visible = b.binary(BinOp::Ge, x, y).unwrap();
+                b.binary(BinOp::Mul, visible, y).unwrap()
+            }),
+        ] {
+            assert_eq!(
+                refusal(data).missing,
+                Capability::NarrowingRange { dtype: DType::F32 }
+            );
+        }
+    }
+
+    /// An integer converts to FP16 inside a narrowed region only when the graph declares it inside FP16's exact
+    /// integers: a slot declared below 256 positions lowers its conversion, one declared below 4096 (or not
+    /// declared at all) is refused with the exact limit.
+    /// Mutation: have the exactness check accept any declared range; the 4096 row lowers.
+    #[test]
+    fn a_declared_integer_converts_to_f16_only_inside_the_exact_range() {
+        let converted = |range: Option<IndexRange>| {
+            let g = graph_of(|b| {
+                let ty = f(DType::I32, &[4]);
+                let pos = match range {
+                    Some(range) => b
+                        .slot_named_ranged(Slot::Activation, "ids", ty, range)
+                        .unwrap(),
+                    None => b.slot_named(Slot::Activation, "ids", ty).unwrap(),
+                };
+                b.cast(pos, DType::F32).unwrap()
+            });
+            narrowed_region(&g, &narrowing_caps())
+        };
+        assert!(converted(IndexRange::below(256)).is_ok());
+        assert!(converted(IndexRange::below(2049)).is_ok());
+        for refused in [IndexRange::below(2050), IndexRange::below(4096), None] {
+            assert_eq!(
+                refusal(converted(refused)).missing,
+                Capability::IntegerToFloat {
+                    to: DType::F16,
+                    exact_limit: 2048
+                },
+                "{refused:?}"
             );
         }
     }

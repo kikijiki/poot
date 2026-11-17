@@ -39,8 +39,8 @@ use poot_l0_runtime::{
 use poot_npu_artifacts::{VpuBinding, VpuGraphArtifact, VpuInvocation, VpuLayer};
 use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
 use poot_target::{
-    BufferStorage, ElementKind, NarrowingContract, Queried, TargetId, VendorCompilerId, VpuCaps,
-    VpuTargetId,
+    BufferStorage, ElementKind, NarrowingContract, Queried, StepWidths, TargetId, VendorCompilerId,
+    VpuCaps, VpuTargetId,
 };
 
 use crate::blob_cache::{BlobCache, BlobKey};
@@ -54,8 +54,12 @@ const INTEL_VENDOR_ID: u32 = 0x8086;
 /// `vpu_narrowing` device rows hold the normwise error of the Qwen2.5-0.5B MLP and attention-core fragments to.
 /// Measured 2026-10-18 on the laptop's NPU4 (driver compiler 1.38.0), three steps each against the F32 CPU
 /// oracle: worst 4.7e-4 (MLP) and 1.6e-3 (attention core). The recorded 5e-3 is about three times the worst
-/// measurement, and covers those region classes only: a graph with longer reductions or a wider dynamic range
-/// is outside what was measured. The range precondition is FP16's: the largest finite value, 65504.
+/// measurement, and covers those region classes only (the fragment-class figure): a graph with longer reductions or
+/// a wider dynamic range is outside what was measured. The whole-step figure stands beside it, not instead of it:
+/// 24 chained layers and two chunks of Qwen2.5-0.5B measured worst 1.9e-2 (KV) and 8.3e-3 (logits) against the F32
+/// oracle, held to 4e-2 by `poot-npu-rows`'s `vpu_qwen_prompt`. The reference is the F32 evaluation and the
+/// interior precision is the vendor compiler's at the version pinned in `npu-stack.pin`. The range precondition
+/// is FP16's: the largest finite value, 65504.
 const NPU4_F32_NARROWING: NarrowingContract = NarrowingContract {
     max_relative_error_ppm: 5_000,
     max_magnitude: 65_504,
@@ -73,6 +77,10 @@ pub struct VpuConfig {
     pub run_timeout: Duration,
     /// Where compiled blobs are cached between runs. `None` compiles every region every time.
     pub cache_dir: Option<PathBuf>,
+    /// The step widths the operator configured this device for (POOT-1278): the device prepares a model step of
+    /// one of these widths and refuses any other before a vendor compile. A set is the operator's, never a
+    /// constant of the crate.
+    pub step_widths: StepWidths,
 }
 
 impl Default for VpuConfig {
@@ -80,6 +88,7 @@ impl Default for VpuConfig {
         Self {
             run_timeout: Duration::from_secs(10),
             cache_dir: None,
+            step_widths: StepWidths::NONE,
         }
     }
 }
@@ -419,6 +428,7 @@ impl VpuDevice {
             compiler: Queried::Known(compiler),
             memory_budget_bytes: Queried::Unknown,
             narrowing: Some(NPU4_F32_NARROWING),
+            step_widths: config.step_widths,
         };
         let cache = BlobCache::new(config.cache_dir.clone());
         Ok(Self {

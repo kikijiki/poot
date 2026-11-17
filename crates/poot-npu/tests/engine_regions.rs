@@ -172,6 +172,7 @@ mod aie_engine {
                 host_input_streams: Queried::Known(16),
                 host_output_streams: Queried::Known(16),
             },
+            step_widths: poot_target::StepWidths::NONE,
         }
     }
 
@@ -466,6 +467,7 @@ mod vpu_engine {
                     compiler: Queried::Known(VendorCompilerId { major: 8, minor: 3 }),
                     memory_budget_bytes: Queried::Unknown,
                     narrowing: None,
+                    step_widths: poot_target::StepWidths::NONE,
                 },
             })
         }

@@ -361,6 +361,7 @@ impl XdnaDevice {
             instruction_bytes: Queried::Known(INSTRUCTION_BYTES),
             memory_budget_bytes: locked_memory_limit().map_or(Queried::Unknown, Queried::Known),
             region: REGION_LIMITS,
+            step_widths: poot_target::StepWidths::NONE,
         };
         Ok(Self {
             device,
