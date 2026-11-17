@@ -166,7 +166,7 @@ mod state;
 /// The one kernel-authoring accessor: `ImportedKernel::ArgmaxChunk.body()`. One variant per shipped
 /// kernel with a production consumer, contributed by its family file's `kernel_assets!` invocation. `pub`,
 /// not `pub(crate)`: the executor engine reaches `CopyWords` through it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ImportedKernel {
     // packed.rs
     /// Axis-0 embedding gather over a dense BF16 table read as packed `u32` lanes, widened to F32 in the kernel.

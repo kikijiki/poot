@@ -596,15 +596,14 @@ fn gpu_causal_conv1d_prefill_matches_cpu() {
         .output
         .into_host()
         .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
+    let (got, class) = run_via_contract_classed(&mut gpu, target, &g, &inputs);
     assert_eq!(got.shape(), cpu.shape());
     assert_prefill_op_gpu_matches_cpu(
         "causal_conv1d_prefill",
         "out",
         got.as_f32().unwrap(),
         cpu.as_f32().unwrap(),
-        3e-3,
-        1e-3,
+        class,
     );
 }
 

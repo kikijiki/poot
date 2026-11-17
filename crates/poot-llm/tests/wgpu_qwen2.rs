@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Executor, NoSync, StepInputs};
+use poot_executor_parity::assert_within_class;
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::{ForwardSlotMap, Graph, Slot, SlotKey, Storage, ValueId, ValueTable};
 use poot_graph_plan::{
     CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
@@ -25,7 +27,7 @@ use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor, HostView};
-use poot_test_util::{assert_close_rel, max_abs_error};
+use poot_test_util::max_abs_error;
 use poot_wgpu_device::device::WgpuDevice;
 
 /// Compile `g` for `target` through the executor contract's one staged program.
@@ -156,10 +158,11 @@ fn run_once_contract_v(
     target: Target,
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
-) -> Vec<f32> {
+) -> (Vec<f32>, Tier2Class) {
     let (store, slot_binds) = split_consts_and_slots_v(g, inputs);
     let (bound, map) = ConstWeights::bind(g, &store);
     let program = staged(&bound, target);
+    let class = program.numerics_class();
     let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
@@ -170,7 +173,7 @@ fn run_once_contract_v(
         .unwrap();
     exec.remove_entry(exe, entry).unwrap();
     exec.unload(exe).unwrap();
-    f32_bytes(&bytes)
+    (f32_bytes(&bytes), class)
 }
 
 /// A graph whose sole output IS one named state value, for reading a carried state buffer back through
@@ -189,10 +192,10 @@ fn state_probe_graph(name: &str, aval: poot_graph_ir::TensorType) -> Graph {
 /// `step().read()` returns flat bytes with no shape of its own, so `g`'s declared output aval is the
 /// only source of the shape the comparison checks (review 546b-b1b F1): a length-only check would
 /// miss a same-numel shape mismatch.
-fn assert_close_bytes(g: &Graph, got: &[f32], cpu: &HostTensor, label: &str) {
+fn assert_close_bytes(g: &Graph, class: Tier2Class, got: &[f32], cpu: &HostTensor, label: &str) {
     assert_eq!(g.aval(g.result()).shape, cpu.shape(), "{label}: shape");
     assert_eq!(got.len(), cpu.as_f32().unwrap().len(), "{label}: length");
-    assert_close_rel(got, cpu.as_f32().unwrap(), 5e-3);
+    assert_within_class(class, label, got, cpu.as_f32().unwrap());
     eprintln!(
         "{label}: GPU matches CPU (max abs diff {:.2e})",
         max_abs_error(got, cpu.as_f32().unwrap())
@@ -350,6 +353,7 @@ fn assert_replay_matches_cpu(g: &Graph, feeds: &[Feed], label: &str) {
     let (bound, map) = ConstWeights::bind(g, &store);
     let (store, map) = (Arc::new(store), Arc::new(map));
     let program = staged(&bound, target);
+    let class = program.numerics_class();
     let mut cpu_state: Vec<HostTensor> = Vec::new();
     let mut loaded: Option<(poot_executor::ExecutableId, poot_executor::EntryId)> = None;
     for (i, feed) in feeds.iter().enumerate() {
@@ -370,7 +374,13 @@ fn assert_replay_matches_cpu(g: &Graph, feeds: &[Feed], label: &str) {
                 .read()
                 .unwrap(),
         );
-        assert_close_bytes(g, &gpu_logits, &cpu_logits, &format!("{label} step {i}"));
+        assert_close_bytes(
+            g,
+            class,
+            &gpu_logits,
+            &cpu_logits,
+            &format!("{label} step {i}"),
+        );
     }
     if let Some((exe, entry)) = loaded {
         exec.remove_entry(exe, entry).unwrap();
@@ -397,8 +407,8 @@ fn qwen2_decode_gpu_matches_cpu() {
     // (`executor/run.rs`); the contract has one path, the device-resident one every other row here
     // already exercises.
     let (cpu, _) = cpu_step(&g, &bind(&g, &feed, false), &[]);
-    let got = run_once_contract_v(&mut *exec, target, &g, &bind(&g, &feed, false));
-    assert_close_bytes(&g, &got, &cpu, "qwen2 tiny decode on GPU");
+    let (got, class) = run_once_contract_v(&mut *exec, target, &g, &bind(&g, &feed, false));
+    assert_close_bytes(&g, class, &got, &cpu, "qwen2 tiny decode on GPU");
 }
 
 #[test]
@@ -436,9 +446,10 @@ fn flash_attention_pass_prefill_gpu_matches_cpu() {
         "the flash pass must rewrite the prefill attention"
     );
     let (cpu, _) = cpu_step(&g, &bind(&g, &feed, false), &[]);
-    let got = run_once_contract_v(&mut *exec, target, &fused, &bind(&fused, &feed, false));
+    let (got, class) = run_once_contract_v(&mut *exec, target, &fused, &bind(&fused, &feed, false));
     assert_close_bytes(
         &fused,
+        class,
         &got,
         &cpu,
         "flash_attention pass prefill on GPU vs materialized on CPU",
@@ -464,10 +475,15 @@ fn prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu() {
         (0..n as i32).collect(),
     );
     let (cpu, _) = cpu_step(&g, &bind(&g, &feed, false), &[]);
-    let got = run_once_contract_v(&mut *exec, target, &g, &bind(&g, &feed, false));
+    let (got, class) = run_once_contract_v(&mut *exec, target, &g, &bind(&g, &feed, false));
     assert_eq!(g.aval(g.result()).shape, cpu.shape());
     assert_eq!(got.len(), cpu.as_f32().unwrap().len());
-    assert_close_rel(&got, cpu.as_f32().unwrap(), 5e-3);
+    assert_within_class(
+        class,
+        "prefill flash-fused GPU vs CPU",
+        &got,
+        cpu.as_f32().unwrap(),
+    );
     eprintln!(
         "prefill flash-fused GPU vs CPU: max abs diff = {:.2e}",
         max_abs_error(&got, cpu.as_f32().unwrap())
@@ -557,7 +573,8 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
     };
     let target = device.target();
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
-    let cont = run_once_contract_v(&mut *exec, target, &g_cont, &bind(&g_cont, &feed_c, false));
+    let (cont, _) =
+        run_once_contract_v(&mut *exec, target, &g_cont, &bind(&g_cont, &feed_c, false));
     let inputs = bind(&g_paged, &feed_p, false);
     let (store, slot_binds) = split_consts_and_slots_v(&g_paged, &inputs);
     let (bound, map) = ConstWeights::bind(&g_paged, &store);
@@ -624,8 +641,14 @@ fn qwen2_decode_gpu_resident_matches_cpu() {
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
     let (g, feed) = tiny_decode_graph();
     let (cpu, _) = cpu_step(&g, &bind(&g, &feed, false), &[]);
-    let got = run_once_contract_v(&mut *exec, target, &g, &bind(&g, &feed, false));
-    assert_close_bytes(&g, &got, &cpu, "qwen2 tiny decode on GPU (device resident)");
+    let (got, class) = run_once_contract_v(&mut *exec, target, &g, &bind(&g, &feed, false));
+    assert_close_bytes(
+        &g,
+        class,
+        &got,
+        &cpu,
+        "qwen2 tiny decode on GPU (device resident)",
+    );
 }
 
 /// G5a: the fused decode graph (pointwise chains synthesized into single kernels) runs on the Arc and matches
@@ -670,8 +693,10 @@ fn fused_decode_matches_unfused_on_gpu() {
         n_row
     );
 
-    let unfused_gpu = run_once_contract_v(&mut *exec, target, &base, &bind(&base, &feed, false));
-    let fused_gpu = run_once_contract_v(&mut *exec, target, &fg, &bind(&fg, &feed, false));
+    let (unfused_gpu, _) =
+        run_once_contract_v(&mut *exec, target, &base, &bind(&base, &feed, false));
+    let (fused_gpu, fused_class) =
+        run_once_contract_v(&mut *exec, target, &fg, &bind(&fg, &feed, false));
     // Fusion keeps region intermediates in registers instead of f32 global buffers, so they can round ~1 ULP
     // differently: the fused result equals the unfused one only within a tight fp tolerance (~9e-10 max_abs
     // measured on 4/32 elems).
@@ -687,7 +712,13 @@ fn fused_decode_matches_unfused_on_gpu() {
     );
     // and both match the CPU reference.
     let (cpu, _) = cpu_step(&g, &bind(&g, &feed, false), &[]);
-    assert_close_bytes(&g, &fused_gpu, &cpu, "fused qwen2 tiny decode on GPU");
+    assert_close_bytes(
+        &g,
+        fused_class,
+        &fused_gpu,
+        &cpu,
+        "fused qwen2 tiny decode on GPU",
+    );
 }
 
 // `const_cache_warms_after_first_run` deleted (Card 546b): it tested GpuExecutor's own

@@ -30,15 +30,14 @@ fn gpu_ut_transform_matches_cpu_c64() {
         .output
         .into_host()
         .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
+    let (got, class) = run_via_contract_classed(&mut gpu, target, &g, &inputs);
     assert_eq!(got.shape(), cpu.shape());
     assert_prefill_op_gpu_matches_cpu(
         "unit_lower_triangular_inverse",
         "T",
         got.as_f32().unwrap(),
         cpu.as_f32().unwrap(),
-        3e-3,
-        1e-3,
+        class,
     );
 }
 
@@ -97,15 +96,14 @@ fn gpu_attention_prefill_matches_cpu_l64() {
         .output
         .into_host()
         .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
+    let (got, class) = run_via_contract_classed(&mut gpu, target, &g, &inputs);
     assert_eq!(got.shape(), cpu.shape());
     assert_prefill_op_gpu_matches_cpu(
         "attention_prefill",
         "out",
         got.as_f32().unwrap(),
         cpu.as_f32().unwrap(),
-        5e-3,
-        1e-3,
+        class,
     );
 }
 
@@ -175,15 +173,14 @@ fn gpu_attention_prefill_matches_cpu_past_matmul_grid_cap() {
         .output
         .into_host()
         .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
+    let (got, class) = run_via_contract_classed(&mut gpu, target, &g, &inputs);
     assert_eq!(got.shape(), cpu.shape());
     assert_prefill_op_gpu_matches_cpu(
         "attention_prefill_past_matmul_grid_cap",
         "out",
         got.as_f32().unwrap(),
         cpu.as_f32().unwrap(),
-        5e-3,
-        1e-3,
+        class,
     );
 }
 
@@ -281,14 +278,13 @@ fn gpu_attention_prefill_matches_cpu_real_d() {
         .output
         .into_host()
         .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
+    let (got, class) = run_via_contract_classed(&mut gpu, target, &g, &inputs);
     assert_eq!(got.shape(), cpu.shape());
     assert_prefill_op_gpu_matches_cpu(
         "attention_prefill_real_d",
         "out",
         got.as_f32().unwrap(),
         cpu.as_f32().unwrap(),
-        5e-3,
-        1e-3,
+        class,
     );
 }

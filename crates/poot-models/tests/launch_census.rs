@@ -6,7 +6,7 @@
 //! census is the evidence a launch-geometry change is judged by. `tests/launch_census/real_dims.tsv` has one row per
 //! distinct request: the model, step shape, target, op and the request's `kind` (family, form and, for a dense Gemv,
 //! its schedule and shape), how many equations of the program plan exactly that request, and the request's
-//! canonical text, which states every field of its schedule (width, cols, unroll, tiling lanes, output tile, micro
+//! `Debug` text (a reading aid; the request's identity is its typed encoding, not this text), which states every field of its schedule (width, cols, unroll, tiling lanes, output tile, micro
 //! tile, depth, key block, grid). A change to a figure the planner reads therefore changes a row.
 //!
 //! A card that changes plans by design regenerates the file with `just test-launch-census-regen`, reads `git diff`
@@ -89,7 +89,7 @@ fn render_census() -> String {
                             target: id,
                             op: eqn.op.name().to_string(),
                             kind: request.display_label(),
-                            request: choice.canonical_text(),
+                            request: format!("{choice:?}"),
                         };
                         *rows.entry(row).or_default() += 1;
                     }

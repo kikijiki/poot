@@ -39,6 +39,17 @@ fn run_once_rocm(
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> HostTensor {
+    run_once_rocm_classed(engine, target, g, inputs).0
+}
+
+/// [`run_once_rocm`] with the numerics class the compiled program publishes: the class the output is compared
+/// with the oracle within.
+fn run_once_rocm_classed(
+    engine: &mut Engine<RocmDevice>,
+    target: Target,
+    g: &Graph,
+    inputs: &HashMap<ValueId, Value>,
+) -> (HostTensor, Tier2Class) {
     let mut builder = WeightStore::builder();
     for &id in g.inputs() {
         let meta = g.meta(id);
@@ -78,6 +89,7 @@ fn run_once_rocm(
         )
         .expect("compile_staged")
     };
+    let class = staged.numerics_class();
     let exe = engine
         .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
@@ -94,7 +106,10 @@ fn run_once_rocm(
         .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    HostTensor::f32(g.aval(g.result()).shape.clone(), data)
+    (
+        HostTensor::f32(g.aval(g.result()).shape.clone(), data),
+        class,
+    )
 }
 
 fn fill(seed: u64, count: usize) -> Vec<f32> {
@@ -1068,13 +1083,12 @@ fn masked_attention_rocm_matches_cpu() {
         .output
         .into_host()
         .unwrap();
-    let got = run_once_rocm(&mut rocm, target, &g, &inputs);
-    // Softmax + matmul accumulate; tolerance accounts for exp/sum order.
-    assert_close(
+    let (got, class) = run_once_rocm_classed(&mut rocm, target, &g, &inputs);
+    poot_executor_parity::assert_within_class(
+        class,
+        "rocm_attention",
         got.as_f32().unwrap(),
         cpu.as_f32().unwrap(),
-        "rocm_attention",
-        5e-3,
     );
 }
 

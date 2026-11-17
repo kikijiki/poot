@@ -8,7 +8,6 @@
 //! file's pass-soundness rows (the pass forms the op from the traced chain).
 
 use poot_models::model::LogitRows;
-use poot_test_util::assert_close_rel;
 
 use super::qwen2_pipeline::{eval_step, tiny_qwen2, trace_step};
 
@@ -39,7 +38,11 @@ fn masked_decode_does_not_depend_on_capacity() {
             None,
             wide_caches.as_deref(),
         );
-        assert_close_rel(a.logits.as_f32().unwrap(), b.logits.as_f32().unwrap(), 5e-3);
+        super::assert_reassociation_close(
+            "tight-cap against wide-cap decode logits",
+            a.logits.as_f32().unwrap(),
+            b.logits.as_f32().unwrap(),
+        );
         (tight_caches, wide_caches) = (Some(a.state), Some(b.state));
     }
 }

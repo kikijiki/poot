@@ -152,9 +152,21 @@ fn run_once_contract(
     g: &Graph,
     inputs: &HashMap<ValueId, HostTensor>,
 ) -> Vec<f32> {
+    run_once_contract_classed(exec, target, g, inputs).0
+}
+
+/// [`run_once_contract`] with the numerics class the compiled program publishes: the class the output is
+/// compared with the oracle within.
+fn run_once_contract_classed(
+    exec: &mut dyn Executor,
+    target: Target,
+    g: &Graph,
+    inputs: &HashMap<ValueId, HostTensor>,
+) -> (Vec<f32>, poot_graph_ir::analysis::Tier2Class) {
     let (store, slot_binds) = split_consts_and_slots(g, inputs);
     let (bound, map) = ConstWeights::bind(g, &store);
     let program = staged(&bound, target);
+    let class = program.numerics_class();
     let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
@@ -165,7 +177,7 @@ fn run_once_contract(
         .unwrap();
     exec.remove_entry(exe, entry).unwrap();
     exec.unload(exe).unwrap();
-    f32_bytes(&bytes)
+    (f32_bytes(&bytes), class)
 }
 
 fn run_once_contract_i32(
@@ -648,9 +660,8 @@ fn masked_attention_cross_backend() {
     .output
     .into_host()
     .unwrap();
-    let got = run_once_contract(&mut *exec, target, &g, &inputs);
-    // Softmax + matmul accumulate; tolerance accounts for exp/sum order.
-    assert_close(&got, cpu.as_f32().unwrap(), "attention", 5e-3);
+    let (got, class) = run_once_contract_classed(&mut *exec, target, &g, &inputs);
+    poot_executor_parity::assert_within_class(class, "attention", &got, cpu.as_f32().unwrap());
 }
 
 // ── FFN block ────────────────────────────────────────────────────────────

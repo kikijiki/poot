@@ -18,6 +18,7 @@ use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{
     BindError, Executor, ExecutorStats, LoadError, NoSync, StateScope, StepInputs,
 };
+use poot_executor_parity::assert_within_class;
 use poot_graph_ir::{
     Graph, PackedSourceName, Slot, SlotKey, StateRole, Storage, TensorType, ValueId,
 };
@@ -344,7 +345,9 @@ fn qwen2_decode_on_the_contract_matches_the_oracle_and_records_once() {
     let store = store_for(&[&g]);
     let (named, map) = bind_graphs(&store, &[&g]);
     let exe = exec.load_weights(Arc::new(store.clone()), map).unwrap();
-    let decode = exec.add_entry(exe, &staged(&named[0], target)).unwrap();
+    let program = staged(&named[0], target);
+    let class = program.numerics_class();
+    let decode = exec.add_entry(exe, &program).unwrap();
     let mut oracle_state = HashMap::new();
     for pos in 0..CAP {
         let token = ((pos * 7 + 3) % 32) as u32;
@@ -356,7 +359,7 @@ fn qwen2_decode_on_the_contract_matches_the_oracle_and_records_once() {
                 .unwrap();
             bytemuck_f32(&out.read().unwrap())
         };
-        assert_close_rel(&got, &expected, 5e-3);
+        assert_within_class(class, "qwen2 decode step", &got, &expected);
     }
     let ExecutorStats { recordings, .. } = exec.stats();
     assert_eq!(recordings, 1, "one entry, one recording after 8 steps");
@@ -379,8 +382,14 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
     let store = Arc::new(store_for(&[&prefill_g, &decode_g]));
     let (named, map) = bind_graphs(&store, &[&prefill_g, &decode_g]);
     let exe = engine.load_weights(store.clone(), map).unwrap();
-    let prefill = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
-    let decode = engine.add_entry(exe, &staged(&named[1], target)).unwrap();
+    let prefill_program = staged(&named[0], target);
+    let decode_program = staged(&named[1], target);
+    let prefill_class = prefill_program.numerics_class();
+    let decode_class = decode_program.numerics_class();
+    // The KV state the probes read is written by both entries.
+    let state_class = prefill_class.max(decode_class);
+    let prefill = engine.add_entry(exe, &prefill_program).unwrap();
+    let decode = engine.add_entry(exe, &decode_program).unwrap();
 
     // One state-probe entry per KV state name, sharing the real entries' buffers.
     let mut probes = Vec::new();
@@ -408,7 +417,7 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
                 .read()
                 .unwrap(),
         );
-        assert_close_rel(&got, &expected, 5e-3);
+        assert_within_class(prefill_class, "prefill", &got, &expected);
         for pos in n..CAP {
             let values = slot_values(&decode_g, &[((pos * 3 + 1) % 32) as u32], pos);
             let expected = oracle_step(&decode_g, &store, &values, &mut oracle_state);
@@ -419,7 +428,7 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
                     .read()
                     .unwrap(),
             );
-            assert_close_rel(&got, &expected, 5e-3);
+            assert_within_class(decode_class, "decode", &got, &expected);
         }
         for &(ref name, probe, _) in &probes {
             let got = bytemuck_f32(
@@ -430,7 +439,7 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
                     .unwrap(),
             );
             let expected = oracle_state[name].as_f32().unwrap().to_vec();
-            assert_close_rel(&got, &expected, 5e-3);
+            assert_within_class(state_class, "KV state probe", &got, &expected);
         }
         engine.reset_state(exe, StateScope::All).unwrap();
         for &(_, probe, bytes) in &probes {
@@ -978,7 +987,9 @@ fn many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle() 
     let store = store_for(&[&prefill_g]);
     let (named, map) = bind_graphs(&store, &[&prefill_g]);
     let exe = engine.load_weights(Arc::new(store.clone()), map).unwrap();
-    let prefill = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
+    let program = staged(&named[0], target);
+    let class = program.numerics_class();
+    let prefill = engine.add_entry(exe, &program).unwrap();
     let prompt: Vec<u32> = (0..n as u32).map(|t| t % 32).collect();
     let values = slot_values(&prefill_g, &prompt, 0);
     let mut oracle_state = HashMap::new();
@@ -992,7 +1003,7 @@ fn many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle() 
             .unwrap(),
     );
     let submits_after = engine.device().context().submits();
-    assert_close_rel(&got, &expected, 5e-3);
+    assert_within_class(class, "many-layer prefill", &got, &expected);
     assert!(
         submits_after - submits_before > 1,
         "a {n}-token prefill's recorded run must split into more than one submit_cached call \
@@ -1019,7 +1030,9 @@ fn single_decode_step_crosses_flush_work_by_summed_work_and_matches_the_oracle()
     let store = store_for(&[&g]);
     let (named, map) = bind_graphs(&store, &[&g]);
     let exe = engine.load_weights(Arc::new(store.clone()), map).unwrap();
-    let decode = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
+    let program = staged(&named[0], target);
+    let class = program.numerics_class();
+    let decode = engine.add_entry(exe, &program).unwrap();
     let values = slot_values(&g, &[0], 0);
     let mut oracle_state = HashMap::new();
     let expected = oracle_step(&g, &store, &values, &mut oracle_state);
@@ -1032,7 +1045,7 @@ fn single_decode_step_crosses_flush_work_by_summed_work_and_matches_the_oracle()
             .unwrap(),
     );
     let submits_after = engine.device().context().submits();
-    assert_close_rel(&got, &expected, 5e-3);
+    assert_within_class(class, "huge-vocab decode", &got, &expected);
     assert!(
         submits_after - submits_before > 1,
         "a huge-vocab decode step's recorded run must split into more than one submit_cached call \

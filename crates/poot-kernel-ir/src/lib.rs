@@ -228,7 +228,7 @@ ir_node! {
 
 ir_node! {
     /// Binary operators. Signedness (sdiv/udiv, etc.) is taken from the operand `Ty` at emit time.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub enum BinOp {
         /// Addition.
         Add,
@@ -271,7 +271,7 @@ ir_node! {
 
 ir_node! {
     /// Unary operators.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub enum UnOp {
         /// Arithmetic negation.
         Neg,
@@ -283,7 +283,7 @@ ir_node! {
 ir_node! {
     /// Float math ops that lower to LLVM intrinsics. The transcendentals (exp/sin/cos) are split per
     /// backend in `poot-codegen` (NVPTX approx intrinsics vs SPIR-V GLSL.std.450); the IR stays abstract.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum MathOp {
         /// Square root.
         Sqrt,

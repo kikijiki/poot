@@ -759,6 +759,18 @@ fn compare_step(class: Tier2Class, got: &HostTensor, want: &HostTensor) -> Resul
         .map_err(|worst| format!("{worst} outside the {class:?} tolerance {tolerance}"))
 }
 
+/// Asserts every element of `got` is within `class.tolerance() * max(|oracle|, 1)` of the oracle's `want`: the
+/// one tier-2 element bound (ADR-0101 decision 2) for a test that compares a device output with the oracle
+/// outside [`run_parity`]. `class` is the class the compiled program publishes (`numerics_class()`), never a
+/// literal: a row that picks its own tolerance is not a parity row. `what` names the comparison in the panic.
+#[track_caller]
+pub fn assert_within_class(class: Tier2Class, what: &str, got: &[f32], want: &[f32]) {
+    let tolerance = class.tolerance();
+    if let Err(worst) = poot_test_util::check_close_unit_floor(got, want, tolerance) {
+        panic!("{what}: {worst} outside the {class:?} tolerance {tolerance}");
+    }
+}
+
 /// One named `Storage::Const` row for [`run_once`]: the checkpoint-style name a traced graph's
 /// const input declares (`meta.name`) and its typed host tensor (matching [`StepFixture`]'s
 /// `Storage::Slot` row shape).
@@ -819,6 +831,19 @@ pub fn run_once_under(
     slots: &[StepFixture],
     policy: impl Into<Policy>,
 ) -> Result<HostTensor, String> {
+    run_once_classed_under(exec, target, g, consts, slots, policy).map(|(output, _)| output)
+}
+
+/// [`run_once_under`] with the numerics class the compiled program publishes: the class the output is compared with
+/// the oracle within ([`assert_within_class`]).
+pub fn run_once_classed_under(
+    exec: &mut dyn Executor,
+    target: Target,
+    g: &Graph,
+    consts: &[ConstFixture],
+    slots: &[StepFixture],
+    policy: impl Into<Policy>,
+) -> Result<(HostTensor, Tier2Class), String> {
     let policy = policy.into();
     let mut builder = WeightStore::builder();
     for c in consts {
@@ -853,6 +878,7 @@ pub fn run_once_under(
         },
     )
     .map_err(|e| format!("run_once: compile_staged: {e}"))?;
+    let class = staged.numerics_class();
     let entry = exec
         .add_entry(exe, &staged)
         .map_err(|e| format!("run_once: add_entry: {e}"))?;
@@ -870,7 +896,7 @@ pub fn run_once_under(
         .map_err(|e| format!("run_once: remove_entry: {e}"))?;
     exec.unload(exe)
         .map_err(|e| format!("run_once: unload: {e}"))?;
-    Ok(output)
+    Ok((output, class))
 }
 
 /// The softcapped trace's oracle differs from the uncapped trace's at some step by more than `5e-2`, relative
@@ -1305,6 +1331,72 @@ mod compare_tests {
             &want,
         )
         .expect("a result 0.5x the tolerance off the oracle must pass");
+    }
+
+    /// The message a closure's panic carries.
+    fn panic_message(f: impl FnOnce()) -> Option<String> {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err()?;
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+    }
+
+    /// `want` moved by `multiple` of `class`'s tolerance at each element's own scale (`max(|want|, 1)`).
+    fn moved(want: &[f32], class: Tier2Class, multiple: f32) -> Vec<f32> {
+        want.iter()
+            .map(|w| w + multiple * class.tolerance() * w.abs().max(1.0))
+            .collect()
+    }
+
+    /// POOT-1470 (b): a test comparing a device output outside `run_parity` compares within the tolerance of
+    /// the class it is given, for every class: 0.5x off passes, 2x off fails naming the class.
+    ///
+    /// Mutation: in `assert_within_class` compare within `Tier2Class::NarrowStorage.tolerance()` whatever the
+    /// class; the `Unfused` and `Reassociating` 2x rows pass and this goes red on `must fail`.
+    #[test]
+    fn assert_within_class_bounds_each_class_by_its_own_tolerance() {
+        let want = [10.0f32, -4.0, 0.5, 0.0];
+        for class in [
+            Tier2Class::Unfused,
+            Tier2Class::Reassociating,
+            Tier2Class::NarrowStorage,
+        ] {
+            assert_within_class(class, "within", &moved(&want, class, 0.5), &want);
+            let message = panic_message(|| {
+                assert_within_class(class, "outside", &moved(&want, class, 2.0), &want);
+            })
+            .unwrap_or_else(|| panic!("{class:?}: a result 2x the tolerance off must fail"));
+            assert!(
+                message.starts_with("outside: ")
+                    && message.contains(&format!("outside the {class:?} tolerance")),
+                "{class:?}: {message}"
+            );
+        }
+    }
+
+    /// The classes are told apart by one table: a result 3e-3 off the oracle (3x the reassociating class,
+    /// 0.6x the narrow-storage class) passes only as a narrow-storage program's.
+    ///
+    /// Mutation: in `assert_within_class` read `Tier2Class::Reassociating.tolerance()` whatever the class;
+    /// the narrow-storage row fails and this goes red on `narrow-storage must accept`.
+    #[test]
+    fn a_narrow_storage_program_accepts_what_a_reassociating_program_refuses() {
+        let want = [1.0f32, 2.0];
+        let got = [1.003f32, 2.006];
+        assert_within_class(
+            Tier2Class::NarrowStorage,
+            "narrow-storage must accept",
+            &got,
+            &want,
+        );
+        assert!(
+            panic_message(|| {
+                assert_within_class(Tier2Class::Reassociating, "reassociating", &got, &want);
+            })
+            .is_some(),
+            "a reassociating program must refuse a 3e-3 error"
+        );
     }
 
     /// SC-002, through `run_parity` itself: the real engine, compile and `run_parity` run over a device

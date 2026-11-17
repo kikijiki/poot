@@ -1032,6 +1032,48 @@ fn cse_folds_duplicate_eqns_and_stays_valid() {
     assert_eq!(c.aval(c.result()).shape, g.aval(g.result()).shape);
 }
 
+/// POOT-1622 SC-004: two equations are one when they are structurally equal, whatever their `Debug` text. The key
+/// is the typed `(OpKind, operands)` pair, whose float literals compare by bit pattern: the same literal merges,
+/// and literals that differ in one bit (a NaN payload, the sign of zero) stay apart. A `Debug`-text key prints every
+/// NaN as `NaN`, so it merges two different constants.
+/// Mutation: key the map by `format!("{:?}|{:?}", eqn.op, inputs)`; the NaN-payload case merges and this row goes red.
+#[test]
+fn cse_keys_structurally_not_by_debug_text() {
+    let nan_a = f32::from_bits(0x7fc0_0001);
+    let nan_b = f32::from_bits(0x7fc0_0002);
+    assert_eq!(
+        format!("{nan_a:?}"),
+        format!("{nan_b:?}"),
+        "the premise: two NaN payloads print alike"
+    );
+    let scaled = |literals: &[f32]| {
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+        let mut out = x;
+        for &lit in literals {
+            let eqn = b.binary_scalar(BinOp::Mul, x, Scalar::F32(lit)).unwrap();
+            out = b.binary(BinOp::Add, out, eqn).unwrap();
+        }
+        let g = b.finish(out).unwrap();
+        let merged = cse(&g).unwrap();
+        let muls = |g: &Graph| {
+            g.eqns()
+                .iter()
+                .filter(|e| matches!(e.op, OpKind::Binary(BinOp::Mul)))
+                .count()
+        };
+        (muls(&g), muls(&merged))
+    };
+    assert_eq!(scaled(&[2.0, 2.0]), (2, 1), "one literal twice is one eqn");
+    assert_eq!(scaled(&[nan_a, nan_a]), (2, 1), "one NaN twice is one eqn");
+    assert_eq!(
+        scaled(&[nan_a, nan_b]),
+        (2, 2),
+        "two NaN payloads are two constants"
+    );
+    assert_eq!(scaled(&[0.0, -0.0]), (2, 2), "the sign of zero is a bit");
+}
+
 #[test]
 fn cse_is_idempotent() {
     let b = Builder::for_tests();

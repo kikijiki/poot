@@ -184,7 +184,11 @@ fn fixed_kv_decode_matches_prefill() {
         let out = eval_step(&g, &[token], &[pos as i32], None, caches.as_deref());
         caches = Some(out.state);
         let want = prefill_logits(pos + 1);
-        assert_close_rel(out.logits.as_f32().unwrap(), want.as_f32().unwrap(), 5e-3);
+        super::assert_reassociation_close(
+            "fixed-KV decode against prefill",
+            out.logits.as_f32().unwrap(),
+            want.as_f32().unwrap(),
+        );
     }
 }
 
@@ -255,13 +259,10 @@ fn chunked_prefill_matches_one_shot_shared_pool() {
         logits_chunked.shape(),
         "chunked_prefill_matches_one_shot_shared_pool: logits shape mismatch"
     );
-    let logit_err = max_abs_error(
+    super::assert_reassociation_close(
+        "chunked vs one-shot logits",
         logits_chunked.as_f32().unwrap(),
         one_shot.logits.as_f32().unwrap(),
-    );
-    assert!(
-        logit_err < 5e-3,
-        "chunked vs one-shot logits differ by more than FP-reassociation noise: max abs err {logit_err}"
     );
 
     // cross-check the resident pool itself, not just the final logits: every physical slot's K/V must match between the
@@ -278,14 +279,10 @@ fn chunked_prefill_matches_one_shot_shared_pool() {
             one_shot_pool.shape(),
             "state pair {i}: pool shape mismatch"
         );
-        let pool_err = max_abs_error(
+        super::assert_reassociation_close(
+            &format!("state pair {i}: chunked vs one-shot pool"),
             chunk_pool.as_f32().unwrap(),
             one_shot_pool.as_f32().unwrap(),
-        );
-        assert!(
-            pool_err < 5e-3,
-            "state pair {i}: chunked vs one-shot pool differ by more than FP-reassociation noise: \
-             max abs err {pool_err}"
         );
     }
 }
@@ -542,11 +539,10 @@ fn speculative_verify_batched_matches_sequential_decode() {
 
     // Tolerance: FP-reassociation only (a different but equivalent reduction order over the gathered pool window vs the
     // fresh k/v); compare max absolute error, not relative (some logits sit near 0).
-    let logit_err = max_abs_error(verify.logits.as_f32().unwrap(), &logits_seq);
-    assert!(
-        logit_err < 5e-3,
-        "batched verify vs sequential decode logits differ by more than FP-reassociation noise: \
-         max abs err {logit_err}"
+    super::assert_reassociation_close(
+        "batched verify vs sequential decode logits",
+        verify.logits.as_f32().unwrap(),
+        &logits_seq,
     );
 
     assert_eq!(verify.state.len(), seq_state.len());
@@ -556,11 +552,10 @@ fn speculative_verify_batched_matches_sequential_decode() {
             seq_pool.shape(),
             "state pair {i}: pool shape mismatch"
         );
-        let pool_err = max_abs_error(verify_pool.as_f32().unwrap(), seq_pool.as_f32().unwrap());
-        assert!(
-            pool_err < 5e-3,
-            "state pair {i}: batched-verify vs sequential-decode pool differ by more than \
-             FP-reassociation noise: max abs err {pool_err}"
+        super::assert_reassociation_close(
+            &format!("state pair {i}: batched-verify vs sequential-decode pool"),
+            verify_pool.as_f32().unwrap(),
+            seq_pool.as_f32().unwrap(),
         );
     }
 }
@@ -671,11 +666,10 @@ fn draft_propose_round_schedule_matches_sequential_draft_decode() {
         let finished = finished_logits[row]
             .as_ref()
             .expect("every row's own final propose round ran within total_rounds");
-        let logit_err = max_abs_error(&dl, finished);
-        assert!(
-            logit_err < 5e-3,
-            "row {row}: batched vs sequential final logits differ by more than FP-reassociation noise: \
-             max abs err {logit_err}"
+        super::assert_reassociation_close(
+            &format!("row {row}: batched vs sequential final logits"),
+            &dl,
+            finished,
         );
     }
 }

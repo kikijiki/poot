@@ -496,6 +496,7 @@ fn qwen2_5_0_5b_real_weights_match_the_oracle_logits_at_every_prompt_position_on
     let expected: Vec<HostTensor> = fixture.steps.iter().map(|step| oracle(step)).collect();
     let got = poot_executor_parity::run_outputs(exec.as_mut(), target, &fixture)
         .unwrap_or_else(|e| panic!("{e}"));
+    let class = poot_executor_parity::staged(&fixture, target).numerics_class();
 
     let top1 = |logits: &HostTensor| {
         let values = logits.as_f32().expect("F32 logits");
@@ -514,12 +515,12 @@ fn qwen2_5_0_5b_real_weights_match_the_oracle_logits_at_every_prompt_position_on
             "position {position}: logits shape"
         );
         let (got_values, want_values) = (got.as_f32().unwrap(), want.as_f32().unwrap());
-        for (index, (a, b)) in got_values.iter().zip(want_values).enumerate() {
-            assert!(
-                (a - b).abs() <= 5e-3 * b.abs().max(1.0),
-                "position {position} logit {index}: device {a} vs oracle {b}"
-            );
-        }
+        poot_executor_parity::assert_within_class(
+            class,
+            &format!("position {position} logits, device vs oracle"),
+            got_values,
+            want_values,
+        );
         assert_eq!(top1(got), top1(want), "position {position}: top-1 token");
         let spread = want_values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(

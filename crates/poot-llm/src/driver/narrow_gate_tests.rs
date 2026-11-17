@@ -412,7 +412,7 @@ gate_rows! {
     qwen3_0_6b_q8_0 => "qwen3-0.6b-gguf/Qwen3-0.6B-Q8_0.gguf", 0.3601,
     qwen2_5_1_5b_q4_k_m => "qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf", 0.4845,
     #[ignore = "parked (POOT-1463): with the driver's f16 KV cache traced the bf16 shift on ROCm is 3.87 > 2.1 and the mean KL \
-                1.2e-3 > 1e-3, the Gemma 3 bf16 rounding-boundary amplification parked on PTX by POOT-1459"]
+                1.2e-3 > 1e-3, the cause is unexplained (the PTX row is parked on POOT-1459 for the same model)"]
     gemma_3_1b_it => "gemma-3-1b-it", 0.8601,
     llama_3_2_1b_instruct => "llama-3.2-1b-instruct", 0.1467,
 }
@@ -442,7 +442,7 @@ gate_rows! {
     qwen3_0_6b_q8_0 => "qwen3-0.6b-gguf/Qwen3-0.6B-Q8_0.gguf", 0.4848,
     qwen2_5_1_5b_q4_k_m => "qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf", 0.4820,
     #[ignore = "parked (POOT-1454 section 10): under bf16 on PTX the mean KL is 2.0e-3 > 1e-3 on an RTX 4090 and 2.7e-4 \
-                on an RTX PRO 4500 Blackwell, bf16 rounding-boundary amplification that depends on the device"]
+                on an RTX PRO 4500 Blackwell; the cause is unexplained (POOT-1470), not shown to be rounding-boundary amplification"]
     gemma_3_1b_it => "gemma-3-1b-it", 4.2317,
     llama_3_2_1b_instruct => "llama-3.2-1b-instruct", 0.1603,
 }

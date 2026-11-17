@@ -131,7 +131,7 @@ impl From<VpuTargetId> for TargetId {
 
 /// A short, `Copy` ASCII holder for an AMD gfx code (e.g. `"gfx1151"`); the inline buffer keeps
 /// [`AmdArch`] `Copy`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GfxCode {
     buf: [u8; 16],
     len: u8,
@@ -163,7 +163,7 @@ impl std::fmt::Debug for GfxCode {
 
 /// An AMD GPU codegen target: the `-mcpu` gfx code plus wavefront size and matrix units. Derived
 /// at runtime from the HSA-reported ISA name and wavefront size ([`AmdArch::from_isa_name`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct AmdArch {
     gfx: GfxCode,
     /// Wavefront size (32 or 64), from the runtime-detected value.

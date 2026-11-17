@@ -43,7 +43,7 @@ pub const LANES: usize = 256;
 const GENERATOR: &str = "block_top_k_body";
 
 /// What the planner asks the block top-k generator for.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockTopKSpec {
     /// Queries: `rows * tokens`, one workgroup each.
     pub queries: usize,

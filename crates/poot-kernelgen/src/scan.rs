@@ -29,7 +29,7 @@ use crate::emit::cu;
 use crate::helpers::{copy, elem, ld, slice_f32};
 
 /// Which recurrence a scan kernel runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScanKernel {
     /// The delta-rule recurrence, `rows == width == D`, over six operands.
     DeltaRule,
@@ -47,7 +47,7 @@ impl ScanKernel {
 }
 
 /// What the planner asks the scan generator for.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScanSpec {
     /// Which recurrence the kernel runs.
     pub kernel: ScanKernel,

@@ -5,7 +5,7 @@ use poot_tensor::HostTensor;
 
 use super::swa_gemma3::{named_weights, run_step};
 use poot_test_util::fill;
-use poot_test_util::{assert_close, max_abs_error};
+use poot_test_util::max_abs_error;
 // --- Shared reference helpers for bit-exact model tests ---
 
 /// Deterministic weight tensor by name (same xorshift seed as the bench `weight()` helper).
@@ -490,15 +490,10 @@ fn gemma2_prefill_matches_decode_last_position() {
     assert_eq!(prefill_logits.shape(), vec![1, 1, 8]);
 
     // The prefill last-position logits must match the decode logits at pos=n-1.
-    let max_abs = max_abs_error(
+    super::assert_reassociation_close(
+        "Gemma2 prefill/decode consistency",
         decode_logits.as_f32().unwrap(),
         prefill_logits.as_f32().unwrap(),
-    );
-
-    eprintln!("gemma2_prefill_matches_decode max_abs = {max_abs:.2e}");
-    assert!(
-        max_abs <= 5e-3,
-        "Gemma2 prefill/decode consistency mismatch: max_abs={max_abs:.2e}"
     );
 
     // The carried state matters as much as the logits: the K/V caches prefill leaves must be the ones n decode
@@ -511,10 +506,10 @@ fn gemma2_prefill_matches_decode_last_position() {
             decode_cache.shape(),
             "cache {i} shape"
         );
-        assert_close(
+        super::assert_reassociation_close(
+            &format!("cache {i}"),
             prefill_cache.as_f32().unwrap(),
             decode_cache.as_f32().unwrap(),
-            5e-3,
         );
     }
 }

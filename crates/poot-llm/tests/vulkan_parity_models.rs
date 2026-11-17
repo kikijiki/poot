@@ -13,7 +13,6 @@ use poot_executor_parity::Fixture;
 use poot_graph_plan::Target;
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
-use poot_test_util::assert_close_rel;
 use poot_vulkan_device::VulkanDevice;
 
 /// The raw-Vulkan executor and the target it compiles for, or `None` (a skip) without a device.
@@ -130,9 +129,9 @@ fn sixteen_replayed_steps_record_once() {
             poot_executor_parity::fixture_weights(&fixture),
         )
         .unwrap();
-    let entry = engine
-        .add_entry(exe, &poot_executor_parity::staged(&fixture, target))
-        .unwrap();
+    let program = poot_executor_parity::staged(&fixture, target);
+    let class = program.numerics_class();
+    let entry = engine.add_entry(exe, &program).unwrap();
     for (i, step) in fixture.steps.iter().enumerate() {
         let want = oracle(step);
         let got = engine
@@ -140,7 +139,12 @@ fn sixteen_replayed_steps_record_once() {
             .unwrap()
             .to_host()
             .unwrap();
-        assert_close_rel(got.as_f32().unwrap(), want.as_f32().unwrap(), 5e-3);
+        poot_executor_parity::assert_within_class(
+            class,
+            &format!("step {i}"),
+            got.as_f32().unwrap(),
+            want.as_f32().unwrap(),
+        );
         let ExecutorStats {
             recordings,
             replays,

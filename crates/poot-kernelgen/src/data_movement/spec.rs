@@ -12,7 +12,7 @@ const G: &str = "data_movement";
 
 /// How a tensor's logical elements sit in its buffer. Movement never decodes or re-encodes a payload:
 /// every element moves as the bits its storage holds.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Storage {
     /// One logical element per buffer element. `carrier` is the buffer's element type (`F32`, `I32`, `F16`,
     /// `BF16`); a copy never converts, so a carrier names a bit width, not an interpretation.
@@ -86,7 +86,7 @@ pub(super) fn rows_of(shape: &[usize]) -> (usize, usize) {
 }
 
 /// Where a runtime or baked update slice starts along its axis.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum UpdateIndex {
     /// Baked into the body.
     Static(usize),
@@ -98,7 +98,7 @@ pub enum UpdateIndex {
 /// A window of a scatter's source units one dispatch writes: the unit `offset` the window starts at and the
 /// `threads` it launches. Consecutive windows cover every source unit once, so a wide scatter splits into
 /// dispatches that each stay under a device's watchdog budget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UnitWindow {
     /// First output unit the window writes.
     pub offset: usize,
@@ -108,7 +108,7 @@ pub struct UnitWindow {
 
 /// One input of a movement read through a layout: the logical `shape` it presents, the logical shape `source` of
 /// the buffer that holds it, and the `from` layout that places each logical element in that buffer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MovementRead {
     /// The logical shape read.
     pub shape: Vec<usize>,
@@ -159,7 +159,7 @@ impl MovementRead {
 
 /// The index mapping of one movement. The output shape is [`MovementSpec::out_shape`]; every input shape a
 /// variant carries is the logical shape, whatever the storage.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MovementOp {
     /// `out[i] = source[from(i)]`: every output element read through `from`, a [`Layout`] over the logical
     /// shape `source`. A transpose, a slice, a broadcast, a reshape of a view and any chain of them is one
@@ -239,7 +239,7 @@ impl MovementOp {
 
 /// A data-movement kernel: the storage its tensors share, the output shape, the index mapping and how the
 /// launch folds past the device's x-grid cap. `fold.numel` is [`MovementSpec::threads`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MovementSpec {
     /// How every tensor of the movement is stored.
     pub storage: Storage,

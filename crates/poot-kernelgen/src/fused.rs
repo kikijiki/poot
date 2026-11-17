@@ -24,7 +24,7 @@ use poot_kernel_ir::{
 /// `Cast` to F32, `Recip`, `Tanh` and `Erf` are the unary ops with a synthesized body). Kernelgen does not
 /// depend on the graph IR, and the one translation, `poot_graph_plan`'s `map_fused_op`, is total over the graph
 /// ops: each is lowered or refused by name (`FusedStepGap`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FusedScalarOp {
     /// A kernel-ir unary op.
     Unary(UnOp),
@@ -312,7 +312,7 @@ pub enum FusedInput {
 }
 
 /// One step of a fused region: `step[s] = op(inputs...)`, computed in a register.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct FusedStep {
     /// The scalar operation the step computes.
     pub op: FusedScalarOp,
@@ -321,7 +321,7 @@ pub struct FusedStep {
 }
 
 /// The element type a fused kernel reads one leaf as.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LeafTy {
     /// A 32-bit float leaf.
     F32,
@@ -348,7 +348,7 @@ impl LeafTy {
 /// The recipe for a fused elementwise kernel: one input slice per entry of `leaf_tys`, a straight-line list of scalar
 /// steps, and which value is written out. The kernelgen-native mirror of `poot_graph_ir::FusedRegion`
 /// (kept separate so kernelgen does not depend on the graph IR).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct FusedKernel {
     /// The element type of each leaf, one per leaf. A float region reads F32 leaves, plus I32 leaves that
     /// only a `Select` step may read (its condition); an exact-I32 region reads I32 leaves only.
@@ -360,7 +360,7 @@ pub struct FusedKernel {
 }
 
 /// A last-axis reduction op inside a row-wise fused region.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash)]
 pub enum RowReduce {
     /// Sum of the row.
     Sum,
@@ -370,7 +370,7 @@ pub enum RowReduce {
 
 /// One step of a row-wise fused region: a pointwise op (a Map over the row when any operand is a row
 /// value, a per-row Scalar op otherwise) or a last-axis reduction (a row value -> a per-row scalar).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum RowOp {
     /// A pointwise op over row values and per-row scalars.
     Pointwise {
@@ -388,9 +388,27 @@ pub enum RowOp {
     },
 }
 
+/// A request's identity hashes its `f32` literal by bit pattern, so `-0.0` and every NaN payload are different
+/// literals.
+impl std::hash::Hash for FusedInput {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Leaf(leaf) => leaf.hash(state),
+            Self::Step(step) => step.hash(state),
+            Self::Lit(value) => value.to_bits().hash(state),
+            Self::LitI32(value) => value.hash(state),
+            Self::LeafLane { leaf, lane } => {
+                leaf.hash(state);
+                lane.hash(state);
+            }
+        }
+    }
+}
+
 /// A value of a row-wise fused kernel that can be written out: a leaf row or a step's result, never a literal
 /// or a packed lane.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum RowValue {
     /// An input leaf's row.
     Leaf(LeafId),
@@ -412,7 +430,7 @@ impl From<RowValue> for FusedInput {
 /// kernelgen-native mirror of `poot_graph_ir::RowRegion`. Lowered by [`fused_row`] to one kernel that
 /// processes a row per thread, computing each reduction into a register and recomputing the pointwise
 /// chain per pass.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct RowKernel {
     /// Number of input leaves, each a row-major tensor whose last axis is the reduction extent.
     pub n_leaves: usize,

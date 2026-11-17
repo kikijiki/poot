@@ -190,7 +190,7 @@ pub fn gumbel_noise(u: f32) -> f32 {
 
 /// A scalar pointwise op inside a fused region (the subset G5a fuses). A composition of these over the region's
 /// inputs lowers to one kernel that keeps every intermediate in registers.
-#[derive(Clone, Copy, PartialEq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum FusedOp {
     /// A [`UnOp`] step.
     Unary(UnOp),
@@ -298,7 +298,7 @@ impl fmt::Display for LaneId {
 /// An operand of a [`FusedStep`]: a local value id, or an inline literal captured from the source graph. Locals
 /// `0..n_inputs` are the region's external inputs (matching the fused eqn's `inputs`, all `Operand::Value`, in
 /// order); locals `n_inputs + j` are the result of step `j`.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FusedOperand {
     /// A local value: an external input (`0..n_inputs`) or an earlier step's result.
     Local(LocalId),
@@ -315,7 +315,7 @@ pub enum FusedOperand {
 }
 
 /// One straight-line step of a fused region: `local[n_inputs + j] = op(inputs...)`.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FusedStep {
     /// The pointwise operation this step computes.
     pub op: FusedOp,
@@ -328,7 +328,7 @@ pub struct FusedStep {
 /// (`poot_kernelgen::fused`) instead of one kernel per primitive. `output` is the local id of the region's
 /// result (a step result, or degenerately an input). Every step's output shares the region's output shape;
 /// inputs may broadcast on read.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FusedRegion {
     /// The number of external inputs, which are locals `0..n_inputs`.
     pub n_inputs: usize,
@@ -490,7 +490,7 @@ fn pack_lane_ty(
 
 /// One step of a row-wise fused region ([`RowRegion`]): a pointwise op (a Map over the row, or a Scalar
 /// op on per-row reduction results - the synthesizer tells them apart by shape) or a last-axis reduction.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum RowStep {
     /// A pointwise step.
     Pointwise {
@@ -518,7 +518,7 @@ pub enum RowStep {
 /// each of `side_outputs` is one more value the same kernel writes, which the graph names by the one
 /// [`OpKind::SideOutput`] equation that projects it. One kernel then writes a normalized row and its per-row
 /// scale, or an updated residual and its norm.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct RowRegion {
     /// The number of external inputs, which are locals `0..n_inputs`.
     pub n_inputs: usize,
@@ -1010,7 +1010,7 @@ impl ContractionHead {
 /// every consumer matches, never a flag on the others. The operand list is `[q, k, v, mask]`, then the shared key
 /// part when `key` is [`KeyLayout::Split`] or the slot map `read` when it is [`KeyLayout::Paged`], then `len`
 /// when `bound` is [`KvBound::Live`], then the per-head `sinks [Hq]` when `sink` is [`SinkOperand::PerHead`].
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub struct AttentionAttrs {
     /// Query heads per key/value head (`Hq / Hkv`).
     pub n_rep: usize,
@@ -1029,6 +1029,36 @@ pub struct AttentionAttrs {
     pub sink: SinkOperand,
     /// How Q, K, V and the probabilities P enter the two products: P is rounded where it enters `P V`.
     pub precision: OperandPrecision,
+}
+
+/// Equality is structural: the float fields compare by bit pattern, so equal attributes hash equal and a NaN scale
+/// equals itself.
+impl PartialEq for AttentionAttrs {
+    fn eq(&self, other: &Self) -> bool {
+        self.n_rep == other.n_rep
+            && self.scale.to_bits() == other.scale.to_bits()
+            && self.softcap.map(f32::to_bits) == other.softcap.map(f32::to_bits)
+            && self.mask == other.mask
+            && self.key == other.key
+            && self.bound == other.bound
+            && self.sink == other.sink
+            && self.precision == other.precision
+    }
+}
+
+impl Eq for AttentionAttrs {}
+
+impl std::hash::Hash for AttentionAttrs {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.n_rep.hash(state);
+        self.scale.to_bits().hash(state);
+        self.softcap.map(f32::to_bits).hash(state);
+        self.mask.hash(state);
+        self.key.hash(state);
+        self.bound.hash(state);
+        self.sink.hash(state);
+        self.precision.hash(state);
+    }
 }
 
 impl AttentionAttrs {
@@ -1112,7 +1142,7 @@ pub enum KvBound {
 }
 
 /// Orthogonal tensor algebra. The whole transformer composes from these (graph-architecture.md 3.2).
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum OpKind {
     /// Elementwise [`UnOp`] over one operand.
     Unary(UnOp),
@@ -3270,7 +3300,7 @@ fn infer_all_gather(
 }
 
 /// The attributes of [`OpKind::SelectedAttention`].
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub struct SelectedAttentionAttrs {
     /// Query heads per key/value head (`Hq / Hkv`).
     pub n_rep: usize,
@@ -3284,6 +3314,31 @@ pub struct SelectedAttentionAttrs {
     pub k: usize,
     /// How Q, K, V and the probabilities enter the two products.
     pub precision: OperandPrecision,
+}
+
+/// Equality is structural: the float fields compare by bit pattern, so equal attributes hash equal.
+impl PartialEq for SelectedAttentionAttrs {
+    fn eq(&self, other: &Self) -> bool {
+        self.n_rep == other.n_rep
+            && self.scale.to_bits() == other.scale.to_bits()
+            && self.softcap.map(f32::to_bits) == other.softcap.map(f32::to_bits)
+            && self.ratio == other.ratio
+            && self.k == other.k
+            && self.precision == other.precision
+    }
+}
+
+impl Eq for SelectedAttentionAttrs {}
+
+impl std::hash::Hash for SelectedAttentionAttrs {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.n_rep.hash(state);
+        self.scale.to_bits().hash(state);
+        self.softcap.map(f32::to_bits).hash(state);
+        self.ratio.hash(state);
+        self.k.hash(state);
+        self.precision.hash(state);
+    }
 }
 
 /// The extents a [`OpKind::SelectedAttention`]'s operands fix.
@@ -5616,7 +5671,7 @@ mod tests {
     fn params_hash(op: &OpKind) -> u64 {
         use std::hash::Hasher;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        op.hash_params(&mut h);
+        std::hash::Hash::hash(op, &mut h);
         h.finish()
     }
 
@@ -5656,15 +5711,15 @@ mod tests {
         })
     }
 
-    /// R469-005-style key correctness for the nullary `Iota`: `hash_params` fingerprints the op's content, so two
+    /// R469-005-style key correctness for the nullary `Iota`: `Hash` fingerprints the op's content, so two
     /// iotas of different lengths or dtypes must not hash alike while equal ones do.
     #[test]
-    fn iota_hash_params_distinguish_lengths_and_dtypes() {
+    fn iota_hash_distinguishes_lengths_and_dtypes() {
         use std::hash::Hasher;
 
         fn hash(op: &OpKind) -> u64 {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            op.hash_params(&mut hasher);
+            std::hash::Hash::hash(&op, &mut hasher);
             hasher.finish()
         }
 
@@ -5678,10 +5733,10 @@ mod tests {
     ///
     /// Mutation: hash nothing for `OpKind::MatMul`; the two forms hash alike.
     #[test]
-    fn matmul_hash_params_distinguish_the_accumulate_form() {
+    fn matmul_hash_distinguishes_the_accumulate_form() {
         let hash = |op: &OpKind| {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            op.hash_params(&mut hasher);
+            std::hash::Hash::hash(&op, &mut hasher);
             std::hash::Hasher::finish(&hasher)
         };
         let matmul = |accumulate| OpKind::MatMul {
@@ -5698,7 +5753,7 @@ mod tests {
         );
     }
 
-    /// Card 528a SC-003. `hash_params` is the content fingerprint that guards the wgpu CSE memo and decode
+    /// Card 528a SC-003. `Hash` is the content fingerprint that guards the wgpu CSE memo and decode
     /// cache, so two fused regions that differ anywhere must not hash alike. The first pair is the R466-020
     /// collision: `x + 1` and `x * 2` share input count, output local and step count, which is all the baseline
     /// hashed.
@@ -5881,203 +5936,5 @@ mod tests {
             .infer(&[TensorType::new(vec![3], DType::I32)])
             .unwrap();
         assert_eq!(out, TensorType::new(vec![3, 5], DType::F32));
-    }
-
-    /// Fold one fused-region operand into a hasher. A literal hashes its dtype tag and bit pattern, so `1.0`,
-    /// `-0.0` versus `0.0` and distinct NaN payloads all stay distinct. `#[cfg(test)]` alongside
-    /// [`OpKind::hash_params`], its only caller.
-    fn hash_fused_operand<H: std::hash::Hasher>(operand: &FusedOperand, h: &mut H) {
-        use std::hash::Hash;
-        match operand {
-            FusedOperand::Local(id) => {
-                0u8.hash(h);
-                id.hash(h);
-            }
-            FusedOperand::Lit(Scalar::F32(v)) => {
-                1u8.hash(h);
-                v.to_bits().hash(h);
-            }
-            FusedOperand::Lit(Scalar::I32(v)) => {
-                2u8.hash(h);
-                v.hash(h);
-            }
-            FusedOperand::PackLane { input, lane } => {
-                3u8.hash(h);
-                input.hash(h);
-                lane.hash(h);
-            }
-        }
-    }
-
-    fn hash_fused_operands<H: std::hash::Hasher>(operands: &[FusedOperand], h: &mut H) {
-        use std::hash::Hash;
-        operands.len().hash(h);
-        for operand in operands {
-            hash_fused_operand(operand, h);
-        }
-    }
-
-    impl OpKind {
-        /// Fold this op's own parameters (not just its discriminant) into a hasher, allocation-free (no `Debug` or
-        /// `format!`). `OpKind` cannot derive `Hash` because `Attention` etc. carry an `f32 scale`,
-        /// which is not `Eq`/`Hash` under IEEE NaN semantics; every f32 field hashes its bit pattern instead. Hashing
-        /// only the discriminant cannot distinguish two eqns of the same op kind with different params (a `Slice` at
-        /// a different offset, a `DynamicUpdateSlice` on a different axis, a different `DType`).
-        ///
-        /// `Fused`/`FusedRow` hash their full region description: every step's op and operands (local ids, literal
-        /// bit patterns, pack lanes), the output local, the pack list and the row axis. A fused region is the whole
-        /// program of one synthesized kernel, so two regions that differ anywhere (`x + 1` versus `x * 2`) must hash
-        /// differently.
-        ///
-        /// `pub(crate)`/test-only (card 546b): the production consumer was `poot-wgpu-device`'s `GraphIdentity`
-        /// (guarding `CseMemo`/`DecodeCache` reuse), gone with the rest of the pre-contract executor.
-        pub(crate) fn hash_params<H: std::hash::Hasher>(&self, h: &mut H) {
-            use std::hash::Hash;
-            std::mem::discriminant(self).hash(h);
-            match self {
-                OpKind::Unary(op) => op.hash(h),
-                OpKind::Binary(op) => op.hash(h),
-                OpKind::Reduce { op, axis, keepdim } => {
-                    op.hash(h);
-                    axis.hash(h);
-                    keepdim.hash(h);
-                }
-                OpKind::Broadcast { shape } => shape.hash(h),
-                OpKind::Cast { to } => to.hash(h),
-                OpKind::Reshape { shape } => shape.hash(h),
-                OpKind::Transpose { perm } => perm.hash(h),
-                OpKind::Slice { axis, start, end } => {
-                    axis.hash(h);
-                    start.hash(h);
-                    end.hash(h);
-                }
-                OpKind::Concat { axis } => axis.hash(h),
-                OpKind::Iota { len, dtype } => {
-                    len.hash(h);
-                    dtype.hash(h);
-                }
-                OpKind::Gather { axis } => axis.hash(h),
-                OpKind::MatMul {
-                    accumulate,
-                    precision,
-                } => {
-                    accumulate.hash(h);
-                    precision.hash(h);
-                }
-                OpKind::IndexedMatMul { rows, precision } => {
-                    rows.hash(h);
-                    precision.hash(h);
-                }
-                OpKind::Select | OpKind::ScatterUpdate => {} // no params beyond the discriminant already hashed
-                OpKind::ContractionEpilogue { head, region } => {
-                    head.hash(h);
-                    region.n_inputs.hash(h);
-                    region.steps.len().hash(h);
-                    for step in &region.steps {
-                        step.op.hash(h);
-                        hash_fused_operands(&step.inputs, h);
-                    }
-                    region.output.hash(h);
-                }
-                OpKind::PackedDequant { descriptor } => descriptor.hash(h),
-                OpKind::PackedContraction {
-                    descriptor,
-                    rows,
-                    precision,
-                } => {
-                    descriptor.hash(h);
-                    rows.hash(h);
-                    precision.hash(h);
-                }
-                OpKind::PackedRowGather { descriptor } => descriptor.hash(h),
-                OpKind::DenseContraction { weight, precision } => {
-                    weight.hash(h);
-                    precision.hash(h);
-                }
-                OpKind::GroupedDenseContraction {
-                    weight,
-                    groups,
-                    precision,
-                } => {
-                    weight.hash(h);
-                    groups.hash(h);
-                    precision.hash(h);
-                }
-                OpKind::DenseRowGather { source } => source.hash(h),
-                OpKind::ArgTopK { k } => k.hash(h),
-                OpKind::ExpertGroup { experts, block } => {
-                    experts.hash(h);
-                    block.hash(h);
-                }
-                OpKind::DynamicUpdateSlice { axis } => axis.hash(h),
-                OpKind::Fused(region) => {
-                    region.n_inputs.hash(h);
-                    region.steps.len().hash(h);
-                    for step in &region.steps {
-                        step.op.hash(h);
-                        hash_fused_operands(&step.inputs, h);
-                    }
-                    region.output.hash(h);
-                    region.pack.hash(h);
-                }
-                OpKind::FusedRow(region) => {
-                    region.n_inputs.hash(h);
-                    region.axis.hash(h);
-                    region.steps.len().hash(h);
-                    for step in &region.steps {
-                        match step {
-                            RowStep::Pointwise { op, inputs } => {
-                                0u8.hash(h);
-                                op.hash(h);
-                                hash_fused_operands(inputs, h);
-                            }
-                            RowStep::Reduce { op, input } => {
-                                1u8.hash(h);
-                                op.hash(h);
-                                hash_fused_operand(input, h);
-                            }
-                        }
-                    }
-                    region.output.hash(h);
-                    region.side_outputs.hash(h);
-                }
-                OpKind::SideOutput { index, ty } => {
-                    index.hash(h);
-                    ty.hash(h);
-                }
-                OpKind::Attention(attrs) => {
-                    attrs.n_rep.hash(h);
-                    attrs.scale.to_bits().hash(h);
-                    attrs.softcap.map(f32::to_bits).hash(h);
-                    attrs.mask.hash(h);
-                    attrs.key.hash(h);
-                    attrs.bound.hash(h);
-                    attrs.sink.hash(h);
-                    attrs.precision.hash(h);
-                }
-                OpKind::Rope { rot } => rot.hash(h),
-                OpKind::Scan(attrs) => attrs.hash(h),
-                OpKind::BlockTopK(attrs) => attrs.hash(h),
-                OpKind::StableRank(attrs) => attrs.hash(h),
-                OpKind::SelectedAttention(attrs) => {
-                    attrs.n_rep.hash(h);
-                    attrs.scale.to_bits().hash(h);
-                    attrs.softcap.map(f32::to_bits).hash(h);
-                    attrs.ratio.hash(h);
-                    attrs.k.hash(h);
-                    attrs.precision.hash(h);
-                }
-                OpKind::AllReduce { op, axis } => {
-                    op.hash(h);
-                    axis.hash(h);
-                }
-                OpKind::AllGather { axis, world } => {
-                    axis.hash(h);
-                    world.hash(h);
-                }
-                OpKind::RandomUniform { cols } => cols.hash(h),
-                OpKind::SampleToken { rule } => rule.hash(h),
-            }
-        }
     }
 }

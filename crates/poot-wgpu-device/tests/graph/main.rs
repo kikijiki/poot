@@ -76,6 +76,23 @@ fn run_via_contract(
     )
 }
 
+/// [`run_via_contract`] with the numerics class the compiled program publishes: the class the output is compared with
+/// the oracle within.
+fn run_via_contract_classed(
+    exec: &mut dyn Executor,
+    target: Target,
+    g: &poot_graph_ir::Graph,
+    inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
+) -> (HostTensor, poot_graph_ir::analysis::Tier2Class) {
+    run_via_contract_classed_under(
+        exec,
+        target,
+        g,
+        inputs,
+        poot_graph_ir::MatmulPrecision::Exact,
+    )
+}
+
 /// [`run_via_contract`] compiled under `policy` (`poot_executor_parity::Policy`): a row about the Gemv or the tiled
 /// schedule over the rows grouped by expert pins it, since at the dimensions these graphs have the planner's cost model
 /// plans the Gemv at every row count (POOT-1489).
@@ -86,6 +103,17 @@ fn run_via_contract_under(
     inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
     policy: impl Into<poot_executor_parity::Policy>,
 ) -> HostTensor {
+    run_via_contract_classed_under(exec, target, g, inputs, policy).0
+}
+
+/// [`run_via_contract_under`] with the numerics class the compiled program publishes.
+fn run_via_contract_classed_under(
+    exec: &mut dyn Executor,
+    target: Target,
+    g: &poot_graph_ir::Graph,
+    inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
+    policy: impl Into<poot_executor_parity::Policy>,
+) -> (HostTensor, poot_graph_ir::analysis::Tier2Class) {
     let mut consts = Vec::new();
     let mut slots = Vec::new();
     for (&id, t) in inputs {
@@ -133,7 +161,7 @@ fn run_via_contract_under(
             ),
         }
     }
-    poot_executor_parity::run_once_under(exec, target, g, &consts, &slots, policy)
+    poot_executor_parity::run_once_classed_under(exec, target, g, &consts, &slots, policy)
         .unwrap_or_else(|e| panic!("{e}"))
 }
 
@@ -281,28 +309,20 @@ fn build_rope_decomposition(
 // tests run each prefill-only op standalone on the GPU against CPU `eval` on the same graph. Landmines in this 64-wide
 // regime: the >64-lane cross-wave LDS cap (barrier-in-loop-crashes-spirv) and the tiled-GEMM high-workgroup-count race
 // (tiled-gemm-large-workgroup-race). A real divergence would be gross (like the card-128 ROCm dispatch bugs,
-// max_abs~156), so the tolerance is generous; the printed max_abs_err is the diagnostic.
+// max_abs~156); the printed max_abs_err is the diagnostic.
 
-/// Element-wise GPU-vs-CPU comparison with a diagnostic print for the card-158 probes. `tol = mul * max(|cpu_elem|, floor)`
-/// per element; prints `op` and the overall max abs error first.
+/// Element-wise GPU-vs-CPU comparison with a diagnostic print for the card-158 probes, within the tolerance of the
+/// compiled program's numerics `class`; prints `op` and the overall max abs error first.
 fn assert_prefill_op_gpu_matches_cpu(
     op: &str,
     tag: &str,
     got: &[f32],
     cpu: &[f32],
-    mul: f32,
-    floor: f32,
+    class: poot_graph_ir::analysis::Tier2Class,
 ) {
     assert_eq!(got.len(), cpu.len(), "{op} [{tag}]: length mismatch");
-    let max_err = max_abs_error(got, cpu);
-    println!("{op} [{tag}]: max_abs_err={max_err:.3e}");
-    for (i, (a, b)) in got.iter().zip(cpu.iter()).enumerate() {
-        let tol = mul * b.abs().max(floor);
-        assert!(
-            (a - b).abs() <= tol,
-            "{op} [{tag}] elem {i}: gpu {a} vs cpu {b} (tol {tol:.2e}, max_abs_err={max_err:.3e})"
-        );
-    }
+    println!("{op} [{tag}]: max_abs_err={:.3e}", max_abs_error(got, cpu));
+    poot_executor_parity::assert_within_class(class, &format!("{op} [{tag}]"), got, cpu);
 }
 
 /// Realistic GDN-shaped strictly-lower-triangular `[c,c]` attn matrix (mirrors poot-eval's private `realistic_gdn_attn`):
@@ -462,7 +482,7 @@ fn check_gdn_prefill_chunked_gpu(
             .output
             .into_host()
             .unwrap();
-        let got = run_via_contract(exec, target, &graph, &inputs);
+        let (got, class) = run_via_contract_classed(exec, target, &graph, &inputs);
         assert_eq!(
             got.shape(),
             cpu.shape(),
@@ -473,8 +493,7 @@ fn check_gdn_prefill_chunked_gpu(
             &format!("l={l} c={c} {label}"),
             got.as_f32().unwrap(),
             cpu.as_f32().unwrap(),
-            3e-3,
-            1e-3,
+            class,
         );
     }
 }

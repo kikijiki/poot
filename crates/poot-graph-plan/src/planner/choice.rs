@@ -10,6 +10,7 @@ use crate::planner::kg::Layout;
 use crate::refusal::Site;
 use crate::types::{Launch, ScratchDecl};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use poot_kernelgen::{KernelRequest, generate};
 use poot_target::{AieTargetId, Backend, DeviceCaps};
@@ -22,7 +23,7 @@ use poot_kernel_ir::{Body, IndexWidth};
 use poot_tensor::DType;
 
 /// An equation that plans no kernel launch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NoDispatch {
     /// The output aliases an input buffer (reshape, an identity cast).
     Alias,
@@ -37,7 +38,7 @@ pub enum NoDispatch {
 /// The kernel the planner chose for one equation.
 // One record per planned equation, matched by value in many places: boxing the request would put a
 // `Box` pattern wall between every caller and the request it reads.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum KernelChoice {
     /// A body `poot-kernelgen` generated from this request, launched as a thread grid.
     Generated(KernelRequest),
@@ -93,32 +94,84 @@ impl KernelChoice {
         }
     }
 
-    /// The canonical encoding of this choice: its `Debug` text, without the `precision: Exact` a request carries
-    /// by default. An exact request is the one that existed before the field did, so a plan compiled under the
-    /// exact policy keeps the key it always had; a narrowed one names its precision and keys differently.
-    pub fn canonical_text(&self) -> String {
-        // The defaults a later field added are omitted, so a request that does not use the field keeps the text
-        // (and the plan digest) it had: an exact precision (POOT-1430), an f32 activation (POOT-1448).
-        format!("{self:?}")
-            .replace(", precision: Exact", "")
-            .replace(", activation_stored: None", "")
-    }
-
     /// The digest of this choice's canonical encoding for `target`'s codegen epoch.
     fn digest(&self, target: poot_codegen::Target) -> ChoiceDigest {
-        // The `Debug` form of the plain-data choice is its encoding. That is sound only while no type
-        // reachable from a request has a lossy `Debug`: the audit (card 636) found one hand-written
-        // impl, `TileSize`, which prints its `u32` edge, and `f32` fields (`FusedInput::Lit`), whose `Debug`
-        // is the shortest round-trip text and so distinguishes every value but the NaN payloads. The
-        // `every_request_family_has_a_field_that_changes_the_digest` test pins one field per family (and the
-        // `TileSize` edge and the Gemv launch shape of the packed family).
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(poot_codegen::kernel_cache_epoch(target).as_bytes());
-        hasher.update(b"\n");
-        // The target itself, not only the flags the epoch folds in: two targets may share an epoch's flags.
-        hasher.update(format!("{target:?}\n").as_bytes());
-        hasher.update(self.canonical_text().as_bytes());
-        ChoiceDigest(*hasher.finalize().as_bytes())
+        // The epoch, then the target itself, not only the flags the epoch folds in: two targets may share an
+        // epoch's flags. The choice follows as its typed fields ([`encoding_digest`]).
+        ChoiceDigest(encoding_digest(&(
+            poot_codegen::kernel_cache_epoch(target),
+            target,
+            self,
+        )))
+    }
+
+    /// The hex digest of this choice's typed fields alone, without the codegen epoch or a target: the identity
+    /// of the request, stable across toolchain and codegen edits that change no field. The plan summary
+    /// records it per equation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn request_fingerprint(&self) -> String {
+        encoding_digest(self)
+            .iter()
+            .try_fold(String::new(), |mut hex, byte| {
+                fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}")).map(|()| hex)
+            })
+            .expect("write to a String")
+    }
+}
+
+/// The canonical encoding of a value, digested: its fields in declaration order through [`Hash`], never its
+/// `Debug` text. Every integer is written as fixed-width little-endian bytes, a slice and a string carry their
+/// length, an enum carries its variant index and a float field is hashed by its bit pattern in its own `Hash`
+/// impl. So a change to how a type prints changes nothing, a change to any field changes the digest, and the
+/// encoding does not depend on the platform's word size.
+///
+/// The encoding follows the order of the fields and variants: reordering them moves every digest, which is the
+/// intended signal (the plan digest file says a plan moved), and renaming one moves none.
+fn encoding_digest<T: Hash + ?Sized>(value: &T) -> [u8; 32] {
+    let mut writer = EncodingWriter(blake3::Hasher::new());
+    value.hash(&mut writer);
+    *writer.0.finalize().as_bytes()
+}
+
+/// A [`Hasher`] whose state is a blake3 hasher: it feeds every written byte through and fixes the byte order of
+/// the integer writes, so the digest is the same on every platform. [`Hasher::finish`] is not the digest and is
+/// never called; [`encoding_digest`] finalizes the blake3 state.
+struct EncodingWriter(blake3::Hasher);
+
+macro_rules! fixed_width_writes {
+    ($($write:ident($int:ty)),* $(,)?) => {
+        $(fn $write(&mut self, value: $int) {
+            self.0.update(&value.to_le_bytes());
+        })*
+    };
+}
+
+impl Hasher for EncodingWriter {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    fixed_width_writes!(
+        write_u16(u16),
+        write_u32(u32),
+        write_u64(u64),
+        write_u128(u128),
+        write_i16(i16),
+        write_i32(i32),
+        write_i64(i64),
+        write_i128(i128),
+    );
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.write_i64(value as i64);
+    }
+
+    fn finish(&self) -> u64 {
+        unreachable!("an EncodingWriter is finalized by `encoding_digest`, not by `Hasher::finish`")
     }
 }
 
@@ -687,13 +740,10 @@ mod tests {
             .to_string()
     }
 
-    /// POOT-1430: the default policy leaves every plan key where it was. A request at `precision: Exact` encodes
-    /// without the field, byte for byte as it did before the field existed, so no program compiled under the
-    /// default policy changes digest; a narrowed or split request names its precision and keys differently from
-    /// the exact one and from every other precision. Mutation: drop the `replace` in `canonical_text`; the exact
-    /// request names its precision, every digest in `plan_summary` moves, and this row goes red.
+    /// POOT-1430: every operand precision of a request is a field of its encoding, so the exact, narrowed and split
+    /// forms (each fragment dtype) key differently.
     #[test]
-    fn an_exact_request_keeps_its_pre_precision_encoding_and_a_narrowed_one_does_not() {
+    fn every_operand_precision_of_a_request_has_its_own_digest() {
         use poot_graph_ir::{FragmentDtype, OperandPrecision};
         use poot_kernelgen::{
             ContractionSpec, GemvActivation, IndexedContraction, Schedule, WeightLayout,
@@ -718,12 +768,6 @@ mod tests {
                 },
             )))
         };
-        let exact = indexed(OperandPrecision::Exact).canonical_text();
-        assert!(!exact.contains("precision"), "{exact}");
-        assert!(
-            exact.ends_with("] })))"),
-            "the text ends as it did before the field: {exact}"
-        );
         let digests: Vec<_> = [
             OperandPrecision::Exact,
             OperandPrecision::Narrow(FragmentDtype::Bf16),
@@ -745,11 +789,9 @@ mod tests {
         }
     }
 
-    /// Card 636: the digest hashes the `Debug` text of the request, so every field must be visible
-    /// in it. This is per family, not per field: one field of each family (the `f32` literal a fused region
-    /// carries, and for the packed family the hand-written `TileSize` `Debug` and the Gemv launch shape)
-    /// changes the digest. Mutation: make `TileSize`'s `Debug` write "0" (`packed/kernel.rs`); the tiled
-    /// packed pair goes red.
+    /// Card 636: every field of a request is part of its encoding. This is per family, not per field: one field
+    /// of each family (the `f32` literal a fused region carries, and for the packed family the `TileSize` edge and
+    /// the Gemv launch shape) changes the digest.
     #[test]
     fn every_request_family_has_a_field_that_changes_the_digest() {
         use poot_kernel_ir::{BinOp, Ty};
@@ -961,6 +1003,96 @@ mod tests {
             );
             assert_eq!(digest_of(base.clone()), digest_of(base), "{family}: stable");
         }
+    }
+
+    /// A pointwise request over one `f32` literal: the smallest request whose field `Debug` prints lossily.
+    fn literal_request(literal: f32) -> KernelRequest {
+        use poot_kernel_ir::BinOp;
+        use poot_kernelgen::{
+            Fold, FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafId, LeafTy, PointwiseForm,
+            PointwiseSpec, StepId, ViewOperand,
+        };
+        KernelRequest::Pointwise(PointwiseSpec {
+            out_shape: vec![4],
+            numel: 4,
+            leaves: vec![ViewOperand {
+                shape: vec![4],
+                layout: poot_kernelgen::Layout::contiguous(&[4]),
+            }],
+            kernel: FusedKernel {
+                leaf_tys: vec![LeafTy::F32; 1],
+                steps: vec![FusedStep {
+                    op: FusedScalarOp::Binary(BinOp::Add),
+                    inputs: vec![FusedInput::Leaf(LeafId::new(0)), FusedInput::Lit(literal)],
+                }],
+                output: FusedInput::Step(StepId::new(0)),
+            },
+            form: PointwiseForm::Float {
+                fold: Fold {
+                    numel: 4,
+                    two_d: false,
+                    width: 256,
+                },
+            },
+        })
+    }
+
+    /// POOT-1622: two requests that differ in one field have different digests, even when the field prints alike.
+    /// Two NaN literals of different payloads print as `NaN` in `Debug`, so a digest of the request's `Debug` text
+    /// gives them one key; the encoding of the fields gives each its own, and the same literal the same.
+    /// Mutation: have `encoding_digest` hash `format!("{value:?}")` instead of `value.hash`; the two NaN
+    /// requests collide and this row goes red.
+    #[test]
+    fn requests_differing_in_a_field_that_prints_alike_have_different_digests() {
+        let (nan_a, nan_b) = (f32::from_bits(0x7fc0_0001), f32::from_bits(0x7fc0_0002));
+        assert_eq!(
+            format!("{:?}", literal_request(nan_a)),
+            format!("{:?}", literal_request(nan_b)),
+            "the premise: the two requests print alike"
+        );
+        assert_ne!(
+            digest_of(literal_request(nan_a)),
+            digest_of(literal_request(nan_b)),
+            "two NaN payloads are two kernels"
+        );
+        assert_eq!(
+            digest_of(literal_request(nan_a)),
+            digest_of(literal_request(nan_a))
+        );
+    }
+
+    /// A type whose `Debug` text is a switch of the test, not a function of its fields.
+    #[derive(Hash)]
+    struct Printed(u32);
+
+    thread_local! {
+        static PRINT_FIELD: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    }
+
+    impl fmt::Debug for Printed {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            if PRINT_FIELD.get() {
+                write!(f, "Printed({})", self.0)
+            } else {
+                f.write_str("Printed")
+            }
+        }
+    }
+
+    /// POOT-1622: the digest is a function of the fields, not of how a type prints. The same value digests alike
+    /// whether its `Debug` shows its field or hides it, and two values that differ in the field digest apart
+    /// while their `Debug` text, hidden, is one string.
+    /// Mutation: have `encoding_digest` hash `format!("{value:?}")` instead of `value.hash`; the digest of the
+    /// value moves with its `Debug` text and this row goes red.
+    #[test]
+    fn a_debug_only_change_to_a_type_leaves_its_digest_unchanged() {
+        let shown = encoding_digest(&Printed(7));
+        PRINT_FIELD.set(false);
+        let hidden = encoding_digest(&Printed(7));
+        let other = encoding_digest(&Printed(8));
+        PRINT_FIELD.set(true);
+        assert_eq!(shown, hidden, "a change of `Debug` alone moved the digest");
+        assert_ne!(hidden, other, "a changed field must change the digest");
     }
 
     /// A split plan with no dispatch has no choice to record: `Planned::split` refuses it as a typed

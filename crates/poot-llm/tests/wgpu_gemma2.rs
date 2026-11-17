@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Executor, NoSync, StepInputs};
+use poot_executor_parity::assert_within_class;
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::op::{FusedOp, FusedOperand, OpKind, UnOp};
 use poot_graph_ir::{Graph, Slot, SlotKey, Storage, ValueId};
 use poot_graph_plan::{
@@ -28,7 +30,7 @@ use poot_models::test_support::dense::{Dense, Family, step};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor, HostView};
-use poot_test_util::{assert_close_rel, max_abs_error};
+use poot_test_util::max_abs_error;
 use poot_wgpu_device::device::WgpuDevice;
 
 /// Compile `g` for `target` through the executor contract's one staged program.
@@ -314,6 +316,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     assert_eq!(g.aval(g.result()).shape, cpu_logits.shape());
     assert_eq!(gpu_logits.len(), cpu_logits.as_f32().unwrap().len());
     assert_eq!(cpu_logits.shape(), vec![1, 1, cfg.vocab]);
+    let class = program.numerics_class();
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
     for (a, b) in gpu_logits.iter().zip(cpu_logits.as_f32().unwrap().iter()) {
@@ -331,10 +334,11 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
          (n={n}, layers={}, head_dim={:?})",
         cfg.layers, cfg.head_dim
     );
-    assert!(
-        max_rel <= 5e-3,
-        "GPU softcapped flash-prefill vs CPU materialized softcap reference: max relative diff \
-         {max_rel} too large"
+    assert_within_class(
+        class,
+        "GPU softcapped flash-prefill vs CPU materialized softcap reference",
+        &gpu_logits,
+        cpu_logits.as_f32().unwrap(),
     );
 }
 
@@ -434,9 +438,10 @@ fn run_decode_once(
     g: &poot_graph_ir::Graph,
     store: &Arc<WeightStore>,
     binds: &[SlotBind],
-) -> Vec<f32> {
+) -> (Vec<f32>, Tier2Class) {
     let (bound, map) = ConstWeights::bind(g, store);
     let program = staged(&bound, target);
+    let class = program.numerics_class();
     let exe = exec.load_weights(Arc::clone(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let inputs = step_inputs(binds);
@@ -447,7 +452,7 @@ fn run_decode_once(
         .unwrap();
     exec.remove_entry(exe, entry).unwrap();
     exec.unload(exe).unwrap();
-    f32_bytes(&bytes)
+    (f32_bytes(&bytes), class)
 }
 
 /// Does this fused region carry the tanh-approximate GELU (`ops::gelu`) of a GeGLU MLP: its `exp` step and
@@ -557,8 +562,8 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu() {
     // the consts/slots computed from `g` bind either graph unchanged.
     let (store, slot_binds) = gpu_consts_and_slots_decode(&g, pos, 5);
     let store = Arc::new(store);
-    let unfused_gpu = run_decode_once(&mut *exec, target, &base, &store, &slot_binds);
-    let fused_gpu = run_decode_once(&mut *exec, target, &fg, &store, &slot_binds);
+    let (unfused_gpu, _) = run_decode_once(&mut *exec, target, &base, &store, &slot_binds);
+    let (fused_gpu, fused_class) = run_decode_once(&mut *exec, target, &fg, &store, &slot_binds);
 
     assert_eq!(fused_gpu.len(), unfused_gpu.len());
     assert_eq!(fused_gpu.len(), cpu.as_f32().unwrap().len());
@@ -569,7 +574,12 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu() {
         fused_vs_unfused <= 1e-4,
         "fused GPU decode must match un-fused within fp tolerance: max_abs={fused_vs_unfused:.3e}"
     );
-    assert_close_rel(&fused_gpu, cpu.as_f32().unwrap(), 5e-3);
+    assert_within_class(
+        fused_class,
+        "fused GeGLU decode vs the CPU oracle",
+        &fused_gpu,
+        cpu.as_f32().unwrap(),
+    );
     eprintln!(
         "gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu: fused/unfused max_abs={:.3e}, \
          fused/cpu max_abs={:.3e}",

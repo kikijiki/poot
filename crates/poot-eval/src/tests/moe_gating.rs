@@ -802,14 +802,22 @@ fn deterministic_moe_routes_match_stable_sort_table() {
     }
 
     for invalid_k in [0, 6] {
-        let result = std::panic::catch_unwind(|| {
-            let b = Builder::for_tests();
-            let scores = b.constant("scores", TensorType::f32(vec![1, 5])).unwrap();
-            let _ = top_k_gate(&b, scores, invalid_k).unwrap();
-        });
+        let b = Builder::for_tests();
+        let scores = b.constant("scores", TensorType::f32(vec![1, 5])).unwrap();
+        let err = top_k_gate(&b, scores, invalid_k)
+            .expect_err("an out-of-range k must fail graph construction");
         assert!(
-            result.is_err(),
-            "k={invalid_k} must fail graph construction"
+            matches!(
+                err,
+                poot_graph_ir::BuilderError::Requirement {
+                    requirement: poot_graph_ir::Requirement::TopKRange {
+                        k,
+                        experts: 5,
+                    },
+                    ..
+                } if k == invalid_k
+            ),
+            "k={invalid_k}: {err:?}"
         );
     }
 }

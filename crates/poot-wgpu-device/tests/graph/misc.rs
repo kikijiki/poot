@@ -88,18 +88,14 @@ fn masked_attention_gpu_matches_cpu() {
         .output
         .into_host()
         .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
+    let (got, class) = run_via_contract_classed(&mut gpu, target, &g, &inputs);
     assert_eq!(got.shape(), cpu.shape());
-    for (i, (a, b)) in got
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(cpu.as_f32().unwrap().iter())
-        .enumerate()
-    {
-        let tol = 5e-3 * b.abs().max(1e-3);
-        assert!((a - b).abs() <= tol, "elem {i}: gpu {a} vs cpu {b}");
-    }
+    poot_executor_parity::assert_within_class(
+        class,
+        "masked attention",
+        got.as_f32().unwrap(),
+        cpu.as_f32().unwrap(),
+    );
 }
 
 #[test]

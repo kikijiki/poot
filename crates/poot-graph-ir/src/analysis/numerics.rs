@@ -284,7 +284,7 @@ mod operand_precision_tests {
         assert_eq!(ops[1].name(), "matmul precision=narrow(bf16)");
         let hashed = |op: &OpKind| {
             let mut h = DefaultHasher::new();
-            op.hash_params(&mut h);
+            std::hash::Hash::hash(op, &mut h);
             h.finish()
         };
         assert_ne!(hashed(&ops[0]), hashed(&ops[1]));

@@ -405,7 +405,7 @@ pub enum ValidationPacketError {
 }
 
 /// An operand: an SSA value reference or an inline literal (the jaxpr `Atom`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Operand {
     /// A value of the graph, by id.
     Value(ValueId),
@@ -556,7 +556,7 @@ impl Slot {
 /// `Slot` = a per-token-varying input routed through a stable device buffer; `Device` = an intermediate;
 /// `State` = a persistent buffer carried across decode steps (the KV cache), fed in and overwritten by
 /// its paired `state_out` (see [`Graph::state`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Storage {
     /// An intermediate living in a device buffer the planner assigns.
     Device,

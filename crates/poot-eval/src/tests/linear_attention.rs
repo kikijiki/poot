@@ -839,7 +839,11 @@ fn gdn_prefill_chunked_matches_decode_recurrence_multi_chunk_c64() {
 
 /// Card 158 diagnostic: sweep decay magnitude at real GDN dims (H_k=16, H_v=32, D=128, C=64, L=115). Real
 /// Qwen3-Next feeds g = softplus(dt) * ssm_a with ssm_a down to ~-72 (blk.0), far larger than the small-g
-/// synthetic oracle (g in [-0.05, -0.17], D <= 8). Prints errors, asserts nothing.
+/// synthetic oracle (g in [-0.05, -0.17], D <= 8). Prints the errors and holds each level to a ceiling relative to
+/// the output's magnitude.
+///
+/// Mutation: in `gdn_prefill_chunked` drop the key decay of the state update (`k_gdiff = kr`); the first level goes
+/// red on `chunked prefill diverges from the sequential recurrence` (4.1e-2 against the 1e-5 ceiling).
 #[test]
 fn gdn_prefill_chunked_decay_magnitude_sweep_real_dims() {
     let (h_k, h_v, d, chunk, l) = (16usize, 32usize, 128usize, 64usize, 115usize);
@@ -1094,8 +1098,25 @@ fn gdn_prefill_chunked_decay_magnitude_sweep_real_dims() {
         eprintln!(
             "g_mean={g_mean:>6} v_scale={v_scale:>5}: chunked-vs-sequential max_abs_error(all)={err:.3e} last_pos={last_err:.3e}"
         );
+        // The measured error is ~2e-8 at v_scale 1 and ~1e-6 at v_scale 50 (it scales with the output), so the
+        // ceiling is relative to the sequential reference's own magnitude, the same 1e-5 the c64 oracle row
+        // above holds absolutely: a wrong carry or decay moves the output by a fraction of its size.
+        let magnitude = want_o.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            err <= CHUNKED_VS_SEQUENTIAL_RELATIVE_CEILING * magnitude,
+            "g_mean={g_mean} v_scale={v_scale}: chunked prefill diverges from the sequential recurrence: \
+             max_abs_error {err:.3e} exceeds {CHUNKED_VS_SEQUENTIAL_RELATIVE_CEILING:e} x output magnitude {magnitude:.3e}"
+        );
+        assert!(
+            last_err <= CHUNKED_VS_SEQUENTIAL_RELATIVE_CEILING * magnitude,
+            "g_mean={g_mean} v_scale={v_scale}: the last position (the state carried through every chunk) \
+             diverges: {last_err:.3e} exceeds {CHUNKED_VS_SEQUENTIAL_RELATIVE_CEILING:e} x output magnitude {magnitude:.3e}"
+        );
     }
 }
+
+/// The chunked-vs-sequential output ceiling of the real-dims sweep, relative to the output's magnitude.
+const CHUNKED_VS_SEQUENTIAL_RELATIVE_CEILING: f32 = 1e-5;
 
 /// Follow-up to `gdn_prefill_chunked_decay_magnitude_sweep_real_dims`: after prefill, does the (tiny, ~1e-6..1e-8)
 /// chunked-vs-sequential state divergence grow over further decode steps, or shrink/stay flat?

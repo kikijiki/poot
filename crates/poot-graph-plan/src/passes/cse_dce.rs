@@ -1,3 +1,5 @@
+use std::collections::hash_map::Entry;
+
 use poot_graph_ir::graph::ComputedConst;
 
 use super::{EditError, Eqn, Graph, HashMap, OpKind, Operand, Storage, ValueId, with_eqns};
@@ -32,7 +34,9 @@ pub fn cse(g: &Graph) -> Result<Graph, EditError> {
             }
         }
     }
-    let mut seen: HashMap<String, ValueId> = HashMap::new(); // eqn key -> canonical out id
+    // The structural key of an eqn: its op (parameters included) and its resolved operands, compared and
+    // hashed field by field, with float literals and scales by bit pattern. Never a formatted text.
+    let mut seen: HashMap<(OpKind, Vec<Operand>), ValueId> = HashMap::new();
     let mut eqns: Vec<Eqn> = Vec::with_capacity(g.eqns().len());
 
     let resolve = |o: &Operand, remap: &HashMap<ValueId, ValueId>| -> Operand {
@@ -44,18 +48,19 @@ pub fn cse(g: &Graph) -> Result<Graph, EditError> {
 
     for eqn in g.eqns() {
         let inputs: Vec<Operand> = eqn.inputs.iter().map(|o| resolve(o, &remap)).collect();
-        // a deterministic structural key: the op (params included) + the resolved operands.
-        let key = format!("{:?}|{:?}", eqn.op, inputs);
-        if let Some(&canon) = seen.get(&key) {
-            remap.insert(eqn.out, canon);
-        } else {
-            seen.insert(key, eqn.out);
-            eqns.push(Eqn {
-                op: eqn.op.clone(),
-                inputs,
-                out: eqn.out,
-                layer: eqn.layer,
-            });
+        match seen.entry((eqn.op.clone(), inputs)) {
+            Entry::Occupied(canon) => {
+                remap.insert(eqn.out, *canon.get());
+            }
+            Entry::Vacant(slot) => {
+                eqns.push(Eqn {
+                    op: eqn.op.clone(),
+                    inputs: slot.key().1.clone(),
+                    out: eqn.out,
+                    layer: eqn.layer,
+                });
+                slot.insert(eqn.out);
+            }
         }
     }
 

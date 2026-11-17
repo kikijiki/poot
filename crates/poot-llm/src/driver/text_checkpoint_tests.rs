@@ -199,7 +199,20 @@ mod chat_template_checkpoints {
         let out = render(&tmpl, &messages, None, None, None)
             .expect("the real gemma4 chat_template must render (this is the reported bug)");
         eprintln!("gemma4 chat_template render:\n{out}");
-        assert!(!out.is_empty());
+        // The gemma4 turn markup, in conversation order: a user turn carrying the question, then a model turn
+        // (the `assistant` role is named `model`) carrying the answer. The ChatFormat fallback writes none of it.
+        let position = |needle: &str| {
+            out.find(needle)
+                .unwrap_or_else(|| panic!("the rendered prompt has no `{needle}`: {out}"))
+        };
+        let user_turn = position("<|turn>user\n");
+        let question = position("What is the capital of France?");
+        let model_turn = position("<|turn>model\n");
+        let answer = position("Paris.");
+        assert!(
+            user_turn < question && question < model_turn && model_turn < answer,
+            "the turns are out of order: {out}"
+        );
     }
 }
 
@@ -256,9 +269,10 @@ mod phi3_gguf_inspect_legacy {
         );
     }
 
-    // Feasibility probe for a GGUF phi3 path: dumps the arch, phi3.* / rope metadata, and per-layer tensor
-    // names (fused vs split qkv/gate_up, how LongRoPE factors are carried). Run with:
-    //   cargo test -p poot-llm --release phi3_gguf_metadata -- --ignored --nocapture
+    // The Phi-3-mini-4k GGUF as the loader reads it: the architecture, the dimensions the phi3 builder derives its
+    // shapes from, full-width rotary embeddings with no LongRoPE factor tensors (that is the 128k variant), and the
+    // fused attention (`attn_qkv`) and gate/up (`ffn_up`) weights the loader splits. Header-only (no tensor data).
+    // Run with: cargo test -p poot-llm phi3_gguf_metadata -- --ignored
     #[test]
     #[ignore = "needs the phi-3-mini GGUF under POOT_MODELS_DIR"]
     fn phi3_gguf_metadata() {
@@ -271,37 +285,52 @@ mod phi3_gguf_inspect_legacy {
             &poot_quant::StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap(),
         )
         .expect("load phi3 gguf");
-        eprintln!("arch = {:?}", g.architecture());
-        let mut keys: Vec<&String> = g
-            .metadata
-            .keys()
-            .filter(|k| {
-                let k = k.as_str();
-                k.contains("rope")
-                    || k.contains("rotary")
-                    || k.contains("phi")
-                    || k.contains("scal")
-                    || k.contains("head")
-                    || k.contains("context")
-                    || k.contains("embedding")
-            })
-            .collect();
-        keys.sort();
-        eprintln!("-- selected metadata --");
-        for k in keys {
-            eprintln!("  {k} = {:?}", g.metadata.get(k));
-        }
-        // layer-0 tensor names (fused vs split), plus any rope_factors tensors.
-        let mut tnames: Vec<&String> = g
-            .tensors
-            .keys()
-            .filter(|t| t.starts_with("blk.0.") || t.contains("rope") || !t.starts_with("blk."))
-            .collect();
-        tnames.sort();
-        eprintln!("-- tensors (blk.0 + non-block + rope) --");
-        for t in tnames {
-            eprintln!("  {t}  dims={:?}", g.tensors.get(t).map(|i| &i.dims));
-        }
+        assert_eq!(g.architecture(), Some("phi3"));
+        let number = |key: &str| -> u64 {
+            g.get(key)
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| panic!("the phi3 GGUF carries no numeric `{key}`"))
+        };
+        let (heads, kv_heads) = (
+            number("phi3.attention.head_count"),
+            number("phi3.attention.head_count_kv"),
+        );
+        let (hidden, ffn) = (
+            number("phi3.embedding_length"),
+            number("phi3.feed_forward_length"),
+        );
+        assert_eq!(
+            (number("phi3.block_count"), number("phi3.context_length")),
+            (32, 4096)
+        );
+        assert_eq!((heads, kv_heads, hidden, ffn), (32, 32, 3072, 8192));
+        assert_eq!(
+            number("phi3.rope.dimension_count"),
+            hidden / heads,
+            "Phi-3-mini rotates the whole head"
+        );
+        let dims = |name: &str| -> Vec<u64> {
+            g.tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("the phi3 GGUF has no tensor `{name}`"))
+                .dims
+                .clone()
+        };
+        let head_dim = hidden / heads;
+        assert_eq!(
+            dims("blk.0.attn_qkv.weight"),
+            [hidden, (heads + 2 * kv_heads) * head_dim],
+            "attention is one fused q/k/v weight"
+        );
+        assert_eq!(
+            dims("blk.0.ffn_up.weight"),
+            [hidden, 2 * ffn],
+            "gate and up are one fused weight"
+        );
+        assert!(
+            !g.tensors.keys().any(|name| name.contains("rope_factors")),
+            "the 4k model carries no LongRoPE factor tensors"
+        );
     }
 }
 

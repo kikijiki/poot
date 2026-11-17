@@ -69,8 +69,22 @@ pub enum EpilogueInput {
     Lit(f32),
 }
 
+/// An epilogue's identity hashes its `f32` literal by bit pattern, so `-0.0` and every NaN payload are different
+/// literals.
+impl std::hash::Hash for EpilogueInput {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Head => {}
+            Self::Leaf(leaf) => leaf.hash(state),
+            Self::Step(step) => step.hash(state),
+            Self::Lit(value) => value.to_bits().hash(state),
+        }
+    }
+}
+
 /// One pointwise step: `step[s] = op(inputs...)`, rounded through the epilogue's dtype.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct EpilogueStep {
     /// The pointwise operation the step computes.
     pub op: FusedScalarOp,
@@ -80,7 +94,7 @@ pub struct EpilogueStep {
 
 /// An extra input of an epilogue: its shape, broadcast against the head's output shape on the right as the graph's
 /// pointwise ops do, and how its elements sit in its buffer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct EpilogueLeaf {
     /// The leaf's shape, right-aligned against the head's output shape (missing leading axes broadcast).
     pub shape: Vec<usize>,
@@ -97,7 +111,7 @@ pub struct EpilogueLeaf {
 /// weight a [`FusedScalarOp::Widen`] step widens (a bias stored BF16 under an f32 epilogue) is the exception: its
 /// [`EpilogueLeaf::storage`] names the packed lane it is read through. `out_shape` is the head's output shape,
 /// which the region runs over; `leaves[j]` is extra input `j`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct Epilogue {
     /// The dtype of the head, every step, the result and every leaf read as stored.
     pub dt: Ty,

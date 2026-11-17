@@ -341,7 +341,7 @@ pub(crate) fn row_major_strides(shape: &[usize]) -> Vec<usize> {
 /// Lives here, not in `poot-graph-plan` (which owns the planner-facing `Plan::View`), because the dependency
 /// runs `poot-graph-plan -> poot-kernelgen`: the kernel bodies that read a view (`fused`,
 /// `fused_row`, `fused_row_parallel`) need the type. `poot-graph-plan` re-exports it as `poot_graph_plan::Layout`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Layout {
     /// Element stride of each axis of the viewed value, in the value's own axis order.
     pub strides: Vec<usize>,

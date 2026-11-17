@@ -119,12 +119,43 @@ impl fmt::Display for TensorType {
 }
 
 /// An inline scalar constant (the jaxpr `Literal`): eps, a scale, 1/N, an index bound, etc.
-#[derive(Clone, Copy, PartialEq, Debug)]
+///
+/// Equality and hashing are on the bit pattern, so two literals are equal exactly when they are the same
+/// constant: `0.0` and `-0.0` differ and a NaN equals itself. That is the structural identity common-subexpression
+/// elimination keys on.
+#[derive(Clone, Copy, Debug)]
 pub enum Scalar {
     /// A 32-bit float literal.
     F32(f32),
     /// A 32-bit signed integer literal.
     I32(i32),
+}
+
+impl PartialEq for Scalar {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::F32(a), Self::F32(b)) => a.to_bits() == b.to_bits(),
+            (Self::I32(a), Self::I32(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Scalar {}
+
+impl std::hash::Hash for Scalar {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::F32(v) => {
+                0u8.hash(state);
+                v.to_bits().hash(state);
+            }
+            Self::I32(v) => {
+                1u8.hash(state);
+                v.hash(state);
+            }
+        }
+    }
 }
 
 impl Scalar {

@@ -51,7 +51,7 @@ use poot_target::AmdArch;
 pub use spirv_postprocess::NoContractionError;
 
 /// A codegen backend target.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Target {
     /// SPIR-V for Vulkan/wgpu (triple `spirv-unknown-vulkan1.3-compute`, carried in the IR text).
     SpirvVulkan,

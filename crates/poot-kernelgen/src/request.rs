@@ -4,11 +4,9 @@
 //! A request is plain data: the planner picks the family, schedule and widths from shapes and
 //! [`DeviceCaps`] (policy lives in `poot-graph-plan`), and the generator implements that selection. It
 //! does not choose a performance policy. [`generate`] is a pure function of `(request, caps)`, so
-//! the request is the kernel's identity: its `Debug` form is the canonical encoding the planner digests
-//! into a plan key, and two requests that differ in any parameter (an `f32` is stored as its bits) are
-//! different kernels. `Debug` is the canonical encoding only while no request type has a lossy hand-written
-//! `Debug` (today only `TileSize`, which prints its `u32` edge and is injective), and an `f32` prints its
-//! shortest round-trip text, which tells every value apart except NaN payloads.
+//! the request is the kernel's identity: the planner digests its typed fields (its `Hash`, an `f32` by its bit
+//! pattern) into a plan key, and two requests that differ in any parameter are different kernels. How a request
+//! prints is not part of that identity.
 //!
 //! The launch grid is derived here from the request, in threads (`[x, y, z]`; a caller divides by the
 //! body's workgroup size to get dispatch counts), so a body and the grid that shapes it come out of one
@@ -234,7 +232,7 @@ pub fn fold_groups(total: usize, max_x: u32) -> (usize, usize) {
 /// Whether a one-thread-per-element kernel folds past the target's X grid cap onto a 2-D grid of
 /// `width`-wide workgroups. The planner decides `two_d` (a policy predicate over the equation and the
 /// device); the body's `x_groups` and the launch grid both follow from it here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Fold {
     /// Output elements the kernel computes, one thread each.
     pub numel: usize,
@@ -272,7 +270,7 @@ impl Fold {
 }
 
 /// A shape read through a physical [`Layout`] (a strided view, or the row-major default).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct ViewOperand {
     /// The logical shape read.
     pub shape: Vec<usize>,
@@ -281,7 +279,7 @@ pub struct ViewOperand {
 }
 
 /// One generation request. See the module docs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum KernelRequest {
     /// A dtype cast between two storage types.
     Cast(CastSpec),
@@ -468,7 +466,7 @@ fn schedule_label(schedule: &Schedule) -> String {
 }
 
 /// A dtype cast between two storage types.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum CastSpec {
     /// `f32` to `bf16`, one thread per element.
     F32ToBf16 {
@@ -512,7 +510,7 @@ pub enum CastSpec {
 }
 
 /// Which element form a pointwise region computes in.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum PointwiseForm {
     /// Float arithmetic (`fused_views`) on the elementwise 2-D fold, one thread per output element.
     Float {
@@ -533,7 +531,7 @@ pub enum PointwiseForm {
 }
 
 /// A fused pointwise region: its output shape, leaves, steps and the form it computes in.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct PointwiseSpec {
     /// The output's logical shape.
     pub out_shape: Vec<usize>,
@@ -548,7 +546,7 @@ pub struct PointwiseSpec {
 }
 
 /// A row-wise fused region or a last-axis reduction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum RowSpec {
     /// A row-wise fused region: one workgroup of `width` lanes per row.
     Fused {
@@ -580,7 +578,7 @@ pub enum RowSpec {
 }
 
 /// The dtype and shapes of a batched matmul.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct MatmulShapes {
     /// The output's shape: batch dimensions then `[M, N]`.
     pub out_shape: Vec<usize>,
@@ -591,7 +589,7 @@ pub struct MatmulShapes {
 }
 
 /// A contraction request: which schedule and which operand storage computes one matmul or GEMV.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum ContractionSpec {
     /// The one-thread-per-output reference kernel, with `epilogue` applied to each output before the store.
     Serial {
@@ -708,7 +706,7 @@ impl ContractionSpec {
 /// before its store. The body is shape-generic; the planner chooses the tiling and the launch (the tiles folded
 /// onto the grid and split into tile ranges, each its own request), so `grid` and `meta` ride in the request.
 /// `meta` is `[K, out_per_block, m_per_block, x_groups, tile_offset]`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct DenseTiledContraction {
     /// The weight's orientation and planned storage.
     pub weight: DenseTiledWeight,
@@ -731,7 +729,7 @@ pub struct DenseTiledContraction {
 /// decode, with `epilogue` applied to each column's sum before its store. The planner validates and chooses the
 /// launch (the schedule's grid, folded and checked against the device's limits with a typed refusal), so `grid`
 /// and `meta` ride in the request.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct PackedContraction {
     /// The weight's format, whose descriptor drives the decode.
     pub format: WeightFormat,
@@ -778,7 +776,7 @@ impl PackedRows {
 /// packed BF16); `epilogue` (f32) runs over each output element's sum before its store. The planner chooses the
 /// launch (the grid folded and checked against the device's limits) and the metadata `[K, N, M, x_groups,
 /// tile_offset, E]`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct IndexedContraction {
     /// [`Schedule::Gemv`] for decode or [`Schedule::RegisterTiled`] for prefill.
     pub schedule: Schedule,
@@ -799,7 +797,7 @@ pub struct IndexedContraction {
 
 /// A generated packed-weight kernel that is not a contraction (a standalone dequantize or a row gather). The
 /// planner validates and chooses the launch, so it rides in the request.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct PackedRequest {
     /// Name the generated body carries.
     pub name: &'static str,
@@ -812,7 +810,7 @@ pub struct PackedRequest {
 }
 
 /// Rotary position embedding in half-split (GPT-NeoX) form, over the leading `rot` channels of the head dim.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct RopeSpec {
     /// The storage element type of `x`, `cos`, `sin` and the output.
     pub dt: Ty,
@@ -827,7 +825,7 @@ pub struct RopeSpec {
 }
 
 /// Batched argtop-k index extraction: `rank [rows, e]` to `out [rows, k]`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct TopKSpec {
     /// Entries per row of `rank`.
     pub e: usize,
@@ -839,7 +837,7 @@ pub struct TopKSpec {
 
 /// The block-aligned grouping of MoE rows by expert (POOT-1451): `ids [M]` to the
 /// [`poot_graph_ir::ExpertGrouping`] layout, one workgroup.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct ExpertGroupSpec {
     /// The expert count; ids in `0..experts` are valid.
     pub experts: usize,
@@ -1402,6 +1400,30 @@ pub struct NumericalContract {
     pub domain: (f32, f32),
 }
 
+/// A contract is part of a kernel's identity, so its `f32` fields hash by bit pattern.
+impl std::hash::Hash for ErrorBound {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Exact => {}
+            Self::OperandUlps(n) | Self::TermsUlps(n) => n.hash(state),
+            Self::Result { abs, rel } => {
+                abs.to_bits().hash(state);
+                rel.to_bits().hash(state);
+            }
+        }
+    }
+}
+
+impl std::hash::Hash for NumericalContract {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.bound.hash(state);
+        self.domain.0.to_bits().hash(state);
+        self.domain.1.to_bits().hash(state);
+    }
+}
+
 /// A pointwise op an AIE core runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AieOp {
@@ -1877,7 +1899,7 @@ impl SerializedAccess {
 
 /// One buffer of a serialized kernel: its logical dimensions, element kind, whether the loop writes it, and
 /// how many leading elements the loop touches.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SerializedBinding {
     /// Logical dimensions of the buffer.
     pub dims: Vec<u64>,

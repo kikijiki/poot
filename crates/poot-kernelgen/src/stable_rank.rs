@@ -39,7 +39,7 @@ const GENERATOR: &str = "stable_rank_body";
 const MAX_EXPERTS: usize = 1 << 24;
 
 /// What the planner asks the stable rank generator for.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StableRankSpec {
     /// Rows: `numel / experts`, one workgroup each.
     pub rows: usize,

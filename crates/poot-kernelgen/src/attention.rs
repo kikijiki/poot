@@ -66,7 +66,7 @@ mod tiled;
 
 /// What the planner asks the attention generator for: the region's shape, its score transform, mask and
 /// bound, and the schedule that runs it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionSpec {
     /// Batch rows `B`.
     pub batch: usize,
@@ -257,7 +257,7 @@ impl AttentionSpec {
 /// key/value heads' rows, under the tiled schedule its blocks of rows), launched as one dispatch of its own:
 /// `count` row groups of `spec` starting at `first`. A prefill whose whole grid would run past the device's watchdog is several
 /// of these over disjoint rows of one output, all this one body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionRows {
     /// The whole attention: its shape and its [`AttentionSchedule::Streaming`] or [`AttentionSchedule::Tiled`]
     /// schedule.
@@ -271,7 +271,7 @@ pub struct AttentionRows {
 /// The combine stage of a split-KV attention: one workgroup of `lanes` threads per row, each lane a strided
 /// share of the `dv` output channels, reduces the row's `splits` partials stage one wrote into the scratch.
 /// Params: the partials `[rows, splits, dv + 2]` (read), then `out [rows, dv]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionCombineSpec {
     /// `batch * hq * lq` rows.
     pub rows: usize,
@@ -301,7 +301,7 @@ impl AttentionCombineSpec {
 
 /// How a raw `q . k` dot product becomes a score before the mask is added. Scale and cap ride as `f32`
 /// bits, so the request stays plain data with an injective `Debug`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScoreTransform {
     /// `score = dot * scale`.
     Scale {
@@ -318,7 +318,7 @@ pub enum ScoreTransform {
 }
 
 /// The mask operand's head axis `Hm`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MaskKind {
     /// `Hm == 1`: one `[Lq, Lk]` plane per batch row, shared by every head.
     Broadcast,
@@ -348,7 +348,7 @@ pub enum MaskKind {
 }
 
 /// How the key operand is laid out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyLayout {
     /// One dense `[B, Hkv, Lk, Dk]` tensor.
     Single,
@@ -366,7 +366,7 @@ pub enum KeyLayout {
 }
 
 /// Which keys a row visits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyBound {
     /// All `lk` positions, a loop bound known when the kernel is generated; the mask removes the ones that
     /// must not count.
@@ -378,7 +378,7 @@ pub enum KeyBound {
 
 /// Whether the softmax includes a sink: one learned logit per query head that joins the row maximum and the
 /// normalizer and is no key, so it weighs nothing in the value sum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AttentionSink {
     /// No sink.
     Absent,
@@ -404,7 +404,7 @@ pub struct KeyWalk {
 }
 
 /// How the region's keys are walked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AttentionSchedule {
     /// The clustered key walk: one workgroup of `lanes` threads per `(batch, key/value head, query row)`,
     /// serving the head's `n_rep` query heads, the lanes in clusters of `walk.cluster` each walking a key per

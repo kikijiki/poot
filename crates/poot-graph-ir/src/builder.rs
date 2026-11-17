@@ -3350,18 +3350,24 @@ mod tests {
     /// literal on either side, so no coercion carve-out applies) turns every one of the four red.
     #[test]
     fn binary_dtype_rule_rejects_the_same_mismatch_at_every_call_site() {
-        // 1. Builder::binary panics at trace time.
+        // 1. Builder::binary refuses at trace time, with the dtype error and no other.
         let builder = Builder::for_tests();
         let float = builder.constant("float", TensorType::f32(vec![2])).unwrap();
         let int = builder
             .constant("int", TensorType::new(vec![2], DType::I32))
             .unwrap();
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            builder.binary(BinOp::Add, float, int).unwrap()
-        }));
+        let err = builder
+            .binary(BinOp::Add, float, int)
+            .expect_err("Builder::binary must reject mismatched dtypes");
         assert!(
-            panicked.is_err(),
-            "Builder::binary must panic on mismatched dtypes"
+            matches!(
+                err,
+                BuilderError::Inference {
+                    source: ShapeError::Dtype { .. },
+                    ..
+                }
+            ),
+            "{err:?}"
         );
 
         // 2. BuilderAppendPlan::equation_named (via `equation`), which checks eagerly at staging time.
