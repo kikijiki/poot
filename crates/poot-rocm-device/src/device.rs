@@ -200,6 +200,10 @@ impl Device for RocmDevice {
     type Recording = RocmRecording;
     type Error = RocmGpuError;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(self.ctx.memory_domain())
+    }
+
     fn copy_mechanism(&mut self) -> CopyMechanism<'_, RocmGpuError> {
         CopyMechanism::Kernel(Box::new(CopyLoader {
             ctx: &self.ctx,

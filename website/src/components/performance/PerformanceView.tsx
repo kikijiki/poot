@@ -2,8 +2,9 @@ import React, { useEffect, useState } from "react";
 import data from "@site/src/data/performance.json";
 import Lines from "./Lines";
 import RunBars from "./RunBars";
-import { CHART_METRICS, MEMORY_METRICS, metricInfo, seriesColor } from "./format";
-import { chartMetrics, defaultSecond, findHardware, fromQuery, options, resolve, selectPoints, legendGroups, runBars, seriesLines, toQuery, yTop, type Selection, type Side } from "./selection";
+import ServeLines from "./ServeLines";
+import { CHART_METRICS, MEMORY_METRICS, SERVE_CHARTS, metricInfo, seriesColor } from "./format";
+import { chartMetrics, defaultSecond, findHardware, fromQuery, options, resolve, selectPoints, legendGroups, runBars, selectServePoints, serveLines, seriesLines, toQuery, yTop, type Selection, type Side } from "./selection";
 import styles from "./performance.module.css";
 import type { Hardware, PerformanceData, PointMetric } from "./types";
 
@@ -57,6 +58,7 @@ function Column({ side, other, slots, onChange }: { side: Side; other?: Side; sl
   const points = selectPoints(hw, side);
   const otherPoints = other ? selectPoints(findHardware(report, other.hw) as Hardware, other) : [];
   const metrics = chartMetrics(report, points);
+  const servePoints = selectServePoints(hw, side);
   return (
     <div className={styles.column} style={slots ? ({ "--rows": FIXED_ROWS + Math.max(slots.length, 1) } as React.CSSProperties) : undefined}>
       {compare && <Pickers report={report} side={side} onChange={onChange} />}
@@ -104,7 +106,18 @@ function Column({ side, other, slots, onChange }: { side: Side; other?: Side; sl
           );
         })}
       </div>
-      {(slots ?? metrics).length === 0 && <p className={styles.sentence}>No measurement for this model.</p>}
+      {(slots ?? metrics).length === 0 && servePoints.length === 0 && <p className={styles.sentence}>No measurement for this model.</p>}
+      {servePoints.length > 0 && (
+        <div className={compare ? styles.chartsHalf : styles.charts}>
+          {SERVE_CHARTS.map((m) => {
+            const info = metricInfo(m.key);
+            const lines = serveLines(servePoints, m.key);
+            if (lines.length === 0) return null;
+            const prompt = servePoints[0].isl;
+            return <ServeLines key={m.key} title={`Serve: ${m.title}`} subtitle={`${side.model}, ${info.unit.suffix} over concurrent requests of ${prompt} input tokens, ${info.higherIsBetter ? "higher" : "lower"} is better`} metric={m.key} lines={lines} />;
+          })}
+        </div>
+      )}
     </div>
   );
 }

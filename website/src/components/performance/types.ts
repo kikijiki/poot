@@ -4,7 +4,7 @@ export type Stat = { median: number; min: number; max: number; n: number };
 
 // A measured quantity of a point. tpot, first-token latency and end-to-end time are derived from the decode and prefill rates and
 // appear in tables and tooltips only.
-export type PointMetric = "decode_tok_s" | "prefill_tok_s" | "ttft_ms" | "tpot_ms" | "e2e_ms" | "peak_vram_bytes" | "peak_rss_bytes" | "load_vram_bytes" | "load_rss_bytes" | "rss_anon_bytes" | "rss_file_bytes" | "weights_bytes" | "kv_bytes" | "workspace_bytes" | "staging_bytes" | "energy_j";
+export type PointMetric = "decode_tok_s" | "output_tok_s" | "prefill_tok_s" | "ttft_ms" | "tpot_ms" | "e2e_ms" | "peak_vram_bytes" | "peak_rss_bytes" | "load_vram_bytes" | "load_rss_bytes" | "rss_anon_bytes" | "rss_file_bytes" | "weights_bytes" | "kv_bytes" | "workspace_bytes" | "staging_bytes" | "energy_j";
 
 // A point whose repeats do not verify but is committed on the list of known-unverified points: its numbers are still measured.
 export type Unverified = { pair: string; failed_repeats: number; reason: string };
@@ -26,6 +26,9 @@ export type Point = {
   precision: string | null;
   // Input tokens: the prompt length of a single-point run, or a context length of a sweep.
   isl: number;
+  // A serve-throughput point: the requests kept in flight against the engine's server. Its `isl` is the fixed prompt length. Every
+  // other point is a single stream and has none.
+  concurrency?: number;
   repeats: number;
   // The hosts whose cells the value is taken over, and how many cells of the class were verified or not.
   hosts: number;

@@ -4137,6 +4137,10 @@ mod kernel_identity_tests {
         type Recording = ();
         type Error = std::convert::Infallible;
 
+        fn memory_topology(&self) -> poot_target::MemoryTopology {
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+        }
+
         fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
             CopyMechanism::Native
         }
@@ -4235,6 +4239,10 @@ mod kernel_identity_tests {
         type Kernel = String;
         type Recording = ();
         type Error = std::convert::Infallible;
+
+        fn memory_topology(&self) -> poot_target::MemoryTopology {
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+        }
 
         fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
             CopyMechanism::Kernel(Box::new(OfferLog(&mut self.offered)))
@@ -4503,6 +4511,10 @@ mod arena_slot_alloc_tests {
         type Recording = ();
         type Error = std::convert::Infallible;
 
+        fn memory_topology(&self) -> poot_target::MemoryTopology {
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+        }
+
         fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
             CopyMechanism::Native
         }
@@ -4646,6 +4658,10 @@ mod f16_packed_weight_upload_tests {
         type Kernel = ();
         type Recording = ();
         type Error = std::convert::Infallible;
+
+        fn memory_topology(&self) -> poot_target::MemoryTopology {
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+        }
 
         fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
             CopyMechanism::Native
@@ -5622,6 +5638,10 @@ mod weight_source_tests {
         type Kernel = ();
         type Recording = ();
         type Error = std::convert::Infallible;
+
+        fn memory_topology(&self) -> poot_target::MemoryTopology {
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+        }
 
         fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
             CopyMechanism::Native
@@ -8435,6 +8455,10 @@ mod weight_source_tests {
         type Recording = ();
         type Error = WriteFault;
 
+        fn memory_topology(&self) -> poot_target::MemoryTopology {
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+        }
+
         fn copy_mechanism(&mut self) -> CopyMechanism<'_, WriteFault> {
             CopyMechanism::Native
         }
@@ -8675,6 +8699,10 @@ mod weight_source_tests {
         type Kernel = ();
         type Recording = ();
         type Error = Fault;
+
+        fn memory_topology(&self) -> poot_target::MemoryTopology {
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+        }
 
         fn copy_mechanism(&mut self) -> CopyMechanism<'_, Fault> {
             CopyMechanism::Native

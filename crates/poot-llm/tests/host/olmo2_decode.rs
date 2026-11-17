@@ -3,9 +3,7 @@
 //! post-norm + full-dim QK-norm block is composed identically. Tiny synthetic config, CPU eval:
 //! no model, no GPU.
 
-mod common;
-
-use common::{step, token_pos, zero_state};
+use crate::common::{step, token_pos, zero_state};
 use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step as step_shape};
 

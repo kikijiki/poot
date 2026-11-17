@@ -92,8 +92,8 @@ def load_policy(path=MANIFEST):
         for field in _METRIC_FIELDS[1:]:
             if not (isinstance(entry.get(field), (int, float)) and 0 < entry[field] < 1):
                 errors.append(f"[performance.metrics.{name}] {field} must be a fraction in (0, 1)")
-    for field in ("headline_metric", "curve_point_metrics"):
-        for name in [policy.get(field)] if field == "headline_metric" else policy.get(field, []):
+    for field in ("headline_metric", "curve_point_metrics", "serve_headline_metric", "serve_latency_metrics"):
+        for name in [policy.get(field)] if field.endswith("headline_metric") else policy.get(field, []):
             if name not in metrics:
                 errors.append(f"[performance] {field} names {name!r}, which has no [performance.metrics] entry")
     if errors:
@@ -600,10 +600,35 @@ ROW_IDENTITY_FIELDS = (
 EXTERNAL_ROW_IDENTITY_FIELDS = ("precision", "prompt_tokens", "requested_output", "framework_version")
 
 
-def row_identity_fields(framework):
-    """The identity fields a row of `framework` must state and agree on to be compared."""
-    return ROW_IDENTITY_FIELDS if framework in BUILD_IDENTITY_FRAMEWORKS else EXTERNAL_ROW_IDENTITY_FIELDS
+def row_identity_fields(framework, serve=False):
+    """The identity fields a row of `framework` must state and agree on to be compared (a serve row's: `serve`)."""
+    if framework not in BUILD_IDENTITY_FRAMEWORKS:
+        return EXTERNAL_ROW_IDENTITY_FIELDS
+    return SERVE_ROW_IDENTITY_FIELDS if serve else ROW_IDENTITY_FIELDS
 HEADLINE_CELL = "headline"
+# The latency cell of a serve receipt: the TTFT and TPOT medians at the cell's concurrency.
+SERVE_LATENCY_CELL = "latency"
+
+
+# What a serve row (a cell of a server under concurrent requests) states about the workload and the build that ran it. A
+# server has no prefill chunk and no profiled mode; its concurrency is the cell key, not identity.
+SERVE_ROW_IDENTITY_FIELDS = (
+    "precision",
+    "prompt_tokens",
+    "requested_output",
+    "build_profile",
+    "build_features",
+    "rustc_version",
+    "adapter",
+    "driver_version",
+    "checkpoint_digest",
+    "compute_dtype",
+)
+
+
+def is_serve_row(row):
+    """Whether a stored row is a cell of the serve scenario: it states the concurrency it ran at."""
+    return row.get("concurrency") is not None
 
 
 # What a row's `prefill_chunk` identity is when its prompts prefill whole, in one chunk each.
@@ -642,7 +667,12 @@ def row_workload_field(row, field):
 
 def row_identity(row):
     """What one stored row states about the workload and the build and platform that ran it."""
-    return {field: row_workload_field(row, field) for field in row_identity_fields(row.get("framework"))}
+    return {field: row_workload_field(row, field) for field in row_identity_fields(row.get("framework"), is_serve_row(row))}
+
+
+def headline_metric(row, policy):
+    """The metric a row's cell is judged by: output tokens per second for a serve row, decode tokens per second otherwise."""
+    return policy["serve_headline_metric"] if is_serve_row(row) else policy["headline_metric"]
 
 
 def rows_receipt(rows, policy):
@@ -653,15 +683,20 @@ def rows_receipt(rows, policy):
     not only the smallest-context headline.
     """
     ok = [row for row in rows if row.get("status") == "ok"]
+    serve = is_serve_row((ok or rows)[0])
+    headline = headline_metric((ok or rows)[0], policy)
     cells = {
         HEADLINE_CELL: {
-            "repeats": [
-                {"status": "ok", "metrics": {policy["headline_metric"]: row.get(policy["headline_metric"])}}
-                for row in ok
-            ]
+            "repeats": [{"status": "ok", "metrics": {headline: row.get(headline)}} for row in ok]
             + [{"status": "failed"} for row in rows if row.get("status") != "ok"]
         }
     }
+    if serve:
+        # A server cell is judged by its throughput and by what each request waited, at the one concurrency it ran.
+        cells[SERVE_LATENCY_CELL] = {
+            "repeats": [{"status": "ok", "metrics": {m: row.get(m) for m in policy["serve_latency_metrics"]}} for row in ok]
+            + [{"status": "failed"} for row in rows if row.get("status") != "ok"]
+        }
     for row in ok:
         for point in row.get("curve") or []:
             metrics = {name: point[name]["p50"] for name in policy["curve_point_metrics"]}
@@ -669,16 +704,19 @@ def rows_receipt(rows, policy):
                 {"status": "ok", "metrics": metrics}
             )
     for name, record in cells.items():
-        if name != HEADLINE_CELL:
+        if name not in (HEADLINE_CELL, SERVE_LATENCY_CELL):
             record["repeats"] += [{"status": "failed"} for row in rows if row.get("status") != "ok"]
-    return {"identity": row_identity((ok or rows)[0]), "cells": cells}
+    return {"identity": row_identity((ok or rows)[0]), "kind": "serve" if serve else "single", "cells": cells}
 
 
 def rows_spec(baseline_receipt, policy):
     """The coverage the baseline sets: the headline and every curve point it measured."""
-    return {
-        "cells": {
-            name: [policy["headline_metric"]] if name == HEADLINE_CELL else list(policy["curve_point_metrics"])
-            for name in baseline_receipt["cells"]
-        }
-    }
+    serve = baseline_receipt.get("kind") == "serve"
+    headline = [policy["serve_headline_metric"] if serve else policy["headline_metric"]]
+
+    def metrics(name):
+        if name == HEADLINE_CELL:
+            return headline
+        return list(policy["serve_latency_metrics"] if name == SERVE_LATENCY_CELL else policy["curve_point_metrics"])
+
+    return {"cells": {name: metrics(name) for name in baseline_receipt["cells"]}}

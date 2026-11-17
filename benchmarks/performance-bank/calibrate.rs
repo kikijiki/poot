@@ -29,6 +29,17 @@
 //! - `gemv-fit --rows F --out E`: for each output count, the columns that ran fastest and by how much, and which
 //!   figures the sweep identifies. It opens no device.
 //!
+//! Packed Gemv geometry modes (POOT-1608), for the decode Gemv over one packed `[N, K]` weight whose launch geometry
+//! `(cols, rows, run, depth)` the planner scores from the device's `GemvDevice` figures:
+//! - `packed-gemv-cells --bank B`: one `format<TAB>NxK<TAB>cols<TAB>rows<TAB>run<TAB>depth` line per geometry of
+//!   [`PACKED_GEMV_CORPUS`] the format's decode admits and the lane's registers hold;
+//! - `packed-gemv-measure --bank B --format F --cell NxK --cols C --rows R --run U --depth D`: pin that geometry
+//!   (`CompileOptions::packed_gemv_pin`), refuse unless the planner planned exactly it, time the plan on the device
+//!   clock (the weights held as the bank's rotation copies, so a step streams them from memory) and print one TSV row:
+//!   the cell, the geometry, the median device microseconds and the body facts the model scores that geometry with
+//!   (warp instructions and cache lines per trip, the device's compute units and warp lanes, the weight bytes);
+//! - the fit is `benchmarks/calibration/fit_packed_gemv.py`, which reads those rows. It opens no device.
+//!
 //! Packed grouped modes (POOT-1505), for a routed projection over a packed expert stack (a `packed_grouped_experts`
 //! bank case) at several prompt lengths:
 //! - `packed-cells --bank B --case ID`: one `tokens<TAB>precision<TAB>index` line per tiling the device runs for the
@@ -156,6 +167,7 @@ where
         tiling: Some(tiling),
         indexed_rows: None,
         gemv_cols: None,
+        packed_gemv: None,
     };
     let prepared = prepare(bank, &case, ops)?;
     let schedules = tiled_schedules_of(&staged(
@@ -331,10 +343,12 @@ where
         Some("gemv-fit") => gemv_fit(backend, &args),
         Some("dense-cells") => dense_cells(device),
         Some("dense-measure") => dense_measure(&args, device),
+        Some("packed-gemv-cells") => packed_gemv_cells(&args, device),
+        Some("packed-gemv-measure") => packed_gemv_measure(&args, device),
         Some("packed-cells") => packed_cells(&args, device),
         Some("packed-measure") => packed_measure(&args, device),
         other => Err(format!(
-            "usage: calibrate_launch shapes|measure|fit|indexed-cells|indexed-measure|indexed-choice|indexed-fit|gemv-cells|gemv-measure|gemv-fit|dense-cells|dense-measure|packed-cells|packed-measure, got {other:?}"
+            "usage: calibrate_launch shapes|measure|fit|indexed-cells|indexed-measure|indexed-choice|indexed-fit|gemv-cells|gemv-measure|gemv-fit|dense-cells|dense-measure|packed-gemv-cells|packed-gemv-measure|packed-cells|packed-measure, got {other:?}"
         )),
     }
 }
@@ -510,6 +524,7 @@ where
         tiling: None,
         indexed_rows: Some(rows),
         gemv_cols: None,
+        packed_gemv: None,
     };
     let prepared = prepare(bank, &case, ops)?;
     let schedules = indexed_schedules_of(&staged(
@@ -597,6 +612,7 @@ where
         tiling: None,
         indexed_rows: None,
         gemv_cols: None,
+        packed_gemv: None,
     };
     for cell in indexed_cells() {
         let schedules = indexed_schedules_of(&staged(
@@ -965,6 +981,7 @@ where
         tiling: None,
         indexed_rows: None,
         gemv_cols: None,
+        packed_gemv: None,
     };
     let prepared = prepare(&bank, &case, unpinned)?;
     let chosen = gemv_cols_of(&dense_gemv_schedules_of(&staged(
@@ -1071,6 +1088,232 @@ fn gemv_fit(backend: &str, args: &[String]) -> Result<(), String> {
     }
     std::fs::write(&out, &report).map_err(|e| format!("write {}: {e}", out.display()))?;
     print!("{report}");
+    Ok(())
+}
+
+/// The cells of the packed Gemv corpus (POOT-1608, POOT-1610): a bank `storage` name and the `[N, K]` weight of a decode
+/// projection (a gate or up, a down, and the head of the 27B; a short-`K` and a small-`N` projection of the 4B, and POOT-1611's three more small decode cells of the 4B: its
+/// attention output and query projections and a Q6_K value projection, the latency-bound end of the model), each
+/// swept over the whole geometry space the planner searches. The formats are the ones whose decode admits a 32-value
+/// run (Q4_K, Q5_K, IQ4_XS: the planner's run 32 of POOT-1606) and two it does not (Q6_K, Q8_0), so a figure that fits
+/// the first cannot flip the second unseen.
+const PACKED_GEMV_CORPUS: [(&str, usize, usize); 15] = [
+    ("q4_k", 17408, 5120),
+    ("q4_k", 5120, 17408),
+    ("q4_k", 2560, 9728),
+    ("q4_k", 65536, 5120),
+    ("q4_k", 9728, 2560),
+    ("q4_k", 1024, 2560),
+    ("q5_k", 17408, 5120),
+    ("q5_k", 5120, 17408),
+    ("iq4_xs", 17408, 5120),
+    ("iq4_xs", 5120, 17408),
+    ("q6_k", 17408, 5120),
+    ("q8_0", 17408, 5120),
+    ("q4_k", 2560, 4096),
+    ("q4_k", 4096, 2560),
+    ("q6_k", 1024, 2560),
+];
+/// The columns, runs, rows and depths a cell sweeps: the planner's `COLS` and runs, `GemvRows` (those dividing the
+/// cell's `N`, as the planner's) and `LoadDepth`.
+const PACKED_GEMV_COLS: [u32; 6] = [1, 2, 4, 8, 16, 32];
+const PACKED_GEMV_RUNS: [u32; 4] = [32, 16, 8, 4];
+
+/// The `(rows, depth)` pairs a cell with `n` outputs sweeps.
+fn rows_and_depths(n: usize) -> Vec<(u32, u32)> {
+    (1..=poot_kernelgen::GemvRows::MAX)
+        .filter(|&rows| n.is_multiple_of(rows as usize))
+        .flat_map(|rows| (1..=poot_kernelgen::LoadDepth::MAX).map(move |depth| (rows, depth)))
+        .collect()
+}
+
+/// The Gemv schedule of a geometry over a weight of `k` values on the device `caps`, as the planner builds it for the
+/// Vec4 activation read every run of this corpus takes.
+fn packed_gemv_schedule(
+    caps: &poot_target::DeviceCaps,
+    (cols, rows, run, depth): (u32, u32, u32, u32),
+) -> Result<Schedule, String> {
+    Ok(Schedule::Gemv {
+        width: caps.gemm_launch().gemv_width,
+        cols,
+        unroll: run,
+        activation: poot_kernelgen::GemvActivation::Vec4,
+        rows: poot_kernelgen::GemvRows::new(rows).map_err(|e| format!("rows {rows}: {e:?}"))?,
+        depth: poot_kernelgen::LoadDepth::new(depth)
+            .map_err(|e| format!("depth {depth}: {e:?}"))?,
+    })
+}
+
+/// `packed-gemv-cells`: the geometries of the corpus the format's decode admits and the lane's registers hold.
+fn packed_gemv_cells<D>(
+    args: &[String],
+    device: impl FnOnce() -> Result<D, String>,
+) -> Result<(), String>
+where
+    D: Device + 'static,
+{
+    let _ = read_bank(args)?;
+    let device = device()?;
+    let Target::Gpu { caps, .. } = device.target() else {
+        return Err("the device is not a GPU target".into());
+    };
+    for (storage, n, k) in PACKED_GEMV_CORPUS {
+        let format = crate::runner::packed_format(storage)?;
+        let sharing = poot_kernelgen::packed_run_sharing(format).map_err(|e| format!("{e:?}"))?;
+        for run in PACKED_GEMV_RUNS {
+            let admitted = match sharing {
+                poot_kernelgen::PackedRunSharing::FactorRun { factor_run } => {
+                    factor_run.is_multiple_of(run as usize)
+                }
+                _ => true,
+            };
+            if !admitted {
+                continue;
+            }
+            for (rows, depth) in rows_and_depths(n) {
+                for cols in PACKED_GEMV_COLS {
+                    let schedule = packed_gemv_schedule(&caps, (cols, rows, run, depth))?;
+                    if poot_kernelgen::packed_gemv_body_cost(format, schedule, &caps).is_ok() {
+                        println!("{storage}\t{n}x{k}\t{cols}\t{rows}\t{run}\t{depth}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The packed Gemv of the plan `program` holds, in plan order.
+fn packed_gemv_schedules_of(program: &StagedProgram) -> Vec<Schedule> {
+    program
+        .stages()
+        .flat_map(|(_, _, p)| p.planned())
+        .flat_map(|(_, plan)| plan.dispatches().iter())
+        .filter_map(|d| match d.choice() {
+            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(spec))) => {
+                Some(spec.schedule)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `packed-gemv-measure`: one row of the packed Gemv corpus.
+fn packed_gemv_measure<D>(
+    args: &[String],
+    device: impl FnOnce() -> Result<D, String>,
+) -> Result<(), String>
+where
+    D: Device + 'static,
+{
+    let bank = read_bank(args)?;
+    let storage = flag(args, "--format")?;
+    let cell = flag(args, "--cell")?;
+    let (n, k) = cell
+        .split_once('x')
+        .and_then(|(n, k)| Some((n.parse::<usize>().ok()?, k.parse::<usize>().ok()?)))
+        .ok_or_else(|| format!("cell {cell:?} is not NxK"))?;
+    let number = |name: &str| -> Result<u32, String> {
+        flag(args, name)?
+            .parse()
+            .map_err(|e| format!("{name}: {e}"))
+    };
+    let geometry = (
+        number("--cols")?,
+        number("--rows")?,
+        number("--run")?,
+        number("--depth")?,
+    );
+    let format = crate::runner::packed_format(&storage)?;
+    let mut case = bank["cases"]
+        .as_array()
+        .and_then(|cases| cases.iter().find(|c| c["id"] == "packed-decode-gemv"))
+        .ok_or("the bank has no case packed-decode-gemv")?
+        .clone();
+    case["storage"] = storage.clone().into();
+    case["shape"] = serde_json::json!({ "m": 1, "k": k, "n": n });
+    let device = device()?;
+    let Target::Gpu { caps, .. } = device.target() else {
+        return Err("the device is not a GPU target".into());
+    };
+    let (cols, rows, run, depth) = geometry;
+    let ops = Operands {
+        packed_gemv: Some(poot_graph_plan::PackedGemvPin {
+            cols,
+            rows,
+            run,
+            depth,
+        }),
+        ..Operands::of(device.target(), &case)?
+    };
+    let prepared = prepare(&bank, &case, ops)?;
+    let ran = packed_gemv_schedules_of(&staged(
+        &prepared.graphs[0],
+        device.target(),
+        ops,
+        &facts_of(&device),
+    )?);
+    let wanted = packed_gemv_schedule(&caps, geometry)?;
+    let [
+        Schedule::Gemv {
+            width,
+            cols: ran_cols,
+            unroll,
+            rows: ran_rows,
+            depth: ran_depth,
+            ..
+        },
+    ] = ran[..]
+    else {
+        return Err(format!(
+            "{storage} {cell}: the planner ran {ran:?}, not a Gemv"
+        ));
+    };
+    if (ran_cols, ran_rows.get(), unroll, ran_depth.get()) != geometry {
+        return Err(format!(
+            "{storage} {cell}: the planner ran {ran:?}, not the pinned {wanted:?}"
+        ));
+    }
+    let body = poot_kernelgen::packed_gemv_body_cost(format, ran[0], &caps)
+        .map_err(|e| format!("{storage} {cell}: {e:?}"))?;
+    let warp =
+        match caps.subgroup {
+            poot_target::Queried::Known(poot_target::SubgroupSupport::Present {
+                max_size, ..
+            }) if max_size > 0 => max_size,
+            _ => 32,
+        };
+    let lines = body.lines_per_trip(poot_kernelgen::LaneMap {
+        warp_lanes: warp,
+        lanes_per_col: width / cols,
+    });
+    let units = caps
+        .compute_units
+        .known()
+        .ok_or("the device reports no compute units")?;
+    let descriptor = poot_quant::PackedWeight::try_new(format, [n, k])
+        .map_err(|e| format!("{storage} {cell}: {e:?}"))?;
+    let weight_bytes: usize = descriptor
+        .sources()
+        .into_iter()
+        .map(|role| descriptor.slab_bytes(role))
+        .sum();
+    let measured = measure(device, &bank, &prepared, ops)?;
+    if !measured.agrees {
+        return Err(format!(
+            "{storage} {cell}: the output disagrees with the reference (worst {})",
+            measured.worst
+        ));
+    }
+    let mut samples = measured
+        .device_us
+        .ok_or("the device reports no timestamps; build it with device timing")?;
+    samples.sort_by(f64::total_cmp);
+    println!(
+        "{storage}\t{cell}\t{cols}\t{rows}\t{run}\t{depth}\t{}\t{}\t{lines}\t{units}\t{warp}\t{width}\t{weight_bytes}",
+        samples[samples.len() / 2],
+        body.warp_instructions,
+    );
     Ok(())
 }
 

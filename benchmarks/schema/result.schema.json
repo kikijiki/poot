@@ -201,10 +201,28 @@
       }
     },
     "device_time": { "$ref": "#/definitions/deviceTime" },
+    "concurrency": { "type": "integer", "minimum": 1, "description": "serve-throughput (POOT-1334): the number of requests the load client kept in flight against the server. Each concurrency of the scenario is its own cell, so it is part of the cell key: a compare, the Performance page and the known-unverified list never merge two concurrencies. Absent on every other scenario." },
+    "output_tok_s": { "type": "number", "exclusiveMinimum": 0, "description": "serve-throughput: output tokens per second summed over every request of the cell, over the whole wall time from the first request's start to the last one's finish. The headline of a serve cell." },
+    "server_slots": { "type": "integer", "minimum": 1, "description": "serve-throughput: the requests the server could run at once, as the server states it (poot: the engine's rows; vLLM: --max-num-seqs; llama.cpp: --parallel). At least the concurrency." },
+    "serve": {
+      "type": "object",
+      "required": ["concurrency", "requests", "failed_requests", "wall_ms", "output_tok_s", "ttft_ms", "tpot_ms", "e2e_ms"],
+      "description": "serve-throughput: the load client's requests aggregated by the harness (result_contract.py): how many were timed and failed (a cell with a failed request is an error row, so failed_requests is 0 here), the wall time, the aggregate output tokens per second and the percentiles over the requests of time to first token, time per output token after the first and end-to-end time.",
+      "properties": {
+        "concurrency": { "type": "integer", "minimum": 1 },
+        "requests": { "type": "integer", "minimum": 1 },
+        "failed_requests": { "type": "integer", "minimum": 0 },
+        "wall_ms": { "type": "number", "exclusiveMinimum": 0 },
+        "output_tok_s": { "type": "number", "exclusiveMinimum": 0 },
+        "ttft_ms": { "$ref": "#/definitions/nonnegativePercentiles" },
+        "tpot_ms": { "$ref": "#/definitions/positivePercentiles" },
+        "e2e_ms": { "$ref": "#/definitions/nonnegativePercentiles" }
+      }
+    },
     "timing_claim": {
       "type": "string",
-      "enum": ["request-window", "row-level"],
-      "description": "The timing capability the runner claims. request-window: every request reports its raw boundaries (tokens, first/last token, finish, steps) and TPOT is the mean inter-token gap; row-level: only ttft/e2e/per-token gaps are reported, TPOT is (e2e - ttft)/(osl - 1), and rows compare on the row-level identity subset only. Declared once, in harness/result_contract.py."
+      "enum": ["request-window", "row-level", "client-stream"],
+      "description": "The timing capability the runner claims. request-window: every request reports its raw boundaries (tokens, first/last token, finish, steps) and TPOT is the mean inter-token gap; row-level: only ttft/e2e/per-token gaps are reported, TPOT is (e2e - ttft)/(osl - 1), and rows compare on the row-level identity subset only; client-stream: a serve cell, every request timed by the one load client on its HTTP stream, whatever the engine. Declared once, in harness/result_contract.py."
     },
     "preparation": {
       "type": "object",

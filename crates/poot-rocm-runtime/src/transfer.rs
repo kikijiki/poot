@@ -7,8 +7,8 @@ use crate::bindings::{
 };
 use crate::buffer::{Pool, RocmAlloc, checked_byte_range, checked_copy, checked_layout};
 use crate::context::{
-    Held, HsaShutdownGuard, StagingBuffer, TimeoutLeaks, UploadStrategy, require_gpu_check,
-    upload_strategy_for_pool,
+    Held, HsaShutdownGuard, StagingBuffer, TimeoutLeaks, UploadStrategy, memory_domain_for_pool,
+    require_gpu_check,
 };
 use crate::discovery::{
     GpuPicker, PoolState, agent_isa_name, agent_limits, agent_name, agent_vendor,
@@ -32,6 +32,7 @@ use crate::{
 };
 use poot_runtime_common::BufferRole;
 use poot_target::BufferStorage;
+use poot_target::MemoryDomain;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use tracing::info;
@@ -184,8 +185,12 @@ impl RocmContext {
                 &mut fine_pool_flags as *mut _ as *mut c_void,
             ))?;
         }
-        let upload_strategy = upload_strategy_for_pool(fine_pool_location, fine_pool_flags);
-        info!(?upload_strategy, "resolved upload strategy for fine_pool");
+        let memory_domain = memory_domain_for_pool(fine_pool_location, fine_pool_flags);
+        info!(
+            ?memory_domain,
+            upload_strategy = ?UploadStrategy::of(memory_domain),
+            "resolved memory domain for fine_pool"
+        );
 
         let mut max_size: u32 = 0;
         // SAFETY: `HSA_AGENT_INFO_QUEUE_MAX_SIZE` writes a `uint32_t` into the local.
@@ -376,7 +381,7 @@ impl RocmContext {
             wavefront,
             fine_pool,
             coarse_pool: gpu_coarse_pool,
-            upload_strategy,
+            memory_domain,
             queue,
             queue_role: plan.role(),
             queue_ring_provenance,
@@ -605,7 +610,7 @@ impl RocmContext {
             // transfer has nothing to do.
             return Ok(());
         }
-        match self.upload_strategy {
+        match self.upload_strategy() {
             UploadStrategy::HostWrite => {
                 // SAFETY: `HostWrite` means the pool is host-visible, so `dst` is a host address valid
                 // for `size` bytes, as is `src` (function contract); host and pool memory do not overlap.
@@ -635,7 +640,7 @@ impl RocmContext {
         if size == 0 {
             return Ok(());
         }
-        match self.upload_strategy {
+        match self.upload_strategy() {
             UploadStrategy::HostWrite => {
                 // SAFETY: `HostWrite` means `src` is a host-visible pool address readable for `size`
                 // bytes, and `dst` is writable for `size` bytes (function contract); they do not overlap.
@@ -872,7 +877,7 @@ impl RocmContext {
         }
         // SAFETY: `range` proved `offset..offset + len` lies inside `buf`'s live allocation.
         let dst = unsafe { buf.alloc.as_ptr().byte_add(range.byte_offset) };
-        match (buf.pool(), self.upload_strategy) {
+        match (buf.pool(), self.upload_strategy()) {
             (Pool::Fine, UploadStrategy::HostWrite) => {
                 // SAFETY: `HostWrite` means the fine pool is host-visible, so `dst` is a host address for
                 // `len` bytes of the live allocation; nothing else references it while `fill` runs.
@@ -993,9 +998,15 @@ impl RocmContext {
         }
     }
 
-    /// How host<->device transfers reach this context's buffer pool, decided at construction.
+    /// The memory domain of this context's buffer pool, decided at construction from the pool's location and
+    /// flags: what the device reports through `Device::memory_topology`.
+    pub fn memory_domain(&self) -> MemoryDomain {
+        self.memory_domain
+    }
+
+    /// How host<->device transfers reach this context's buffer pool: derived from its [`Self::memory_domain`].
     pub fn upload_strategy(&self) -> UploadStrategy {
-        self.upload_strategy
+        UploadStrategy::of(self.memory_domain)
     }
 }
 

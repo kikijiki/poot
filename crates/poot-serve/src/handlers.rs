@@ -114,6 +114,8 @@ struct Shaped {
     /// User stop sequences, and a chat's turn-end markers.
     stops: Vec<String>,
     max_new: usize,
+    /// Generate to `max_new` whatever the model samples (`ignore_eos`).
+    ignore_eos: bool,
     /// The choices: one concurrent job each.
     n: usize,
     /// The request's seed (its own, else one drawn from the OS); choice `i` samples from `seed + i`.
@@ -129,6 +131,7 @@ impl Shaped {
             max_new: self.max_new,
             sampler,
             stop: self.stops.clone(),
+            ignore_eos: self.ignore_eos,
             stream,
             lora_adapter: self.lora_adapter,
         }
@@ -151,6 +154,7 @@ fn shape_completion(served: &Served, req: &CompletionReq) -> Result<Shaped> {
         .into());
     }
     req.sampling.check()?;
+    let ignore_eos = req.ignores_eos()?;
     let stops = Stop::list(&req.stop)?;
     let seed = req.sampling.resolve_seed()?;
     let caps = served.view.caps();
@@ -164,6 +168,7 @@ fn shape_completion(served: &Served, req: &CompletionReq) -> Result<Shaped> {
         stops,
         // Bound once, before any engine is asked to size an allocation from it.
         max_new: req.effective_max_tokens(),
+        ignore_eos,
         n,
         seed,
         lora_adapter,
@@ -204,6 +209,7 @@ fn shape_chat(served: &Served, req: &ChatReq, client_gone: ClientGone<'_>) -> Re
         .into());
     }
     req.sampling.check()?;
+    let ignore_eos = req.ignores_eos()?;
     let user_stops = Stop::list(&req.stop)?;
     let seed = req.sampling.resolve_seed()?;
     let caps = served.view.caps();
@@ -222,13 +228,17 @@ fn shape_chat(served: &Served, req: &ChatReq, client_gone: ClientGone<'_>) -> Re
     check_choices(n, &caps)?;
     let lora_adapter =
         resolve_lora_adapter(&served.view, &req.lora_adapter).map_err(LoraAdapterError)?;
-    // Stop at the template's end marker(s) as well as user stop sequences.
+    // Stop at the template's end marker(s) as well as user stop sequences, unless the request generates
+    // to its token cap: its turn-end markers end nothing either.
     let mut stops = user_stops;
-    stops.extend(turn_stops);
+    if !ignore_eos {
+        stops.extend(turn_stops);
+    }
     Ok(Shaped {
         prompt,
         stops,
         max_new: req.effective_max_tokens(),
+        ignore_eos,
         n,
         seed,
         lora_adapter,

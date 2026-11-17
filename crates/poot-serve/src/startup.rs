@@ -7,12 +7,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use poot_build_identity::BuildIdentity;
 use poot_llm::driver::error::DriverError;
+use poot_llm::driver::identity::RunIdentity;
 use poot_llm::driver::{
     DraftPolicy, LoadOptions, ModelHandle, open_executor, open_group, open_timed_executor,
 };
 use poot_llm::encoders::Pooling;
 use poot_models::registry::Registry;
+use poot_runtime_common::DeviceIdentity;
 
 use crate::admin::LoraAdminPolicyMode;
 use crate::batch::engine::{DriverEngine, run_engine_thread};
@@ -215,6 +218,18 @@ fn load_served(model_dir: &str, options: &LoadOptions) -> Result<Arc<ModelHandle
     Ok(model)
 }
 
+/// What a started engine hands the thread that started it.
+struct StartedEngine {
+    /// The counters its loop updates.
+    metrics: Arc<Metrics>,
+    /// The view of itself it publishes for the connection threads.
+    view: EngineView,
+    /// The adapter and driver of its device, when it runs on one.
+    device: Option<DeviceIdentity>,
+    /// The registry family of the model it serves.
+    family: String,
+}
+
 /// Start the engine thread and wait for it to report its plan. The device is opened, the workload fitted
 /// and prepared, and the loop run on that one thread: an executor is not `Send`, so the driver cannot be
 /// built elsewhere and moved in. A startup failure comes back here as the error, before the listener
@@ -228,8 +243,8 @@ fn spawn_engine(
     model_name: String,
     health: &EngineHealth,
     jobs: mpsc::Receiver<EngineMsg>,
-) -> Result<(Arc<Metrics>, EngineView)> {
-    type Startup = Result<(Arc<Metrics>, EngineView), StartupError>;
+) -> Result<StartedEngine> {
+    type Startup = Result<StartedEngine, StartupError>;
     let (started_tx, started_rx) = mpsc::channel::<Startup>();
     let health = health.clone();
     workers
@@ -278,7 +293,12 @@ fn spawn_engine(
                 telemetry,
             ));
             let view = EngineView::new(plan.caps.clone());
-            let started = (Arc::clone(&metrics), view.clone());
+            let started = StartedEngine {
+                metrics: Arc::clone(&metrics),
+                view: view.clone(),
+                device: plan.device.clone(),
+                family: plan.model.clone(),
+            };
             if started_tx.send(Ok(started)).is_err() {
                 return;
             }
@@ -350,6 +370,9 @@ fn new_metrics(
     }
 }
 
+/// The build of this server binary (`build.rs`), the same four values the benchmark runner states.
+const BUILD: BuildIdentity = poot_build_identity::build_identity!();
+
 pub(crate) fn run() -> Result<()> {
     reset_drain_cancellation();
     SHUTDOWN.store(false, Ordering::SeqCst);
@@ -378,7 +401,12 @@ pub(crate) fn run() -> Result<()> {
         .map(|_| spawn_image_front_end(&mut workers, &health, Arc::clone(&model), config.backend))
         .transpose()?;
     let args = engine_args(&config, draft)?;
-    let (metrics, view) = spawn_engine(
+    let StartedEngine {
+        metrics,
+        view,
+        device,
+        family,
+    } = spawn_engine(
         &mut workers,
         Arc::clone(&model),
         if images.is_some() {
@@ -391,7 +419,19 @@ pub(crate) fn run() -> Result<()> {
         &health,
         job_rx,
     )?;
+    let identity = device
+        .map(|device| RunIdentity::of(BUILD, family, device, model.store()))
+        .transpose()
+        .context("digest the served checkpoint")?;
+    match &identity {
+        Some(identity) => tracing::info!(
+            identity = %identity.to_json(),
+            "run identity"
+        ),
+        None => tracing::info!("no run identity: the placement has no single device"),
+    }
     let served = Arc::new(Served {
+        identity,
         pooling: served_pooling(std::path::Path::new(&model_dir))?,
         model,
         engine: job_tx,

@@ -62,6 +62,8 @@ pub(crate) mod encoder_routes;
 mod engine_loop;
 mod hostile_http;
 mod http_parse;
+mod identity;
+mod ignore_eos;
 mod lifecycle;
 mod other;
 mod recording_engine;
@@ -249,6 +251,7 @@ pub(crate) fn served_with_caps(
         model,
         engine,
         view: EngineView::new(caps),
+        identity: None,
         pooling: Pooling::Mean,
         images: None,
         max_queue_wait: TEST_QUEUE_WAIT,
@@ -384,6 +387,7 @@ pub(crate) fn generation_request(prompt: &str, max_new: usize, stream: bool) -> 
         max_new,
         sampler: Sampler::greedy(),
         stop: Vec::new(),
+        ignore_eos: false,
         stream,
         lora_adapter: AdapterRef::Base,
     }

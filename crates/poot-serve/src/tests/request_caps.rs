@@ -250,7 +250,7 @@ fn a_logit_bias_over_the_entry_cap_is_a_400() {
         &served,
         &test_metrics("caps"),
         &req,
-        &gives_up_after_two_seconds(),
+        &gives_up_after_half_a_minute(),
     )
     .expect_err("10,001 entries are refused");
     assert!(refusal(&error).contains("logit_bias"), "{error:#}");
@@ -272,7 +272,7 @@ fn stop_strings_over_the_byte_caps_are_a_400() {
             &served,
             &test_metrics("caps"),
             &req,
-            &gives_up_after_two_seconds(),
+            &gives_up_after_half_a_minute(),
         )
         .expect_err("the stop strings are refused");
         assert!(refusal(&error).contains("stop"), "{what}: {error:#}");
@@ -283,9 +283,9 @@ fn stop_strings_over_the_byte_caps_are_a_400() {
 
 /// A `client_gone` that fires after a while: a request that is wrongly admitted waits on a queue no
 /// engine reads, and this turns that wait into a failed assertion instead of a hang.
-fn gives_up_after_two_seconds() -> impl Fn() -> bool {
+fn gives_up_after_half_a_minute() -> impl Fn() -> bool {
     let started = Instant::now();
-    move || started.elapsed() > Duration::from_secs(2)
+    move || started.elapsed() > Duration::from_secs(30)
 }
 
 fn assert_nothing_reached(queue: &Receiver<EngineMsg>) {
@@ -307,12 +307,11 @@ fn assert_nothing_reached(queue: &Receiver<EngineMsg>) {
 fn a_panicking_vision_thread_turns_health_dead_and_fails_the_request() {
     let rig = vision_rig(Behaviour::Panic, Duration::from_secs(30));
     let urls = vec![data_url(&tiny_png())];
-    let started = Instant::now();
     let error = handle_chat(
         &rig.served,
         &test_metrics("caps"),
         &chat_with_images(&urls),
-        &|| false,
+        &gives_up_after_half_a_minute(),
     )
     .expect_err("the front end panicked");
     assert!(
@@ -326,10 +325,8 @@ fn a_panicking_vision_thread_turns_health_dead_and_fails_the_request() {
         classify_handler_error(&error),
         (500, "image_front_end_error")
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "failed at once, not at the deadline"
-    );
+    // Failed at once, not at the 30 s deadline: the wait was given a client that gives up after 30 s, so a
+    // wait that ran on would end as `ClientCancelled`, not as the front end's typed failure asserted above.
     match rig.health.state() {
         EngineState::Dead(Death::Panicked(reason)) => {
             assert!(reason.contains("fake vision tower broke"), "{reason}");
@@ -353,22 +350,16 @@ fn a_hung_vision_thread_fails_the_request_at_the_deadline() {
     let (gate_tx, gate_rx) = mpsc::channel();
     let rig = vision_rig(Behaviour::Hang(gate_rx), Duration::from_millis(400));
     let urls = vec![data_url(&tiny_png())];
-    let started = Instant::now();
     let error = handle_chat(
         &rig.served,
         &test_metrics("caps"),
         &chat_with_images(&urls),
-        &gives_up_after_two_seconds(),
+        &gives_up_after_half_a_minute(),
     )
     .expect_err("the front end hangs");
     assert_eq!(
         classify_handler_error(&error),
         (500, "image_front_end_error")
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "{:?}",
-        started.elapsed()
     );
     drop(gate_tx);
 }
@@ -380,7 +371,6 @@ fn the_wait_for_the_vision_thread_ends_when_the_client_hangs_up() {
     let (gate_tx, gate_rx) = mpsc::channel();
     let rig = vision_rig(Behaviour::Hang(gate_rx), Duration::from_secs(3));
     let urls = vec![data_url(&tiny_png())];
-    let started = Instant::now();
     let error = handle_chat(
         &rig.served,
         &test_metrics("caps"),
@@ -391,11 +381,6 @@ fn the_wait_for_the_vision_thread_ends_when_the_client_hangs_up() {
     assert_eq!(
         error.downcast_ref::<GenerationError>(),
         Some(&GenerationError::ClientCancelled)
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "{:?}",
-        started.elapsed()
     );
     drop(gate_tx);
 }

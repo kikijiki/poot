@@ -12,8 +12,6 @@
 //! QK-norm in the olmo2 body (the two ways this arch differs from plain qwen2) would show as a
 //! numeric divergence.
 
-mod common;
-
 use poot_models::test_support::dense::{Dense, Family};
 
 /// Tiny GQA config (n_heads != n_kv_heads, unlike the MHA OLMo-2-1B), as in
@@ -28,5 +26,5 @@ fn olmo2_batched_prefill_fills_cache_identically_to_token_by_token() {
         .max_positions(64)
         .with("rope_theta", 500_000.0)
         .f32_model();
-    common::assert_prefill_fills_cache_like_token_by_token(&m, 2, 1e-4);
+    crate::common::assert_prefill_fills_cache_like_token_by_token(&m, 2, 1e-4);
 }

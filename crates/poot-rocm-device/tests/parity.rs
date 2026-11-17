@@ -404,6 +404,24 @@ fn split_kv_decode_matches_the_oracle_on_rocm() {
         .unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// POOT-1549 row 14: the grouped-query decode of the Qwen3.8-27B attention shape (`n_rep = 6`, `dk = dv = 256`) and
+/// of the qwen2.5 shape (`n_rep = 7`, `dk = 64`), an `f32` attention over a 512-key cache stepped at live lengths
+/// 512, 77 and 1, matches the CPU oracle's evaluation of each length within `SPLIT_KV_DEVICE_TOLERANCE` on every query
+/// head of every group.
+/// Mutation: in `poot-kernelgen`'s clustered attention body (`attention/clustered.rs`), load the query row at
+/// `row - r * lq` (every head of a group reads the group's first head's query); the `n_rep = 6` case goes red
+/// against the oracle (worst error 0.038 on ROCm).
+#[test]
+fn gqa_decode_matches_the_oracle_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention::assert_gqa_decode_matches_the_oracle(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// POOT-1400: the split-KV decode over the same live prefix of a 256-key and of a 4096-key cache gives
 /// bit-identical outputs, though the two plan different grids: the live length alone partitions the keys. The
 /// keys past the length are NaN in both caches.

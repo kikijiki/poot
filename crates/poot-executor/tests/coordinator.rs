@@ -222,6 +222,10 @@ impl Device for FakeDevice {
     type Recording = Rc<Recording>;
     type Error = Injected;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native
     }
@@ -568,7 +572,13 @@ fn layered() -> (Graph, Arc<WeightStore>, Arc<WeightMap>) {
 fn targets(devices: usize) -> TargetSet {
     TargetSet::new(
         (0..devices)
-            .map(|index| (DeviceId(index as u32), target()))
+            .map(|index| {
+                (
+                    DeviceId(index as u32),
+                    target(),
+                    poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+                )
+            })
             .collect(),
     )
     .unwrap()

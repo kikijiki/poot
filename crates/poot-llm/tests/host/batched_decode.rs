@@ -6,9 +6,7 @@
 //! equivalence check on CPU eval: the batch axis must not leak across rows. No checkpoint, runs in
 //! milliseconds.
 
-mod common;
-
-use common::{slot_maps, step, token_pos, zero_state};
+use crate::common::{slot_maps, step, token_pos, zero_state};
 use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step as step_shape};
 use poot_models::test_support::weight_map::MappedModel;

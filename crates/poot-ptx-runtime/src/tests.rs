@@ -524,6 +524,7 @@ fn surviving_graph_scopes_launch_and_sync_after_context_switch_or_clear() {
         funcs: RefCell::new(HashMap::new()),
         capture: CaptureRetention::default(),
         device_caps: poot_target::DeviceCaps::ptx_default(),
+        memory_domain: poot_target::MemoryDomain::Local,
         device_timing: false,
         peers: RefCell::new(Vec::new()),
     };
@@ -724,6 +725,7 @@ fn children_delay_context_cleanup_and_preserve_dependency_order() {
         funcs: RefCell::new(HashMap::new()),
         capture: CaptureRetention::default(),
         device_caps: poot_target::DeviceCaps::ptx_default(),
+        memory_domain: poot_target::MemoryDomain::Local,
         device_timing: false,
         peers: RefCell::new(Vec::new()),
     };
@@ -792,6 +794,7 @@ fn mock_context(mock: &Arc<MockCleanup>) -> PtxContext {
         funcs: RefCell::new(HashMap::new()),
         capture: CaptureRetention::default(),
         device_caps: poot_target::DeviceCaps::ptx_default(),
+        memory_domain: poot_target::MemoryDomain::Local,
         device_timing: false,
         peers: RefCell::new(Vec::new()),
     }

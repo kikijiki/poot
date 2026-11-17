@@ -53,7 +53,7 @@ MEMORY_SCOPE_LIFETIME = "includes_load"
 # What a scenario measures. The page charts decode throughput from `decode` scenarios, prefill throughput from
 # `prefill` scenarios and decode against context length from `curve` scenarios.
 SCENARIO_ROLES = {"decode-128": "decode", "prefill-1k": "prefill", "decode-curve": "curve",
-                  "decode-curve-large": "curve"}
+                  "decode-curve-large": "curve", "serve-throughput": "serve"}
 # A request whose prompt is at least this long has a prefill rate worth stating; a 5-token prompt does not.
 PREFILL_MIN_PROMPT_TOKENS = 128
 
@@ -82,7 +82,7 @@ FRAMEWORK_LABELS = {
 IDENTITY_FIELDS = (
     "build_sha", "adapter", "driver_version", "compute_dtype", "checkpoint_digest", "rustc_version", "framework_version",
 )
-ROW_METRICS = ("decode_tok_s", "ttft_ms", "tpot_ms", "e2e_ms", "peak_rss_bytes", "peak_vram_bytes", "energy_j")
+ROW_METRICS = ("decode_tok_s", "output_tok_s", "ttft_ms", "tpot_ms", "e2e_ms", "peak_rss_bytes", "peak_vram_bytes", "energy_j")
 # The engine-reported device memory classes (result_contract.MEMORY_CLASS_FIELDS) the page states per cell.
 MEMORY_CLASS_METRICS = ("weights_bytes", "kv_bytes", "workspace_bytes", "staging_bytes")
 
@@ -164,10 +164,10 @@ def contract_exclusion(rows, policy):
         n, roles = throttled[0]
         return f"repeat {n} reached the throttle point of the {' and '.join(roles)}"
     identities = [receipts.row_identity(row) for row in rows]
-    for field in receipts.row_identity_fields(rows[0]["framework"]):
+    for field in receipts.row_identity_fields(rows[0]["framework"], receipts.is_serve_row(rows[0])):
         if len({repr(identity[field]) for identity in identities}) > 1:
             return f"the repeats differ in {field}"
-    metric = policy["headline_metric"]
+    metric = receipts.headline_metric(rows[0], policy)
     if not all(receipts.is_finite(row.get(metric)) for row in rows):
         return f"non-finite {metric}"
     return None
@@ -175,7 +175,7 @@ def contract_exclusion(rows, policy):
 
 def relative_band(rows, policy):
     """The noise band of the headline metric over the repeats as a fraction of its median, or None for a zero median."""
-    values = [row.get(policy["headline_metric"]) for row in rows]
+    values = [row.get(receipts.headline_metric(rows[0], policy)) for row in rows]
     median = statistics.median(values)
     return 2 * receipts.noise(values, policy["min_trials"]) / median if median else None
 
@@ -183,7 +183,7 @@ def relative_band(rows, policy):
 def noise_exclusion(rows, policy):
     """Why the headline metric of a cell's rows is too noisy to be a verified cell, or None when it is narrow enough."""
     band = relative_band(rows, policy)
-    tolerated = policy["metrics"][policy["headline_metric"]]["max_uncertainty"]
+    tolerated = policy["metrics"][receipts.headline_metric(rows[0], policy)]["max_uncertainty"]
     if band is None:
         return "zero median"
     return f"noise band {band:.1%} of the median exceeds {tolerated:.0%}" if band > tolerated else None
@@ -218,6 +218,7 @@ def cell_record(set_name, date, rows, policy, known=None):
         "precision": first.get("precision"),
         "prompt_tokens": first.get("prompt_tokens"),
         "gen_tokens": first.get("gen_tokens") or first.get("osl"),
+        "concurrency": first.get("concurrency"),
         "repeats": len(rows),
         "verified": known is None,
         "memory_scope": MEMORY_SCOPE_INFERENCE if inferred else MEMORY_SCOPE_LIFETIME,
@@ -291,17 +292,17 @@ def collect_runs(results_dir, policy, hosts, known_path):
             if reason:
                 entry["excluded"].append({
                     "set": set_name, "model": key[0], "series": series_label(key[2], row_backend(cell_rows[0])),
-                    "reason": reason,
+                    "reason": reason, **({"concurrency": key[7]} if key[7] is not None else {}),
                 })
             else:
                 entry["cells"].append(cell_record(set_name, date, cell_rows, policy, known))
     for entry in hosts.values():
         newest = {}
         for cell in sorted(entry["cells"], key=lambda c: (c["date"], c["set"])):
-            newest[(cell["model"], cell["scenario"], cell["series"])] = cell["set"]
+            newest[(cell["model"], cell["scenario"], cell["series"], cell["concurrency"])] = cell["set"]
         for cell in entry["cells"]:
-            cell["latest"] = newest[(cell["model"], cell["scenario"], cell["series"])] == cell["set"]
-        entry["cells"].sort(key=lambda c: (c["model"], c["scenario"], c["series"], c["date"], c["set"]))
+            cell["latest"] = newest[(cell["model"], cell["scenario"], cell["series"], cell["concurrency"])] == cell["set"]
+        entry["cells"].sort(key=lambda c: (c["model"], c["scenario"], c["series"], c["concurrency"] or 0, c["date"], c["set"]))
 
 
 def collect_kernels(bank_root=None):
@@ -349,6 +350,8 @@ CELL_LEVEL_METRICS = ("peak_vram_bytes", "peak_rss_bytes", "load_vram_bytes", "l
 DECODE_GEN_TOKENS = 128
 GENERATION_LENGTH_METRICS = ("decode_tok_s", "tpot_ms", "e2e_ms")
 POINT_FIELDS = ("set", "date", "model", "framework", "backend", "series", "precision", "repeats", "verified", "memory_scope", "band", "latest", "identity")
+# A serve cell is a point on a second axis: its x is the concurrency it ran at, its `isl` the prompt length it held fixed.
+# The point states `concurrency` only when it has one.
 
 
 def cell_points(cell):
@@ -373,7 +376,10 @@ def cell_points(cell):
                 record["over_sweep"] = True
             points.append(record)
         return points
-    return [{**base, "isl": cell["prompt_tokens"], "metrics": kept(cell["metrics"])}]
+    point = {**base, "isl": cell["prompt_tokens"], "metrics": kept(cell["metrics"])}
+    if cell.get("concurrency") is not None:
+        point["concurrency"] = cell["concurrency"]
+    return [point]
 
 
 def host_label(host_cpu, driver, hosts_of_cpu):
@@ -459,34 +465,35 @@ def aggregate_hosts(host_points, declared):
     # The same per (model, series, scenario): the date of the newest set and the lengths it measured.
     newest_set, measured = {}, {}
     for host, scenario, point in host_points:
-        key = (point["model"], point["series"], point["isl"], scenario)
+        key = (point["model"], point["series"], point["isl"], scenario, point.get("concurrency"))
         if point["latest"]:
             newest[key] = max(newest.get(key, ""), point["date"])
             if point["verified"]:
                 newest_verified[key] = max(newest_verified.get(key, ""), point["date"])
     for host, scenario, point in host_points:
         if point["latest"]:
-            sweep = (point["model"], point["series"], scenario)
+            sweep = (point["model"], point["series"], scenario, point.get("concurrency"))
             newest_set[sweep] = max(newest_set.get(sweep, ""), point["date"])
     for host, scenario, point in host_points:
-        sweep = (point["model"], point["series"], scenario)
+        sweep = (point["model"], point["series"], scenario, point.get("concurrency"))
         if point["latest"] and point["date"] == newest_set[sweep]:
             measured.setdefault(sweep, set()).add(point["isl"])
 
     def current(scenario, point):
-        sweep = (point["model"], point["series"], scenario)
+        sweep = (point["model"], point["series"], scenario, point.get("concurrency"))
         return point["date"] >= newest_set[sweep] or point["isl"] in measured[sweep] or point["isl"] in declared.get(scenario, ())
 
     groups, older = {}, []
     for host, scenario, point in host_points:
-        key = (point["model"], point["series"], point["isl"], scenario)
+        key = (point["model"], point["series"], point["isl"], scenario, point.get("concurrency"))
         if not point["latest"] or not current(scenario, point) or point["date"] < newest_verified.get(key, newest[key]):
             # A set another host has since re-measured, or a legacy length of a superseded set, is a row of its own and feeds no headline value.
             older.append(combine_hosts([{**point, "latest": False}], [host]))
             continue
         group = groups.setdefault(key, {})
         if host in group:
-            raise ValueError(f"host {host!r} has two newest points for {point['model']} {point['series']} at {point['isl']} tokens")
+            raise ValueError(f"host {host!r} has two newest points for {point['model']} {point['series']} at {point['isl']} tokens"
+                             + (f", concurrency {point['concurrency']}" if point.get("concurrency") is not None else ""))
         group[host] = point
     return [combine_hosts(list(group.values()), list(group)) for group in groups.values()] + older
 
@@ -515,7 +522,7 @@ def hardware_classes(hosts, kernels, declared):
             host_points += [(label, cell["scenario"], point) for cell in entry["cells"] for point in cell_points(cell)]
             cls["excluded"] += [{**item, "host": label} for item in entry["excluded"]]
         cls["points"] = aggregate_hosts(host_points, declared)
-        cls["points"].sort(key=lambda p: (p["model"], p["series"], p["isl"], p["date"], p["set"]))
+        cls["points"].sort(key=lambda p: (p["model"], p["series"], p["isl"], p.get("concurrency") or 0, p["date"], p["set"]))
         cls["excluded"].sort(key=lambda e: (e["host"], e["set"], e["model"], e["series"]))
         cls["kernels"].sort(key=lambda k: (k["case"], k["backend"]))
     return sorted((c for c in classes.values() if c["points"]), key=lambda c: c["label"])

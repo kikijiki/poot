@@ -233,6 +233,10 @@ impl Device for FixtureDevice {
     type Recording = ();
     type Error = FixtureError;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native
     }
@@ -1968,8 +1972,16 @@ fn smallest_candidate_bytes(
 ) -> [u64; 2] {
     let candidate = *candidates(handle, args).last().expect("a domain");
     let targets = TargetSet::new(vec![
-        (DeviceId(0), ptx_target()),
-        (DeviceId(1), ptx_target()),
+        (
+            DeviceId(0),
+            ptx_target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            ptx_target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
     ])
     .unwrap();
     let rows = [candidate.rows];

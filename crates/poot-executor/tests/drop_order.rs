@@ -66,6 +66,10 @@ impl Device for LoggingDevice {
     type Recording = LoggedRecording;
     type Error = Failed;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native
     }

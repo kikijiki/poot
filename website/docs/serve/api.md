@@ -34,10 +34,11 @@ curl -i http://localhost:8080/v1/completions \
 
 | Endpoint | Notes |
 | --- | --- |
-| `POST /v1/completions` | `prompt`, `max_tokens`, `stream`, `stop`, `n`, `logprobs`, sampling, guided fields, `lora_adapter`. |
+| `POST /v1/completions` | `prompt`, `max_tokens`, `stream`, `stop`, `n`, `logprobs`, `ignore_eos`, sampling, guided fields, `lora_adapter`. |
 | `POST /v1/chat/completions` | `messages`, `max_tokens` or `max_completion_tokens`, `logprobs`/`top_logprobs`, `tools`/`tool_choice`, `response_format`, plus the completions fields. |
 | `POST /v1/embeddings`, `POST /v1/rerank` | See [Embeddings and reranking](./embeddings-and-reranking.md). |
 | `GET /v1/models`, `GET /v1/models/{id}` | One served model; an unknown id is 404. |
+| `GET /v1/identity` | What the server runs on: build (`build_sha`, `build_profile`, `build_features`, `rustc_version`), `adapter`, `driver_version`, `checkpoint_digest` and `compute_dtype`. Read once at startup; 404 on a placement over several devices. |
 | `GET`/`POST`/`DELETE /v1/lora_adapters` | See [LoRA adapters](./lora-adapters.md). |
 | `GET /health`, `GET /metrics`, `GET /metrics/prometheus` | Liveness and metrics. |
 
@@ -51,7 +52,10 @@ A request invalid on its face is a `400` before the engine is asked:
 - an invalid guided-decoding constraint, or image input the served model cannot take;
 - `n` above the engine's rows, or `logprobs` on a stream;
 - more than 10,000 `logit_bias` entries;
-- a `stop` string over 1,024 bytes, or `stop` strings totalling over 4,096 bytes.
+- a `stop` string over 1,024 bytes, or `stop` strings totalling over 4,096 bytes;
+- `ignore_eos` together with `stop`, a guided-decoding field, a `response_format` that constrains the output, `tools` or `tool_choice`.
+
+`ignore_eos: true` (vLLM's field) generates to `max_tokens` whatever the model samples: an end-of-sequence token is an ordinary generated token and a chat's turn-end markers end nothing. Absent or `false` is the default behaviour. A request that ends early at the engine's own position limit still finishes with `length`.
 
 `max_tokens` above 32768, `n`, `logprobs` and more than 16 `stop` strings are clamped, not refused.
 

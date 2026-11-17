@@ -10,8 +10,8 @@ use crate::bindings::{
 };
 use crate::buffer::{Pool, RocmAlloc, checked_copy, checked_layout};
 use crate::context::{
-    DevicePoison, Held, StagingBuffer, TimeoutLeaks, UploadStrategy, require_gpu_check_with,
-    ticks_to_duration, upload_strategy_for_pool,
+    DevicePoison, Held, StagingBuffer, TimeoutLeaks, UploadStrategy, memory_domain_for_pool,
+    require_gpu_check_with, ticks_to_duration,
 };
 use crate::discovery::agent_isa_name;
 use crate::error::{check, describe};
@@ -23,6 +23,7 @@ use crate::queue::{
     validate_queue_plan_provenance,
 };
 use poot_runtime_common::{BufferRole, MemoryCounters, UPLOAD_CHUNK_BYTES, fnv1a};
+use poot_target::MemoryDomain;
 use poot_target::{BufferStorage, ElementKind};
 use std::cell::Cell;
 use std::ffi::{OsString, c_void};
@@ -838,72 +839,81 @@ fn kernel_symbol_matching_is_exact_except_for_amdhsa_descriptor_suffix() {
     assert!(!kernel_symbol_matches("other.kd", "resident"));
 }
 
-// Card 125 (spec 120 FR-004/SC-004): `upload_strategy_for_pool` is a pure function of (location,
+// Card 125 (spec 120 FR-004/SC-004): `memory_domain_for_pool` is a pure function of (location,
 // flags), so it is unit-checkable with no HSA context. The DMA transfer itself and the second-target
 // run are the hardware gate (card 125).
 
 #[test]
-fn upload_strategy_cpu_pool_is_host_write() {
+fn memory_domain_cpu_pool_is_host() {
     // A CPU-located pool is always host-visible regardless of its coherency flags.
     assert_eq!(
-        upload_strategy_for_pool(HSA_AMD_MEMORY_POOL_LOCATION_CPU, 0),
-        UploadStrategy::HostWrite
+        memory_domain_for_pool(HSA_AMD_MEMORY_POOL_LOCATION_CPU, 0),
+        MemoryDomain::Host
     );
     assert_eq!(
-        upload_strategy_for_pool(
+        memory_domain_for_pool(
             HSA_AMD_MEMORY_POOL_LOCATION_CPU,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED
         ),
-        UploadStrategy::HostWrite
+        MemoryDomain::Host
     );
 }
 
 #[test]
-fn upload_strategy_gpu_extended_scope_fine_is_host_write() {
+fn memory_domain_gpu_extended_scope_fine_is_host() {
     // Strix Halo's aliased unified-memory view: GPU-located, EXTENDED_SCOPE_FINE_GRAINED.
     assert_eq!(
-        upload_strategy_for_pool(
+        memory_domain_for_pool(
             HSA_AMD_MEMORY_POOL_LOCATION_GPU,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED
         ),
-        UploadStrategy::HostWrite
+        MemoryDomain::Host
     );
     // KERNARG_INIT alongside EXTENDED_SCOPE_FINE_GRAINED (the realistic combination) still counts.
     assert_eq!(
-        upload_strategy_for_pool(
+        memory_domain_for_pool(
             HSA_AMD_MEMORY_POOL_LOCATION_GPU,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED
                 | HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT
         ),
-        UploadStrategy::HostWrite
+        MemoryDomain::Host
     );
 }
 
 #[test]
-fn upload_strategy_gpu_coarse_grained_is_dma() {
+fn memory_domain_gpu_coarse_grained_is_local() {
     // A discrete GPU's plain VRAM pool: GPU-located, COARSE_GRAINED only.
     assert_eq!(
-        upload_strategy_for_pool(
+        memory_domain_for_pool(
             HSA_AMD_MEMORY_POOL_LOCATION_GPU,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED
         ),
-        UploadStrategy::Dma
+        MemoryDomain::Local
     );
 }
 
 #[test]
-fn upload_strategy_gpu_plain_fine_grained_is_dma() {
+fn memory_domain_gpu_plain_fine_grained_is_local() {
     // FR-004: a GPU-located pool that is FINE_GRAINED (device-coherent) but not
     // EXTENDED_SCOPE_FINE_GRAINED guarantees device coherency, not host-mappability (e.g. a
     // coherent-fabric multi-GPU VRAM pool on CDNA without an APU-style host-mapped alias). It must
-    // resolve to Dma.
+    // resolve to Local.
     assert_eq!(
-        upload_strategy_for_pool(
+        memory_domain_for_pool(
             HSA_AMD_MEMORY_POOL_LOCATION_GPU,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED
         ),
-        UploadStrategy::Dma
+        MemoryDomain::Local
     );
+}
+
+#[test]
+fn a_transfer_into_a_pool_is_a_host_write_exactly_when_the_pool_is_host_memory() {
+    assert_eq!(
+        UploadStrategy::of(MemoryDomain::Host),
+        UploadStrategy::HostWrite
+    );
+    assert_eq!(UploadStrategy::of(MemoryDomain::Local), UploadStrategy::Dma);
 }
 
 /// M0 acceptance: build a context, assert the agent picker found a GPU and the ISA name is
@@ -1503,7 +1513,7 @@ fn staged_dma_transfers_round_trip_every_byte() {
     unsafe { ctx.ring_copy(bytes.as_ptr(), buffer.alloc.as_ptr(), bytes.len()) }
         .expect("ring_copy");
     ctx.drain_uploads("test").expect("drain");
-    if ctx.upload_strategy == UploadStrategy::HostWrite {
+    if ctx.upload_strategy() == UploadStrategy::HostWrite {
         // SAFETY: under `HostWrite` the allocation is host-visible, `bytes.len()` bytes long, and fully
         // written by the completed upload.
         let resident =

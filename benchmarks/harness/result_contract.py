@@ -21,6 +21,7 @@ except ImportError:  # direct `python harness/bench.py` execution
     )
 
 CURVE_KIND = "decode-curve"
+SERVE_KIND = "serve"
 
 # Frameworks whose runner is a binary built from this repository (`BUILD_IDENTITY_FRAMEWORKS`) state which build
 # produced a result and on which backend, so a row is attributable to one binary and one backend. Every other
@@ -41,6 +42,9 @@ RELEASE_PROFILE = "release"
 # the row-level identity subset, and TPOT is (e2e - ttft) / (osl - 1). One derivation per capability, never both.
 REQUEST_WINDOW = "request-window"
 ROW_LEVEL = "row-level"
+# A serve cell is timed by one load client over HTTP, the same for every engine: it reports each request's TTFT and
+# end-to-end time as it saw them on the stream, so a serve row's timing claim does not depend on the engine.
+CLIENT_STREAM = "client-stream"
 WINDOW_CLAIMING_FRAMEWORKS = frozenset({"poot"})
 
 
@@ -66,8 +70,10 @@ def memory_class_errors(value):
     return errors
 
 
-def timing_claim(framework):
-    """The timing capability `framework`'s runner claims."""
+def timing_claim(framework, scenario=None):
+    """The timing capability a cell's runner claims: the load client's of a serve scenario, else `framework`'s own."""
+    if scenario is not None and _is_serve(scenario):
+        return CLIENT_STREAM
     return REQUEST_WINDOW if framework in WINDOW_CLAIMING_FRAMEWORKS else ROW_LEVEL
 
 
@@ -102,6 +108,10 @@ def _is_finite_number(value: object) -> TypeGuard[int | float]:
 
 def _is_curve(scenario):
     return scenario.get("kind") == CURVE_KIND
+
+
+def _is_serve(scenario):
+    return scenario.get("kind") == SERVE_KIND
 
 
 def _check_fields(payload, rules, prefix=""):
@@ -241,8 +251,13 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
 
     if framework in BUILD_IDENTITY_FRAMEWORKS:
         errors.extend(_build_identity_errors(result, backend))
-        errors.extend(_measurement_identity_errors(result))
-        errors.extend(preparation_shape_errors(result.get("preparation"), require_state=False))
+        if _is_serve(scenario):
+            # A server states the identity of what it runs on (`GET /v1/identity`); it has no profiled mode, no
+            # prefill chunk and no preparation probe of a benchmark runner.
+            errors.extend(_identity_field_errors(result, ("family", *MEASUREMENT_IDENTITY_FIELDS)))
+        else:
+            errors.extend(_measurement_identity_errors(result))
+            errors.extend(preparation_shape_errors(result.get("preparation"), require_state=False))
     elif not (isinstance(result.get("framework_version"), str) and result["framework_version"].strip()):
         errors.append(f"an external runner names the version it measured; framework_version is {result.get('framework_version')!r}")
 
@@ -253,7 +268,7 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
     if "status" in result and result["status"] != "ok":
         errors.append(f"runner reported status {result['status']!r}")
 
-    expected_mode = CURVE_KIND if _is_curve(scenario) else "single"
+    expected_mode = CURVE_KIND if _is_curve(scenario) else SERVE_KIND if _is_serve(scenario) else "single"
     if "mode" in result and result["mode"] != expected_mode:
         errors.append(
             f"mode mismatch: requested {expected_mode!r}, reported {result['mode']!r}"
@@ -292,7 +307,11 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
         )
 
     curve = None
-    if _is_curve(scenario):
+    served = None
+    if _is_serve(scenario):
+        serve_errors, served = _validate_serve_result(result, scenario, framework)
+        errors.extend(serve_errors)
+    elif _is_curve(scenario):
         curve_errors, curve = _validate_curve_result(result, scenario, timing_claim(framework), framework)
         errors.extend(curve_errors)
     else:
@@ -317,6 +336,8 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
         prepared = dict(result)
         prepared["curve"] = curve
         return prepared
+    if served is not None:
+        return {**result, "serve": served}
     return result
 
 
@@ -667,3 +688,86 @@ def _validate_curve_aggregates(curve):
                 f"got {throughput!r}"
             )
     return errors
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# serve: aggregate throughput of an engine's server under N concurrent streaming requests
+# ----------------------------------------------------------------------------------------------------------------
+def _serve_request_errors(request, prefix, prompt_tokens, output_tokens):
+    """One timed request as the load client saw it: it succeeded, with exactly the requested lengths, and its
+    first-token and finish times are ordered. A failed request is not judged here (it is counted)."""
+    errors = []
+    ttft, e2e = request.get("ttft_ms"), request.get("e2e_ms")
+    for field, value in (("ttft_ms", ttft), ("e2e_ms", e2e)):
+        if not (_is_finite_number(value) and value >= 0):
+            errors.append(f"{prefix}{field} must be a finite nonnegative number; got {value!r}")
+    if not errors and e2e <= ttft:
+        errors.append(f"{prefix}e2e_ms must be greater than ttft_ms")
+    if request.get("tokens") != output_tokens:
+        errors.append(f"{prefix}generated {request.get('tokens')!r} tokens, expected {output_tokens}")
+    if request.get("prompt_tokens") != prompt_tokens:
+        errors.append(f"{prefix}prompt was {request.get('prompt_tokens')!r} tokens, expected {prompt_tokens}")
+    return errors
+
+
+def serve_request_tpot_ms(request, output_tokens):
+    """A request's time per output token after the first: (e2e - ttft) / (tokens - 1). The one derivation for every engine."""
+    return (request["e2e_ms"] - request["ttft_ms"]) / (output_tokens - 1)
+
+
+def _validate_serve_result(result, scenario, framework):
+    """Validate a serve run and return `(errors, aggregate)`.
+
+    The run is one concurrency of the scenario against one server: `requests` holds every timed request the load
+    client issued, each `ok` or failed with its error. Any failed request fails the cell with the count and the first
+    error: a throughput over the requests that happened to succeed is not the cell's throughput. The aggregate states
+    the tokens per second over the whole wall time and the TTFT, TPOT and end-to-end percentiles of the requests.
+    """
+    errors = []
+    concurrency, prompt_tokens, output_tokens = (scenario.get(k) for k in ("concurrency", "prompt_tokens", "output_tokens"))
+    wanted = scenario.get("requests")
+    if not all(_is_int(v) and v > 0 for v in (concurrency, prompt_tokens, wanted)) or not (_is_int(output_tokens) and output_tokens > 1):
+        return [f"the scenario states concurrency, prompt_tokens, requests and an output_tokens above one: {scenario!r}"], None
+    for field, expected in (("concurrency", concurrency), ("prompt_tokens", prompt_tokens), ("output_tokens", output_tokens)):
+        if result.get(field) != expected:
+            errors.append(f"{field} mismatch: requested {expected!r}, reported {result.get(field)!r}")
+    slots = result.get("server_slots")
+    if not (_is_int(slots) and slots >= concurrency):
+        errors.append(f"server_slots must be an integer of at least the concurrency {concurrency}: the server held {slots!r}, "
+                      "so the cell is not that many requests in flight")
+    wall = result.get("wall_ms")
+    if not (_is_finite_number(wall) and wall > 0):
+        errors.append(f"wall_ms must be a finite positive number; got {wall!r}")
+    requests = result.get("requests")
+    if not isinstance(requests, list) or len(requests) != wanted:
+        got = len(requests) if isinstance(requests, list) else requests
+        errors.append(f"requests must hold the {wanted} timed requests; got {got!r}")
+        return errors, None
+    failed, good = [], []
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict) or not isinstance(request.get("ok"), bool):
+            errors.append(f"requests[{index}] must be an object with a boolean ok")
+        elif request["ok"]:
+            problems = _serve_request_errors(request, f"requests[{index}].", prompt_tokens, output_tokens)
+            (errors.extend(problems) if problems else good.append(request))
+        else:
+            failed.append(request.get("error") or "no error stated")
+    if failed:
+        errors.append(f"{len(failed)} of {wanted} requests failed at concurrency {concurrency} (first: {failed[0]})")
+    if errors:
+        return errors, None
+    ttfts = [r["ttft_ms"] for r in good]
+    tpots = [serve_request_tpot_ms(r, output_tokens) for r in good]
+    if not all(_is_finite_positive_number(t) for t in tpots):
+        return ["every request's time per output token must be a finite positive number"], None
+    total = sum(r["tokens"] for r in good)
+    return [], {
+        "concurrency": concurrency,
+        "requests": wanted,
+        "failed_requests": 0,
+        "wall_ms": wall,
+        "output_tok_s": total / (wall / 1000.0),
+        "ttft_ms": _summary(ttfts),
+        "tpot_ms": _summary(tpots),
+        "e2e_ms": _summary([r["e2e_ms"] for r in good]),
+    }

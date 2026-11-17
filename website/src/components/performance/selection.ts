@@ -41,9 +41,17 @@ export function defaultHardware(report: PerformanceData): Hardware {
   return findHardware(report, DEFAULT_HARDWARE) ?? report.hardware[0];
 }
 
-// The points of the selected model. Charts draw the newest set of each series and input length only.
+// A point of a single stream, on the input-token axis. A serve-throughput point (it has a concurrency) is on its own axis.
+export const isSingleStream = (p: Point) => p.concurrency === undefined;
+
+// The points of the selected model on the input-token axis. Charts draw the newest set of each series and input length only.
 export function selectPoints(hw: Hardware, sel: Side): Point[] {
-  return hw.points.filter((p) => p.latest && p.model === sel.model);
+  return hw.points.filter((p) => p.latest && p.model === sel.model && isSingleStream(p));
+}
+
+// The serve-throughput points of the selected model: the newest set of each series at each concurrency.
+export function selectServePoints(hw: Hardware, sel: Side): Point[] {
+  return hw.points.filter((p) => p.latest && p.model === sel.model && !isSingleStream(p));
 }
 
 export type Options = {
@@ -62,7 +70,7 @@ export function options(report: PerformanceData, sel: Pick<Side, "hw">): Options
 // The metrics the page may chart: those some newest point measured on every hardware entry. A metric one hardware lacks is drawn on
 // none, so the columns of a comparison always hold the same charts; it appears by itself once that hardware has the data.
 export function commonMetrics(report: PerformanceData): PointMetric[] {
-  return CHART_METRICS.map((m) => m.key).filter((key) => report.hardware.every((h) => h.points.some((p) => p.latest && p.metrics[key])));
+  return CHART_METRICS.map((m) => m.key).filter((key) => report.hardware.every((h) => h.points.some((p) => p.latest && isSingleStream(p) && p.metrics[key])));
 }
 
 // The charts of the selected model, in the page's order: every common metric some point of it measured (no empty card).
@@ -111,6 +119,36 @@ export function fromQuery(query: string): RawSelection {
     model: q.get("model") ?? undefined,
     ...(q.get("compare") === "1" ? { b: { hw: q.get("hw2") ?? undefined, model: q.get("model2") ?? undefined } } : {}),
   };
+}
+
+// One line per framework and backend over the concurrency, for one serve metric. A line is verified when all its points are.
+export type ServeLine = { id: string; label: string; verified: boolean; points: { concurrency: number; stat: Stat; point: Point }[] };
+
+export function serveLines(points: Point[], metric: PointMetric): ServeLine[] {
+  const lines = new Map<string, ServeLine>();
+  for (const p of [...points].sort((a, b) => (a.concurrency ?? 0) - (b.concurrency ?? 0))) {
+    const stat = p.metrics[metric];
+    if (!stat || p.concurrency === undefined) continue;
+    const id = pointSeries(p);
+    const line = lines.get(id) ?? { id, label: p.series, verified: true, points: [] };
+    line.points.push({ concurrency: p.concurrency, stat, point: p });
+    line.verified &&= p.verified;
+    lines.set(id, line);
+  }
+  return [...lines.values()].sort((a, b) => bySeries(a.id, b.id));
+}
+
+// The top of a serve chart's y axis in the unit's scale, fitting every line.
+export function serveTop(lines: ServeLine[], scale: number): number {
+  return niceMax(Math.max(...lines.flatMap((l) => l.points.map((p) => p.stat.max))) * scale);
+}
+
+// Every series of a serve chart at one concurrency, in the order of the legend; a series with no point there reads "no data".
+export function serveRowsAt(lines: ServeLine[], concurrency: number, unit: Unit): TipRow[] {
+  return lines.map((l) => {
+    const p = l.points.find((q) => q.concurrency === concurrency);
+    return { id: l.id, label: l.label, value: p ? `${num(p.stat.median, unit)} ${unit.suffix}` : NO_DATA };
+  });
 }
 
 export type Line = { id: string; label: string; verified: boolean; points: { isl: number; stat: Stat; point: Point }[] };

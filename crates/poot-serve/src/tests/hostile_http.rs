@@ -20,10 +20,18 @@ use crate::http::MAX_HEADER_BYTES;
 /// Run `handle` over `request` (written in full, then the write side closed, as a client that has
 /// sent everything it will) and return the response text, `""` when the connection closed unanswered.
 fn exchange(request: &[u8], limits: &Limits) -> String {
-    exchange_with(request, limits, true)
+    exchange_with(request, limits, true, Instant::now())
 }
 
-fn exchange_with(request: &[u8], limits: &Limits, finish_writing: bool) -> String {
+/// `accepted` is when the handler is told the connection arrived: the request deadline is that plus
+/// `limits.request_timeout`, so a test that wants an expired deadline passes an instant that far back instead of
+/// waiting for one.
+fn exchange_with(
+    request: &[u8],
+    limits: &Limits,
+    finish_writing: bool,
+    accepted: Instant,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
     client
@@ -45,7 +53,7 @@ fn exchange_with(request: &[u8], limits: &Limits, finish_writing: bool) -> Strin
         .expect("a loopback policy without a key");
     let _ = handle(
         server,
-        Instant::now(),
+        accepted,
         &served,
         &EngineHealth::serving_for_test("fake", 1, 64),
         &test_metrics("hostile-http"),
@@ -285,18 +293,23 @@ fn an_unknown_method_is_refused_with_405() {
     assert_eq!(status_of(&response), 405, "{response}");
 }
 
-/// A client that never finishes its head is answered 408 at the request deadline, not held.
+/// A client that never finishes its head is answered 408 once the request deadline has passed, not held.
+/// The connection is reported as accepted two deadlines ago, so the deadline is already behind the first read:
+/// no wait on the asserted path and no wall-clock bound a loaded box could break. The client still has its
+/// write side open and the head unfinished, so the 408 is the deadline's answer and not an EOF's.
 #[test]
 fn a_head_that_never_ends_is_answered_with_408_at_the_deadline() {
     let limits = test_limits_with(8, Duration::from_millis(300));
-    let started = Instant::now();
-    let response = exchange_with(b"GET /health HTTP/1.1\r\nHost: loc", &limits, false);
-    assert_eq!(status_of(&response), 408, "{response}");
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "{:?}",
-        started.elapsed()
+    let accepted = Instant::now()
+        .checked_sub(2 * limits.request_timeout)
+        .expect("the monotonic clock is more than 600 ms old");
+    let response = exchange_with(
+        b"GET /health HTTP/1.1\r\nHost: loc",
+        &limits,
+        false,
+        accepted,
     );
+    assert_eq!(status_of(&response), 408, "{response}");
 }
 
 /// Seeded garbage and mutated requests: the handler returns, never panics, and what it answers is a

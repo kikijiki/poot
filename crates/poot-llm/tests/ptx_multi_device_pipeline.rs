@@ -90,7 +90,19 @@ fn compile(
 }
 
 fn targets(first: Target, second: Target) -> TargetSet {
-    TargetSet::new(vec![(DeviceId(0), first), (DeviceId(1), second)]).unwrap()
+    TargetSet::new(vec![
+        (
+            DeviceId(0),
+            first,
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            second,
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+    ])
+    .unwrap()
 }
 
 /// `model`'s decode logits for `steps` on one device, all stages of `placement` on device 0, and the numerics
@@ -156,7 +168,7 @@ fn pipelined<D: Collectives>(
     let set = TargetSet::new(
         devices
             .iter()
-            .map(|(id, device)| (*id, device.target()))
+            .map(|(id, device)| (*id, device.target(), device.memory_topology()))
             .collect(),
     )
     .unwrap();
@@ -454,6 +466,10 @@ impl Device for FailingFinish {
     type Kernel = <PtxDevice as Device>::Kernel;
     type Recording = <PtxDevice as Device>::Recording;
     type Error = PtxGpuError;
+
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        self.inner.memory_topology()
+    }
 
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         self.inner.copy_mechanism()

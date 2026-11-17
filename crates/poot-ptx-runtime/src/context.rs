@@ -8,7 +8,7 @@ use std::time::Duration;
 use cudarc::driver::{result, sys};
 use poot_codegen::{CompiledKernel, KernelCode};
 use poot_runtime_common::{BufferRole, DeviceBackend, fnv1a};
-use poot_target::ElementKind;
+use poot_target::{ElementKind, MemoryDomain};
 
 use super::buffer::{PtxBuffer, allocate_owned, checked_copy};
 use super::driver::{CudaDriver, DriverCleanup};
@@ -30,6 +30,9 @@ pub struct PtxContext {
     /// The device-capability descriptor, measured once at construction (card 522 review M1):
     /// [`PtxContext::device_caps`] returns this stored value, never re-queries the driver.
     pub(crate) device_caps: poot_target::DeviceCaps,
+    /// The memory domain of this device, read once from the CUDA `INTEGRATED` attribute at construction
+    /// ([`memory_domain_from_integrated`]).
+    pub(crate) memory_domain: MemoryDomain,
     /// Card 552 (SC-006): true when this context was built via
     /// [`PtxContext::new_with_device_timing`], so [`PtxContext::launch_timed`] brackets each replay
     /// with one CUDA event pair instead of skipping timing (a plain [`PtxGraphExec::launch`] with no
@@ -102,6 +105,27 @@ fn measure_device_caps(dev: sys::CUdevice) -> Result<poot_target::DeviceCaps, Pt
             multiprocessor_count: attr(Attr::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         },
     ))
+}
+
+/// The memory domain a device's CUDA `CU_DEVICE_ATTRIBUTE_INTEGRATED` value implies: an integrated GPU (a
+/// Jetson, a laptop part) shares the host's RAM and is [`MemoryDomain::Host`]; a discrete one allocates from
+/// its own VRAM and is [`MemoryDomain::Local`].
+fn memory_domain_from_integrated(integrated: i32) -> MemoryDomain {
+    if integrated != 0 {
+        MemoryDomain::Host
+    } else {
+        MemoryDomain::Local
+    }
+}
+
+/// Reads the `INTEGRATED` attribute of `dev` and maps it ([`memory_domain_from_integrated`]).
+fn measure_memory_domain(dev: sys::CUdevice) -> Result<MemoryDomain, PtxError> {
+    // SAFETY: `dev` came from `result::device::get` at context construction.
+    let integrated = unsafe {
+        result::device::get_attribute(dev, sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
+    }
+    .map_err(PtxError::Driver)?;
+    Ok(memory_domain_from_integrated(integrated))
 }
 
 /// The `cuDeviceGetAttribute` values [`caps_from_attributes`] reads: the seam a test feeds sentinels
@@ -215,12 +239,14 @@ impl PtxContext {
         // thread (`construct_owner`'s `guard.keep_current()`): every later `device_caps()` call
         // returns this stored `Copy` instead of re-querying the driver.
         let device_caps = measure_device_caps(device)?;
+        let memory_domain = measure_memory_domain(device)?;
         Ok(PtxContext {
             upload: RefCell::new(UploadRing::new(Arc::clone(&owner))),
             owner,
             funcs: RefCell::new(HashMap::new()),
             capture: CaptureRetention::default(),
             device_caps,
+            memory_domain,
             device_timing: false,
             peers: RefCell::new(Vec::new()),
         })
@@ -417,6 +443,12 @@ impl PtxContext {
     /// driver-error path to a plan call that has nothing to do with planning).
     pub fn device_caps(&self) -> poot_target::DeviceCaps {
         self.device_caps
+    }
+
+    /// The memory domain of this device: `Host` for an integrated GPU, `Local` for a discrete one, read from
+    /// the CUDA `INTEGRATED` attribute at construction.
+    pub fn memory_domain(&self) -> MemoryDomain {
+        self.memory_domain
     }
 
     /// Overwrite an existing device buffer's contents in place (H2D to its stable address), e.g. to refresh a
@@ -1171,6 +1203,14 @@ mod caps_tests {
         }
     }
 
+    /// POOT-1273 SC-002: an integrated device is `Host` and a discrete one `Local`, from the CUDA `INTEGRATED`
+    /// attribute alone. Mutation: report `Local` for every device, and the integrated row goes red.
+    #[test]
+    fn the_integrated_attribute_decides_the_memory_domain() {
+        assert_eq!(memory_domain_from_integrated(1), MemoryDomain::Host);
+        assert_eq!(memory_domain_from_integrated(0), MemoryDomain::Local);
+    }
+
     /// SC-003: every attribute lands in the field that names it (no two sentinels are equal, so a swap
     /// or a default substituted for a query cannot pass). Mutation: report `ptx_default()`'s 49152 LDS
     /// or its 32-lane warp, and the equality fails on that field.
@@ -1225,7 +1265,8 @@ mod caps_tests {
         };
         assert_eq!(calibrated(12, 0), Calibrated::SM_120);
         assert_eq!(calibrated(8, 9), Calibrated::SM_89);
-        for (major, minor) in [(8, 0), (8, 6), (9, 0), (12, 1)] {
+        assert_eq!(calibrated(8, 6), Calibrated::SM_86);
+        for (major, minor) in [(8, 0), (9, 0), (12, 1)] {
             assert_eq!(
                 calibrated(major, minor),
                 Calibrated::Portable,

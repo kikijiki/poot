@@ -375,7 +375,7 @@ pub(crate) struct Site<'a> {
 
 /// The schedule choices a compile fixes for the calibration sweep and the tests that time or inspect one candidate
 /// ([`crate::CompileOptions::tiling_pin`], [`crate::CompileOptions::indexed_rows_pin`],
-/// [`crate::CompileOptions::gemv_cols_pin`]). `Pins::default()` leaves
+/// [`crate::CompileOptions::gemv_cols_pin`], [`crate::CompileOptions::packed_gemv_pin`]). `Pins::default()` leaves
 /// every choice to the cost model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Pins<'a> {
@@ -385,6 +385,8 @@ pub(crate) struct Pins<'a> {
     pub(crate) indexed_rows: Option<crate::predicates::IndexedRows>,
     /// The columns per workgroup every dense decode Gemv must launch.
     pub(crate) gemv_cols: Option<u32>,
+    /// The launch geometry every packed decode Gemv must run.
+    pub(crate) packed_gemv: Option<crate::PackedGemvPin>,
     /// The device compiler a tiling's register feasibility is asked of ([`crate::CompileOptions::register_feedback`]);
     /// `None` leaves it to the register model.
     pub(crate) feedback: Option<&'a crate::RegisterFeedback>,
@@ -429,6 +431,11 @@ impl<'a> Site<'a> {
     /// The columns per workgroup a dense decode Gemv at this site must launch, if the compile pinned them.
     pub(crate) fn gemv_cols_pin(&self) -> Option<u32> {
         self.pins.gemv_cols
+    }
+
+    /// The geometry a packed decode Gemv at this site must run, if the compile pinned one.
+    pub(crate) fn packed_gemv_pin(&self) -> Option<crate::PackedGemvPin> {
+        self.pins.packed_gemv
     }
 
     /// The body limits a kernel generated at this site is held to.

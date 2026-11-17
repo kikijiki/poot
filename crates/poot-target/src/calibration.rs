@@ -47,20 +47,55 @@ pub const PORTABLE_GEMV_DEVICE: GemvDevice = GemvDevice {
     dram_latency_cycles: 1600.0,
     l1_lines_per_cycle: 1.0,
     dispatch_cycles: 8000.0,
+    dependent_issue_cycles: 4.0,
     issue_per_cycle: 2.0,
     resident_lanes: 1024,
 };
 
-/// The packed Gemv figures of the RTX PRO 6000 Blackwell Server (sm_120): the design's model priors (800 ns loaded
-/// DRAM latency, one L1 line per cycle, 4 us per dispatch) at the part's 2.43 GHz SM clock, over its four warp
-/// schedulers and 1536 resident lanes per SM. The three rates are priors: the POOT-1563 pod session measures them and
-/// replaces these.
+/// The packed Gemv figures of the RTX PRO 6000 Blackwell Server (sm_120) at the part's 2.43 GHz SM clock, over its
+/// four warp schedulers and 1536 resident lanes per SM. The latency, L1 rate and dependent issue interval are
+/// identified by `benchmarks/calibration/fit_packed_gemv.py` over the 2440-row corpus of POOT-1608, POOT-1610 and POOT-1611 (the
+/// `lines` of its body-facts file are the generator's, every column group's activation read paid); the dispatch is the
+/// measured empty launch.
 pub const SM_120_GEMV_DEVICE: GemvDevice = GemvDevice {
-    dram_latency_cycles: 1944.0,
-    l1_lines_per_cycle: 1.0,
-    dispatch_cycles: 9720.0,
+    dram_latency_cycles: 2070.0,
+    l1_lines_per_cycle: 0.77,
+    dispatch_cycles: 4450.0,
+    dependent_issue_cycles: 2.9,
     issue_per_cycle: 4.0,
     resident_lanes: 1536,
+};
+
+/// Warp instructions one SM issues per cycle at compute capabilities 8.6 and 8.9: four schedulers.
+const SM_86_89_ISSUE_PER_CYCLE: f64 = 4.0;
+
+/// Lanes one SM holds resident at compute capabilities 8.6 and 8.9: 48 warps of 32.
+const SM_86_89_RESIDENT_LANES: u32 = 1536;
+
+/// The packed Gemv figures of the RTX 4090 (sm_89, 2.52 GHz boost): the SM's structural facts (four warp schedulers,
+/// 1536 resident lanes), the L1 rate the POOT-1614 sweep identified (852 rows over five cells on one RTX 4090,
+/// `benchmarks/calibration/ptx-sm89-packed-gemv.tsv`), and priors for what that sweep did not identify (the latency
+/// and the dependent issue interval) or did not measure (the dispatch, borrowed from sm_120's empty launch). Their
+/// provenance rows say which is which.
+pub const SM_89_GEMV_DEVICE: GemvDevice = GemvDevice {
+    dram_latency_cycles: 2016.0,
+    l1_lines_per_cycle: 0.824,
+    dispatch_cycles: 4610.0,
+    dependent_issue_cycles: 4.0,
+    issue_per_cycle: SM_86_89_ISSUE_PER_CYCLE,
+    resident_lanes: SM_86_89_RESIDENT_LANES,
+};
+
+/// The packed Gemv figures of the RTX 3090 and A5000 (sm_86): the same SM as sm_89's in the two structural facts, and
+/// every rate the portable prior's: no packed Gemv sweep exists on an sm_86 part (POOT-1605 ran only POOT-1602's
+/// expert-projection row there), so nothing of sm_89's identified L1 rate is carried over.
+pub const SM_86_GEMV_DEVICE: GemvDevice = GemvDevice {
+    dram_latency_cycles: PORTABLE_GEMV_DEVICE.dram_latency_cycles,
+    l1_lines_per_cycle: PORTABLE_GEMV_DEVICE.l1_lines_per_cycle,
+    dispatch_cycles: PORTABLE_GEMV_DEVICE.dispatch_cycles,
+    dependent_issue_cycles: PORTABLE_GEMV_DEVICE.dependent_issue_cycles,
+    issue_per_cycle: SM_86_89_ISSUE_PER_CYCLE,
+    resident_lanes: SM_86_89_RESIDENT_LANES,
 };
 
 /// The cost model's ratios of a device nobody identified them on, and of Strix Halo behind RADV: the POOT-1403 fit
@@ -178,6 +213,9 @@ pub struct GemvDevice {
     pub l1_lines_per_cycle: f64,
     /// Cycles one Gemv dispatch costs besides its trips: launch, ramp, the column tree and the store.
     pub dispatch_cycles: f64,
+    /// Cycles between two dependent instructions of one warp: the chain a warp runs after its loads land, which
+    /// the latency arm of a trip adds to the DRAM latency per instruction of the trip.
+    pub dependent_issue_cycles: f64,
     /// Warp instructions one unit issues per cycle (its schedulers).
     pub issue_per_cycle: f64,
     /// Lanes one unit holds resident.
@@ -292,12 +330,26 @@ impl PerfCalibration {
     };
 
     /// The RTX 4090 (compute capability 8.9). Measured for the Gemv's direct value and per-dot-product cost
-    /// ([`SM_89_COST_RATIOS`], POOT-1602); every other figure is [`Self::PORTABLE`]'s, spelled out as borrowed.
+    /// ([`SM_89_COST_RATIOS`], POOT-1602); the packed Gemv's figures are [`SM_89_GEMV_DEVICE`]'s (POOT-1613, POOT-1614)
+    /// and every other figure is [`Self::PORTABLE`]'s, spelled out as borrowed.
     pub const SM_89: Self = Self {
         dense_gemv_cols: Self::PORTABLE.dense_gemv_cols,
-        packed_gemv: Self::PORTABLE.packed_gemv,
+        packed_gemv: SM_89_GEMV_DEVICE,
         lds_gemv_width: Self::PORTABLE.lds_gemv_width,
         cost: SM_89_COST_RATIOS,
+        attention_key_blocks: Self::PORTABLE.attention_key_blocks,
+        attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
+    };
+
+    /// The RTX 3090 and A5000 (compute capability 8.6). Nobody identified a cost ratio on it (POOT-1605 ran POOT-1602's
+    /// row on an RTX A5000 pod: the portable ratios plan it within 1.10 of the fastest schedule, 1.09), so every
+    /// ratio is [`Self::PORTABLE`]'s, spelled out as borrowed; the packed Gemv's two structural facts are the SM's and its
+    /// rates priors ([`SM_86_GEMV_DEVICE`], POOT-1613).
+    pub const SM_86: Self = Self {
+        dense_gemv_cols: Self::PORTABLE.dense_gemv_cols,
+        packed_gemv: SM_86_GEMV_DEVICE,
+        lds_gemv_width: Self::PORTABLE.lds_gemv_width,
+        cost: PORTABLE_COST_RATIOS,
         attention_key_blocks: Self::PORTABLE.attention_key_blocks,
         attention_split_min_steps: PORTABLE_ATTENTION_SPLIT_MIN_STEPS,
     };
@@ -315,6 +367,8 @@ pub enum MeasuredDevice {
     Sm120,
     /// The RTX 4090 (compute capability 8.9).
     Sm89,
+    /// The RTX 3090 and A5000 (compute capability 8.6).
+    Sm86,
 }
 
 impl MeasuredDevice {
@@ -325,6 +379,7 @@ impl MeasuredDevice {
             Self::StrixHaloVulkan => PerfCalibration::STRIX_HALO_VULKAN,
             Self::Sm120 => PerfCalibration::SM_120,
             Self::Sm89 => PerfCalibration::SM_89,
+            Self::Sm86 => PerfCalibration::SM_86,
         }
     }
 }
@@ -352,6 +407,9 @@ impl Calibrated {
 
     /// The RTX 4090's measured entry.
     pub const SM_89: Self = Self::Measured(MeasuredDevice::Sm89);
+
+    /// The RTX 3090 and A5000's measured entry.
+    pub const SM_86: Self = Self::Measured(MeasuredDevice::Sm86);
 
     /// The figures the planner reads.
     pub const fn figures(self) -> PerfCalibration {
@@ -385,6 +443,7 @@ impl Calibrated {
         match (major, minor) {
             (12, 0) => Self::SM_120,
             (8, 9) => Self::SM_89,
+            (8, 6) => Self::SM_86,
             _ => Self::Portable,
         }
     }
@@ -662,6 +721,11 @@ mod tests {
             source: "prior, not measured: the design model's 4 us fixed cost per Gemv dispatch (model.py FIXED_US) at a ~2 GHz unit clock; the POOT-1319 fit of 35 K-quant rows gave 13.9 us on sm_120 in a per-dispatch-timed window, an upper bound",
         },
         Provenance {
+            name: "PORTABLE_GEMV_DEPENDENT_ISSUE_CYCLES",
+            value: 4.0,
+            source: "prior, not measured: a warp's dependent-ALU issue interval, about 4 cycles on Ampere and later and the same order on RDNA (Volkov, Understanding Latency Hiding on GPUs, UC Berkeley EECS-2016-143); POOT-1609 design section 6",
+        },
+        Provenance {
             name: "PORTABLE_GEMV_ISSUE_PER_CYCLE",
             value: 2.0,
             source: "structural: an RDNA3.5 compute unit has two SIMD32, each issuing one wave instruction per cycle (AMD RDNA3 ISA guide); the floor over the parts poot targets",
@@ -673,18 +737,23 @@ mod tests {
         },
         Provenance {
             name: "SM_120_GEMV_DRAM_LATENCY_CYCLES",
-            value: 1944.0,
-            source: "prior, not measured: the design model's 800 ns loaded GDDR7 latency (model.py LATENCY_NS) at the part's 2.43 GHz SM clock. The POOT-1563 pod session replaces it; until then the model's argmin is a prior",
+            value: 2070.0,
+            source: "not identified, POOT-1611: log least squares over the 2440 measured geometries of 15 cells (POOT-1608/1610/1611) gives 1785 cycles, and the region within 5 % of the least log error spans 708-2833 (x4.0), flat over a 4x range, so the corpus does not identify it. 2070 (0.85 us, a loaded latency) is the point of the region with the least worst-cell regret together with the L1 rate and the dependent issue interval; the design prior 1944 chooses identically. Trades with the dependent issue interval along a ridge. Held out by cell the worst regret is 1.331 (Q4_K 1024x2560, which every refit then sends to depth 2), by format 1.465 (Q4_K out), in sample 1.183 (Q6_K 1024x2560)",
         },
         Provenance {
             name: "SM_120_GEMV_L1_LINES_PER_CYCLE",
-            value: 1.0,
-            source: "prior, not measured: model.py L1_LINES_PER_CYCLE, to be measured by POOT-1563's L1-broadcast probe, which separates the issue term from the L1 term",
+            value: 0.77,
+            source: "identified, POOT-1611: log least squares over the 2440-row corpus gives 0.756 lines per cycle, the region within 5 % of the least error spans 0.756-0.953 (x1.26), and 0.77 lies in it. Mechanism not established: the POOT-1610 probe is consistent with the L1 cost scaling with the lanes' addresses, not distinct lines, but `ncu` counters were unavailable (ERR_NVGPUCTRPERM), so the compiler splitting the column groups' loads is not excluded",
         },
         Provenance {
             name: "SM_120_GEMV_DISPATCH_CYCLES",
-            value: 9720.0,
-            source: "prior, not measured: model.py FIXED_US 4 us at 2.43 GHz; POOT-1563's streaming probe measures the dispatch's fixed cost",
+            value: 4450.0,
+            source: "measured, not identified by any geometry sweep: the 1.83 us empty launch of the POOT-1606 probe at 2.43 GHz. The dispatch is added to every geometry of a cell, so no corpus moves an argmin with it; it matters only where a Gemv is priced against a tile",
+        },
+        Provenance {
+            name: "SM_120_GEMV_DEPENDENT_ISSUE_CYCLES",
+            value: 2.9,
+            source: "identified within a ridge, POOT-1611: log least squares gives 4.85, the region within 5 % of the least error spans 1.9-6.1 (x3.2), and 2.9 is the point of it with the least worst-cell regret at the committed latency and L1 (1.183, mean 1.088; at 3.6 and above the worst is 1.331 through Q4_K 1024x2560). Trades with the latency along a ridge; the prior was 4",
         },
         Provenance {
             name: "SM_120_GEMV_ISSUE_PER_CYCLE",
@@ -695,6 +764,56 @@ mod tests {
             name: "SM_120_GEMV_RESIDENT_LANES",
             value: 1536.0,
             source: "structural: 48 resident warps of 32 lanes per SM at compute capability 12.0 (CUDA programming guide, technical specifications table)",
+        },
+        Provenance {
+            name: "SM_89_GEMV_DRAM_LATENCY_CYCLES",
+            value: 2016.0,
+            source: "prior, NOT identified, POOT-1613/POOT-1614: the design model's 800 ns loaded latency at the RTX 4090's 2.52 GHz boost clock. The 852-row sweep of 5 cells (ptx-sm89-packed-gemv.tsv) fits 2012 cycles but the region within 5 % of the least error spans 503-2534 (x5), so the corpus does not identify it; a pod sweep with more cells replaces it",
+        },
+        Provenance {
+            name: "SM_89_GEMV_L1_LINES_PER_CYCLE",
+            value: 0.824,
+            source: "identified, POOT-1614: log least squares over the 852 rows of the 5 cells of one RTX 4090 (secure pod, ptx-sm89-packed-gemv.tsv, sha256 db5f58bb), 0.824 lines per cycle (sm_120: 0.77). Identified within the region the sweep spans (0.75-0.85 across the leave-one-cell-out refits); one part, five cells",
+        },
+        Provenance {
+            name: "SM_89_GEMV_DISPATCH_CYCLES",
+            value: 4610.0,
+            source: "borrowed, not measured on sm_89: sm_120's measured empty launch of 1.83 us (POOT-1606) at the 4090's 2.52 GHz. No geometry sweep moves an argmin with it; it matters only where a Gemv is priced against a tile. An empty-launch probe on the 4090 replaces it",
+        },
+        Provenance {
+            name: "SM_89_GEMV_DEPENDENT_ISSUE_CYCLES",
+            value: 4.0,
+            source: "prior, NOT identified, POOT-1613/POOT-1614: the portable prior, a warp's dependent-ALU issue interval of about 4 cycles on Ampere and later. The sm_89 sweep fits 1.08 but the region spans 0.27-4.3 (x16), so it is not identified",
+        },
+        Provenance {
+            name: "SM_86_GEMV_DRAM_LATENCY_CYCLES",
+            value: 1600.0,
+            source: "prior, not measured on sm_86: the portable prior (PORTABLE_GEMV_DRAM_LATENCY_CYCLES). No packed Gemv sweep exists on an sm_86 part, and sm_89's figures are not carried over, so every sm_86 rate is a prior until a pod sweep identifies it",
+        },
+        Provenance {
+            name: "SM_86_GEMV_L1_LINES_PER_CYCLE",
+            value: 1.0,
+            source: "prior, not measured on sm_86: the portable prior (PORTABLE_GEMV_L1_LINES_PER_CYCLE). sm_89's identified 0.824 is that part's and is not assumed for sm_86",
+        },
+        Provenance {
+            name: "SM_86_GEMV_DISPATCH_CYCLES",
+            value: 8000.0,
+            source: "prior, not measured on sm_86: the portable prior (PORTABLE_GEMV_DISPATCH_CYCLES), the design model's 4 us at a ~2 GHz unit clock",
+        },
+        Provenance {
+            name: "SM_86_GEMV_DEPENDENT_ISSUE_CYCLES",
+            value: 4.0,
+            source: "prior, not measured on sm_86: the portable prior (PORTABLE_GEMV_DEPENDENT_ISSUE_CYCLES)",
+        },
+        Provenance {
+            name: "SM_86_89_GEMV_ISSUE_PER_CYCLE",
+            value: 4.0,
+            source: "structural, sm_86 and sm_89: four warp schedulers per SM, one warp instruction each per cycle (NVIDIA Ampere GA10x tuning guide, compute capability 8.6, and Ada tuning guide, 8.9); CUDA programming guide, compute capability table. It replaces the RDNA3.5 prior of 2 that these parts planned with",
+        },
+        Provenance {
+            name: "SM_86_89_GEMV_RESIDENT_LANES",
+            value: 1536.0,
+            source: "structural: 48 resident warps of 32 lanes per SM at compute capabilities 8.6 and 8.9 (CUDA programming guide, technical specifications per compute capability: maximum resident warps per multiprocessor 48). It replaces the RDNA3.5 prior of 1024",
         },
         Provenance {
             name: "STRIX_HALO_LDS_GEMV_WIDTH",
@@ -857,6 +976,7 @@ mod tests {
             PerfCalibration::STRIX_HALO_VULKAN,
             PerfCalibration::SM_120,
             PerfCalibration::SM_89,
+            PerfCalibration::SM_86,
         ] {
             let PerfCalibration {
                 dense_gemv_cols,
@@ -884,13 +1004,14 @@ mod tests {
                 *narrowest as u32,
             );
         }
-        for (device, [latency, l1, dispatch, issue, resident]) in [
+        for (device, [latency, l1, dispatch, dependent, issue, resident]) in [
             (
                 PerfCalibration::PORTABLE.packed_gemv,
                 [
                     "PORTABLE_GEMV_DRAM_LATENCY_CYCLES",
                     "PORTABLE_GEMV_L1_LINES_PER_CYCLE",
                     "PORTABLE_GEMV_DISPATCH_CYCLES",
+                    "PORTABLE_GEMV_DEPENDENT_ISSUE_CYCLES",
                     "PORTABLE_GEMV_ISSUE_PER_CYCLE",
                     "PORTABLE_GEMV_RESIDENT_LANES",
                 ],
@@ -901,8 +1022,31 @@ mod tests {
                     "SM_120_GEMV_DRAM_LATENCY_CYCLES",
                     "SM_120_GEMV_L1_LINES_PER_CYCLE",
                     "SM_120_GEMV_DISPATCH_CYCLES",
+                    "SM_120_GEMV_DEPENDENT_ISSUE_CYCLES",
                     "SM_120_GEMV_ISSUE_PER_CYCLE",
                     "SM_120_GEMV_RESIDENT_LANES",
+                ],
+            ),
+            (
+                PerfCalibration::SM_89.packed_gemv,
+                [
+                    "SM_89_GEMV_DRAM_LATENCY_CYCLES",
+                    "SM_89_GEMV_L1_LINES_PER_CYCLE",
+                    "SM_89_GEMV_DISPATCH_CYCLES",
+                    "SM_89_GEMV_DEPENDENT_ISSUE_CYCLES",
+                    "SM_86_89_GEMV_ISSUE_PER_CYCLE",
+                    "SM_86_89_GEMV_RESIDENT_LANES",
+                ],
+            ),
+            (
+                PerfCalibration::SM_86.packed_gemv,
+                [
+                    "SM_86_GEMV_DRAM_LATENCY_CYCLES",
+                    "SM_86_GEMV_L1_LINES_PER_CYCLE",
+                    "SM_86_GEMV_DISPATCH_CYCLES",
+                    "SM_86_GEMV_DEPENDENT_ISSUE_CYCLES",
+                    "SM_86_89_GEMV_ISSUE_PER_CYCLE",
+                    "SM_86_89_GEMV_RESIDENT_LANES",
                 ],
             ),
         ] {
@@ -910,12 +1054,14 @@ mod tests {
                 dram_latency_cycles,
                 l1_lines_per_cycle,
                 dispatch_cycles,
+                dependent_issue_cycles,
                 issue_per_cycle,
                 resident_lanes,
             } = device;
             assert_provenance(latency, dram_latency_cycles);
             assert_provenance(l1, l1_lines_per_cycle);
             assert_provenance(dispatch, dispatch_cycles);
+            assert_provenance(dependent, dependent_issue_cycles);
             assert_provenance(issue, issue_per_cycle);
             assert_provenance(resident, resident_lanes);
         }
@@ -980,10 +1126,42 @@ mod tests {
             (portable.lds_read, portable.staged_value, None, None),
             "sm_89 borrows the prior's tile ratios"
         );
-        assert_eq!(
+        // sm_86 and sm_89 share one SM: the same two structural facts, 4 schedulers and 1536 lanes, not the RDNA3.5
+        // prior's (POOT-1613). sm_86 has no packed Gemv sweep, so every one of its rates is the prior's; sm_89
+        // identified the L1 rate only (POOT-1614).
+        let prior = PerfCalibration::PORTABLE.packed_gemv;
+        let (sm_86_gemv, sm_89_gemv) = (
+            PerfCalibration::SM_86.packed_gemv,
             PerfCalibration::SM_89.packed_gemv,
-            PerfCalibration::PORTABLE.packed_gemv,
-            "sm_89 borrows the prior's packed Gemv figures"
+        );
+        for gemv in [sm_86_gemv, sm_89_gemv] {
+            assert_eq!(
+                (gemv.issue_per_cycle, gemv.resident_lanes),
+                (4.0, 1536),
+                "cc 8.6 and 8.9 have four schedulers and 48 resident warps"
+            );
+        }
+        assert_eq!(
+            GemvDevice {
+                issue_per_cycle: prior.issue_per_cycle,
+                resident_lanes: prior.resident_lanes,
+                ..sm_86_gemv
+            },
+            prior,
+            "every rate of sm_86 is the prior's"
+        );
+        assert_eq!(
+            (
+                sm_89_gemv.l1_lines_per_cycle,
+                sm_89_gemv.dependent_issue_cycles
+            ),
+            (0.824, prior.dependent_issue_cycles),
+            "sm_89 identified the L1 rate and left the dependent issue interval at the prior"
+        );
+        assert_eq!(
+            PerfCalibration::SM_86.cost,
+            portable,
+            "sm_86 identified no cost ratio"
         );
         assert_provenance("GFX11_MATRIX_FMA_RATE", GFX11_MATRIX_FMA_RATE);
         assert_provenance("SM80_MATRIX_FMA_RATE", SM80_MATRIX_FMA_RATE);
@@ -1023,19 +1201,31 @@ mod tests {
             "PORTABLE_GEMV_DRAM_LATENCY_CYCLES",
             "PORTABLE_GEMV_L1_LINES_PER_CYCLE",
             "PORTABLE_GEMV_DISPATCH_CYCLES",
+            "PORTABLE_GEMV_DEPENDENT_ISSUE_CYCLES",
             "PORTABLE_GEMV_ISSUE_PER_CYCLE",
             "PORTABLE_GEMV_RESIDENT_LANES",
             "SM_120_GEMV_DRAM_LATENCY_CYCLES",
             "SM_120_GEMV_L1_LINES_PER_CYCLE",
             "SM_120_GEMV_DISPATCH_CYCLES",
+            "SM_120_GEMV_DEPENDENT_ISSUE_CYCLES",
             "SM_120_GEMV_ISSUE_PER_CYCLE",
             "SM_120_GEMV_RESIDENT_LANES",
+            "SM_89_GEMV_DRAM_LATENCY_CYCLES",
+            "SM_89_GEMV_L1_LINES_PER_CYCLE",
+            "SM_89_GEMV_DISPATCH_CYCLES",
+            "SM_89_GEMV_DEPENDENT_ISSUE_CYCLES",
+            "SM_86_GEMV_DRAM_LATENCY_CYCLES",
+            "SM_86_GEMV_L1_LINES_PER_CYCLE",
+            "SM_86_GEMV_DISPATCH_CYCLES",
+            "SM_86_GEMV_DEPENDENT_ISSUE_CYCLES",
+            "SM_86_89_GEMV_ISSUE_PER_CYCLE",
+            "SM_86_89_GEMV_RESIDENT_LANES",
         ]);
     }
 
     /// A device's figures follow its identity, not its runtime family: Strix Halo is measured through HSA and
     /// through Vulkan, another AMD, an Intel or an NVIDIA Vulkan device is portable, and CUDA is measured on
-    /// sm_120 and sm_89 only (sm_86 shares no entry with sm_89). Mutation: key the Vulkan arm on the vendor alone; the discrete AMD card reads `Measured`.
+    /// sm_120, sm_89 and sm_86 only (sm_86 and sm_89 share their packed Gemv figures, not an entry). Mutation: key the Vulkan arm on the vendor alone; the discrete AMD card reads `Measured`.
     #[test]
     fn performance_figures_follow_device_identity() {
         assert_eq!(
@@ -1065,7 +1255,11 @@ mod tests {
             Calibrated::of_cuda_compute_capability(8, 9),
             Calibrated::SM_89
         );
-        for (major, minor) in [(8, 0), (8, 6), (9, 0), (10, 0), (12, 1)] {
+        assert_eq!(
+            Calibrated::of_cuda_compute_capability(8, 6),
+            Calibrated::SM_86
+        );
+        for (major, minor) in [(8, 0), (9, 0), (10, 0), (12, 1)] {
             assert_eq!(
                 Calibrated::of_cuda_compute_capability(major, minor),
                 Calibrated::Portable,

@@ -546,6 +546,84 @@ pub fn assert_split_kv_decode_is_capacity_independent(
     Ok(())
 }
 
+// ---- Grouped-query decode (POOT-1549 row 14) ----
+
+/// The live length of each step of the grouped-query rows: the full cache, a mid-length that ends inside a
+/// key's cluster walk, and a one-key length.
+const GQA_LIVE_LENGTHS: [i32; 3] = [512, 77, 1];
+
+/// The grouped-query shapes of [`assert_gqa_decode_matches_the_oracle`], each at reduced length: the
+/// Qwen3.8-27B attention shape (`n_rep = 6`, `dk = dv = 256`) and the qwen2.5 shape (`n_rep = 7`, `dk = 64`).
+/// Two key/value heads each, so a query head that read another group's key head is wrong.
+///
+/// The operands are `f32`: the live graph builder fuses only an `f32` composite into the generated attention
+/// (a two-byte one stays primitives, `attention_live.rs`), so an `f16` cache reaches this kernel only through a
+/// model's typed KV state (the coherence rows) and the interpreter rows of `poot-kernelgen`.
+fn gqa_fixtures() -> [poot_eval::test_support::live_attention::LiveAttentionFixture; 2] {
+    let at = |n_rep: usize, width: usize| {
+        poot_eval::test_support::live_attention::LiveAttentionFixture {
+            batch: 1,
+            hq: 2 * n_rep,
+            hkv: 2,
+            cap: 512,
+            dk: width,
+            dv: width,
+            shared_dim: None,
+            softcap: None,
+            dtype: poot_tensor::DType::F32,
+        }
+    };
+    [at(6, 256), at(7, 64)]
+}
+
+/// The grouped-query decode of [`gqa_fixtures`] stepped through [`GQA_LIVE_LENGTHS`] over one executable
+/// on `exec` at `target`: the plan holds one generated attention, and every step's output, for every query
+/// head of every key/value head's group, matches the CPU oracle's evaluation of that live length within
+/// [`SPLIT_KV_DEVICE_TOLERANCE`]. The cache is full and one set of consts serves every step, so a step that
+/// read past its live length changes the output.
+pub fn assert_gqa_decode_matches_the_oracle(
+    exec: &mut dyn Executor,
+    target: poot_graph_plan::Target,
+) -> Result<(), String> {
+    for fixture in gqa_fixtures() {
+        let label = format!(
+            "n_rep {} dk {} dv {}",
+            fixture.hq / fixture.hkv,
+            fixture.dk,
+            fixture.dv
+        );
+        let built = fixture.build(true);
+        // The plan must hold the generated attention (at least one dispatch), not the primitives.
+        let (dispatches, _) = attention_launches(&built, target);
+        if dispatches == 0 {
+            return Err(format!(
+                "{label}: the live decode planned no attention dispatch"
+            ));
+        }
+        let inputs = fixture.inputs(&built, &[GQA_LIVE_LENGTHS[0]], false);
+        let positions: Vec<Vec<i32>> = GQA_LIVE_LENGTHS.iter().map(|&len| vec![len - 1]).collect();
+        let got = crate::live_attention::live_steps(exec, target, &built, &inputs, &positions)
+            .map_err(|e| format!("{label}: grouped-query run: {e}"))?;
+        for (step, &len) in GQA_LIVE_LENGTHS.iter().enumerate() {
+            let want = fixture.oracle(&inputs, &built, &[len]);
+            if got[step].len() != want.len() {
+                return Err(format!(
+                    "{label}, live length {len}: {} elements against the oracle's {}",
+                    got[step].len(),
+                    want.len()
+                ));
+            }
+            let worst = poot_test_util::max_abs_error(&got[step], &want);
+            if worst > SPLIT_KV_DEVICE_TOLERANCE {
+                return Err(format!(
+                    "{label}, live length {len}: worst absolute error {worst} against the oracle exceeds {SPLIT_KV_DEVICE_TOLERANCE}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---- Split-KV decode in each stage of a two-stage pipeline ----
 
 /// Two split-KV decode layers of [`split_kv_fixture`]'s shape, one per pipeline stage: layer `l` attends

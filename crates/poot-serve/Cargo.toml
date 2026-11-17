@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+poot-build-identity.workspace = true
 poot-llm.workspace = true
 # `ChatFormat` (the fallback chat format) lives with the model families.
 poot-models.workspace = true
@@ -41,6 +42,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
+
+[build-dependencies]
+poot-build-identity.workspace = true
 
 [dev-dependencies]
 poot-graph-plan = { workspace = true, features = ["test-support"] }

@@ -1797,7 +1797,7 @@ name = "poot-bench-runner"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "blake3",
+ "poot-build-identity",
  "poot-executor",
  "poot-llm",
  "poot-models",
@@ -1811,6 +1811,10 @@ dependencies = [
  "tokenizers",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "poot-build-identity"
+version = "0.0.0"
 
 [[package]]
 name = "poot-codegen"
@@ -1975,9 +1979,11 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "blake3",
  "bytemuck",
  "clap",
  "image",
+ "poot-build-identity",
  "poot-codegen",
  "poot-eval",
  "poot-executor",
@@ -2210,6 +2216,7 @@ version = "0.0.0"
 dependencies = [
  "ash",
  "libc",
+ "poot-target",
 ]
 
 [[package]]
@@ -2221,6 +2228,7 @@ dependencies = [
  "clap",
  "image",
  "libc",
+ "poot-build-identity",
  "poot-codegen",
  "poot-executor",
  "poot-graph-ir",

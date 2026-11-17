@@ -22,6 +22,7 @@ pub mod calibration;
 pub mod dram_channels;
 mod kernel_compiler;
 mod matrix;
+pub mod memory;
 mod register_file;
 pub mod storage;
 pub mod vpu;
@@ -32,6 +33,7 @@ pub use matrix::{
     CooperativeMatrixConfig, FragmentConfig, FragmentDtype, FragmentLayout, FragmentShape, LaneMap,
     MatrixUnits, OperandNarrowing, RoundingConversions,
 };
+pub use memory::{LinkCost, MemoryDomain, MemoryTopology, ShareMechanism, ShareMechanisms};
 pub use register_file::{RegisterBudget, RegisterFile};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout, ViewError};
 pub use vpu::{NarrowingContract, VendorCompilerId, VpuCaps, VpuTargetId};

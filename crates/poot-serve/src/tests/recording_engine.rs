@@ -439,6 +439,7 @@ pub(crate) struct JobSpec {
     pub(crate) prompt: String,
     pub(crate) max_new: usize,
     pub(crate) stop: Vec<String>,
+    pub(crate) ignore_eos: bool,
     pub(crate) stream: bool,
     /// Embedding rows standing in for the first prompt token: a multimodal prompt.
     pub(crate) embeds: bool,
@@ -464,6 +465,7 @@ impl JobSpec {
             prompt: prompt.to_string(),
             max_new,
             stop: Vec::new(),
+            ignore_eos: false,
             stream: false,
             embeds: false,
             overdue: false,
@@ -478,6 +480,12 @@ impl JobSpec {
 
     pub(crate) fn stop(mut self, stop: &str) -> Self {
         self.stop.push(stop.to_string());
+        self
+    }
+
+    /// The request asks to ignore the model's end-of-sequence tokens.
+    pub(crate) fn ignoring_eos(mut self) -> Self {
+        self.ignore_eos = true;
         self
     }
 
@@ -509,6 +517,7 @@ impl JobSpec {
             max_new: self.max_new,
             sampler: Sampler::greedy(),
             stop: self.stop,
+            ignore_eos: self.ignore_eos,
             stream: self.stream,
             reply,
             submitted: Instant::now(),

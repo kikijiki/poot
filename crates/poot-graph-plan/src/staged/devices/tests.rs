@@ -13,7 +13,7 @@ use poot_test_util::device_caps::default_caps_for;
 use crate::multi_device::{AccountingError, PlacementError};
 use crate::planner::test_only::per_eqn_plans_inside_compile;
 use crate::staged::{
-    DeviceId, DevicePlacement, ExpertPlacement, Partition, StageId, StagedCompileError,
+    DeviceId, DevicePlacement, DomainKey, ExpertPlacement, Partition, StageId, StagedCompileError,
     StagedProgram, TargetSet, compile_staged,
 };
 use crate::test_support::gpu_caps;
@@ -49,7 +49,13 @@ fn targets(backend: Backend, budgets: &[u64]) -> TargetSet {
         budgets
             .iter()
             .enumerate()
-            .map(|(index, &budget)| (DeviceId(index as u32), target(backend, budget)))
+            .map(|(index, &budget)| {
+                (
+                    DeviceId(index as u32),
+                    target(backend, budget),
+                    poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+                )
+            })
             .collect(),
     )
     .expect("distinct devices")
@@ -384,9 +390,21 @@ fn a_device_with_an_unknown_budget_is_refused() {
     };
     assert_eq!(gpu_caps(&unknown).memory_budget_bytes, None);
     devices = TargetSet::new(vec![
-        (DeviceId(0), devices.devices()[0].1),
-        (DeviceId(1), unknown),
-        (DeviceId(2), devices.devices()[2].1),
+        (
+            DeviceId(0),
+            devices.devices()[0].1,
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            unknown,
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(2),
+            devices.devices()[2].1,
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
     ])
     .unwrap();
     match compile_on(&graph, &devices, &pipeline(3)) {
@@ -477,4 +495,44 @@ fn the_weight_derivation_of_a_layered_decode_places_every_owner_on_its_stages() 
             "{device:?} holds the weights its stage reads"
         );
     }
+}
+
+/// POOT-1273 SC-003: every `Host` device is one memory and each `Local` device its own. Two `Local` devices
+/// of one backend get distinct keys (a key by runtime would merge them), a `Host` device never shares a key
+/// with a `Local` one, and a device the set does not hold, or the lone device of `TargetSet::single`, has none.
+/// Mutation: key a `Local` device by its target's id instead of its device id: the two `Local` rows share a
+/// key and the distinctness assertion fails.
+#[test]
+fn host_devices_share_one_domain_key_and_each_local_device_has_its_own() {
+    use poot_target::{MemoryDomain, MemoryTopology};
+
+    let host = MemoryTopology::unmeasured(MemoryDomain::Host);
+    let local = MemoryTopology::unmeasured(MemoryDomain::Local);
+    let set = TargetSet::new(vec![
+        (DeviceId(0), target(Backend::SpirvVulkan, 1 << 30), host),
+        (DeviceId(1), target(Backend::SpirvVulkan, 1 << 30), host),
+        (DeviceId(2), target(Backend::Nvptx, 1 << 30), local),
+        (DeviceId(3), target(Backend::Nvptx, 1 << 30), local),
+    ])
+    .expect("distinct devices");
+
+    assert_eq!(set.domain_key(DeviceId(0)), Some(DomainKey::Host));
+    assert_eq!(set.domain_key(DeviceId(1)), set.domain_key(DeviceId(0)));
+    assert_eq!(
+        set.domain_key(DeviceId(2)),
+        Some(DomainKey::Device(DeviceId(2)))
+    );
+    assert_ne!(
+        set.domain_key(DeviceId(2)),
+        set.domain_key(DeviceId(3)),
+        "two Local devices of one runtime are two memories"
+    );
+    assert_ne!(set.domain_key(DeviceId(2)), set.domain_key(DeviceId(0)));
+    assert_eq!(set.domain_key(DeviceId(9)), None, "not in the set");
+    let single = TargetSet::single(DeviceId(0), target(Backend::Nvptx, 1 << 30));
+    assert_eq!(
+        single.domain_key(DeviceId(0)),
+        None,
+        "one device is its own home"
+    );
 }

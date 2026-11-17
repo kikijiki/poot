@@ -46,7 +46,7 @@ pub(crate) fn record_prefix_admission(cache: &CacheMetrics, prompt_len: usize, r
 }
 
 /// Commit one step's picks for `slot`: keep tokens until one ends the request (an EOS from the model's
-/// set, a stop string, `max_new`, a gone client), stream each kept token's released text, then commit
+/// set unless the request ignores EOS, a stop string, `max_new`, a gone client), stream each kept token's released text, then commit
 /// exactly the kept prefix with the engine. A token after the ending one is never kept, so it enters
 /// neither the sequence nor the sampler's history.
 pub(crate) fn commit_tokens<E: ServeEngine>(
@@ -58,7 +58,7 @@ pub(crate) fn commit_tokens<E: ServeEngine>(
     let mut fate = SlotFate::Continue;
     let mut kept = 0;
     for &next in &result.tokens {
-        if engine.eos().contains(&next) {
+        if !slot.ignore_eos && engine.eos().contains(&next) {
             fate = SlotFate::Finished {
                 reason: FinishReason::Eos,
             };

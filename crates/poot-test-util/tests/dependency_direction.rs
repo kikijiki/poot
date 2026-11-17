@@ -54,6 +54,7 @@ const RANKS: &[(&str, u8)] = &[
     ("poot-kernel-ir", 0),
     ("poot-kernel-intrinsics", 0),
     ("poot-orchestrator", 0),
+    ("poot-build-identity", 0),
     ("poot-tensor", 0),
     ("poot-text", 0),
     // 1: shared runtime helpers, the NPU artifact types, test helpers, kernel attributes

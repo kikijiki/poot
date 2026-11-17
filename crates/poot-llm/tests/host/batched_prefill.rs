@@ -6,8 +6,6 @@
 //! The cache that (a) leaves must equal what (b) leaves, so a decode continuing from either is unchanged.
 //! Deterministic synthetic weights (no real model); CPU eager executor only.
 
-mod common;
-
 use poot_models::test_support::dense::{Dense, Family};
 
 #[test]
@@ -20,5 +18,5 @@ fn batched_prefill_fills_cache_identically_to_token_by_token() {
         .head_dim(4)
         .max_positions(64)
         .f32_model();
-    common::assert_prefill_fills_cache_like_token_by_token(&m, 2, 1e-5);
+    crate::common::assert_prefill_fills_cache_like_token_by_token(&m, 2, 1e-5);
 }

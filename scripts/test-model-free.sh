@@ -67,6 +67,7 @@ readonly gate_policy=(
   "poot-load|reviewed|"
   "poot-models|reviewed|"
   "poot-orchestrator|host|"
+  "poot-build-identity|host|"
   "poot-profile|host|"
   "poot-ptx-device|reviewed|"
   "poot-ptx-runtime|reviewed|"

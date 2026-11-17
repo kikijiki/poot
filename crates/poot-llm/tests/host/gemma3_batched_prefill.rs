@@ -13,8 +13,6 @@
 //! layer 0 is local (window 3 over a 5-token prompt, so the window cuts keys) and layer 1 global, with
 //! distinct rope bases so a table mixup shows as a numeric divergence, not just a shape match.
 
-mod common;
-
 use poot_models::test_support::dense::{Dense, Family};
 
 #[test]
@@ -28,5 +26,5 @@ fn gemma3_batched_prefill_fills_cache_identically_to_token_by_token() {
         .with("rope_theta", 1_000_000.0)
         .with("rope_local_base_freq", 10_000.0)
         .f32_model();
-    common::assert_prefill_fills_cache_like_token_by_token(&m, 2, 1e-4);
+    crate::common::assert_prefill_fills_cache_like_token_by_token(&m, 2, 1e-4);
 }

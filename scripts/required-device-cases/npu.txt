@@ -10,6 +10,7 @@
 # run's poison and quarantine. The region rows (POOT-1160): twenty distinct-shape equations in three hardware
 # contexts, intermediates with no buffer, one run per region, the measured region bounds and the packaging
 # that splits at them, and a reordered chain being its own artifact. Every pointwise op is run against its numerical contract.
+# The XDNA device reports the Host memory domain and keys with a Host GPU (POOT-1273).
 # Every row reduction and norm is run against its contract, and a gather returns its rows bit for bit (POOT-1174).
 poot-npu::aie_pointwise	every_pointwise_op_meets_its_numerical_contract_on_the_npu
 poot-npu::aie_pointwise	executables_over_one_graph_and_different_data_each_compute_their_own_on_the_npu
@@ -24,6 +25,7 @@ poot-npu::xdna_device	every_buffer_is_released_when_the_executable_is_unloaded
 poot-npu::xdna_device	replaying_a_recording_over_reset_state_is_bit_identical
 poot-npu::xdna_device	the_declared_tile_memory_is_the_size_that_links_and_runs
 poot-npu::xdna_device	the_fixture_bank_matches_the_oracle_on_the_npu
+poot-npu::xdna_device	the_xdna_device_reports_the_host_domain_and_keys_with_a_host_gpu
 poot-npu::xdna_region	a_chain_region_returns_one_value_and_allocates_nothing_for_the_rest
 poot-npu::xdna_region	a_region_at_every_declared_limit_links_and_one_past_is_refused
 poot-npu::xdna_region	a_reordered_chain_is_its_own_artifact_and_computes_its_own_function

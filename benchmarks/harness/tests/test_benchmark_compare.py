@@ -115,7 +115,7 @@ class CompareCellKeyTests(unittest.TestCase):
 
         cells = bench.compare_cells(legacy + repeats(BASELINE), legacy + repeats(BASELINE), receipts.POLICY)
 
-        self.assertEqual({cell["key"][3:] for cell in cells}, {(None, None, None, None), ("ptx", DEVICE, HOST_CPU, DRIVER)})
+        self.assertEqual({cell["key"][3:] for cell in cells}, {(None, None, None, None, None), ("ptx", DEVICE, HOST_CPU, DRIVER, None)})
 
     def test_hosts_of_the_same_gpu_are_separate_cells(self):
         # The same GPU on two host CPUs: a host-bound metric differs between them, so one band over both would
@@ -175,15 +175,15 @@ class CompareCellKeyTests(unittest.TestCase):
         self.assertEqual(
             got,
             {
-                ("only-a", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER): receipts.NOT_RUN,
-                ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER): receipts.WITHIN_NOISE,
-                ("only-b", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER): receipts.NEW,
+                ("only-a", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER, None): receipts.NOT_RUN,
+                ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER, None): receipts.WITHIN_NOISE,
+                ("only-b", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER, None): receipts.NEW,
             },
         )
 
 
 class CompareNoiseBandTests(unittest.TestCase):
-    key = ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER)
+    key = ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER, None)
 
     def verdict(self, candidate_samples, **kwargs):
         return verdicts(repeats(BASELINE), repeats(candidate_samples, **kwargs))[self.key]
@@ -288,7 +288,7 @@ def curve_repeats(isls, **kwargs):
 
 
 class CompareCurveCoverageTests(unittest.TestCase):
-    key = ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER)
+    key = ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER, None)
     ISLS = (128, 2048, 8192)
 
     def cell(self, candidate, baseline=None):

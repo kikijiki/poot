@@ -111,7 +111,7 @@ pub use passes::{
 pub use planner::{KernelChoice, NoDispatch, Planned, region_member_work};
 #[cfg(any(test, feature = "test-support"))]
 pub use planner::{plan_eqn, plan_eqn_choice, plan_eqn_views};
-pub use predicates::{IndexedRows, compute_views, numel, value_ids};
+pub use predicates::{IndexedRows, PackedGemvPin, compute_views, numel, value_ids};
 pub use refusal::{Capability, FusedStepGap, Refusal, RefusalDtypes, StorageGap};
 pub use register_feedback::{
     CompiledRegisters, FeedbackError, RegisterFeedback, RegisterProbe, RegisterVerdict,

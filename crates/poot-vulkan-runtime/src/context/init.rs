@@ -429,6 +429,25 @@ impl Context {
         self.graphs_recorded.load(Ordering::Relaxed)
     }
 
+    /// The memory topology of the selected physical device (POOT-1273): its domain, read from the adapter's
+    /// memory heaps and device type ([`poot_runtime_common::vulkan_probe::memory_domain`]); no share mechanism
+    /// and an unmeasured staging cost until POOT-1279 and POOT-1280.
+    pub fn memory_topology(&self) -> poot_target::MemoryTopology {
+        // SAFETY: `self.physical_device` is valid for `self.instance`'s whole lifetime.
+        let (props, memory) = unsafe {
+            (
+                self.instance
+                    .get_physical_device_properties(self.physical_device),
+                self.instance
+                    .get_physical_device_memory_properties(self.physical_device),
+            )
+        };
+        poot_target::MemoryTopology::unmeasured(poot_runtime_common::vulkan_probe::memory_domain(
+            props.device_type,
+            &memory,
+        ))
+    }
+
     /// The selected physical device's name (e.g. `"AMD Radeon Graphics (RADV GFX1151)"`), for diagnostics.
     pub fn device_name(&self) -> String {
         // SAFETY: `self.physical_device` is valid for `self.instance`'s whole lifetime.

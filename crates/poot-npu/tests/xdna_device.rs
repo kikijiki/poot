@@ -795,3 +795,29 @@ fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
         "the failed run's three buffers and two arenas stay charged after every handle to them dropped"
     );
 }
+
+/// POOT-1273 SC-004: the XDNA device reports the `Host` memory domain (its buffers are system DRAM, the memory
+/// the iGPU shares), with no share mechanism and an unmeasured staging cost until POOT-1279 and POOT-1280, so a
+/// target set that holds it keys it with a `Host` GPU. The GPU side of that claim is the ROCm and wgpu
+/// `memory_topology` rows, which assert the same `Host` topology of the iGPU.
+/// Mutation: make `XdnaDevice::memory_topology` report `Local`; both assertions go red.
+#[test]
+fn the_xdna_device_reports_the_host_domain_and_keys_with_a_host_gpu() {
+    use poot_graph_plan::staged::{DeviceId, DomainKey, TargetSet};
+    use poot_target::{MemoryDomain, MemoryTopology};
+
+    let Some((_lock, device)) = device(XdnaConfig::default()) else {
+        return;
+    };
+    let host = MemoryTopology::unmeasured(MemoryDomain::Host);
+    assert_eq!(device.memory_topology(), host);
+
+    let set = TargetSet::new(vec![
+        (DeviceId(0), device.target(), device.memory_topology()),
+        // The iGPU of the same box: its rocm and wgpu rows assert this topology.
+        (DeviceId(1), device.target(), host),
+    ])
+    .expect("distinct devices");
+    assert_eq!(set.domain_key(DeviceId(0)), Some(DomainKey::Host));
+    assert_eq!(set.domain_key(DeviceId(0)), set.domain_key(DeviceId(1)));
+}

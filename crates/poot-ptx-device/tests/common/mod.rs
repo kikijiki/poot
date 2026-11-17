@@ -368,6 +368,10 @@ impl Device for PtxDeviceProxy<'_> {
     type Recording = <PtxDevice as Device>::Recording;
     type Error = <PtxDevice as Device>::Error;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        self.0.memory_topology()
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         self.0.copy_mechanism()
     }

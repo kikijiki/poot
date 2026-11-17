@@ -136,18 +136,14 @@ fn the_request_past_the_queue_cap_is_answered_429_at_once() {
         .client
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let started = Instant::now();
+    // The refusal comes at once, not after a wait: the 2 s read timeout above is the only bound, and a
+    // refusal that waited would have drawn no response at all.
     let response = fifth.response();
     assert!(
         status(&response).starts_with("HTTP/1.1 429"),
         "the fifth request must be refused, got {response:?}"
     );
     assert!(response.contains("Retry-After:"), "{response}");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the refusal comes at once, not after a wait: {:?}",
-        started.elapsed()
-    );
     assert_nothing_queued(&queue, "the fifth request");
 
     // A finished request frees its place: the next one is admitted again.
@@ -161,35 +157,44 @@ fn the_request_past_the_queue_cap_is_answered_429_at_once() {
     drop(queue);
 }
 
-/// SC-002. A client that sends one byte every 0.5 s is cut off at the 2 s total deadline from accept; a
-/// per-read timeout would let it go on for as long as it likes. Baseline: held until the client was done.
-/// Mutation: make `DeadlineStream::read` wait a fixed 2 s per read instead of what is left of the total;
-/// the trickle never stalls for 2 s and the row goes red.
+/// SC-002. A client that keeps sending a byte every 10 ms is cut off at the 200 ms total deadline from
+/// accept; a per-read timeout would let it go on for as long as it likes. The client sends until the server
+/// closes on it (a write error) or its 3000-byte allowance is spent, and the row asserts the cut came first:
+/// load only slows the client, which makes the cut come sooner in bytes, never later. Baseline: held until
+/// the client was done.
+/// Mutation: make `DeadlineStream::read` wait a fixed 200 ms per read instead of what is left of the total;
+/// the trickle never stalls for 200 ms, the allowance runs out first and the row goes red.
 #[test]
 fn a_client_that_trickles_its_request_is_cut_off_at_the_total_deadline() {
-    let (served, _queue, limits) = setup(1, test_limits_with(8, Duration::from_secs(2)));
+    let timeout = Duration::from_millis(200);
+    let (served, _queue, limits) = setup(1, test_limits_with(8, timeout));
     let mut connection = Connection::open(&served, &limits);
+    let accepted = Instant::now();
     connection.send(b"POST /v1/completions HTTP/1.1\r\nX-Slow: ");
     let mut trickle = connection.client.try_clone().unwrap();
     let writer = std::thread::spawn(move || {
-        for _ in 0..16 {
-            std::thread::sleep(Duration::from_millis(500));
+        for sent in 0..3000 {
+            std::thread::sleep(Duration::from_millis(10));
             if trickle.write_all(b"a").is_err() {
-                return;
+                return Some(sent);
             }
         }
+        None
     });
-    let started = Instant::now();
     let response = connection.response();
-    let elapsed = started.elapsed();
-    writer.join().unwrap();
+    let cut_after = writer.join().unwrap();
     assert!(
         status(&response).starts_with("HTTP/1.1 408"),
         "the trickling client is told its time is up: {response:?}"
     );
     assert!(
-        elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_millis(3500),
-        "cut off at the 2 s deadline, not before and not when the client stops: {elapsed:?}"
+        cut_after.is_some(),
+        "the client was still sending when its allowance ran out: the deadline did not cut it off"
+    );
+    assert!(
+        accepted.elapsed() >= timeout,
+        "cut off before the {timeout:?} deadline: {:?}",
+        accepted.elapsed()
     );
 }
 
@@ -306,14 +311,10 @@ fn the_rate_limit_is_decided_before_the_body_is_read() {
 
     let mut second = Connection::open(&served, &limits);
     second.send(post_head("/v1/completions", "", 64).as_bytes());
-    let started = Instant::now();
+    // Answered on the head, not after the deadline: the body never arrives, so an answer that waited for
+    // it would be the 408 of the request deadline and not this 429.
     let response = second.response();
     assert!(status(&response).starts_with("HTTP/1.1 429"), "{response}");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "answered on the head, not after the deadline: {:?}",
-        started.elapsed()
-    );
 }
 
 /// SC-004. `n = 128` runs as 128 engine jobs from the one handler thread: while all 128 are in the
@@ -569,7 +570,9 @@ fn a_slow_reader_cannot_stretch_a_write_past_its_deadline() {
             .kind(),
         std::io::ErrorKind::TimedOut
     );
-    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    // Cut at the write deadline, not before; that it is not stretched is the `recv_timeout` above: a write
+    // that restarted its clock on every drained chunk would run for hours.
+    assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
     writer.join().unwrap();
     stop.store(true, Ordering::SeqCst);
     reader.join().unwrap();
@@ -610,7 +613,9 @@ fn requests_still_sending_their_body_are_bounded_apart_from_the_queue() {
     let mut stalled = Connection::open(&served, &limits);
     stalled.send(post_head("/v1/completions", "", COMPLETION.len()).as_bytes());
     // Let the stalled request take its place before the second arrives.
-    std::thread::sleep(Duration::from_millis(300));
+    while limits.receiving.admitted_for_test() == 0 {
+        std::thread::yield_now();
+    }
 
     let mut second = Connection::open(&served, &limits);
     second.post("/v1/completions", "", COMPLETION);

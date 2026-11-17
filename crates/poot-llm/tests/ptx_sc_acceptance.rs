@@ -499,6 +499,10 @@ impl Device for FaultyOnceDevice {
     type Recording = <PtxDevice as Device>::Recording;
     type Error = <PtxDevice as Device>::Error;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        self.inner.memory_topology()
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         self.inner.copy_mechanism()
     }
@@ -672,6 +676,10 @@ impl Device for FaultyOnceSyncDevice {
     type Kernel = <PtxDevice as Device>::Kernel;
     type Recording = <PtxDevice as Device>::Recording;
     type Error = <PtxDevice as Device>::Error;
+
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        self.inner.memory_topology()
+    }
 
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         self.inner.copy_mechanism()

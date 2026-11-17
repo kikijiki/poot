@@ -21,6 +21,7 @@ use crate::handlers::{
 use crate::lifecycle::deadline_after;
 use crate::metrics::Metrics;
 use crate::types::Served;
+use poot_llm::driver::identity::RunIdentity;
 
 /// Per-key request-rate limiter (card 058). Fixed 60-second window per key: the first request starts the
 /// window, later ones increment until `rpm` is reached, then the window rejects until it rolls over.
@@ -690,7 +691,13 @@ fn serve(connection: &mut Connection<'_>, shared: &Shared<'_>) -> Result<()> {
     match head.method.as_str() {
         "GET" => {
             *body_unread = head.content_length.is_some_and(|length| length > 0);
-            serve_get(stream, &head.path, shared.health, shared.metrics)
+            serve_get(
+                stream,
+                &head.path,
+                shared.health,
+                shared.metrics,
+                shared.served.identity.as_ref(),
+            )
         }
         "POST" => serve_model(
             stream,
@@ -748,6 +755,7 @@ fn serve_get(
     path: &str,
     health: &EngineHealth,
     metrics: &Metrics,
+    identity: Option<&RunIdentity>,
 ) -> Result<()> {
     if path.starts_with("/health") {
         let (status, body) = health_response(health);
@@ -771,6 +779,18 @@ fn serve_get(
             format_args!("model '{id}' not found"),
             "invalid_request_error",
         );
+    }
+    // What the server runs on, read once at startup: the build, device, checkpoint digest and compute dtype.
+    if route == "/v1/identity" {
+        return match identity {
+            Some(identity) => respond(stream, 200, &identity.to_json().to_string()),
+            None => respond_error(
+                stream,
+                404,
+                "this server's placement has no single device to identify",
+                "invalid_request_error",
+            ),
+        };
     }
     // Prometheus text format (checked before the generic /metrics JSON route).
     if path.starts_with("/metrics/prometheus") {
@@ -985,6 +1005,13 @@ pub(crate) fn respond_typed_with_header(
 #[cfg(test)]
 pub(crate) mod test_only {
     use super::*;
+
+    impl RequestQueue {
+        /// The requests holding a slot now: what a test waits on to know a request has taken its place.
+        pub(crate) fn admitted_for_test(&self) -> usize {
+            self.admitted.load(Ordering::SeqCst)
+        }
+    }
 
     /// A request the way the socket-independent parser returns it: the head's `Authorization` kept beside
     /// the method, path and body. Production authorizes on the head before the body is read, so no

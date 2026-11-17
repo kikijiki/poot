@@ -12,7 +12,7 @@ use poot_codegen::CompiledKernel;
 use poot_graph_plan::{ImportedKernel, NpuHandle, Program, Region, Target};
 use poot_kernel_ir::Body;
 use poot_npu_artifacts::{AieInvocation, VpuInvocation};
-use poot_target::BufferStorage;
+use poot_target::{BufferStorage, MemoryTopology};
 
 /// One dispatch's device duration within a step's recording, in replay order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +293,11 @@ pub trait Device {
 
     /// The compile target this device executes.
     fn target(&self) -> Target;
+
+    /// Which memory this device allocates from and how it shares it (POOT-1273): the domain its runtime reads
+    /// from the memory it allocates, the mechanisms it can share through and what staging costs. Required: a
+    /// device states it from its runtime's query, never from its backend name.
+    fn memory_topology(&self) -> MemoryTopology;
 
     /// What this device does with weight bytes. Every executing device takes them; only a recording-only
     /// planning device sizes them.

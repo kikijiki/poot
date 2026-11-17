@@ -151,7 +151,7 @@ class KnownUnverifiedList(unittest.TestCase):
 
     def test_an_entry_is_keyed_like_a_cell(self):
         (key,) = self.load(toml_of(ENTRY))
-        self.assertEqual(key, ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER))
+        self.assertEqual(key, ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER, None))
 
     def test_an_entry_missing_its_reason_or_follow_up_is_refused(self):
         for field in ("reason", "follow_up", "band", "repeats", "pair"):

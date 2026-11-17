@@ -37,6 +37,7 @@ use poot_llm::driver::{
 };
 use poot_models::io::ModelSchema;
 use poot_models::model::KvDtype;
+use poot_runtime_common::DeviceIdentity;
 use poot_target::{Backend as TargetBackend, TargetId};
 
 use crate::config::{DEFAULT_ENCODE_ROWS, DEFAULT_MAX_SEQ, DEFAULT_ROWS, PlacementSpec};
@@ -247,6 +248,9 @@ pub(crate) struct EnginePlan {
     /// What `prepare` compiled.
     pub(crate) caps: DriverCaps,
     pub(crate) budget: BudgetReport,
+    /// The adapter and driver of the device the model runs on, as its runtime reports them; `None` for a
+    /// group of devices, which has no single one, and for an executor that cannot say.
+    pub(crate) device: Option<DeviceIdentity>,
 }
 
 impl EnginePlan {
@@ -655,10 +659,12 @@ impl EnginePlan {
             choice: args.backend,
             source,
         })?;
-        let discovered = observe(&Observation::of(match &opened {
+        let opened_executor = match &opened {
             Opened::One(executor) => &**executor,
             Opened::Pipeline(group) | Opened::Tensor(group) => group.executor(),
-        }));
+        };
+        let device = opened_executor.device_identity();
+        let discovered = observe(&Observation::of(opened_executor));
         let (placement, launch) = place(opened, handle, &discovered)?;
         let targets = launch.executor().target_set();
         let devices: Vec<DeviceId> = targets.devices().iter().map(|&(id, _)| id).collect();
@@ -706,6 +712,7 @@ impl EnginePlan {
             workload,
             caps,
             budget,
+            device,
         };
         health.serving(&plan);
         Ok(Started { plan, driver })

@@ -1,8 +1,9 @@
-"""The half of provenance the harness cannot see: which sha, profile, features and compiler build.rs embeds in
-the runner binary.
+"""The half of provenance the harness cannot see: which sha, profile, features and compiler a binary's build
+script embeds.
 
-build.rs is compiled with rustc once and run as cargo would run it (CARGO_MANIFEST_DIR set) against
-temporary git checkouts and against a copy with no .git, so the rules are tested on the real file.
+The `poot-build-identity` crate is compiled with rustc once, a build script that calls its `emit` is compiled
+against it, and that script is run as cargo would run it (CARGO_MANIFEST_DIR set) against temporary git
+checkouts and against a copy with no .git, so the rules are tested on the real code.
 """
 
 import os
@@ -12,7 +13,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-BUILD_RS = Path(__file__).resolve().parents[2] / "runners" / "poot" / "build.rs"
+IDENTITY_CRATE = Path(__file__).resolve().parents[3] / "crates" / "poot-build-identity" / "src" / "lib.rs"
+# The build script of a binary that states its build: it calls the shared crate and nothing else.
+BUILD_SCRIPT = "fn main() { poot_build_identity::emit(); }\n"
 MANIFEST_SUBDIR = Path("benchmarks") / "runners" / "poot"
 STALE = "5" * 40
 
@@ -27,8 +30,13 @@ class BuildShaTests(unittest.TestCase):
         cls.work = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.work.cleanup)
         cls.script = Path(cls.work.name) / "build-script"
+        source = Path(cls.work.name) / "build.rs"
+        source.write_text(BUILD_SCRIPT)
         try:
-            run(["rustc", "--edition", "2021", str(BUILD_RS), "-o", str(cls.script)])
+            run(["rustc", "--edition", "2024", "--crate-type", "rlib", "--crate-name", "poot_build_identity",
+                 str(IDENTITY_CRATE), "--out-dir", cls.work.name])
+            run(["rustc", "--edition", "2024", str(source), "-o", str(cls.script),
+                 "--extern", f"poot_build_identity={cls.work.name}/libpoot_build_identity.rlib"])
         except FileNotFoundError:
             raise AssertionError("rustc is required to test build.rs (run inside `nix develop`)")
 

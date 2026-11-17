@@ -4,9 +4,7 @@
 //! `pos..pos+L` (carrying the cache). Tiny synthetic config with deterministic random weights, CPU
 //! eval: no model, no GPU.
 
-mod common;
-
-use common::{slot_maps, step, token_pos, zero_state};
+use crate::common::{slot_maps, step, token_pos, zero_state};
 use poot_graph_ir::Graph;
 use poot_graph_plan::passes_without_target;
 use poot_models::model::{LogitRows, StepSpec};

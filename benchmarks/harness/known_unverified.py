@@ -32,7 +32,7 @@ except ImportError:  # direct `python harness/bench.py` execution
 FILE_NAME = "known-unverified.toml"
 
 # The fields of a cell key (`bench.cell_key`), in key order. A host CPU or driver the run did not record is left out.
-KEY_FIELDS = ("model", "scenario", "framework", "backend", "device", "host_cpu", "driver")
+KEY_FIELDS = ("model", "scenario", "framework", "backend", "device", "host_cpu", "driver", "concurrency")
 REQUIRED = ("model", "scenario", "framework", "device", "pair", "band", "repeats", "reason", "follow_up")
 BAND_DIGITS = 4
 FOLLOW_UP = re.compile(r"POOT-\d+")

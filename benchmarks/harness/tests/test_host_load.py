@@ -75,33 +75,42 @@ class Accounting(unittest.TestCase):
         self.assertGreaterEqual(waited, 15.0)
 
 
+class StepClock:
+    """A clock only the test moves: a metered window is as long as the test says, whatever the box is doing."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def run_windows(root, windows, write, interval_s=0.1, **meter_kw):
+    """Meter `windows` windows of `interval_s` over the fake /proc at `root`: `write(i)` plants window i's /proc
+    state, then the clock steps one interval and the meter closes the window. No thread, no sleep: the same
+    `LoadMeter.sample` the sampling thread calls, driven by hand."""
+    clock = StepClock()
+    meter = host_load.LoadMeter(proc_root=root, interval_s=interval_s, clock=clock, **meter_kw)
+    meter.begin()
+    for i in range(windows):
+        write(i)
+        clock.now += interval_s
+        meter.sample()
+    return meter
+
+
 class Metering(unittest.TestCase):
     def meter(self, foreign_per_step):
         """Run a LoadMeter over a fake /proc where a process outside the metered tree gains `foreign_per_step` ticks
-        every 20 ms; the verdict it gave."""
-        import threading
-        import time
+        per 20 ms (five times that per 100 ms window); the verdict it gave."""
         with tempfile.TemporaryDirectory() as tmp:
             me = host_load.os.getpid()
             fake_proc(tmp, 0, 4, {me: (0, 1), 500: (0, 1)})
-            stop = threading.Event()
 
-            def burn():
-                ticks = 0
-                while not stop.is_set():
-                    ticks += foreign_per_step
-                    fake_proc(tmp, 0, 4, {me: (0, 1), 500: (ticks, 1)})
-                    time.sleep(0.02)
+            def write(window):
+                fake_proc(tmp, 0, 4, {me: (0, 1), 500: (foreign_per_step * 5 * (window + 1), 1)})
 
-            thread = threading.Thread(target=burn)
-            thread.start()
-            try:
-                with host_load.LoadMeter(proc_root=tmp, interval_s=0.1) as meter:
-                    time.sleep(0.6)
-            finally:
-                stop.set()
-                thread.join()
-            return meter.result()
+            return run_windows(tmp, 6, write).result()
 
     def test_foreign_cpu_outside_the_cell_tree_is_metered(self):
         # 4 CPUs x 0.02 s x 100 ticks = 8 ticks per 20 ms: 8 foreign ticks per step is the whole machine.

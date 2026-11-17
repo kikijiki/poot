@@ -171,8 +171,16 @@ fn a_program_with_no_hosted_site_is_not_host_fed() {
 fn a_device_indexed_site_across_devices_is_refused() {
     let g = ple_like(4096, true);
     let targets = TargetSet::new(vec![
-        (DeviceId(0), target_for(Backend::SpirvVulkan)),
-        (DeviceId(1), target_for(Backend::SpirvVulkan)),
+        (
+            DeviceId(0),
+            target_for(Backend::SpirvVulkan),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            target_for(Backend::SpirvVulkan),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
     ])
     .unwrap();
     let error = compile_staged(

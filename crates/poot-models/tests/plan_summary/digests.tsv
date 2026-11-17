@@ -92,7 +92,7 @@ spirv_vulkan	qwen35.prefill_kv	plans	239	133	79734a48fdd7d2ea
 spirv_vulkan	qwen35/text.decode	plans	233	138	0d4a33e1d56f5d3f
 spirv_vulkan	qwen35/text.prefill	plans	239	133	28313ae726d0f462
 spirv_vulkan	qwen35/text.prefill_kv	plans	239	133	39ff3b94653a9f36
-spirv_vulkan	qwen35/fp8.decode	plans	233	138	a6d19f9ebe810586
+spirv_vulkan	qwen35/fp8.decode	plans	233	138	1783761e493c1c14
 spirv_vulkan	qwen35/fp8.prefill	plans	247	141	6f021a4aef7dcfa1
 spirv_vulkan	qwen35/fp8.prefill_kv	plans	247	141	b3549f6bb52e8f6d
 spirv_vulkan	qwen35/finetune.decode	plans	109	69	362f796308e06ff0
@@ -101,9 +101,9 @@ spirv_vulkan	qwen35/finetune.prefill_kv	plans	111	69	8b76c00f9e1094c0
 spirv_vulkan	qwen4exp.decode	plans	653	367	a6efdb9784eb33ff
 spirv_vulkan	qwen4exp.prefill	plans	659	371	3a1069224f89fd0a
 spirv_vulkan	qwen4exp.prefill_kv	plans	659	371	cddd9bb1b68b457a
-spirv_vulkan	qwen4exp/packed.decode	plans	644	370	ac7db9fb7bdc735c
-spirv_vulkan	qwen4exp/packed.prefill	plans	650	374	375f4f151d8f5a7a
-spirv_vulkan	qwen4exp/packed.prefill_kv	plans	650	374	3bb2dbe8ef807e54
+spirv_vulkan	qwen4exp/packed.decode	plans	644	370	49c0ce97a6aef94f
+spirv_vulkan	qwen4exp/packed.prefill	plans	650	374	c00297e454949dad
+spirv_vulkan	qwen4exp/packed.prefill_kv	plans	650	374	123f26d0e9b03d01
 spirv_vulkan	qwen4exp/finetune.decode	plans	497	285	3aac3e89caecb980
 spirv_vulkan	qwen4exp/finetune.prefill	plans	501	287	fa35f99dc719561d
 spirv_vulkan	qwen4exp/finetune.prefill_kv	plans	501	288	9d62fc031f0dceea
@@ -224,7 +224,7 @@ vulkan	qwen35.prefill_kv	plans	239	133	79734a48fdd7d2ea
 vulkan	qwen35/text.decode	plans	233	138	0d4a33e1d56f5d3f
 vulkan	qwen35/text.prefill	plans	239	133	28313ae726d0f462
 vulkan	qwen35/text.prefill_kv	plans	239	133	39ff3b94653a9f36
-vulkan	qwen35/fp8.decode	plans	233	138	a6d19f9ebe810586
+vulkan	qwen35/fp8.decode	plans	233	138	1783761e493c1c14
 vulkan	qwen35/fp8.prefill	plans	247	141	6f021a4aef7dcfa1
 vulkan	qwen35/fp8.prefill_kv	plans	247	141	b3549f6bb52e8f6d
 vulkan	qwen35/finetune.decode	plans	109	69	362f796308e06ff0
@@ -233,9 +233,9 @@ vulkan	qwen35/finetune.prefill_kv	plans	111	69	8b76c00f9e1094c0
 vulkan	qwen4exp.decode	plans	653	367	a6efdb9784eb33ff
 vulkan	qwen4exp.prefill	plans	659	371	3a1069224f89fd0a
 vulkan	qwen4exp.prefill_kv	plans	659	371	cddd9bb1b68b457a
-vulkan	qwen4exp/packed.decode	plans	644	370	ac7db9fb7bdc735c
-vulkan	qwen4exp/packed.prefill	plans	650	374	375f4f151d8f5a7a
-vulkan	qwen4exp/packed.prefill_kv	plans	650	374	3bb2dbe8ef807e54
+vulkan	qwen4exp/packed.decode	plans	644	370	49c0ce97a6aef94f
+vulkan	qwen4exp/packed.prefill	plans	650	374	c00297e454949dad
+vulkan	qwen4exp/packed.prefill_kv	plans	650	374	123f26d0e9b03d01
 vulkan	qwen4exp/finetune.decode	plans	497	285	3aac3e89caecb980
 vulkan	qwen4exp/finetune.prefill	plans	501	287	fa35f99dc719561d
 vulkan	qwen4exp/finetune.prefill_kv	plans	501	288	9d62fc031f0dceea
@@ -356,7 +356,7 @@ amd_gcn	qwen35.prefill_kv	plans	239	133	79734a48fdd7d2ea
 amd_gcn	qwen35/text.decode	plans	233	138	0d4a33e1d56f5d3f
 amd_gcn	qwen35/text.prefill	plans	239	133	28313ae726d0f462
 amd_gcn	qwen35/text.prefill_kv	plans	239	133	39ff3b94653a9f36
-amd_gcn	qwen35/fp8.decode	plans	233	138	a6d19f9ebe810586
+amd_gcn	qwen35/fp8.decode	plans	233	138	105bd8efd464846a
 amd_gcn	qwen35/fp8.prefill	plans	247	141	6f021a4aef7dcfa1
 amd_gcn	qwen35/fp8.prefill_kv	plans	247	141	b3549f6bb52e8f6d
 amd_gcn	qwen35/finetune.decode	plans	109	69	362f796308e06ff0
@@ -365,9 +365,9 @@ amd_gcn	qwen35/finetune.prefill_kv	plans	111	69	8b76c00f9e1094c0
 amd_gcn	qwen4exp.decode	plans	653	367	a6efdb9784eb33ff
 amd_gcn	qwen4exp.prefill	plans	659	371	3a1069224f89fd0a
 amd_gcn	qwen4exp.prefill_kv	plans	659	371	cddd9bb1b68b457a
-amd_gcn	qwen4exp/packed.decode	plans	644	370	ac7db9fb7bdc735c
-amd_gcn	qwen4exp/packed.prefill	plans	650	374	375f4f151d8f5a7a
-amd_gcn	qwen4exp/packed.prefill_kv	plans	650	374	3bb2dbe8ef807e54
+amd_gcn	qwen4exp/packed.decode	plans	644	370	5fded291c40040cd
+amd_gcn	qwen4exp/packed.prefill	plans	650	374	83ac839d3a457892
+amd_gcn	qwen4exp/packed.prefill_kv	plans	650	374	a4e2fde9352ba778
 amd_gcn	qwen4exp/finetune.decode	plans	497	285	3aac3e89caecb980
 amd_gcn	qwen4exp/finetune.prefill	plans	501	287	fa35f99dc719561d
 amd_gcn	qwen4exp/finetune.prefill_kv	plans	501	288	9d62fc031f0dceea
@@ -488,7 +488,7 @@ nvptx	qwen35.prefill_kv	plans	239	133	1896ecd1c2489f2c
 nvptx	qwen35/text.decode	plans	233	138	50ede7798b9687c7
 nvptx	qwen35/text.prefill	plans	239	133	96bbbc2da738e784
 nvptx	qwen35/text.prefill_kv	plans	239	133	c305d9d9fee1c3d8
-nvptx	qwen35/fp8.decode	plans	233	138	a77bb0511dc93bda
+nvptx	qwen35/fp8.decode	plans	233	138	9be8f8c0e6495a2f
 nvptx	qwen35/fp8.prefill	plans	247	141	fbc7e3cd44cbd9f7
 nvptx	qwen35/fp8.prefill_kv	plans	247	141	988cf06523200c43
 nvptx	qwen35/finetune.decode	plans	109	69	ddfd25ab245ecc52
@@ -497,9 +497,9 @@ nvptx	qwen35/finetune.prefill_kv	plans	111	69	eaf27c35800e5ec3
 nvptx	qwen4exp.decode	plans	653	367	fcdab57342b9c861
 nvptx	qwen4exp.prefill	plans	659	371	af111b1f32f66939
 nvptx	qwen4exp.prefill_kv	plans	659	371	d85644afc46dd445
-nvptx	qwen4exp/packed.decode	plans	644	370	2456c1ff3927b38c
-nvptx	qwen4exp/packed.prefill	plans	650	374	55c30eb7d13b2ae5
-nvptx	qwen4exp/packed.prefill_kv	plans	650	374	bff4b525500ef219
+nvptx	qwen4exp/packed.decode	plans	644	370	fd8851d61499a2be
+nvptx	qwen4exp/packed.prefill	plans	650	374	99729c4302cea093
+nvptx	qwen4exp/packed.prefill_kv	plans	650	374	f6ac8bfdf84da6db
 nvptx	qwen4exp/finetune.decode	plans	497	285	3bcbcab65b53cc8b
 nvptx	qwen4exp/finetune.prefill	plans	501	287	56827d6699500468
 nvptx	qwen4exp/finetune.prefill_kv	plans	501	288	10f65732a78084ff

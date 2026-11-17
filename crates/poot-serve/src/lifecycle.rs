@@ -338,6 +338,8 @@ pub(crate) struct GenerationRequest {
     pub(crate) max_new: usize,
     pub(crate) sampler: Sampler,
     pub(crate) stop: Vec<String>,
+    /// Generate to `max_new` whatever the model samples ([`Job::ignore_eos`]).
+    pub(crate) ignore_eos: bool,
     /// Stream the pieces as they are generated (SSE) instead of only the final completion.
     pub(crate) stream: bool,
     /// The request-owned selection from `resolve_lora_adapter`.
@@ -434,6 +436,7 @@ pub(crate) fn submit(
             max_new,
             sampler,
             stop,
+            ignore_eos,
             stream,
             lora_adapter,
         } = request;
@@ -445,6 +448,7 @@ pub(crate) fn submit(
             max_new,
             sampler,
             stop,
+            ignore_eos,
             stream,
             reply,
             submitted: started,

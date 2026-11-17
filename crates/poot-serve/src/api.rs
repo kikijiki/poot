@@ -585,6 +585,10 @@ pub(crate) struct CompletionReq {
     pub(crate) sampling: SamplingParams,
     #[serde(default)]
     pub(crate) stop: Option<Stop>,
+    /// vLLM's `ignore_eos`: generate to `max_tokens` whatever the model samples ([`check_ignore_eos`]). Absent
+    /// or `false` is the request as it always was.
+    #[serde(default)]
+    pub(crate) ignore_eos: bool,
     /// legacy completions `logprobs`: when set, include that many top alternatives per token.
     #[serde(default)]
     pub(crate) logprobs: Option<usize>,
@@ -635,6 +639,10 @@ pub(crate) struct ChatReq {
     pub(crate) sampling: SamplingParams,
     #[serde(default)]
     pub(crate) stop: Option<Stop>,
+    /// vLLM's `ignore_eos`: generate to the token cap whatever the model samples ([`check_ignore_eos`]). Absent
+    /// or `false` is the request as it always was.
+    #[serde(default)]
+    pub(crate) ignore_eos: bool,
     /// OpenAI chat `logprobs`: when true, return the chosen tokens' log-probabilities.
     #[serde(default)]
     pub(crate) logprobs: bool,
@@ -678,7 +686,56 @@ pub(crate) struct ChatReq {
     pub(crate) lora_adapter: Option<String>,
 }
 
+/// A request's `ignore_eos` against the fields it cannot be combined with. A request that generates to its
+/// token cap whatever the model samples has nothing for a stop string, a grammar or a tool call to end or
+/// shape: each is refused by name, never silently dropped. Returns whether the request ignores EOS.
+fn check_ignore_eos(
+    ignore_eos: bool,
+    present: &[(&'static str, bool)],
+) -> Result<bool, RefusedRequest> {
+    if !ignore_eos {
+        return Ok(false);
+    }
+    let conflicts: Vec<&str> = present
+        .iter()
+        .filter_map(|&(field, set)| set.then_some(field))
+        .collect();
+    if conflicts.is_empty() {
+        return Ok(true);
+    }
+    Err(RefusedRequest(format!(
+        "`ignore_eos` generates to the token cap and cannot be combined with {}",
+        conflicts.join(", ")
+    )))
+}
+
+/// A `response_format` that constrains the output: anything but plain text.
+fn constrains_output(response_format: &Option<serde_json::Value>) -> bool {
+    response_format
+        .as_ref()
+        .is_some_and(|format| format.get("type").and_then(|kind| kind.as_str()) != Some("text"))
+}
+
 impl CompletionReq {
+    /// Whether the request generates to its token cap (`ignore_eos`), or the refusal of a request that
+    /// asks for that beside a field it contradicts.
+    pub(crate) fn ignores_eos(&self) -> Result<bool, RefusedRequest> {
+        check_ignore_eos(
+            self.ignore_eos,
+            &[
+                ("`stop`", self.stop.is_some()),
+                ("`guided_choice`", self.guided_choice.is_some()),
+                ("`guided_regex`", self.guided_regex.is_some()),
+                ("`guided_grammar`", self.guided_grammar.is_some()),
+                ("`guided_json`", self.guided_json.is_some()),
+                (
+                    "`response_format`",
+                    constrains_output(&self.response_format),
+                ),
+            ],
+        )
+    }
+
     /// The generation cap: `max_tokens` (else the default), bounded by [`bound_max_tokens`].
     pub(crate) fn effective_max_tokens(&self) -> usize {
         bound_max_tokens(self.max_tokens)
@@ -686,6 +743,26 @@ impl CompletionReq {
 }
 
 impl ChatReq {
+    /// As [`CompletionReq::ignores_eos`], with the tool fields a chat adds.
+    pub(crate) fn ignores_eos(&self) -> Result<bool, RefusedRequest> {
+        check_ignore_eos(
+            self.ignore_eos,
+            &[
+                ("`stop`", self.stop.is_some()),
+                ("`guided_choice`", self.guided_choice.is_some()),
+                ("`guided_regex`", self.guided_regex.is_some()),
+                ("`guided_grammar`", self.guided_grammar.is_some()),
+                ("`guided_json`", self.guided_json.is_some()),
+                (
+                    "`response_format`",
+                    constrains_output(&self.response_format),
+                ),
+                ("`tools`", self.tools.is_some()),
+                ("`tool_choice`", self.tool_choice.is_some()),
+            ],
+        )
+    }
+
     /// The generation cap: `max_completion_tokens` (the current OpenAI field) wins over the deprecated
     /// `max_tokens` when both are sent; otherwise whichever was provided, else the default. Bounded by
     /// [`bound_max_tokens`].

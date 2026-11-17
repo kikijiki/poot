@@ -90,6 +90,10 @@ impl Device for PtxDevice {
     type Recording = PtxRecording;
     type Error = PtxGpuError;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(self.ctx.memory_domain())
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native
     }

@@ -660,6 +660,10 @@ impl Device for Interp {
     type Recording = Rc<Vec<Recorded>>;
     type Error = InterpFault;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native
     }
@@ -1203,7 +1207,19 @@ fn per_device(footprint: &Footprint, role: BufferRole) -> [u64; 2] {
 #[test]
 fn the_planner_keeps_a_footprint_per_device() {
     let handle = handle();
-    let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
+    let targets = TargetSet::new(vec![
+        (
+            DeviceId(0),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+    ])
+    .unwrap();
     let shapes = serving();
     let reference = {
         let one = TargetSet::single(DeviceId(0), target());
@@ -1264,7 +1280,19 @@ fn the_planner_keeps_a_footprint_per_device() {
 #[test]
 fn each_devices_planned_role_bytes_equal_its_own_prepared_counters() {
     let handle = handle();
-    let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
+    let targets = TargetSet::new(vec![
+        (
+            DeviceId(0),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+    ])
+    .unwrap();
     let shapes = serving();
     for placement in [pipeline(), tensor()] {
         let planned = Planner::new(
@@ -1297,7 +1325,19 @@ fn each_devices_planned_role_bytes_equal_its_own_prepared_counters() {
 #[test]
 fn every_planned_owner_names_a_device_of_the_placement() {
     let handle = handle();
-    let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
+    let targets = TargetSet::new(vec![
+        (
+            DeviceId(0),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+    ])
+    .unwrap();
     let planned = Planner::new(
         Arc::clone(&handle),
         &targets,
@@ -1333,7 +1373,19 @@ fn the_fit_refuses_a_short_rank_of_either_placement_naming_it() {
     use super::capacity::{Budget, CapacityRefusal, DeviceBudget, FitError, Rejection, fit};
 
     let handle = handle();
-    let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
+    let targets = TargetSet::new(vec![
+        (
+            DeviceId(0),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+    ])
+    .unwrap();
     let shapes = serving();
     for placement in [pipeline(), tensor()] {
         let planner = Planner::new(
@@ -1482,7 +1534,19 @@ fn a_paged_tensor_placement_decodes_the_single_device_tokens() {
 #[test]
 fn each_ranks_paged_kv_footprint_is_its_heads_of_the_pool_and_equals_the_prepared_bytes() {
     let handle = attn_handle();
-    let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
+    let targets = TargetSet::new(vec![
+        (
+            DeviceId(0),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+    ])
+    .unwrap();
     let shapes = paged_serving();
 
     let one = TargetSet::single(DeviceId(0), target());
@@ -1601,7 +1665,19 @@ fn every_planned_program_asks_its_device_compiler() {
 #[test]
 fn each_stage_plans_with_its_own_devices_compiler() {
     let handle = handle();
-    let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
+    let targets = TargetSet::new(vec![
+        (
+            DeviceId(0),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+        (
+            DeviceId(1),
+            target(),
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+        ),
+    ])
+    .unwrap();
     let devices = poot_graph_plan::DeviceOptions::none([DeviceId(0)]).union(
         poot_graph_plan::DeviceOptions::single(DeviceId(1), cuda_facts()),
     );

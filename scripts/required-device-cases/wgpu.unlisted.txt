@@ -247,6 +247,7 @@ poot-wgpu-runtime	context::init::launch_caps_tests::an_adapter_without_the_subgr
 poot-wgpu-runtime	context::init::launch_caps_tests::launch_caps_carry_the_granted_limits_and_the_adapter_subgroup_range	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
 poot-wgpu-runtime	context::init::matrix_units_tests::a_non_vulkan_backend_is_unknown_whatever_was_granted	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
 poot-wgpu-runtime	context::init::matrix_units_tests::matrix_units_are_reported_only_for_a_granted_feature	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	context::init::memory_domain_tests::an_integrated_or_cpu_adapter_is_host_and_a_discrete_one_is_local	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
 poot-wgpu-runtime	tests::require_backend_tests::wgpu_context_open_is_required_by_its_own_variable_only	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
 poot-wgpu-runtime	tests::segment_layout_tests::segment_layout_is_contiguous_in_request_order	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
 poot-wgpu-runtime	tests::segment_layout_tests::segment_layout_rejects_overlong_segment	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun

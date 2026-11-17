@@ -95,7 +95,13 @@ fn gpus(backend: Backend, world: u32) -> TargetSet {
     TargetSet::new(
         ranks(world)
             .into_iter()
-            .map(|d| (d, target(backend)))
+            .map(|d| {
+                (
+                    d,
+                    target(backend),
+                    poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
+                )
+            })
             .collect(),
     )
     .unwrap()

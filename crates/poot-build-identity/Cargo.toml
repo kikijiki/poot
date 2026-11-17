@@ -1,0 +1,15 @@
+[package]
+name = "poot-build-identity"
+description = "The identity of a built binary (git sha, profile, features, compiler), embedded at build time and reported by every binary a result or a server states itself with"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+# No dependencies: the build-script half runs in every binary's build, and the runtime half is four strings.
+
+[lints]
+workspace = true

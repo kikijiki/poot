@@ -175,6 +175,10 @@ impl Device for WgpuDevice {
     type Recording = WgpuRecording;
     type Error = RuntimeError;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        self.ctx.memory_topology()
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native
     }

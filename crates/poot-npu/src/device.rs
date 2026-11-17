@@ -518,6 +518,11 @@ impl Device for XdnaDevice {
     type Recording = XdnaRecording;
     type Error = XdnaError;
 
+    /// `Host`: the XDNA NPU allocates its buffers as XRT host-mapped buffer objects in system DRAM, the memory the CPU and the iGPU address too.
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native
     }

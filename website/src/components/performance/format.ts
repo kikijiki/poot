@@ -24,6 +24,13 @@ export const CHART_METRICS: { key: PointMetric; title: string; wholeRun?: true }
 ];
 
 // The whole-run memory metrics: peaks measured after the load and warmup.
+// The charts of the serve section, over the number of requests in flight: aggregate throughput, then what each request waited.
+export const SERVE_CHARTS: { key: PointMetric; title: string }[] = [
+  { key: "output_tok_s", title: "Aggregate output tok/s" },
+  { key: "ttft_ms", title: "Time to first token" },
+  { key: "tpot_ms", title: "Time per output token" },
+];
+
 export const MEMORY_METRICS: PointMetric[] = ["peak_rss_bytes", "peak_vram_bytes"];
 
 export type MetricInfo = { key: PointMetric; label: string; unit: Unit; higherIsBetter: boolean };
@@ -31,6 +38,7 @@ export type MetricInfo = { key: PointMetric; label: string; unit: Unit; higherIs
 // Every measured quantity, for table columns and tooltips.
 export const POINT_METRICS: MetricInfo[] = [
   { key: "decode_tok_s", label: "Decode", unit: TOK_S, higherIsBetter: true },
+  { key: "output_tok_s", label: "Aggregate output", unit: TOK_S, higherIsBetter: true },
   { key: "tpot_ms", label: "Time per output token", unit: MS, higherIsBetter: false },
   { key: "prefill_tok_s", label: "Prefill", unit: TOK_S, higherIsBetter: true },
   { key: "ttft_ms", label: "First token", unit: MS, higherIsBetter: false },

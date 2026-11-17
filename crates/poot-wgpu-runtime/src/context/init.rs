@@ -78,6 +78,13 @@ impl Context {
         self.effective_max_buffer_size
     }
 
+    /// The memory topology of the adapter this context opened (POOT-1273): its domain, read from the adapter's
+    /// memory heaps and device type; no share mechanism and an unmeasured staging cost until POOT-1279 and
+    /// POOT-1280.
+    pub fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(adapter_memory_domain(&self._adapter))
+    }
+
     /// The device-capability descriptor the planner reads (card 522): the buffer, LDS and grid limits, the
     /// shader features and the tensor-core family are this device's own query. The display-watchdog budget and
     /// the tiled-GEMM miscompile ceiling are not device-queryable at all (they are calibrated from observed
@@ -494,6 +501,39 @@ fn granted_shader_features(granted: wgpu::Features) -> poot_target::ShaderFeatur
     }
 }
 
+/// The memory domain of `adapter`: on Vulkan read from the physical device's memory heaps and device type
+/// through the wgpu-hal adapter ([`poot_runtime_common::vulkan_probe::memory_domain`], the query raw Vulkan makes
+/// too); on another API, where wgpu exposes no heaps, from its device type ([`domain_of_device_type`]).
+fn adapter_memory_domain(adapter: &wgpu::Adapter) -> poot_target::MemoryDomain {
+    // SAFETY: `as_hal` yields the live wgpu-hal Vulkan adapter for the guard's lifetime, so its instance and
+    // physical device are valid for the calls.
+    let vulkan = unsafe {
+        adapter.as_hal::<wgpu_hal::vulkan::Api>().map(|hal| {
+            let instance = hal.shared_instance().raw_instance();
+            let physical_device = hal.raw_physical_device();
+            poot_runtime_common::vulkan_probe::memory_domain(
+                instance
+                    .get_physical_device_properties(physical_device)
+                    .device_type,
+                &instance.get_physical_device_memory_properties(physical_device),
+            )
+        })
+    };
+    vulkan.unwrap_or_else(|| domain_of_device_type(adapter.get_info().device_type))
+}
+
+/// The memory domain a wgpu device type implies where the adapter's heaps cannot be read: an integrated GPU
+/// or a CPU adapter shares the host's RAM; a discrete, virtual or unclassified one is `Local`, the choice that
+/// plans a staging copy rather than assume memory is shared.
+fn domain_of_device_type(device_type: wgpu::DeviceType) -> poot_target::MemoryDomain {
+    match device_type {
+        wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu => poot_target::MemoryDomain::Host,
+        wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Other => {
+            poot_target::MemoryDomain::Local
+        }
+    }
+}
+
 /// The adapter's AMD shader-core properties through
 /// [`poot_runtime_common::vulkan_probe::amd_vulkan_shader_core`]; `None` off Vulkan or off AMD.
 fn probe_amd_shader_core(
@@ -544,6 +584,32 @@ impl LaunchCaps {
                 poot_target::SubgroupSupport::Absent
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_domain_tests {
+    use super::*;
+    use poot_target::MemoryDomain;
+
+    #[test]
+    fn an_integrated_or_cpu_adapter_is_host_and_a_discrete_one_is_local() {
+        assert_eq!(
+            domain_of_device_type(wgpu::DeviceType::IntegratedGpu),
+            MemoryDomain::Host
+        );
+        assert_eq!(
+            domain_of_device_type(wgpu::DeviceType::Cpu),
+            MemoryDomain::Host
+        );
+        assert_eq!(
+            domain_of_device_type(wgpu::DeviceType::DiscreteGpu),
+            MemoryDomain::Local
+        );
+        assert_eq!(
+            domain_of_device_type(wgpu::DeviceType::VirtualGpu),
+            MemoryDomain::Local
+        );
     }
 }
 

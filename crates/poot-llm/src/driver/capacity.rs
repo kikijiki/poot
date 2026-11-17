@@ -249,17 +249,6 @@ impl Observation {
             .collect();
         Self { devices }
     }
-
-    /// The targets of the observed devices.
-    pub fn targets(&self) -> TargetSet {
-        TargetSet::new(
-            self.devices
-                .iter()
-                .map(|device| (device.device, device.target))
-                .collect(),
-        )
-        .expect("the devices of an executor are distinct")
-    }
 }
 
 /// The budgets of the devices a footprint may touch, per device: a global figure would admit a plan that
@@ -1113,6 +1102,11 @@ impl Device for PlanningDevice {
     type Kernel = ();
     type Recording = ();
     type Error = PlanningError;
+
+    /// A planning device owns no memory, so it shares none: `Local` plans no sharing it cannot back.
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local)
+    }
 
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native

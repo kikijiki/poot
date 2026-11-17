@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import data from "../../data/performance.json";
 import { SERIES_SLOTS, seriesColor } from "./format";
 import { CHART_METRICS, MS, TOK_S } from "./format";
-import { legendGroups, legendSeries, NO_DATA, rowsAt, chartMetrics, commonMetrics, runBars, defaultSecond, yTop, defaultHardware, defaultModel, modelSize, fromQuery, options, pointSeries, resolve, selectPoints, seriesLines, toQuery } from "./selection";
+import { legendGroups, legendSeries, NO_DATA, rowsAt, selectServePoints, serveLines, serveRowsAt, chartMetrics, commonMetrics, runBars, defaultSecond, yTop, defaultHardware, defaultModel, modelSize, fromQuery, options, pointSeries, resolve, selectPoints, seriesLines, toQuery } from "./selection";
 import type { Hardware, NotRun, PerformanceData, Point, Stat } from "./types";
 
 const stat = (median: number): Stat => ({ median, min: median * 0.99, max: median * 1.01, n: 5 });
@@ -363,5 +363,59 @@ describe("legend groups", () => {
 
   test("a pair with nothing measured is not a group", () => {
     expect(legendGroups([], [gap("m", "poot", "vulkan", "r"), gap("m", "llamacpp", "vulkan", "r")], "m")).toEqual([]);
+  });
+});
+
+// serve-throughput: a cell per concurrency, on its own axis.
+describe("serve-throughput points", () => {
+  const serve = (model: string, framework: string, concurrency: number, outputTokS: number, extra?: Partial<Point>) =>
+    point({
+      framework,
+      backend: "ptx",
+      model,
+      isl: 128,
+      extra: { concurrency, metrics: { output_tok_s: stat(outputTokS), ttft_ms: stat(20 + concurrency), tpot_ms: stat(5) }, ...extra },
+    });
+  const served = hw("srv", [
+    poot("m1", 128, 100),
+    serve("m1", "poot", 16, 900),
+    serve("m1", "poot", 1, 120),
+    serve("m1", "poot", 4, 400),
+    serve("m1", "llamacpp", 1, 150),
+    serve("m1", "llamacpp", 4, 300),
+    serve("m1", "poot", 4, 1, { latest: false }),
+    serve("m2", "poot", 1, 50),
+  ]);
+  const side = { hw: "srv", model: "m1" };
+
+  test("a serve point is never drawn on the input-token axis, and a single stream never on the serve axis", () => {
+    expect(selectPoints(served, side).every((p) => p.concurrency === undefined)).toBe(true);
+    expect(selectPoints(served, side)).toHaveLength(1);
+    const serving = selectServePoints(served, side);
+    expect(serving).toHaveLength(5);
+    expect(serving.every((p) => p.concurrency !== undefined && p.latest && p.model === "m1")).toBe(true);
+  });
+
+  test("each framework and backend is one line over the concurrency, in ascending order", () => {
+    const lines = serveLines(selectServePoints(served, side), "output_tok_s");
+    expect(lines.map((l) => l.id)).toEqual(["poot ptx", "llamacpp ptx"]);
+    expect(lines[0].points.map((p) => [p.concurrency, p.stat.median])).toEqual([[1, 120], [4, 400], [16, 900]]);
+    expect(lines[1].points.map((p) => p.concurrency)).toEqual([1, 4]);
+  });
+
+  test("a concurrency one series lacks reads no data in its tooltip", () => {
+    const lines = serveLines(selectServePoints(served, side), "output_tok_s");
+    expect(serveRowsAt(lines, 16, TOK_S).map((r) => r.value)).toEqual(["900.0 tok/s", NO_DATA]);
+  });
+
+  test("a metric no serve point carries has no line", () => {
+    expect(serveLines(selectServePoints(served, side), "decode_tok_s")).toEqual([]);
+  });
+
+  test("a serve metric does not make a single-stream chart common to every hardware", () => {
+    const only = hw("only-serve", [serve("m1", "poot", 1, 100)]);
+    const streams = hw("streams", [poot("m1", 128, 100, undefined, { metrics: { decode_tok_s: stat(100), ttft_ms: stat(30) } })]);
+    expect(commonMetrics({ ...report, hardware: [only, streams] })).not.toContain("ttft_ms");
+    expect(commonMetrics({ ...report, hardware: [streams] })).toContain("ttft_ms");
   });
 });

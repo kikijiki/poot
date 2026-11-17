@@ -8,10 +8,12 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 ldconfig -p | grep libcuda.so.1 || { echo "no libcuda.so.1: not a GPU pod"; exit 1; }
 mkdir -p ex ws stage bank
 tar -C ws -xzf src.tar.gz
-tar -C / -xzf toolchain.tar.gz            # the toolchain closure at its /nix/store paths
-rust=$(cat rust-path)
-chmod +x cargo-nextest
-export PATH=$rust/bin:$PATH LD_LIBRARY_PATH=$rust/lib
+if [ -f toolchain.tar.gz ]; then          # a calibrate-only run ships neither the lane archive nor the toolchain
+  tar -C / -xzf toolchain.tar.gz          # the toolchain closure at its /nix/store paths
+  rust=$(cat rust-path)
+  chmod +x cargo-nextest
+  export PATH=$rust/bin:$PATH LD_LIBRARY_PATH=$rust/lib
+fi
 export POOT_REQUIRE_PTX=1 POOT_LLC=$(command -v llc || echo /usr/local/bin/llc)
 $POOT_LLC --version | head -2
 nx="/root/cargo-nextest nextest run --archive-file /root/archive.tar.zst --extract-to /root/ex --extract-overwrite --workspace-remap /root/ws --no-tests=fail --no-fail-fast"
@@ -59,8 +61,18 @@ fi
 if [ -x /root/calibrate_launch ]; then
   mkdir -p /root/calibrate
   export POOT_BANK_DEVICE="$(nvidia-smi --query-gpu=name --format=csv,noheader)" CALIBRATE_LAUNCH_BIN=/root/calibrate_launch CALIBRATE_LAUNCH_LOCKED=1
+  chmod +x /root/calibrate_launch
+  # the device must open (cuInit, context, timing events) before any sweep spends the pod's hours
+  /root/calibrate_launch packed-gemv-cells --bank benchmarks/performance-bank/cases.json > /root/probe-cells.tsv 2> /root/probe.err \
+    && echo "device probe ok: $(wc -l < /root/probe-cells.tsv) packed Gemv cells" || { echo "DEVICE PROBE FAILED"; cat /root/probe.err; }
   for mode in $(cat /root/calibrate-modes); do
-    bash scripts/calibrate-launch ptx "$mode" "/root/calibrate/$mode" > "/root/calibrate/$mode.log" 2>&1; echo "calibrate $mode exit $?"
+    # the mode runs in the background so the driver sees its progress (rows written) and a stall shows in the output
+    bash scripts/calibrate-launch ptx "$mode" "/root/calibrate/$mode" > "/root/calibrate/$mode.log" 2>&1 &
+    cpid=$!
+    while kill -0 $cpid 2>/dev/null; do
+      sleep 60; echo "calibrate $mode progress $(date +%T): $(cat /root/calibrate/$mode/rows.tsv 2>/dev/null | wc -l) rows"
+    done
+    wait $cpid; echo "calibrate $mode exit $?"
     tail -3 "/root/calibrate/$mode.log"
   done
   echo ===CALIBRATE-BEGIN===; tar -C /root/calibrate -czf - . | base64 -w0; echo; echo ===CALIBRATE-END===

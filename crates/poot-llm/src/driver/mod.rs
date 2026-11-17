@@ -46,6 +46,7 @@ mod features;
 mod gguf_vocab;
 pub mod handle;
 mod host_sample;
+pub mod identity;
 mod ledger;
 pub mod lora;
 pub mod oneshot;

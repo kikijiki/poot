@@ -108,6 +108,9 @@ pub(crate) struct Operands {
     /// The columns per workgroup every dense decode Gemv of the case must launch ([`CompileOptions::gemv_cols_pin`]);
     /// `None` lets the device's columns table choose. Only `calibrate-launch` sets it.
     pub(crate) gemv_cols: Option<u32>,
+    /// The geometry every packed decode Gemv of the case must launch ([`CompileOptions::packed_gemv_pin`]); `None` lets
+    /// the cost model choose. Only `calibrate-launch` sets it.
+    pub(crate) packed_gemv: Option<poot_graph_plan::PackedGemvPin>,
 }
 
 impl Operands {
@@ -122,6 +125,7 @@ impl Operands {
             tiling: None,
             indexed_rows: None,
             gemv_cols: None,
+            packed_gemv: None,
         })
     }
 
@@ -658,6 +662,9 @@ pub(crate) fn packed_format(storage: &str) -> Result<WeightFormat, String> {
         "q4_k" => Ok(WeightFormat::Q4_K),
         "iq2_xs" => Ok(WeightFormat::Iq2_Xs),
         "iq4_nl" => Ok(WeightFormat::Iq4_Nl),
+        "q5_k" => Ok(WeightFormat::Q5_K),
+        "q6_k" => Ok(WeightFormat::Q6_K),
+        "iq4_xs" => Ok(WeightFormat::Iq4_Xs),
         other => Err(format!("no packed format named {other:?}")),
     }
 }
@@ -702,6 +709,117 @@ fn checkpoint_scaled_payload(format: WeightFormat, shape: [usize; 2], seed: u64)
 fn half_bits(v: f32) -> u16 {
     let exponent = (v.to_bits() >> 23) as i32 - 127;
     (((exponent + 15) as u16) << 10) | ((v.to_bits() >> 13) as u16 & 0x3ff)
+}
+
+/// One packed decode projection (POOT-1608): `m` activation rows through a packed `[N, K]` weight of the case's `storage`
+/// format, the weight held as the cache condition's distinct copies (each its own checkpoint-scaled payload, its own
+/// graph and entry) so a step streams its weights from memory as a decode does. The f64 reference contracts each row
+/// against the weight as the oracle decoder reads it, the operands rounded as the case's precision reads them.
+fn packed_linear(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (m, k, n) = (dim(shape, "m")?, dim(shape, "k")?, dim(shape, "n")?);
+    if case["layout"].as_str() != Some("nk") {
+        return Err("packed_linear reads a packed [N, K] weight (layout nk)".into());
+    }
+    let format = packed_format(case["storage"].as_str().ok_or("case has no storage")?)?;
+    let descriptor = poot_quant::PackedWeight::try_new(format, [n, k])
+        .map_err(|e| format!("{format:?} [{n}, {k}]: {e:?}"))?;
+    let weight_bytes: usize = descriptor
+        .sources()
+        .into_iter()
+        .map(|role| descriptor.slab_bytes(role))
+        .sum();
+    let copies = weight_copies(bank, case, weight_bytes)?;
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"]
+            .as_str()
+            .ok_or("case has no token_fixture")?]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    let x = stream.tensor(m * k);
+    let x_read: Vec<f64> = x.iter().map(|&v| ops.round(v)).collect();
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let (mut graphs, mut references, mut packed) = (Vec::new(), Vec::new(), Vec::new());
+    for copy in 0..copies {
+        let payload = Arc::new(checkpoint_scaled_payload(
+            format,
+            [n, k],
+            copy as u64 * 7 + 101,
+        ));
+        let per_thread = n.div_ceil(threads);
+        let mut want = vec![0.0f64; m * n];
+        let columns: Vec<Vec<f64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|thread| {
+                    let (payload, x_read) = (&payload, &x_read);
+                    scope.spawn(move || -> Result<Vec<f64>, String> {
+                        let (from, to) = (thread * per_thread, ((thread + 1) * per_thread).min(n));
+                        let mut out = Vec::with_capacity(m * to.saturating_sub(from));
+                        let mut decoded = vec![0.0f32; k];
+                        for col in from..to {
+                            payload
+                                .decode_row(col, &mut decoded)
+                                .map_err(|error| format!("row {col}: {error:?}"))?;
+                            for row in 0..m {
+                                out.push(
+                                    x_read[row * k..(row + 1) * k]
+                                        .iter()
+                                        .zip(&decoded)
+                                        .map(|(a, &w)| a * ops.round(w))
+                                        .sum(),
+                                );
+                            }
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a reference thread panicked"))
+                .collect::<Result<_, String>>()
+        })?;
+        for (thread, values) in columns.into_iter().enumerate() {
+            for (offset, chunk) in values.chunks(m).enumerate() {
+                let col = thread * per_thread + offset;
+                for (row, &v) in chunk.iter().enumerate() {
+                    want[row * n + col] = v;
+                }
+            }
+        }
+        references.push(want);
+        let id = format!("w{copy}");
+        let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+        let xi = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+        let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+            &b,
+            xi,
+            &id,
+            payload.weight(),
+            None,
+            None,
+        )
+        .map_err(|e| format!("packed_linear: {e}"))?;
+        graphs.push(b.finish(y).unwrap());
+        packed.push((id, payload));
+    }
+    Ok(Prepared {
+        exact_references: None,
+        graphs,
+        consts: vec![("x".to_string(), HostTensor::f32(vec![m, k], x))],
+        references,
+        out_shape: vec![m, n],
+        packed,
+        slots: Vec::new(),
+        observed: json!({
+            "shape": shape.clone(),
+            "storage": case["storage"].clone(),
+            "layout": case["layout"].clone(),
+            "weight_copies": copies,
+            "weight_bytes_per_copy": weight_bytes,
+        }),
+    })
 }
 
 /// One routed expert projection of a MoE prefill over a packed expert stack (POOT-1505): `tokens * top_k` rows
@@ -1335,6 +1453,7 @@ fn prepare_reading(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared
         Some("recurrence_scan") => recurrence_scan(bank, case),
         Some("grouped_experts") => grouped_experts(bank, case, ops),
         Some("packed_grouped_experts") => packed_grouped_experts(bank, case, ops),
+        Some("packed_linear") => packed_linear(bank, case, ops),
         Some("router_rank") => router_rank(bank, case),
         other => Err(format!("no runner for producer {other:?}")),
     }
@@ -1361,6 +1480,7 @@ pub(crate) fn staged(
     options.tiling_pin = ops.tiling;
     options.indexed_rows_pin = ops.indexed_rows;
     options.gemv_cols_pin = ops.gemv_cols;
+    options.packed_gemv_pin = ops.packed_gemv;
     compile_staged(
         &g.clone(),
         &TargetSet::single(DeviceId(0), target),

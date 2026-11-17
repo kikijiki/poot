@@ -22,6 +22,8 @@ pub(crate) struct Slot<S> {
     pub(crate) max_new: usize,
     pub(crate) sampler: Sampler,
     pub(crate) stops: StopScanner,
+    /// End-of-sequence tokens are ordinary generated tokens ([`Job::ignore_eos`]).
+    pub(crate) ignore_eos: bool,
     pub(crate) stream: bool,
     /// The generated text released so far, cut before a stop string.
     pub(crate) text: String,
@@ -46,6 +48,7 @@ impl<S> Slot<S> {
             max_new,
             sampler: job.sampler,
             stops: StopScanner::new(job.stop),
+            ignore_eos: job.ignore_eos,
             stream: job.stream,
             text: String::new(),
             reply: job.reply,

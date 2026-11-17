@@ -11,7 +11,7 @@ use super::GLOBAL_REQUEST_BYTES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stream {
     /// The activation row: every column group of a warp that shares a block reads the same elements, one lane per
-    /// run.
+    /// run; each group's read is paid in full.
     Activation,
     /// A weight source: a lane's run lies one run stride from its neighbour's, a column group per weight row.
     Weight,
@@ -104,9 +104,12 @@ impl GemvBodyCost {
     /// The cache lines the warp's loads of one trip touch under `lanes`.
     ///
     /// A load of `bytes` per lane at a lane stride of `stride` bytes spans `(lanes - 1) * stride + bytes` bytes over the
-    /// lanes of a column group, and no more lines than one per lane and per line of its own bytes. A weight load repeats
-    /// that for each column group of the warp (each its own row); an activation load is one group's, the groups
-    /// sharing the row; a uniform load is one line.
+    /// lanes of a column group, and no more lines than one per lane and per line of its own bytes. A weight load and an
+    /// activation load both repeat that for each column group of the warp: the groups of a warp read the same
+    /// activation elements, but the L1 serves an instruction by its lanes' addresses, so identical addresses in several
+    /// groups are not served for free (POOT-1611: on sm_120 a warp whose groups read distinct lines is no slower than
+    /// one whose groups read the same line; the counter that would say which mechanism, `ncu`, was unavailable, so the
+    /// compiler splitting the groups' loads is not excluded). A uniform load is one line.
     pub fn lines_per_trip(&self, lanes: LaneMap) -> f64 {
         let line = GLOBAL_REQUEST_BYTES as f64;
         let group = f64::from(lanes.lanes_per_col.clamp(1, lanes.warp_lanes.max(1)));
@@ -120,7 +123,7 @@ impl GemvBodyCost {
             .map(|load| {
                 let bytes = f64::from(load.bytes);
                 match load.stream {
-                    Stream::Activation => group_lines(self.activation_stride_bytes, bytes),
+                    Stream::Activation => groups * group_lines(self.activation_stride_bytes, bytes),
                     Stream::Weight => groups * group_lines(self.weight_stride_bytes, bytes),
                     Stream::Uniform => 1.0,
                 }
@@ -242,10 +245,13 @@ mod tests {
         assert!(two.warp_instructions > one.warp_instructions);
     }
 
-    /// The warp's lines follow its lane map. A lane per run of 64 bytes spreads the activation read of 32 lanes over 16
-    /// lines per load; two column groups of 16 lanes read the same activation elements, so the warp touches half of
-    /// them and adds only the second row's few weight lines; a lane per row shares nothing and touches a line per
-    /// weight load of every lane.
+    /// The warp's lines follow its lane map, and no column group's activation read is free: a lane per run of 64 bytes
+    /// spreads the activation read of 32 lanes over 16 lines per load; two column groups of 16 lanes each pay their own
+    /// 8 lines per load (the same 16), so splitting a warp into groups never lowers its activation lines; a lane per
+    /// row touches a line per load of every lane.
+    ///
+    /// Mutation: price the activation read once per warp (`Stream::Activation => group_lines(..)` without `groups *`);
+    /// the two-group warp then touches fewer lines than the one-group warp and the equality goes red.
     #[test]
     fn a_warps_lines_follow_how_its_lanes_share_rows() {
         let cost = cost(WeightFormat::Q4_K, 16, 1, 1);
@@ -255,8 +261,32 @@ mod tests {
                 lanes_per_col,
             })
         };
+        let activation = |lanes_per_col| {
+            lines(lanes_per_col)
+                - cost
+                    .loads
+                    .iter()
+                    .filter(|load| load.stream != Stream::Activation)
+                    .map(|load| {
+                        // The weight and uniform loads of the same lane map, priced without the activation.
+                        let only = GemvBodyCost {
+                            loads: vec![*load],
+                            ..cost.clone()
+                        };
+                        only.lines_per_trip(LaneMap {
+                            warp_lanes: 32,
+                            lanes_per_col,
+                        })
+                    })
+                    .sum::<f64>()
+        };
         let (one_row, two_rows, a_row_per_lane) = (lines(32), lines(16), lines(1));
-        assert!(two_rows < one_row, "{two_rows} vs {one_row}");
+        assert_eq!(
+            activation(16),
+            activation(32),
+            "groups share no activation lines"
+        );
+        assert!(two_rows > one_row, "{two_rows} vs {one_row}");
         assert!(a_row_per_lane > one_row, "{a_row_per_lane} vs {one_row}");
     }
 }

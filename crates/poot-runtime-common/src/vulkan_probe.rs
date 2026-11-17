@@ -3,6 +3,7 @@
 //! once here, over the raw `ash` handles.
 
 use ash::{amd, vk};
+use poot_target::MemoryDomain;
 
 /// The summed `VK_EXT_memory_budget` figures of a device's device-local heaps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +51,39 @@ pub unsafe fn device_local_heap_budget(
             usage: sum.usage + budget.heap_usage[i],
         },
     )
+}
+
+/// The memory domain of a Vulkan device (POOT-1273), read from its memory heaps and its device type.
+///
+/// A device is [`MemoryDomain::Host`] when it is an integrated (or CPU) part and a `DEVICE_LOCAL` heap has a
+/// `HOST_VISIBLE` memory type: the heap the GPU allocates from is memory the host maps, because it is the
+/// host's RAM. Every other device is [`MemoryDomain::Local`]: one whose `DEVICE_LOCAL` heaps carry no
+/// host-visible type, and a discrete part even when it exposes its VRAM through a resizable BAR, since the
+/// heap structure of a BAR-mapped VRAM and of an APU's shared heap is the same and only the device type
+/// tells the host's own RAM from a window onto a separate memory.
+pub fn memory_domain(
+    device_type: vk::PhysicalDeviceType,
+    memory: &vk::PhysicalDeviceMemoryProperties,
+) -> MemoryDomain {
+    let shares_host_ram = matches!(
+        device_type,
+        vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU
+    );
+    let device_local_heap_is_host_visible = memory.memory_types
+        [..memory.memory_type_count as usize]
+        .iter()
+        .any(|ty| {
+            ty.property_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                && memory.memory_heaps[ty.heap_index as usize]
+                    .flags
+                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+        });
+    if shares_host_ram && device_local_heap_is_host_visible {
+        MemoryDomain::Host
+    } else {
+        MemoryDomain::Local
+    }
 }
 
 /// What AMD's shader-core properties say about a Vulkan device.
@@ -114,5 +148,89 @@ pub unsafe fn amd_vulkan_shader_core(
             vgprs_per_simd: core.vgprs_per_simd,
             simd_per_compute_unit: core.simd_per_compute_unit,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Heaps and types of one device: `(heap flags, [type flags])` per heap, types numbered in order.
+    fn memory(
+        heaps: &[(vk::MemoryHeapFlags, &[vk::MemoryPropertyFlags])],
+    ) -> vk::PhysicalDeviceMemoryProperties {
+        let mut props = vk::PhysicalDeviceMemoryProperties::default();
+        for (heap, (flags, types)) in heaps.iter().enumerate() {
+            props.memory_heaps[heap] = vk::MemoryHeap {
+                size: 1 << 30,
+                flags: *flags,
+            };
+            for ty in *types {
+                props.memory_types[props.memory_type_count as usize] = vk::MemoryType {
+                    property_flags: *ty,
+                    heap_index: heap as u32,
+                };
+                props.memory_type_count += 1;
+            }
+        }
+        props.memory_heap_count = heaps.len() as u32;
+        props
+    }
+
+    const LOCAL: vk::MemoryHeapFlags = vk::MemoryHeapFlags::DEVICE_LOCAL;
+    const NOT_LOCAL: vk::MemoryHeapFlags = vk::MemoryHeapFlags::empty();
+    const DEVICE_LOCAL: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    const MAPPED: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
+        vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
+            | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
+    );
+    const LOCAL_MAPPED: vk::MemoryPropertyFlags =
+        vk::MemoryPropertyFlags::from_raw(DEVICE_LOCAL.as_raw() | MAPPED.as_raw());
+
+    /// Strix Halo as vulkaninfo reports it (RADV, 2026-11-16): a host heap and one large `DEVICE_LOCAL` heap
+    /// with host-visible types.
+    fn unified_heaps() -> vk::PhysicalDeviceMemoryProperties {
+        memory(&[
+            (NOT_LOCAL, &[MAPPED]),
+            (LOCAL, &[DEVICE_LOCAL, LOCAL_MAPPED]),
+        ])
+    }
+
+    /// A discrete card without a resizable BAR: VRAM no host pointer reaches, plus a host heap.
+    fn vram_heaps() -> vk::PhysicalDeviceMemoryProperties {
+        memory(&[(LOCAL, &[DEVICE_LOCAL]), (NOT_LOCAL, &[MAPPED])])
+    }
+
+    #[test]
+    fn an_integrated_device_with_a_mapped_device_local_heap_is_host() {
+        assert_eq!(
+            memory_domain(vk::PhysicalDeviceType::INTEGRATED_GPU, &unified_heaps()),
+            MemoryDomain::Host
+        );
+    }
+
+    #[test]
+    fn a_device_whose_device_local_heaps_are_not_host_visible_is_local() {
+        assert_eq!(
+            memory_domain(vk::PhysicalDeviceType::DISCRETE_GPU, &vram_heaps()),
+            MemoryDomain::Local
+        );
+        // The same heaps on a part that claims to be integrated still have no host-visible local type.
+        assert_eq!(
+            memory_domain(vk::PhysicalDeviceType::INTEGRATED_GPU, &vram_heaps()),
+            MemoryDomain::Local
+        );
+    }
+
+    #[test]
+    fn a_discrete_device_with_a_resizable_bar_stays_local() {
+        let rebar = memory(&[
+            (LOCAL, &[DEVICE_LOCAL, LOCAL_MAPPED]),
+            (NOT_LOCAL, &[MAPPED]),
+        ]);
+        assert_eq!(
+            memory_domain(vk::PhysicalDeviceType::DISCRETE_GPU, &rebar),
+            MemoryDomain::Local
+        );
     }
 }

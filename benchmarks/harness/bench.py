@@ -65,6 +65,7 @@ try:
         BUILD_IDENTITY_FIELDS,
         CURVE_KIND,
         MEASUREMENT_IDENTITY_FIELDS,
+        SERVE_KIND,
         ResultValidationError,
         committed_env_errors,
         known_null_image_digest_sets,
@@ -86,6 +87,7 @@ except ImportError:  # direct `python harness/bench.py` execution
         BUILD_IDENTITY_FIELDS,
         CURVE_KIND,
         MEASUREMENT_IDENTITY_FIELDS,
+        SERVE_KIND,
         ResultValidationError,
         committed_env_errors,
         known_null_image_digest_sets,
@@ -117,15 +119,33 @@ def is_supported(fw_cfg):
     return fw_cfg.get("support", True)
 
 
+def scenario_cells(scen):
+    """The scenarios one manifest scenario runs as: itself, or for a serve scenario one per concurrency it names.
+
+    A serve scenario's concurrency is part of a cell's identity (a row states it, `cell_key` keys on it), so each level
+    is its own scenario with one `concurrency` and its own server; the levels are not points of one cell.
+    """
+    if scen.get("kind") != SERVE_KIND:
+        yield scen
+        return
+    levels = {k: v for k, v in scen.items() if k != "concurrencies"}
+    for concurrency in scen["concurrencies"]:
+        yield {**levels, "concurrency": concurrency}
+
+
 def cells(manifest):
     """Yield every (model, scenario, framework, fw_cfg) cell the manifest declares."""
     for model in manifest["model"]:
-        for scen in manifest["scenario"]:
-            for fw in FRAMEWORKS:
-                fw_cfg = model.get("frameworks", {}).get(fw)
-                if fw_cfg is None:
-                    fw_cfg = {"support": False, "reason": f"not declared for {fw} in manifest"}
-                yield model, scen, fw, fw_cfg
+        for declared in manifest["scenario"]:
+            for scen in scenario_cells(declared):
+                for fw in FRAMEWORKS:
+                    fw_cfg = model.get("frameworks", {}).get(fw)
+                    if fw_cfg is None:
+                        fw_cfg = {"support": False, "reason": f"not declared for {fw} in manifest"}
+                    if scen.get("kind") == SERVE_KIND and fw in scen.get("unsupported", {}):
+                        # The scenario states why this engine has no server to measure: its refusal, not a manifest hole.
+                        fw_cfg = {**fw_cfg, "support": False, "reason": scen["unsupported"][fw]}
+                    yield model, scen, fw, fw_cfg
 
 
 # --------------------------------------------------------------------------------------------------
@@ -191,9 +211,11 @@ def capture_env(manifest_path):
 # --------------------------------------------------------------------------------------------------
 # Running one cell
 # --------------------------------------------------------------------------------------------------
-def resolve_binary(runner):
-    bin_env = runner.get("bin_env")
-    return (os.environ.get(bin_env) if bin_env else None) or runner.get("bin")
+def resolve_binary(runner, field="bin"):
+    """The executable a runner entry names under `field` (`bin`, or `serve_bin` for a serve cell's server): its
+    `<field>_env` environment variable when set, else the default the entry gives."""
+    bin_env = runner.get(f"{field}_env")
+    return (os.environ.get(bin_env) if bin_env else None) or runner.get(field)
 
 
 def binary_sha256(binary):
@@ -219,26 +241,30 @@ def stage_runners(runners, stage_dir):
     """
     staged = {}
     for fw, cfg in runners.items():
-        source = shutil.which(resolve_binary(cfg)) if fw in receipts.BUILD_IDENTITY_FRAMEWORKS else None
-        if source is None:
-            staged[fw] = cfg
-            continue
-        dest = Path(stage_dir) / fw / Path(source).name
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, dest)
-        digest, original = binary_sha256(str(dest)), binary_sha256(source)
-        if digest != original:
-            raise RuntimeError(f"the private copy of the {fw} runner differs from {source} ({digest} against {original}): "
-                               "the shared binary changed while it was copied")
-        staged[fw] = {**{k: v for k, v in cfg.items() if k != "bin_env"}, "bin": str(dest), "staged_sha256": digest}
+        entry = cfg
+        for field, digest_field in (("bin", "staged_sha256"), ("serve_bin", "staged_serve_sha256")):
+            source = shutil.which(resolve_binary(cfg, field) or "") if fw in receipts.BUILD_IDENTITY_FRAMEWORKS else None
+            if source is None:
+                continue
+            dest = Path(stage_dir) / fw / Path(source).name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest)
+            digest, original = binary_sha256(str(dest)), binary_sha256(source)
+            if digest != original:
+                raise RuntimeError(f"the private copy of the {fw} {field} differs from {source} ({digest} against {original}): "
+                                   "the shared binary changed while it was copied")
+            entry = {**{k: v for k, v in entry.items() if k != f"{field}_env"}, field: str(dest), digest_field: digest}
+        staged[fw] = entry
     return staged
 
 
-def resolve_cmd(runner, subst):
+def resolve_cmd(runner, subst, field="cmd"):
+    """The argv of `runner` under `field` (`cmd`, or `serve_cmd` for a serve cell) with its placeholders filled."""
     binary = resolve_binary(runner)
+    serve_binary = resolve_binary(runner, "serve_bin")
     out = []
-    for tok in runner["cmd"]:
-        t = tok.replace("{bin}", binary)
+    for tok in runner[field]:
+        t = tok.replace("{bin}", binary or "").replace("{serve_bin}", serve_binary or "")
         for k, v in subst.items():
             t = t.replace("{" + k + "}", str(v))
         out.append(t)
@@ -322,6 +348,9 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
         "precision": fw_cfg.get("precision", model.get("match_precision", "")),
         "scenario": scen["id"],
     }
+    served = is_serve(scen)
+    if served:
+        base["concurrency"] = scen["concurrency"]
     if model.get("hf_revision"):
         # The commit of the weights repo the cell ran on: a repo re-quantised in place changes what the name means.
         base["weights_revision"] = model["hf_revision"]
@@ -352,14 +381,20 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
         # references {backend}.
         "backend": os.environ.get("POOT_BENCH_BACKEND", "ptx"),
     }
-    cmd = resolve_cmd(runners[fw], subst)
+    if served:
+        subst.update({k: scen[k] for k in ("concurrency", "prompt_tokens", "output_tokens", "warmup_requests", "requests")})
+        if diagnostic:
+            raise ValueError("--diagnostic times the device of a single-stream run: a serve cell has no profiled mode")
+    cmd = resolve_cmd(runners[fw], subst, "serve_cmd" if served else "cmd")
     # Attribution: a repository-built runner is the binary under test, so the digest of the executable that is
     # about to run is part of its row. An external tool runs through an interpreter whose digest says nothing
     # about the tool: its row carries the version the tool reports instead (`framework_version`).
     if fw in receipts.BUILD_IDENTITY_FRAMEWORKS:
-        base["binary_sha256"] = binary_sha256(resolve_binary(runners[fw]))
-        if "staged_sha256" in runners[fw]:
-            base["staged_sha256"] = runners[fw]["staged_sha256"]
+        # A serve cell measures the server binary, not the single-stream runner.
+        field, staged = ("serve_bin", "staged_serve_sha256") if served else ("bin", "staged_sha256")
+        base["binary_sha256"] = binary_sha256(resolve_binary(runners[fw], field))
+        if staged in runners[fw]:
+            base["staged_sha256"] = runners[fw][staged]
     base["device"] = device
     requested_backend = subst["backend"] if fw in receipts.BUILD_IDENTITY_FRAMEWORKS else None
     if requested_backend is not None:
@@ -443,12 +478,12 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
             caveats,
         )
 
-    row = {**base, "status": "ok", "timing_claim": timing_claim(fw)}
+    row = {**base, "status": "ok", "timing_claim": timing_claim(fw, scen)}
     # Timing fields come from the runner; copy only the schema-known keys for this scenario.
     timing_fields = [*BUILD_IDENTITY_FIELDS, *MEASUREMENT_IDENTITY_FIELDS, "framework_version", "family",
                      "engine", "profiled", "prefill_chunk", "kv_dtype", "driver", "backend", "self_reported_vram_bytes",
                      "preparation", "memory_classes"]
-    if not curve:
+    if not curve and not served:
         timing_fields += [
             "prompt_tokens", "gen_tokens", "ttft_ms", "tpot_ms", "e2e_ms",
             "decode_tok_s", "iterations", "ttft_ms_stdev", "decode_tok_s_stdev", "device_time",
@@ -456,6 +491,15 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
     for k in timing_fields:
         if k in timing:
             row[k] = timing[k]
+    if served:
+        # The contract has aggregated the load client's raw requests; the row states the cell's headline and its detail.
+        summary = timing["serve"]
+        row.update({
+            "prompt_tokens": scen["prompt_tokens"], "gen_tokens": scen["output_tokens"], "iterations": summary["requests"],
+            "server_slots": timing["server_slots"], "output_tok_s": summary["output_tok_s"],
+            "ttft_ms": summary["ttft_ms"]["p50"], "tpot_ms": summary["tpot_ms"]["p50"], "e2e_ms": summary["e2e_ms"]["p50"],
+            "serve": summary,
+        })
     # For curves, the contract has already aggregated raw samples into schema-safe points.
     if curve:
         osl = timing["osl"]
@@ -550,6 +594,10 @@ def _caveats(model, fw_cfg):
 
 def is_curve(scen):
     return scen.get("kind") == CURVE_KIND
+
+
+def is_serve(scen):
+    return scen.get("kind") == SERVE_KIND
 
 
 # --------------------------------------------------------------------------------------------------
@@ -731,7 +779,7 @@ def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
                 continue
             if args.skip_unsupported and not is_supported(fw_cfg):
                 continue
-            label = f"{model['id']} / {scen['id']} / {fw}"
+            label = f"{model['id']} / {scen['id']}{f' x{scen['concurrency']}' if is_serve(scen) else ''} / {fw}"
             print(f"[run] {label} ...", file=sys.stderr, flush=True)
             def run_once():
                 return run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite,
@@ -741,6 +789,8 @@ def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
                                 diagnostic=args.diagnostic)
             identity = {"framework": fw, "model": model["id"], "scenario": scen["id"],
                         "precision": fw_cfg.get("precision", model.get("match_precision", ""))}
+            if is_serve(scen):
+                identity["concurrency"] = scen["concurrency"]
             try:
                 row = run_once() if not is_supported(fw_cfg) else run_quiet_cell(run_once, args.quiet_wait_s, gate, lock_paths)
                 row = {**identity, **row}  # a cell refused before it ran (not quiet, never cooled) still names itself
@@ -750,7 +800,7 @@ def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
             out.flush()
             rows.append(row)
             print(f"      -> {row['status']}"
-                  + (f"  {row.get('decode_tok_s','?')} tok/s" if row["status"] == "ok" else
+                  + (f"  {row.get('output_tok_s' if is_serve(scen) else 'decode_tok_s','?')} tok/s" if row["status"] == "ok" else
                      f"  ({row.get('reason','')[:60]})"), file=sys.stderr)
 
     report = render_report(env, rows)
@@ -867,8 +917,10 @@ def render_index(runs, known=()):
                 "| model | scenario | framework | backend | device | host CPU | driver | pair | band | repeats | follow-up | reason |",
                 "|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for entry in sorted(known.values(), key=lambda e: tuple(e.get(f) or "" for f in known_unverified.KEY_FIELDS)):
+            # The concurrency of a serve cell reads beside its scenario; a cell with none keeps the columns it always had.
+            fields = {**entry, "scenario": f"{entry['scenario']} x{entry['concurrency']}" if entry.get("concurrency") else entry["scenario"]}
             out.append("| " + " | ".join(
-                [str(entry.get(f) or "-") for f in known_unverified.KEY_FIELDS]
+                [str(fields.get(f) or "-") for f in known_unverified.KEY_FIELDS[:-1]]
                 + [entry["pair"], f"{entry['band']:.2%}", str(entry["repeats"]), entry["follow_up"], entry["reason"]]) + " |")
         out.append("")
     return "\n".join(out)
@@ -1026,10 +1078,11 @@ def cell_key(row):
     The hardware is the accelerator, the host CPU model and the GPU driver: time metrics that include host-side
     launch work differ between hosts of one GPU, so repeats from two hosts are never one band. A backend, device,
     host CPU or driver the row does not record is part of the key as None (unknown), never a wildcard, so a row
-    of unknown hardware is never pooled with one of known hardware.
+    of unknown hardware is never pooled with one of known hardware. A serve row states the concurrency it ran at,
+    and each concurrency is its own cell (None for every other scenario).
     """
     return (row["model"], row["scenario"], row["framework"], row.get("backend"), row.get("device"),
-            row.get("host_cpu"), row.get("gpu_driver"))
+            row.get("host_cpu"), row.get("gpu_driver"), row.get("concurrency"))
 
 
 def _is_finite(value):
@@ -1086,9 +1139,10 @@ def _compare_cell(key, rows_a, rows_b, policy):
     if rows_a is None:
         return settle(receipts.NEW, "cell is not in the baseline")
     bad = [side for side, ok in (("baseline", ok_a), ("candidate", ok_b))
-           if not all(_is_finite(r.get(policy["headline_metric"])) for r in ok)]
+           if not all(_is_finite(r.get(receipts.headline_metric(r, policy))) for r in ok)]
     if bad:
-        return settle(receipts.INVALID, f"non-finite decode tok/s in the {' and '.join(bad)}")
+        what = "output tok/s" if key[7] is not None else "decode tok/s"
+        return settle(receipts.INVALID, f"non-finite {what} in the {' and '.join(bad)}")
     if not ok_a:
         return settle(receipts.NO_BASELINE, "the baseline has no successful run of this cell")
     if not ok_b:
@@ -1112,13 +1166,13 @@ def _compare_cell(key, rows_a, rows_b, policy):
             repeats = "; ".join(f"repeat {n} reached the throttle point of the {' and '.join(roles)}" for n, roles in throttled)
             return settle(receipts.UNVERIFIED, f"the {side} was throttled: {repeats}")
         identities = [receipts.row_identity(r) for r in ok]
-        mixed = [f for f in receipts.row_identity_fields(key[2]) if len({repr(i[f]) for i in identities}) > 1]
+        mixed = [f for f in receipts.row_identity_fields(key[2], key[7] is not None) if len({repr(i[f]) for i in identities}) > 1]
         if mixed:
             return settle(receipts.UNVERIFIED, f"the {side} runs differ in {', '.join(mixed)}")
 
     baseline, candidate = receipts.rows_receipt(rows_a, policy), receipts.rows_receipt(rows_b, policy)
     report = receipts.compare_receipts(
-        baseline, candidate, receipts.rows_spec(baseline, policy), policy, fields=receipts.row_identity_fields(key[2])
+        baseline, candidate, receipts.rows_spec(baseline, policy), policy, fields=receipts.row_identity_fields(key[2], key[7] is not None)
     )
     if report["verdict"] == receipts.INCOMPARABLE:
         fields = ", ".join(f"{field} ({why})" for field, why in report["identity_mismatches"])
@@ -1218,6 +1272,21 @@ def render_curve(grp):
     return lines
 
 
+def render_serve(model, scenario, concurrency, grp):
+    """One serve cell's table: the engines at one concurrency, by aggregate output tokens per second and the median
+    time to first token and per output token of their requests."""
+    lines = [f"## {model} - {scenario} at concurrency {concurrency}", "",
+             "| framework | precision | status | output tok/s | TTFT p50 ms | TPOT p50 ms | notes |",
+             "|---|---|---|---|---|---|---|"]
+    for r in sorted(grp, key=lambda x: x["framework"]):
+        if r["status"] == "ok":
+            lines.append(f"| {_framework_label(r)} | {r['precision']} | ok | {_num(r.get('output_tok_s'))} | "
+                         f"{_num(r.get('ttft_ms'))} | {_num(r.get('tpot_ms'))} | {'; '.join(r.get('caveats', []))} |")
+        else:
+            lines.append(f"| {_framework_label(r)} | {r.get('precision', '-')} | {r['status']} | - | - | - | {r.get('reason', '')[:80]} |")
+    return lines + [""]
+
+
 def render_report(env, rows):
     lines = ["# poot benchmark report", ""]
     if env:
@@ -1233,9 +1302,12 @@ def render_report(env, rows):
     # Group by (model, scenario); one table per group, frameworks as rows.
     groups = {}
     for r in rows:
-        groups.setdefault((r["model"], r["scenario"]), []).append(r)
+        groups.setdefault((r["model"], r["scenario"], r.get("concurrency") or 0), []).append(r)
 
-    for (model, scenario), grp in sorted(groups.items()):
+    for (model, scenario, concurrency), grp in sorted(groups.items()):
+        if concurrency:
+            lines += render_serve(model, scenario, concurrency, grp)
+            continue
         lines += [f"## {model} - {scenario}", "",
                   "| framework | precision | status | TTFT ms | TPOT ms | decode tok/s | "
                   "GPU GiB at inference | host GiB at inference | peak power W | energy Wh | notes |",
@@ -1296,7 +1368,9 @@ def render_compare(baseline_dirs, candidate_dirs, cells):
              "verdict | build A | build B | VRAM A GiB | VRAM B GiB |",
              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for cell in cells:
-        model, scenario, framework, backend, device, host_cpu, driver = cell["key"]
+        model, scenario, framework, backend, device, host_cpu, driver, concurrency = cell["key"]
+        if concurrency is not None:
+            scenario = f"{scenario} x{concurrency}"
         delta = (
             f"{100.0 * (cell['median_b'] - cell['median_a']) / cell['median_a']:+.1f}"
             if cell["median_a"] and cell["median_b"] is not None else "-"

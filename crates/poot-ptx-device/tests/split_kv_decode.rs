@@ -33,6 +33,24 @@ fn split_kv_decode_matches_the_oracle_on_ptx() {
     .unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// POOT-1549 row 14: the grouped-query decode of the Qwen3.8-27B attention shape (`n_rep = 6`, `dk = dv = 256`) and
+/// of the qwen2.5 shape (`n_rep = 7`, `dk = 64`), an `f32` attention over a 512-key cache stepped at live lengths
+/// 512, 77 and 1, matches the CPU oracle's evaluation of each length within `SPLIT_KV_DEVICE_TOLERANCE` on every query
+/// head of every group.
+/// Mutation: in `poot-kernelgen`'s clustered attention body (`attention/clustered.rs`), load the query row at
+/// `row - r * lq` (every head of a group reads the group's first head's query); the `n_rep = 6` case goes red
+/// against the oracle (worst error 0.038 on ROCm).
+#[test]
+fn gqa_decode_matches_the_oracle_on_ptx() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention::assert_gqa_decode_matches_the_oracle(exec.as_mut(), target)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// The split-KV decode stepped through its live lengths twice over one entry: the second pass replays
 /// the captured two-launch plan as a CUDA graph, and every step's output equals the first pass's bit for
 /// bit (the first pass's first step is the recording step's own execution).

@@ -271,7 +271,7 @@ impl<D: Device + Collectives> Coordinator<D> {
         TargetSet::new(
             devices
                 .iter()
-                .map(|(id, device)| (*id, device.target()))
+                .map(|(id, device)| (*id, device.target(), device.memory_topology()))
                 .collect(),
         )?;
         let ids: Vec<DeviceId> = devices.iter().map(|(id, _)| *id).collect();
@@ -629,7 +629,10 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
             self.devices
                 .iter()
                 .zip(&self.engines)
-                .map(|(&id, engine)| (id, engine.device().target()))
+                .map(|(&id, engine)| {
+                    let device = engine.device();
+                    (id, device.target(), device.memory_topology())
+                })
                 .collect(),
         )
         .expect("the devices were checked distinct at construction")

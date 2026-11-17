@@ -608,6 +608,11 @@ impl Device for VpuDevice {
     type Recording = VpuRecording;
     type Error = VpuError;
 
+    /// `Host`: the Intel NPU allocates its buffers through Level Zero host allocations (`alloc_host`) in system memory, the memory the CPU and the iGPU address too.
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native
     }

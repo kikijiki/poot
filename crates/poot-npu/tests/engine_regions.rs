@@ -58,6 +58,10 @@ mod aie_engine {
         type Recording = ();
         type Error = std::convert::Infallible;
 
+        fn memory_topology(&self) -> poot_target::MemoryTopology {
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+        }
+
         fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
             CopyMechanism::Native
         }
@@ -440,6 +444,10 @@ mod vpu_engine {
         type Kernel = usize;
         type Recording = ();
         type Error = std::convert::Infallible;
+
+        fn memory_topology(&self) -> poot_target::MemoryTopology {
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+        }
 
         fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
             CopyMechanism::Native

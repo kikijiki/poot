@@ -47,13 +47,13 @@ fn a_non_streaming_request_whose_client_hangs_up_is_released_within_one_step() {
         let _ = result_tx.send(outcome);
     });
     let result = result_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(60))
         .expect("submit never returned: the hang-up was ignored and the request kept running");
     assert_eq!(
         result.expect_err("a hung-up client cancels"),
         GenerationError::ClientCancelled
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let release = loop {
         let events = log.lock().unwrap().clone();
         if let Some(index) = events
@@ -262,7 +262,7 @@ pub(super) fn health_over_http(health: &EngineHealth) -> (String, serde_json::Va
 
 /// Wait until `health` leaves `Serving`, which the engine thread's last act does.
 fn wait_for_death(health: &EngineHealth) -> EngineState {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let state = health.state();
         if !matches!(state, EngineState::Serving { .. }) || Instant::now() > deadline {

@@ -6,16 +6,21 @@
 //! shape or a format: the format enters only through its descriptor's run sharing and the cost of the body its
 //! descriptor emits, and the device only through [`poot_target::calibration::GemvDevice`].
 //!
-//! A Gemv is a loop of trips, each a lane's run of `K` elements of each of its rows. For a grid of at most one
-//! residency of the device every workgroup is resident at once, so the dispatch lasts its fixed cost plus its trips, and
-//! a trip costs the larger of two things:
+//! A Gemv is a loop of trips, each a lane's run of `K` elements of each of its rows. A unit holds whole workgroups
+//! (`resident_lanes / width` of them), so a grid past that residency runs in as many rounds as it takes and the busiest
+//! unit of a round holds the ceiling of an even share of the workgroups. The dispatch lasts its fixed cost plus its
+//! rounds of trips, and a trip costs the larger of two things:
 //!
-//! - its work, the larger of the unit's issue of the warps' instructions and its L1's service of their cache lines;
-//! - its latency, spread over the `depth` trips a lane keeps in flight: with one trip in flight a lane waits the DRAM
-//!   latency before it can use what it loaded, so the trip lasts `latency + work`; at depth `d` those `d` trips share
-//!   that wait, `(latency + work) / d`, which cannot go below the work itself.
+//! - its work: the busiest unit's issue of its warps' instructions or its L1's service of their cache lines, whichever
+//!   is more. Every column group of a warp pays its own activation read: the L1 serves an instruction by its lanes'
+//!   addresses, so identical addresses in several groups are not shared for free (POOT-1611, measured on sm_120);
+//! - one warp's own chain: its DRAM latency plus the dependent instructions it issues after the load lands, spread over
+//!   the `depth` trips a lane keeps in flight. The unit's other warps issue meanwhile, so the chain does not grow with
+//!   their number: it binds only where too few warps are resident to cover the latency (Little's law).
 //!
-//! A grid past one residency runs in as many rounds as it takes.
+//! The figures are `GemvDevice`'s, each with its provenance: a measured device's are identified from its geometry sweep,
+//! an unmeasured one's are priors and its plan says so. Register residency (a unit holds fewer workgroups when a lane's
+//! registers fill the file) is not modelled.
 
 use poot_kernelgen::{GemvRows, LaneMap, LoadDepth, PackedRunSharing};
 use poot_quant::format::WeightFormat;
@@ -91,10 +96,12 @@ fn modelled_cycles(
     let workgroups = site
         .outputs
         .div_ceil((geometry.cols * geometry.rows) as usize);
-    let launched = workgroups as f64 * f64::from(geometry.width);
-    let capacity = f64::from(units) * f64::from(device.resident_lanes);
-    let rounds = (launched / capacity).ceil().max(1.0);
-    let warps_per_unit = launched / rounds / f64::from(units) / f64::from(warp);
+    // A unit holds whole workgroups: `resident_lanes / width` of them (at least one), so the grid runs in as many
+    // rounds as it takes at that residency, and the busiest unit of a round holds the ceiling of an even share.
+    let per_unit = (device.resident_lanes / geometry.width).max(1) as usize;
+    let rounds = workgroups.div_ceil(units as usize * per_unit).max(1);
+    let busiest = workgroups.div_ceil(rounds).div_ceil(units as usize);
+    let warps_per_unit = (busiest * geometry.width as usize) as f64 / f64::from(warp);
     let lines = body.lines_per_trip(LaneMap {
         warp_lanes: warp,
         lanes_per_col,
@@ -102,8 +109,14 @@ fn modelled_cycles(
     let issue = warps_per_unit * f64::from(body.warp_instructions) / device.issue_per_cycle;
     let service = warps_per_unit * lines / device.l1_lines_per_cycle;
     let work = issue.max(service);
-    let trip = work.max((device.dram_latency_cycles + work) / f64::from(geometry.depth));
-    device.dispatch_cycles + rounds * trips * trip
+    // One warp's own chain is serial with its latency; the other resident warps issue meanwhile, so the latency arm is
+    // not multiplied by the unit's warps: it is the warp's dependent instructions after the load, shared over the
+    // `depth` trips a lane keeps in flight.
+    let chain = (device.dram_latency_cycles
+        + f64::from(body.warp_instructions) * device.dependent_issue_cycles)
+        / f64::from(geometry.depth);
+    let trip = work.max(chain);
+    device.dispatch_cycles + rounds as f64 * trips * trip
 }
 
 /// One geometry the model scores.
@@ -152,6 +165,12 @@ pub(crate) fn packed_gemv_geometry(
                         run,
                         depth,
                     };
+                    let pinned = site.packed_gemv_pin().is_none_or(|pin| {
+                        (pin.cols, pin.rows, pin.run, pin.depth) == (cols, rows, run, depth)
+                    });
+                    if !pinned {
+                        continue;
+                    }
                     let fits = shape.workgroup_limit.is_none_or(|limit| {
                         shape.outputs.div_ceil((cols * rows) as usize) <= limit
                     });

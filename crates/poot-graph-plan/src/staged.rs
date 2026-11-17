@@ -31,7 +31,9 @@ use std::sync::Arc;
 
 use poot_graph_ir::analysis::{NumericsProperty, Tier2Class};
 use poot_graph_ir::{BoundaryId, Graph, SlotKey, TensorType, ValueId};
-use poot_target::BufferStorage;
+#[cfg(any(test, feature = "test-support"))]
+use poot_target::MemoryDomain;
+use poot_target::{BufferStorage, MemoryTopology};
 use poot_weights::{WeightId, WeightMap};
 
 pub use crate::multi_device::DeviceId;
@@ -101,34 +103,72 @@ impl SyncPoint {
     }
 }
 
-/// The devices an executor exposes, each with the target `compile` plans for.
+/// Which memory a device allocates from, as the residency planner keys it: every `Host` device shares one
+/// memory, each `Local` device has its own.
+///
+/// No production code reads it yet: the residency planner (POOT-1274) is its consumer and lifts the
+/// `test-support` gate (ADR-0113) when it lands.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DomainKey {
+    /// The host's memory, shared by every [`MemoryDomain::Host`] device.
+    Host,
+    /// The memory of one [`MemoryDomain::Local`] device.
+    Device(DeviceId),
+}
+
+/// The devices an executor exposes, each with the target `compile` plans for and the memory topology its
+/// runtime reported.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TargetSet {
     devices: Vec<(DeviceId, Target)>,
+    /// The topology of `devices[i]`, in the same order; read by [`Self::domain_key`] (and so by the
+    /// residency planner, POOT-1274).
+    topologies: Vec<MemoryTopology>,
 }
 
 impl TargetSet {
-    /// A target set of exactly one device.
+    /// A target set of exactly one device. One device is its own home, so it carries no topology: nothing
+    /// is shared with it or staged to it.
     pub fn single(device: DeviceId, target: Target) -> Self {
         Self {
             devices: vec![(device, target)],
+            topologies: Vec::new(),
         }
     }
 
-    /// Several devices, each with the target `compile` plans for it. No production caller yet: held for
-    /// POOT-748, whose coordinator opens one engine per device.
-    pub fn new(devices: Vec<(DeviceId, Target)>) -> Result<Self, TopologyError> {
-        for (index, (device, _)) in devices.iter().enumerate() {
-            if devices[..index].iter().any(|(seen, _)| seen == device) {
+    /// Several devices, each with the target `compile` plans for it and its [`MemoryTopology`].
+    pub fn new(devices: Vec<(DeviceId, Target, MemoryTopology)>) -> Result<Self, TopologyError> {
+        for (index, (device, ..)) in devices.iter().enumerate() {
+            if devices[..index].iter().any(|(seen, ..)| seen == device) {
                 return Err(TopologyError::DuplicateDevice(*device));
             }
         }
-        Ok(Self { devices })
+        let (devices, topologies) = devices
+            .into_iter()
+            .map(|(device, target, topology)| ((device, target), topology))
+            .unzip();
+        Ok(Self {
+            devices,
+            topologies,
+        })
     }
 
     /// Every device with its target, in the order the set was built.
     pub fn devices(&self) -> &[(DeviceId, Target)] {
         &self.devices
+    }
+
+    /// The memory `device` allocates from: one key for every `Host` device, one per `Local` device. `None`
+    /// for a device not in the set and for the lone device of [`Self::single`], which has no topology.
+    /// Gated like [`DomainKey`] until the residency planner (POOT-1274) consumes it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn domain_key(&self, device: DeviceId) -> Option<DomainKey> {
+        let index = self.devices.iter().position(|(id, _)| *id == device)?;
+        match self.topologies.get(index)?.domain {
+            MemoryDomain::Host => Some(DomainKey::Host),
+            MemoryDomain::Local => Some(DomainKey::Device(device)),
+        }
     }
 }
 

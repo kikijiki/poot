@@ -47,6 +47,8 @@ benchmarks/
     poot/              the poot runner: root-workspace crate `poot-bench-runner`, one measure loop over
                        the ptx, rocm, wgpu and vulkan backends
     candle/  torch/  vllm/  llamacpp/    one runner + a NOTES.md (pinned versions, gotchas) each
+    serve/             the serve-throughput scenario: one stdlib load client and the runner that starts each
+                       engine's server for a cell; its NOTES.md holds the prior art
   setup/               per-framework, pinned, on-pod install scripts (the "pull everything" part)
   docker/              the pre-baked image: Dockerfile (bakes the 5 engines, sm_80 + sm_86) + README
   flake.nix            a separate devshell with the image build/push tooling (podman, skopeo, gh, uv)
@@ -151,8 +153,8 @@ order-dependent TTFT variance).
   points (after prefill for TTFT, around each decode token for ITL, after the last for e2e) or the
   per-token timing is wrong.
 
-**Single-stream only.** One request in flight; no concurrency / QPS / continuous-batching / goodput
-(single-process load generators saturate at high QPS). vLLM's batching advantage is a caveat, not exercised.
+**Single stream, and serve.** Every scenario but one has one request in flight. The `serve-throughput` scenario is the
+exception and is its own kind of cell (below): an engine's server under streaming requests at concurrency 1, 4 and 16.
 
 Memory is NOT self-reported. The harness wraps each runner with `observer.py`, which samples total device
 VRAM (NVML, else `nvidia-smi`; on an AMD device the amdgpu sysfs `mem_info_vram_used` + `mem_info_gtt_used`, with power from hwmon `power1_average`) and the host memory of the process tree (a /proc walk of the descendants: `VmRSS` split into `RssAnon`, the heap and staging buffers, and `RssFile`, a mapped checkpoint and libraries) at a fixed interval, keeps the
@@ -208,6 +210,31 @@ scenario-specific contract checks the requested framework and precision, finite 
 counts, and the requested token workload. A degradation curve must contain every requested ISL exactly once,
 with complete per-iteration samples for the requested OSL. Invalid or partial results become `error` rows
 with bounded runner and observer diagnostics; manifest and runner caveats stay visible.
+
+**Serve throughput** (`serve-throughput` in the manifest, `runners/serve/NOTES.md`). One cell is one engine's server at
+one concurrency (1, 4 or 16): the runner starts the server with as many slots as the concurrency, the one load client sends
+`warmup_requests` untimed and then `requests` timed streaming `/v1/completions`, closed loop (a finished request is replaced
+at once, so exactly `concurrency` are in flight until the last is issued), and the harness aggregates the raw requests.
+
+- **The workload is fixed and checked.** Every request has `prompt_tokens` in (the client sizes the prompt against the
+  server's own token count, and a request the server counted differently fails) and exactly `output_tokens` out (the request
+  sets `ignore_eos`; a request that generated fewer fails). Prompts differ between requests, so no server answers from a
+  prefix cache.
+- **One client times every engine.** TTFT is the first stream chunk that carries text, E2E the last, `tokens` the server's
+  own usage count; TPOT is (E2E - TTFT) / (tokens - 1). The row's `timing_claim` is `client-stream` whatever the engine.
+- **Aggregate throughput** (`output_tok_s`, the cell's headline) is the output tokens of all requests over the wall time from
+  the first request's start to the last one's finish. TTFT, TPOT and E2E are stated as p50 and range, with p90 and p99 from
+  20 requests on (the scenario times 32).
+- **A failure is a failure.** Any failed request (HTTP error, an error event, no usage chunk, the wrong lengths) makes the
+  cell an `error` row naming how many of the requests failed and the first error; no throughput is stated for the requests
+  that happened to succeed. So is a server whose slots are fewer than the concurrency.
+- **The concurrency is part of the cell.** A row states `concurrency`; `cell_key` ends with it, so a compare, the Performance
+  page and the known-unverified list never merge two concurrencies. A serve cell is compared by `output_tok_s` and by the median
+  TTFT and TPOT at its concurrency (`[performance] serve_*` in the manifest), with the same noise-band rules as every cell.
+- **Identity.** A poot row names the server binary's build and, read from `GET /v1/identity` of the running server (the same
+  type the bench runner states them with), the family, the stored precision, adapter, driver, checkpoint digest and compute
+  dtype. An engine without a server to measure (candle, transformers) is an `unsupported` row with the scenario's reason.
+- Not exercised: open-loop arrival at a request rate (Poisson), a latency bound or goodput. See the NOTES for why.
 
 **Identity.** A poot result is attributable to one binary, one device and one checkpoint. The runner states
 the commit it was built from (`build_sha`, `-dirty` when a build input differs from HEAD), the cargo profile
@@ -488,6 +515,9 @@ once a clean baseline curve is committed, a poot-only re-run is a single ~30-40 
 
 ## Per-framework gotchas (full detail in each `runners/<fw>/NOTES.md`)
 
+- **serve-throughput** - poot: `cargo build --release -p poot-serve` (`POOT_BENCH_SERVE_BIN`); vLLM: its OpenAI server from the
+  engine's python, prefix caching off; llama.cpp: `llama-server` (`POOT_BENCH_LLAMA_SERVER_BIN`), `--parallel` slots over one
+  context, prompt cache off. Each cell starts and stops its own server, so a cell's memory is that server's.
 - **poot** - built with `cargo build --release -p poot-bench-runner` (a root-workspace member; GPU kernels are
   generated at runtime). One measure loop serves the `ptx`, `rocm`, `wgpu` and `vulkan` backends (`--backend`), all
   over the driver. Decode-curve contexts are prefilled in one batched

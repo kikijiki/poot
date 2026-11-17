@@ -211,7 +211,7 @@ class LoadMeter:
     """
 
     def __init__(self, root_pid=None, proc_root="/proc", interval_s=SAMPLE_INTERVAL_S, limit=FOREIGN_SHARE_LIMIT,
-                 gpu_limit=FOREIGN_GPU_SHARE_LIMIT, gpu=None):
+                 gpu_limit=FOREIGN_GPU_SHARE_LIMIT, gpu=None, clock=time.monotonic):
         self.root_pid = os.getpid() if root_pid is None else root_pid
         self.proc_root = proc_root
         self.interval_s = interval_s
@@ -228,9 +228,13 @@ class LoadMeter:
         self._stop = threading.Event()
         self._thread = None
         self._clk_tck = os.sysconf("SC_CLK_TCK")
+        self._clock = clock  # a test drives time by passing its own and calling `sample()`
+        self._last = None
+        self._cpus = 0
+        self._seen = set()
 
     def _point(self):
-        return time.monotonic(), snapshot(self.proc_root), gpu_engine_ns(self.proc_root)
+        return self._clock(), snapshot(self.proc_root), gpu_engine_ns(self.proc_root)
 
     def _window(self, last, now, cpus, seen):
         seconds = now[0] - last[0]
@@ -266,17 +270,27 @@ class LoadMeter:
             born["cpu_share_max"] = max(born["cpu_share_max"], use["cpu"])
             born["gpu_share_max"] = max(born["gpu_share_max"], use["gpu"])
 
-    def _run(self, last):
-        cpus = cpu_count(self.proc_root)
-        seen = {(pid, proc.started) for pid, proc in last[1].items()}
-        while cpus and last[1] and not self._stop.wait(self.interval_s):
-            now = self._point()
-            self._window(last, now, cpus, seen)
-            last = now
+    def begin(self):
+        """Take the baseline: the reads every later window is measured against."""
+        self._last = self._point()
+        self._cpus = cpu_count(self.proc_root)
+        self._seen = {(pid, proc.started) for pid, proc in self._last[1].items()}
+
+    def sample(self):
+        """Close one window: the foreign load since the previous point. The sampling thread calls this once per
+        `interval_s`; a test calls it directly, with its own clock."""
+        now = self._point()
+        self._window(self._last, now, self._cpus, self._seen)
+        self._last = now
+
+    def _run(self):
+        while self._cpus and self._last[1] and not self._stop.wait(self.interval_s):
+            self.sample()
 
     def __enter__(self):
         # The baseline is taken before the cell can fork, so no process starts between its two reads.
-        self._thread = threading.Thread(target=self._run, args=(self._point(),), daemon=True)
+        self.begin()
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return self
 

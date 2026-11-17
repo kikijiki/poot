@@ -524,6 +524,10 @@ impl<D: Device> Device for Counting<D> {
     type Recording = D::Recording;
     type Error = D::Error;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        self.inner.memory_topology()
+    }
+
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         self.inner.copy_mechanism()
     }

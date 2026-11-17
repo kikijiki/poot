@@ -43,7 +43,7 @@
 //! (`harness/memory_phases.py`). The result line also carries `memory_classes`: the device bytes the engine itself
 //! allocated, by what the buffers are for (see [`memory_classes`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -53,9 +53,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use serde_json::{json, Value};
 
+use poot_build_identity::BuildIdentity;
 use poot_executor::{DetailedTiming, Executor};
 use poot_llm::driver::capacity::{chunk_candidates, fit_prefill_chunk, Observation};
 use poot_llm::driver::error::DriverError;
+use poot_llm::driver::identity::{resident_precision, RunIdentity};
 use poot_llm::driver::MatmulPrecision;
 use poot_llm::driver::{
     open_executor, open_timed_executor, BackendChoice, Driver, DriverOptions, DriverStats,
@@ -66,21 +68,12 @@ use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::KvDtype;
 use poot_models::registry::Registry;
 use poot_profile::{Ceiling, Fit, GB};
-use poot_quant::weights::{WeightEntry, WeightStore};
+use poot_quant::weights::WeightStore;
 use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 
-/// The git sha this binary was built from (`build.rs`); the harness records it with every result.
-const BUILD_SHA: &str = env!("POOT_BUILD_SHA");
-/// The cargo profile (`release` or `debug`), the runner's enabled features (comma-separated) and the compiler
-/// this binary was built with (`build.rs`); recorded with every result beside the sha.
-const BUILD_PROFILE: &str = env!("POOT_BUILD_PROFILE");
-const BUILD_FEATURES: &str = env!("POOT_BUILD_FEATURES");
-const RUSTC_VERSION: &str = env!("POOT_RUSTC_VERSION");
-
-/// The dtype the engine computes in whatever the weights are stored in: matmuls accumulate in f32 and the
-/// activations are f32. Reported beside the resident weight dtype so a row never reads a stored dtype as a
-/// compute one.
-const COMPUTE_DTYPE: &str = "f32";
+/// The build this binary came from (`build.rs`): the git sha, the cargo profile, the enabled features and the
+/// compiler, recorded with every result. The server states the same four through the same type.
+const BUILD: BuildIdentity = poot_build_identity::build_identity!();
 
 /// The context every decode-curve point cycles to reach its exact length.
 const CURVE_BASE_PHRASE: &str = "The quick brown fox jumps over the lazy dog. ";
@@ -1024,35 +1017,6 @@ fn host_memory_json(memory: Option<poot_executor::HostMemory>) -> Value {
     })
 }
 
-/// A stored weight's dtype as a precision name: the checkpoint dtype of a dense tensor (`bf16`), the format of
-/// a packed one without its parameters (`q8_0`, `e4m3block128`).
-fn stored_name(entry: &WeightEntry) -> String {
-    match entry {
-        WeightEntry::Dense(dense) => dense.dtype().to_string(),
-        WeightEntry::Packed(payload) => {
-            let format = format!("{:?}", payload.weight().format());
-            format
-                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                .next()
-                .unwrap_or_default()
-                .to_lowercase()
-        }
-    }
-}
-
-/// The precision the store holds: the dtype most of its stored bytes are in.
-fn resident_precision(store: &WeightStore) -> anyhow::Result<String> {
-    let mut bytes = BTreeMap::<String, usize>::new();
-    for (_, entry) in store.iter() {
-        *bytes.entry(stored_name(entry)).or_default() += entry.stored_bytes();
-    }
-    bytes
-        .into_iter()
-        .max_by_key(|&(_, stored)| stored)
-        .map(|(name, _)| name)
-        .ok_or_else(|| anyhow::anyhow!("the store holds no weight"))
-}
-
 /// The cell's precision is the store's: a request for another dtype is the caller's mistake, and reporting the
 /// request back would label the measurement with a precision it did not run.
 fn ensure_store_holds(requested: &str, store: &WeightStore) -> anyhow::Result<String> {
@@ -1062,51 +1026,6 @@ fn ensure_store_holds(requested: &str, store: &WeightStore) -> anyhow::Result<St
         "--precision {requested} but the checkpoint's store holds {resident}"
     );
     Ok(resident)
-}
-
-/// A digest of the checkpoint's content as the driver holds it: every weight's name, shape, stored dtype and
-/// stored bytes in key order. Two checkpoints with one name but different weights digest differently. The
-/// bytes are read by positional reads into one bounded buffer, several threads at a time, and hashed across
-/// threads, so the digest maps none of the checkpoint in and a cold file is read at the disk's queue depth.
-fn checkpoint_digest(store: &WeightStore) -> anyhow::Result<String> {
-    /// Bytes hashed per round.
-    const CHUNK: usize = 64 << 20;
-    /// Reader threads per round.
-    const READERS: usize = 8;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; CHUNK];
-    for (key, entry) in store.iter() {
-        hasher.update(key.to_string().as_bytes());
-        hasher.update(format!("{:?}", entry.shape()).as_bytes());
-        hasher.update(stored_name(entry).as_bytes());
-        match entry {
-            WeightEntry::Dense(dense) => {
-                let bytes = dense.bytes();
-                for start in (0..bytes.len()).step_by(CHUNK) {
-                    let end = bytes.len().min(start + CHUNK);
-                    let chunk = &mut buffer[..end - start];
-                    poot_quant::read_split(chunk, start, READERS, |range, part| {
-                        bytes.read_at(range, part)
-                    })?;
-                    hasher.update_rayon(chunk);
-                }
-            }
-            WeightEntry::Packed(payload) => {
-                for role in payload.weight().sources() {
-                    let len = payload.weight().source_bytes(role);
-                    for start in (0..len).step_by(CHUNK) {
-                        let end = len.min(start + CHUNK);
-                        let chunk = &mut buffer[..end - start];
-                        poot_quant::read_split(chunk, start, READERS, |range, part| {
-                            payload.read_verified(role, range, part)
-                        })?;
-                        hasher.update_rayon(chunk);
-                    }
-                }
-            }
-        }
-    }
-    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 /// The first workload a mode measures: the cell opens its driver for it while it opens, so loading the
@@ -1135,7 +1054,6 @@ fn open_driver(
     let handle = Arc::new(handle);
     // Before an executor opens: a request the checkpoint does not hold needs no device.
     let precision = ensure_store_holds(&config.precision, handle.store())?;
-    let checkpoint_digest = checkpoint_digest(handle.store())?;
     let first = first_workload(config, &handle)?;
     let executor = if config.profile {
         open_timed_executor(config.backend, DetailedTiming::default_diagnostic())
@@ -1146,6 +1064,8 @@ fn open_driver(
     let device = executor
         .device_identity()
         .context("the device cannot name its adapter and driver")?;
+    let run = RunIdentity::of(BUILD, family.to_string(), device, handle.store())
+        .context("digest the checkpoint")?;
     let mut cell = DriverCell {
         handle,
         recipe: DriverRecipe {
@@ -1171,9 +1091,7 @@ fn open_driver(
     let resolved = Resolved {
         family: family.to_string(),
         precision,
-        adapter: device.adapter,
-        driver_version: device.driver,
-        checkpoint_digest,
+        run,
         kv_dtype: driver.kv_dtype(),
         matmul_precision: driver.matmul_precision(),
         check_ranges: driver.range_check(),
@@ -1188,9 +1106,8 @@ fn open_driver(
 struct Resolved {
     family: String,
     precision: String,
-    adapter: String,
-    driver_version: String,
-    checkpoint_digest: String,
+    /// The build, device, checkpoint digest and compute dtype the cell ran on ([`RunIdentity`]).
+    run: RunIdentity,
     kv_dtype: KvDtype,
     matmul_precision: MatmulPrecision,
     check_ranges: bool,
@@ -1509,10 +1426,9 @@ fn measure(
         config.mode,
         &resolved.precision,
     );
-    line["compute_dtype"] = json!(COMPUTE_DTYPE);
-    line["adapter"] = json!(resolved.adapter);
-    line["driver_version"] = json!(resolved.driver_version);
-    line["checkpoint_digest"] = json!(resolved.checkpoint_digest);
+    for (name, value) in resolved.run.fields() {
+        line[name] = json!(value);
+    }
     line["prefill_chunk"] = json!(engine.prefill_chunk());
     line["kv_dtype"] = json!(resolved.kv_dtype.as_str());
     line["matmul_precision"] = json!(resolved.matmul_precision.as_str());
@@ -1547,15 +1463,14 @@ fn identity(
 ) -> Value {
     let mut line = json!({
         "framework": "poot",
-        "build_sha": BUILD_SHA,
-        "build_profile": BUILD_PROFILE,
-        "build_features": BUILD_FEATURES,
-        "rustc_version": RUSTC_VERSION,
         "family": family,
         "backend": backend.name(),
         "mode": mode.label(),
         "precision": precision,
     });
+    for (name, value) in BUILD.fields() {
+        line[name] = json!(value);
+    }
     if let Some(engine) = engine {
         line["engine"] = json!(engine.label());
     }
@@ -1934,12 +1849,12 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Invocation::Version => {
-            println!("poot-bench-runner {BUILD_SHA}");
+            println!("poot-bench-runner {}", BUILD.git_sha);
             return Ok(());
         }
         Invocation::Run(config) => config,
     };
-    if let Some(reason) = non_release_build(BUILD_PROFILE, cfg!(debug_assertions)) {
+    if let Some(reason) = non_release_build(BUILD.profile, cfg!(debug_assertions)) {
         anyhow::bail!(reason);
     }
     println!("{}", run(&config)?);
@@ -1980,16 +1895,22 @@ fn stdev(xs: &[f64]) -> f64 {
 
 #[cfg(test)]
 mod stub_cell {
-    use super::Resolved;
+    use super::{Resolved, RunIdentity, BUILD};
 
     /// What a stub engine's cell ran on: a fixed store precision, device and digest.
     pub(super) fn resolved(family: &str) -> Resolved {
         Resolved {
             family: family.to_string(),
             precision: "bf16".to_string(),
-            adapter: "stub adapter".to_string(),
-            driver_version: "stub driver 1.0".to_string(),
-            checkpoint_digest: format!("blake3:{}", "0".repeat(64)),
+            run: RunIdentity {
+                build: BUILD,
+                family: family.to_string(),
+                precision: "bf16".to_string(),
+                adapter: "stub adapter".to_string(),
+                driver_version: "stub driver 1.0".to_string(),
+                checkpoint_digest: format!("blake3:{}", "0".repeat(64)),
+                compute_dtype: poot_llm::driver::identity::COMPUTE_DTYPE,
+            },
             kv_dtype: poot_models::model::KvDtype::DEFAULT,
             matmul_precision: poot_llm::driver::MatmulPrecision::DEFAULT,
             check_ranges: false,
@@ -2411,7 +2332,7 @@ mod tests {
     /// stated as the release one so the rest of the contract is judged. That a debug runner measures nothing is
     /// `only_a_release_build_without_debug_assertions_measures` and `tests/release_only.rs`.
     fn as_release_line(line: &Value) -> Value {
-        assert_eq!(line["build_profile"], BUILD_PROFILE);
+        assert_eq!(line["build_profile"], BUILD.profile);
         let mut release = line.clone();
         release["build_profile"] = json!("release");
         release
@@ -2478,7 +2399,7 @@ mod tests {
             assert!(!text.contains('\n'), "{mode:?}: the result is one line");
             assert_eq!(line["mode"], mode.label());
             assert_eq!(line["framework"], "poot");
-            assert_eq!(line["build_sha"], BUILD_SHA);
+            assert_eq!(line["build_sha"], BUILD.git_sha);
             assert_eq!(line["family"], "stub_family");
             harness_accepts(&line, mode == Mode::DecodeCurve, 6, BackendChoice::Rocm);
         }
@@ -2624,7 +2545,7 @@ mod tests {
             line["reason"]
         );
         assert_eq!(line["backend"], "wgpu");
-        assert_eq!(line["build_sha"], BUILD_SHA);
+        assert_eq!(line["build_sha"], BUILD.git_sha);
 
         stub.error = || anyhow::anyhow!("out of memory");
         let error = result_line(
@@ -2760,20 +2681,31 @@ mod tests {
         );
     }
 
-    /// The checkpoint digest follows the stored bytes: the same store digests the same, a store differing in
-    /// one weight byte does not, and the digest names its algorithm.
+    /// A measured line states every field of the shared run identity with the cell's values, and a refusal
+    /// states the build fields: the names are those the server's identity route answers with. Mutation: skip
+    /// the `run.fields()` loop in `measure`; the device fields are missing and the row goes red.
     #[test]
-    fn the_checkpoint_digest_follows_the_stored_bytes() {
-        use poot_models::test_support::weight_map::{qwen2, Projections, DIMS};
-
-        let bf16 = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::BF16);
-        let f32_embed = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::F32);
-        let again = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::BF16);
-
-        let digest = checkpoint_digest(&bf16.store).unwrap();
-        assert!(digest.starts_with("blake3:") && digest.len() == "blake3:".len() + 64);
-        assert_eq!(digest, checkpoint_digest(&again.store).unwrap());
-        assert_ne!(digest, checkpoint_digest(&f32_embed.store).unwrap());
+    fn a_measured_line_states_the_run_identity() {
+        let single = config(&[
+            "--mode",
+            "single",
+            "--gen-tokens",
+            "4",
+            "--warmup",
+            "0",
+            "--iters",
+            "1",
+        ]);
+        let resolved = resolved("stub_family");
+        let line = measure(&single, &mut Stub::new(), &resolved).unwrap();
+        for (name, value) in resolved.run.fields() {
+            assert_eq!(line[name], value, "the line states {name}");
+        }
+        assert_eq!(line["adapter"], "stub adapter");
+        let refusal = identity(None, None, BackendChoice::Wgpu, Mode::Single, "bf16");
+        for (name, value) in BUILD.fields() {
+            assert_eq!(refusal[name], value, "{name}");
+        }
     }
 
     /// The runner measures release builds only: a debug profile, or debug assertions in a release one, is

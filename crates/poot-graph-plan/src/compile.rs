@@ -190,6 +190,13 @@ pub struct CompileOptions {
     /// columns in the pin's place. `None` leaves the choice to the device's calibrated columns table, and the plan is
     /// the one compiled without the option. Only the final plan reads the pin.
     pub gemv_cols_pin: Option<u32>,
+    /// The launch geometry every packed decode Gemv of the program must run (POOT-1608), for the calibration sweep that
+    /// times one `(cols, rows, run, depth)` of the planner's search space. The planner scores only that geometry: it
+    /// plans that launch, refuses the contraction with the generator's own refusal where the lane's registers do not
+    /// hold it, and plans it as it would without a Gemv where the launch does not fit; it never plans another
+    /// geometry in the pin's place. `None` leaves the choice to the cost model, and the plan is the one
+    /// compiled without the option. Only the final plan reads the pin.
+    pub packed_gemv_pin: Option<crate::PackedGemvPin>,
     /// The one fragment dtype the `select_operand_precision` pass may narrow to, on a device that has several
     /// (the f16 contraction variant of the tier-3 gates on a target with bf16 and f16 units, POOT-1438). The
     /// device keeps every unit; only the pass sees the one, so the program still compiles for the real target.
@@ -236,6 +243,7 @@ impl CompileOptions {
             tiling_pin: None,
             indexed_rows_pin: None,
             gemv_cols_pin: None,
+            packed_gemv_pin: None,
             #[cfg(any(test, feature = "test-support"))]
             fragment_only: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -1168,6 +1176,7 @@ pub fn compile(
             tiling: options.tiling_pin,
             indexed_rows: options.indexed_rows_pin,
             gemv_cols: options.gemv_cols_pin,
+            packed_gemv: options.packed_gemv_pin,
             feedback: options.register_feedback.as_ref(),
         },
         npu,

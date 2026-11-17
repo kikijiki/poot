@@ -25,7 +25,7 @@ import thermal  # noqa: E402
 from result_contract import committed_row_errors  # noqa: E402
 from test_benchmark_compare import BASELINE, repeats  # noqa: E402
 from runner_fixtures import POOT_IDENTITY  # noqa: E402
-from test_host_load import fake_proc  # noqa: E402
+from test_host_load import fake_proc, run_windows  # noqa: E402
 
 
 def write_fdinfo(root, pid, engine_ns, client="7"):
@@ -52,32 +52,22 @@ class PlantedContender(unittest.TestCase):
     """A process that was not there when the repeat started takes the GPU mid-repeat."""
 
     def repeat(self, contender_gpu_ns_per_step, contender_cpu_per_step=0):
+        """Six 100 ms windows; the contender is absent from the first and holds the GPU (and `contender_cpu_per_step`
+        ticks per 20 ms) in each later one. Time is a stepped clock, so no scheduler delay can skip a window."""
         with tempfile.TemporaryDirectory() as tmp:
             me = os.getpid()
             fake_proc(tmp, 0, 4, {me: (0, 1)})
-            stop = threading.Event()
 
-            def burn():
-                time.sleep(0.15)  # starts mid-repeat
-                ns, ticks = 0, 0
-                while not stop.is_set():
-                    ns += contender_gpu_ns_per_step
-                    ticks += contender_cpu_per_step
-                    fake_proc(tmp, 0, 4, {me: (0, 1), 500: (ticks, 1)})
-                    (Path(tmp) / "500" / "stat").write_text(
-                        (Path(tmp) / "500" / "stat").read_text().replace("(x y)", "(obsidian)"))
-                    write_fdinfo(tmp, 500, ns)
-                    time.sleep(0.02)
+            def write(window):
+                if window == 0:
+                    return  # the contender starts mid-repeat: not there for the first window
+                steps = 5 * window  # five 20 ms steps per window, cumulative
+                fake_proc(tmp, 0, 4, {me: (0, 1), 500: (contender_cpu_per_step * steps, 1)})
+                (Path(tmp) / "500" / "stat").write_text(
+                    (Path(tmp) / "500" / "stat").read_text().replace("(x y)", "(obsidian)"))
+                write_fdinfo(tmp, 500, contender_gpu_ns_per_step * steps)
 
-            thread = threading.Thread(target=burn)
-            thread.start()
-            try:
-                with host_load.LoadMeter(proc_root=tmp, interval_s=0.1, gpu=FakeGpu(3, 4, 90)) as meter:
-                    time.sleep(0.7)
-            finally:
-                stop.set()
-                thread.join()
-            return meter.result()
+            return run_windows(tmp, 6, write, gpu=FakeGpu(3, 4, 90)).result()
 
     def test_a_gpu_contender_started_mid_repeat_marks_the_repeat_and_is_named(self):
         # 10 ms of engine time per 20 ms step is half of the device.
@@ -101,23 +91,12 @@ class PlantedContender(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             me = os.getpid()
             fake_proc(tmp, 0, 4, {me: (0, 1)})
-            stop = threading.Event()
 
-            def burn():
-                ns = 0
-                while not stop.is_set():
-                    ns += 15_000_000
-                    write_fdinfo(tmp, me, ns)
-                    time.sleep(0.02)
+            def write(window):
+                write_fdinfo(tmp, me, 75_000_000 * (window + 1))  # the cell's own engine time, every window
 
-            thread = threading.Thread(target=burn)
-            thread.start()
-            try:
-                with host_load.LoadMeter(proc_root=tmp, interval_s=0.1, gpu=FakeGpu(0)) as meter:
-                    time.sleep(0.5)
-            finally:
-                stop.set()
-                thread.join()
+            meter = run_windows(tmp, 5, write, gpu=FakeGpu(0))
+        self.assertEqual(len(meter.gpu_windows), 5)
         self.assertFalse(meter.result()["contended"])
 
     def test_a_cpu_hog_is_named_with_its_cpu_share(self):

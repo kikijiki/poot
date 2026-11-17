@@ -126,10 +126,10 @@
 
         # Environment shared by every devShell that builds the workspace.
         #
-        # Card 395: one Cargo target dir shared across every worktree, so cargo's own file lock serializes
-        # concurrent builds. Card 432: an existing CARGO_TARGET_DIR is respected, so a caller can set one to
-        # isolate a build. The default is not a `poot-cargo` slot dir (see below), so a plain `nix develop`
-        # build is never wiped from under itself.
+        # An existing CARGO_TARGET_DIR is respected (`poot-cargo` sets one per slot, see below); a plain
+        # `nix develop` build with none set uses cargo's own default, `target/` in the worktree, which is removed
+        # with the worktree. The shell used to default to one shared ~/.cache/poot-shell-target that no prune
+        # script reached and that grew to 913 GiB (POOT-1342).
         #
         # Invariant: a shared target dir is only safe with checksum freshness on. Cargo's unit hash for path
         # packages omits the worktree path, so default mtime freshness can reuse an artifact built from
@@ -149,7 +149,6 @@
         #    `flock /tmp/poot-gpu.lock cargo nextest run --test-threads=1 ...`. Nothing in the repository
         #    takes it; .config/nextest.toml serializes device tests within one nextest run only.
         cargoEnv = ''
-          export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$HOME/.cache/poot-shell-target}"
           if [ -z "''${RUSTC_WRAPPER+x}" ] && command -v kache >/dev/null 2>&1; then
             export RUSTC_WRAPPER=kache
           fi

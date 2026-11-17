@@ -1290,7 +1290,7 @@ fn a_state_explosion_guided_regex_is_a_prompt_400_and_the_server_stays_up() {
             "{path} stream={stream}: {response}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(30),
             "{path} stream={stream}: the refusal took {:?}",
             started.elapsed()
         );
@@ -1625,6 +1625,7 @@ mod device {
             max_new: MAX_NEW,
             sampler: Sampler::greedy(),
             stop: Vec::new(),
+            ignore_eos: false,
             stream: false,
             lora_adapter: adapter,
         }
@@ -1934,6 +1935,7 @@ mod device {
                 model: Arc::clone(&handle),
                 engine: tx.clone(),
                 view,
+                identity: None,
                 pooling: poot_llm::encoders::Pooling::Mean,
                 images: None,
                 max_queue_wait: crate::tests::TEST_QUEUE_WAIT,

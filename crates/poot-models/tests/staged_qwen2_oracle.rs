@@ -234,6 +234,7 @@ fn a_qwen2_pipeline_on_two_ptx_devices_places_each_layers_weights_on_its_stage()
                 backend: Backend::Nvptx,
                 caps,
             },
+            poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Local),
         )
     };
     let targets = TargetSet::new(vec![ptx(0), ptx(1)]).expect("distinct devices");

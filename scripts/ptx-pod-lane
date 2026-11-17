@@ -103,24 +103,30 @@ if [ -n "$models" ]; then
   grep -v '^#' "$models" > "$work/models.tsv"
 fi
 
+# The lane archive, the toolchain closure and nextest are the device lane's, the checkpoint rows' and the two-GPU lane's;
+# a run that only calibrates or measures a bank case ships none of them (the upload runs at about 3 MB/s).
+need_archive=
+patch_elf() { # stock loader, no nix rpath, no debug info (the upload runs at about 3 MB/s)
+  head -c4 "$1" | grep -q ELF || return 0
+  strip --strip-debug "$1" 2>/dev/null || true
+  patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath "$1" 2>/dev/null || patchelf --remove-rpath "$1"
+}
+[ -n "$device_lane$two_gpu$models" ] && need_archive=1
 exec 8>>/tmp/poot-heavy.lock; flock 8
+if [ -n "$need_archive" ]; then
 # 2. the archive. RUSTC_WRAPPER is cleared: a compile cache must not bake its paths into the binaries.
 RUSTC_WRAPPER= cargo nextest archive --lib --bins --tests \
   -p poot-ptx-device -p poot-ptx-runtime -p poot-kernelgen -p pootc -p poot-llm -p poot-serve \
   --archive-file "$work/archive.tar.zst"
 mkdir "$work/ex"; tar -C "$work/ex" --zstd -xf "$work/archive.tar.zst"; rm "$work/archive.tar.zst"
 chmod -R u+w "$work/ex"
-patch_elf() { # stock loader, no nix rpath, no debug info (the upload runs at about 3 MB/s)
-  head -c4 "$1" | grep -q ELF || return 0
-  strip --strip-debug "$1" 2>/dev/null || true
-  patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath "$1" 2>/dev/null || patchelf --remove-rpath "$1"
-}
 while IFS= read -r f; do patch_elf "$f"; done < <(find "$work/ex/target" -type f \( -perm -u+x -o -name '*.so' \))
 tar -C "$work/ex" -cf - target | zstd -T0 -12 -q -o "$work/archive.tar.zst"
 rm -rf "$work/ex"
 
 # 2b. the patched wgpu-hal the workspace builds against (patches/wgpu-hal/README.md)
 "$(dirname "$0")/wgpu-hal-patched.sh"
+fi
 
 # 3. the bank example
 if [ ${#bank_cases[@]} -gt 0 ]; then
@@ -144,9 +150,11 @@ if [ -n "$calibrate" ]; then
 fi
 
 # 4. the toolchain closure, at its own store paths
-rust=$(dirname "$(dirname "$(readlink -f "$(command -v rustc)")")")
-nix-store -qR "$rust" | sed 's|^/||' | tar -C / -czf "$work/toolchain.tar.gz" -T -
-echo "$rust" > "$work/rust-path"
+if [ -n "$need_archive" ]; then
+  rust=$(dirname "$(dirname "$(readlink -f "$(command -v rustc)")")")
+  nix-store -qR "$rust" | sed 's|^/||' | tar -C / -czf "$work/toolchain.tar.gz" -T -
+  echo "$rust" > "$work/rust-path"
+fi
 
 flock -u 8
 # 5. the pod
@@ -160,16 +168,18 @@ echo "$passes" > "$work/bank-passes"
 # the source tree plus the untracked patched wgpu-hal (step 2b): the Cargo.toml [patch] path must resolve on the pod
 # too, where `pootc::import_run` runs cargo over the workspace
 git archive HEAD --format=tar -o "$work/src.tar"
-tar -rf "$work/src.tar" .patched
+[ -n "$need_archive" ] && tar -rf "$work/src.tar" .patched
 gzip -f "$work/src.tar"
-# the pod needs a prebuilt nextest for the stock glibc (the devshell's is a nix binary)
-curl -sfL https://get.nexte.st/latest/linux | tar -C "$work" -xzf -
-nextest_bin=$work/cargo-nextest
-uploads=(--upload "$work/archive.tar.zst:/root/archive.tar.zst" --upload "$work/toolchain.tar.gz:/root/toolchain.tar.gz"
-  --upload "$work/rust-path:/root/rust-path" --upload "$work/selection.txt:/root/selection.txt"
+uploads=(--upload "$work/selection.txt:/root/selection.txt"
   --upload "$work/bank-cases.txt:/root/bank-cases.txt" --upload "$work/bank-passes:/root/bank-passes"
-  --upload "$work/src.tar.gz:/root/src.tar.gz" --upload "$nextest_bin:/root/cargo-nextest"
+  --upload "$work/src.tar.gz:/root/src.tar.gz"
   --upload scripts/ptx-pod-lane-remote.sh:/root/ptx-pod-lane-remote.sh ${uploads_two_gpu[@]+"${uploads_two_gpu[@]}"})
+if [ -n "$need_archive" ]; then
+  # the pod needs a prebuilt nextest for the stock glibc (the devshell's is a nix binary)
+  curl -sfL https://get.nexte.st/latest/linux | tar -C "$work" -xzf -
+  uploads+=(--upload "$work/archive.tar.zst:/root/archive.tar.zst" --upload "$work/toolchain.tar.gz:/root/toolchain.tar.gz"
+    --upload "$work/rust-path:/root/rust-path" --upload "$work/cargo-nextest:/root/cargo-nextest")
+fi
 [ ${#bank_cases[@]} -gt 0 ] && uploads+=(--upload "$work/performance_bank:/root/performance_bank")
 if [ -n "$models" ]; then
   printf '%s\n' "$checkpoint_filter" > "$work/checkpoint-filter.txt"

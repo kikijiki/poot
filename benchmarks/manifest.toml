@@ -53,6 +53,22 @@ isl = [128, 2048, 8192]         # context lengths to sweep (cap per the model wi
 osl = 128                       # decode tokens timed at each ISL (per-token TPOT/ITL -> window-independent)
 synthetic = true                # exactly-ISL random in-vocab tokens: tokenizer-neutral + defeats prefix cache
 
+# serve-throughput (POOT-1334): a server of each engine under streaming requests at fixed concurrency. Each concurrency is
+# its own cell (`bench.cells` yields one per level; a row states its `concurrency`): `requests` timed requests of exactly
+# `prompt_tokens` in and `output_tokens` out, issued closed-loop (a finished request is replaced at once, so `concurrency`
+# are in flight until the last is issued), after `warmup_requests` untimed ones at the same concurrency. The load client
+# is the same for every engine (benchmarks/runners/serve), so TTFT and TPOT are measured one way. An engine whose
+# server cannot take part is `unsupported`, with the reason, under `unsupported`.
+[[scenario]]
+id = "serve-throughput"
+kind = "serve"
+concurrencies = [1, 4, 16]
+prompt_tokens = 128
+output_tokens = 128
+warmup_requests = 8
+requests = 32
+unsupported = { candle = "candle has no server: its runner is a single-stream binary", transformers = "transformers has no server that batches concurrent requests: its runner is single-stream (Hugging Face text-generation-inference is a different engine)" }
+
 # The large rows (27B, Flash-Next) sweep two contexts: a poot wgpu 27B repeat already takes ~37 min.
 [[scenario]]
 id = "decode-curve-large"
@@ -80,6 +96,10 @@ min_trials = 5
 max_trials = 15
 headline_metric = "decode_tok_s"
 curve_point_metrics = ["tpot_ms", "ttft_ms"]
+# A serve cell (one concurrency of a server under streaming requests) is compared by the aggregate output tokens per
+# second, and by the median TTFT and TPOT of its requests at that concurrency.
+serve_headline_metric = "output_tok_s"
+serve_latency_metrics = ["ttft_ms", "tpot_ms"]
 
 [performance.metrics.ttft_ms]
 direction = "lower"
@@ -102,6 +122,12 @@ practical_threshold = 0.20
 max_uncertainty = 0.10
 
 [performance.metrics.decode_tok_s]
+direction = "higher"
+practical_threshold = 0.20
+max_uncertainty = 0.10
+
+# Output tokens per second summed over every request of a serve cell, over the cell's whole wall time.
+[performance.metrics.output_tok_s]
 direction = "higher"
 practical_threshold = 0.20
 max_uncertainty = 0.10

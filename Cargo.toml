@@ -17,6 +17,7 @@ members = [
     "crates/poot-kernel-ir",
     "crates/poot-codegen",
     "crates/poot-profile",
+    "crates/poot-build-identity",
     "crates/poot-test-util",
     "crates/poot-quant",
     "crates/poot-weights",
@@ -49,6 +50,13 @@ members = [
 # `[profile.dev.package.<crate>] debug = 2` entry.
 [profile.dev]
 debug = "line-tables-only"
+
+# Third-party dependencies carry no debug info: a test or example executable links the whole dependency graph, and
+# their line tables were a quarter to a half of each one (POOT-1342: poot-llm's error_sizes 93 -> 52 MB, capacity
+# 129 -> 88 MB, coherence 168 -> 127 MB). The workspace's own crates keep `line-tables-only`, so a panic or a
+# backtrace through poot code still shows file:line; `"*"` does not match workspace members.
+[profile.dev.package."*"]
+debug = false
 
 # The CPU oracle runs real checkpoints in the checkpoint lanes (a 3.8B model's prefill is trillions of scalar
 # multiply-adds), and at opt-level 0 each is a function call. Optimization does not change a float result
@@ -125,6 +133,7 @@ poot-models = { path = "crates/poot-models" }
 poot-kernel-ir = { path = "crates/poot-kernel-ir" }
 poot-codegen = { path = "crates/poot-codegen" }
 poot-profile = { path = "crates/poot-profile" }
+poot-build-identity = { path = "crates/poot-build-identity" }
 poot-quant = { path = "crates/poot-quant" }
 poot-weights = { path = "crates/poot-weights" }
 poot-target = { path = "crates/poot-target" }

@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use poot_llm::driver::error::FailureClass;
+use poot_llm::driver::identity::RunIdentity;
 use poot_llm::driver::{AdapterRef, DriverCaps, Encoded, ModelHandle};
 use poot_llm::encoders::Pooling;
 use poot_llm::{Sampler, TokenLogprob};
@@ -50,6 +51,10 @@ pub(crate) struct Job {
     /// stop sequences: the loop ends a request as soon as its generated text contains one, and the text
     /// it returns stops before the match.
     pub(crate) stop: Vec<String>,
+    /// The request asked to ignore the model's end-of-sequence tokens (vLLM's `ignore_eos`): the request
+    /// ends only at `max_new`, an end-of-sequence token is an ordinary generated token, and the request
+    /// carries no stop string (the HTTP layer refuses one).
+    pub(crate) ignore_eos: bool,
     /// stream token pieces as generated (SSE) vs only the final completion.
     pub(crate) stream: bool,
     pub(crate) reply: ChoiceReply,
@@ -253,6 +258,9 @@ pub(crate) struct Served {
     pub(crate) model: Arc<ModelHandle>,
     pub(crate) engine: Sender<EngineMsg>,
     pub(crate) view: EngineView,
+    /// What the server runs on: its build, device, checkpoint digest and compute dtype, read once at startup
+    /// and never changed. `None` for a placement over several devices, which has no single one.
+    pub(crate) identity: Option<RunIdentity>,
     /// How a sentence vector is pooled from hidden states, as the checkpoint declares.
     pub(crate) pooling: Pooling,
     /// The image front end of a vision-language checkpoint; `None` serves text only.

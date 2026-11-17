@@ -1282,6 +1282,22 @@ pub enum IndexedRows {
     Grouped,
 }
 
+/// The launch geometry a packed decode Gemv must run (POOT-1608), for the calibration sweep that times one
+/// `(cols, rows, run, depth)` of the planner's own search space. The planner scores only the geometry equal to the pin:
+/// it plans that launch, refuses the contraction with the generator's own refusal where the lane's registers do not
+/// hold it, and plans the contraction as it would without a Gemv where the launch does not fit the workgroup limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedGemvPin {
+    /// The columns per workgroup.
+    pub cols: u32,
+    /// The adjacent output rows a lane accumulates over one activation read.
+    pub rows: u32,
+    /// The lane's run of `K` elements per trip.
+    pub run: u32,
+    /// The trips of weight loads a lane keeps in flight.
+    pub depth: u32,
+}
+
 /// The launch an `IndexedMatMul` of `m` rows and `n` columns would run as a [`kg::Schedule::Gemv`] on every backend,
 /// or `None` when its launch would not fit the device's X grid even at one lane per column. The launch policy is the
 /// dense Gemv's ([`gemv_launch`]) over the `m * n` outputs, widened to fit the grid ([`widened_to_fit_grid`]).

@@ -29,6 +29,14 @@ cmd = ["{bin}", "--model-dir", "{model_dir}", "--prompt-file", "{prompt_file}",
        "--gen-tokens", "{gen_tokens}", "--warmup", "{warmup}", "--iters", "{iters}",
        "--precision", "{precision}", "--backend", "{backend}", "--prefill", "--json"]
 needs_gpu = true
+# A serve cell (scenario kind "serve") measures the engine's server through the one load client, not this runner:
+# the server binary is built from crates/poot-serve (`cargo build --release -p poot-serve`).
+serve_bin_env = "POOT_BENCH_SERVE_BIN"
+serve_bin = "poot-serve"
+serve_cmd = ["python3", "{bench_root}/runners/serve/run.py", "--framework", "poot", "--server-bin", "{serve_bin}",
+             "--model-dir", "{model_dir}", "--precision", "{precision}", "--backend", "{backend}",
+             "--concurrency", "{concurrency}", "--prompt-tokens", "{prompt_tokens}", "--output-tokens", "{output_tokens}",
+             "--warmup-requests", "{warmup_requests}", "--requests", "{requests}"]
 
 [candle]
 # Built from runners/candle/ (cargo build --release --features cuda). See setup/.
@@ -56,6 +64,11 @@ cmd = ["{bin}", "{bench_root}/runners/vllm/run.py", "--model-dir", "{model_dir}"
        "--prompt-file", "{prompt_file}", "--gen-tokens", "{gen_tokens}", "--warmup", "{warmup}",
        "--iters", "{iters}", "--precision", "{precision}", "--image", "{image}"]
 needs_gpu = true
+# vLLM's OpenAI server, started by the same python that runs the engine; the load client is stdlib.
+serve_cmd = ["{bin}", "{bench_root}/runners/serve/run.py", "--framework", "vllm", "--server-bin", "{bin}",
+             "--model-dir", "{model_dir}", "--precision", "{precision}",
+             "--concurrency", "{concurrency}", "--prompt-tokens", "{prompt_tokens}", "--output-tokens", "{output_tokens}",
+             "--warmup-requests", "{warmup_requests}", "--requests", "{requests}"]
 
 [llamacpp]
 # Python wrapper that drives the built llama-bench / llama-cli binaries (paths via env, see the runner).
@@ -66,3 +79,9 @@ cmd = ["{bin}", "{bench_root}/runners/llamacpp/run.py", "--gguf", "{model_dir}",
        "--prompt-file", "{prompt_file}", "--gen-tokens", "{gen_tokens}", "--iters", "{iters}",
        "--warmup", "{warmup}", "--precision", "{precision}"]
 needs_gpu = true
+serve_bin_env = "POOT_BENCH_LLAMA_SERVER_BIN"
+serve_bin = "llama-server"
+serve_cmd = ["{bin}", "{bench_root}/runners/serve/run.py", "--framework", "llamacpp", "--server-bin", "{serve_bin}",
+             "--model-dir", "{model_dir}", "--precision", "{precision}",
+             "--concurrency", "{concurrency}", "--prompt-tokens", "{prompt_tokens}", "--output-tokens", "{output_tokens}",
+             "--warmup-requests", "{warmup_requests}", "--requests", "{requests}"]

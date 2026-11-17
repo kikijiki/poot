@@ -38,6 +38,10 @@ tracing-subscriber = { workspace = true, optional = true }
 poot-graph-plan.workspace = true
 # The checkpoint's weights as stored (ADR-0103): a `poot_quant::weights::WeightStore`, never a widened f32 decode.
 poot-quant.workspace = true
+# The build a run states itself with (`driver::identity`).
+poot-build-identity.workspace = true
+# `driver::identity::checkpoint_digest`.
+blake3 = { workspace = true, features = ["rayon"] }
 poot-weights.workspace = true
 # The backend-neutral executor contract the driver runs on.
 poot-executor.workspace = true

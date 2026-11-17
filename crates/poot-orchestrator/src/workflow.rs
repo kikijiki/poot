@@ -227,7 +227,7 @@ pub(crate) fn expand_tilde(p: &str) -> String {
 /// shape for a split-identity bug like this. `CARGO_MANIFEST_DIR` the runtime env var is set by `cargo run`,
 /// but not by a bare invocation of the built binary, so depending on it would just trade one silent-wrong
 /// failure mode for a silent-missing one. `git rev-parse` reflects where the *process* actually runs from
-/// (the same technique `cmd_exec`'s sha lookup and `benchmarks/runners/poot/build.rs` already use), and a
+/// (the same technique `cmd_exec`'s sha lookup and `poot-build-identity`'s build script already use), and a
 /// checkout not found is a typed error - no caller may silently fall back to a baked or relative path.
 pub(crate) fn repo_root() -> Result<PathBuf> {
     let root = sh(

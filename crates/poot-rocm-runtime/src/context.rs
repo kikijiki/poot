@@ -10,6 +10,7 @@ use crate::owner::HsaRuntimeOwner;
 use crate::queue::{QueueLayout, QueueRingProvenance, QueueRole, take_queue_reference};
 use crate::{DeviceFault, RocmError, bindings, ffi, publication};
 use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot};
+use poot_target::MemoryDomain;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -31,23 +32,35 @@ pub enum UploadStrategy {
     Dma,
 }
 
-/// Decide the [`UploadStrategy`] for a pool from its `HSA_AMD_MEMORY_POOL_INFO_LOCATION` and
-/// `HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS`. Pure function of the two u32s, so it is unit-checkable
-/// without an HSA context (see `tests::upload_strategy_*`).
+/// The [`MemoryDomain`] of the HSA pool a context allocates from, read from its
+/// `HSA_AMD_MEMORY_POOL_INFO_LOCATION` and `HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS`. Pure function of the two
+/// u32s, so it is unit-checkable without an HSA context (see `tests::memory_domain_*`).
 ///
-/// A pool is host-visible (safe for a raw CPU pointer write) iff it is CPU-located or carries
-/// `EXTENDED_SCOPE_FINE_GRAINED`, AMD's signal that a GPU-local pool's fine-grained coherency extends
-/// to host scope (the aliased view of Strix Halo's unified-memory carveout; see `RocmContext::new`'s
-/// doc on the coarse/fine-alias pair). Plain `FINE_GRAINED` on a GPU-located pool only guarantees
-/// device coherency and does not imply the pointer is valid in the host address space: CDNA's
-/// coherent multi-GPU fabric can mark VRAM `FINE_GRAINED` without it being host-mappable.
-pub(crate) fn upload_strategy_for_pool(location: u32, flags: u32) -> UploadStrategy {
+/// A pool is [`MemoryDomain::Host`] (memory the host addresses, safe for a raw CPU pointer write) iff it is
+/// CPU-located or carries `EXTENDED_SCOPE_FINE_GRAINED`, AMD's signal that a GPU-local pool's fine-grained
+/// coherency extends to host scope (the aliased view of Strix Halo's unified-memory carveout; see
+/// `RocmContext::new`'s doc on the coarse/fine-alias pair). Plain `FINE_GRAINED` on a GPU-located pool only
+/// guarantees device coherency and does not imply the pointer is valid in the host address space: CDNA's
+/// coherent multi-GPU fabric can mark VRAM `FINE_GRAINED` without it being host-mappable, so it is
+/// [`MemoryDomain::Local`].
+pub(crate) fn memory_domain_for_pool(location: u32, flags: u32) -> MemoryDomain {
     let host_visible = location == HSA_AMD_MEMORY_POOL_LOCATION_CPU
         || flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED != 0;
     if host_visible {
-        UploadStrategy::HostWrite
+        MemoryDomain::Host
     } else {
-        UploadStrategy::Dma
+        MemoryDomain::Local
+    }
+}
+
+impl UploadStrategy {
+    /// How a transfer reaches a pool in `domain`: a host write into host memory, a DMA copy into a device's
+    /// own memory.
+    pub(crate) fn of(domain: MemoryDomain) -> Self {
+        match domain {
+            MemoryDomain::Host => UploadStrategy::HostWrite,
+            MemoryDomain::Local => UploadStrategy::Dma,
+        }
     }
 }
 
@@ -72,7 +85,7 @@ pub(crate) fn upload_strategy_for_pool(location: u32, flags: u32) -> UploadStrat
 ///
 /// ```compile_fail,E0616
 /// fn forge(ctx: &mut poot_rocm_runtime::RocmContext) {
-///     ctx.upload_strategy = poot_rocm_runtime::UploadStrategy::HostWrite;
+///     ctx.memory_domain = poot_target::MemoryDomain::Host;
 /// }
 /// ```
 ///
@@ -124,11 +137,11 @@ pub struct RocmContext {
     /// [`RocmContext::download_bytes_role_aware`]), never a raw host pointer write, regardless of what
     /// this pool's own location/flags report (the gfx1151 host-mappability risk the card names).
     pub(crate) coarse_pool: hsa_amd_memory_pool_t,
-    /// Card 125 (FR-004/SC-004): the [`UploadStrategy`] for `fine_pool`, decided once at construction
-    /// from its location + flags. Gates every host<->device transfer (`allocate_f32`'s zero-init,
-    /// `upload_f32`/`upload_i32`/`upload_bytes_batch`, `download_f32`) between a raw pointer write and
-    /// `hsa_amd_memory_async_copy` DMA.
-    pub(crate) upload_strategy: UploadStrategy,
+    /// The [`MemoryDomain`] of `fine_pool`, decided once at construction from its location + flags
+    /// ([`memory_domain_for_pool`]). It is the device's reported memory domain, and [`UploadStrategy::of`] it
+    /// gates every host<->device transfer (`allocate_f32`'s zero-init, `upload_f32`/`upload_i32`/
+    /// `upload_bytes_batch`, `download_f32`) between a raw pointer write and `hsa_amd_memory_async_copy` DMA.
+    pub(crate) memory_domain: MemoryDomain,
     /// The single queue acquired for this context's immutable role. Destroyed (or leaked when
     /// poisoned) by `Drop`.
     pub(crate) queue: *mut hsa_queue_t,

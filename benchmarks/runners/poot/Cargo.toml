@@ -21,6 +21,7 @@ name = "poot-score"
 path = "src/bin/score.rs"
 
 [dependencies]
+poot-build-identity.workspace = true
 poot-llm.workspace = true
 poot-executor.workspace = true
 poot-models.workspace = true
@@ -28,9 +29,11 @@ poot-profile.workspace = true
 poot-quant.workspace = true
 poot-runtime-common.workspace = true
 anyhow.workspace = true
-blake3 = { workspace = true, features = ["rayon"] }
 serde_json.workspace = true
 tracing-subscriber.workspace = true
+
+[build-dependencies]
+poot-build-identity.workspace = true
 
 [dev-dependencies]
 poot-models = { workspace = true, features = ["test-support"] }

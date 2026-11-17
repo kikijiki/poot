@@ -136,7 +136,7 @@ fn tensor_parallel(devices: Vec<PtxDevice>, mapped: &MappedModel) -> Group {
     let set = TargetSet::new(
         ids.iter()
             .zip(&devices)
-            .map(|(&id, device)| (id, device.target()))
+            .map(|(&id, device)| (id, device.target(), device.memory_topology()))
             .collect(),
     )
     .unwrap();

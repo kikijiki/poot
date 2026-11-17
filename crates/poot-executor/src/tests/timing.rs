@@ -74,6 +74,10 @@ impl Device for FakeDevice {
     type Recording = ();
     type Error = FakeError;
 
+    fn memory_topology(&self) -> poot_target::MemoryTopology {
+        poot_target::MemoryTopology::unmeasured(poot_target::MemoryDomain::Host)
+    }
+
     fn copy_mechanism(&mut self) -> crate::CopyMechanism<'_, Self::Error> {
         crate::CopyMechanism::Native
     }
