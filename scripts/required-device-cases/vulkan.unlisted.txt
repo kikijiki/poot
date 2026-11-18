@@ -35,6 +35,5 @@ poot-vulkan-runtime	tests::recorded_graph_directly_retains_owner_and_replays_aft
 poot-vulkan-runtime	tests::recorded_graph_retains_buffers_and_pipelines_after_context_drop	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::submit_lost_to_device_loss_poisons	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::submit_refused_for_memory_is_retired_not_poisoned	raw Vulkan runtime row; selected by package so none goes unrun
-poot-vulkan-runtime	tests::vulkan_context_open_is_required_by_its_own_variable_only	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::zero_size_buffer_is_refused_before_the_driver_call	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime::run_add	square_runs_on_gpu_via_raw_vulkan	raw Vulkan add dispatch under the validation layer; selected by package so none goes unrun

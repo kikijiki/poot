@@ -134,14 +134,11 @@ mod pending_fault_tests {
             body.has_trap(),
             "assert_trap's data[idx[i]] bounds check must compile to a real Trap"
         );
-        let ctx = match Context::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "POOT-SKIP dispatch_dev_fault_surfaces_at_the_next_download: no GPU ({e})"
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            Context::new(),
+        ) else {
+            return;
         };
 
         // Green: every idx in range.
@@ -207,14 +204,11 @@ mod pending_fault_tests {
     fn submit_cached_error_word_is_rezeroed_and_rechecked_every_step() {
         let (spv, body) = compile_assert_trap_spirv();
         assert!(body.has_trap());
-        let ctx = match Context::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "POOT-SKIP submit_cached_error_word_is_rezeroed_and_rechecked_every_step: no GPU ({e})"
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            Context::new(),
+        ) else {
+            return;
         };
 
         // Rewritten in place between steps (`Context::write_u32`), so it needs `upload_u32_writable`
@@ -315,14 +309,11 @@ mod pending_fault_tests {
     fn warm_decode_staging_allocation_increments_the_memory_service_independent_of_alloc_f32() {
         let (spv, body) = compile_assert_trap_spirv();
         assert!(body.has_trap());
-        let ctx = match Context::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "POOT-SKIP warm_decode_staging_allocation_increments_the_memory_service_independent_of_alloc_f32: no GPU ({e})"
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            Context::new(),
+        ) else {
+            return;
         };
         let idx = ctx.upload_u32_writable(&[3u32, 0, 2, 1]);
         let data = ctx.upload_f32(&[10.0f32, 20.0, 30.0, 40.0]);
@@ -743,31 +734,6 @@ mod no_contract_tests {
              hardware/driver stopped contracting by default (re-check the marked test still adds value) or \
              `fma_sensitive_rows` needs revisiting"
         );
-    }
-}
-
-mod require_backend_tests {
-
-    use crate::require::require_gpu_check_with;
-    #[test]
-    fn wgpu_context_open_is_required_by_its_own_variable_only() {
-        use poot_runtime_common::DeviceBackend;
-        let fails_open = |variable: &'static str| {
-            std::panic::catch_unwind(|| {
-                require_gpu_check_with(|name| (name == variable).then(|| "1".into()), "no device")
-            })
-            .is_err()
-        };
-        assert!(fails_open(DeviceBackend::Wgpu.variable()));
-        for other in DeviceBackend::ALL
-            .into_iter()
-            .filter(|other| *other != DeviceBackend::Wgpu)
-        {
-            assert!(
-                !fails_open(other.variable()),
-                "{other:?} must not require Wgpu"
-            );
-        }
     }
 }
 
@@ -1201,6 +1167,7 @@ mod device_timing_tests {
             DeviceBackend::Wgpu,
             Context::new_with_options(crate::ContextOptions {
                 wait_timeout: bound,
+                ..crate::ContextOptions::default()
             }),
         ) else {
             return;

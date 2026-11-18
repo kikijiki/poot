@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [features]
 # ADR-0113: the host upload and download entry points (`upload_f16`, `download_i32`) that other crates'
@@ -26,6 +27,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
+# `device_skip`: a device test that finds no device skips, or fails when the lane requires the backend.
+poot-runtime-common = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

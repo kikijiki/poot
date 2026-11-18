@@ -17,6 +17,7 @@ use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
 
 fn main() -> anyhow::Result<()> {
+    poot_llm::driver::report_launch_environment(|name| std::env::var(name).ok());
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         eprintln!("usage: gguf_generate <model.gguf> [prompt]");

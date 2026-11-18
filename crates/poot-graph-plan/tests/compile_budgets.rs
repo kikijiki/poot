@@ -235,40 +235,6 @@ fn a_pass_sized_ahead_of_time_is_refused_before_it_runs() {
     compile(&g, &wgpu(), &options(graph_limits(1 << 20, 3))).expect("room for the lowered reduce");
 }
 
-/// The dtype widening is sized the same way: a matmul can gain a cast per operand, so a one-equation
-/// graph needs room for three whether or not both operands end up widened. Here only the BF16 weight is
-/// cast, which is why the refusal at two is the conservative bound and not the exact growth. Mutation:
-/// skip the `reserve` call; the pass runs, the graph (two equations) fits the cap, and compile succeeds
-/// instead of refusing.
-#[test]
-fn the_dtype_widening_is_sized_before_it_runs() {
-    let b = Builder::for_tests();
-    let x = b.constant("x", TensorType::f32(vec![3, 5])).unwrap();
-    let w = b.constant("w", TensorType::f32(vec![5, 4])).unwrap();
-    let out = b.matmul(x, w).unwrap();
-    let g = poot_graph_ir::test_support::graph_fixtures::derive(&b.finish(out).unwrap(), |draft| {
-        draft.values_mut()[w.id()].aval.dtype = poot_tensor::DType::BF16;
-    })
-    .unwrap();
-    assert_eq!(g.eqns().len(), 1);
-
-    let refusal = expansion(
-        compile(&g, &wgpu(), &options(graph_limits(1 << 20, 2))),
-        "compile",
-    );
-    assert_eq!(
-        refusal,
-        ExpansionError {
-            stage: "widen_mismatched_matmul_dtypes",
-            resource: GraphResource::Eqns,
-            held: 1,
-            attempted: 3,
-            limit: 2,
-        }
-    );
-    compile(&g, &wgpu(), &options(graph_limits(1 << 20, 3))).expect("room for both casts");
-}
-
 /// `exp(x * s) + b` repeated: a float pointwise chain `fuse` turns into one fused region of `depth * 2`
 /// steps.
 fn pointwise_chain(depth: usize) -> Graph {

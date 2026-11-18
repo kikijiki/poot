@@ -56,7 +56,7 @@
 //! }
 //! ```
 
-#![deny(clippy::undocumented_unsafe_blocks)]
+#![expect(unsafe_code, reason = "raw CUDA driver FFI and device memory")]
 
 mod buffer;
 mod compiler_probe;

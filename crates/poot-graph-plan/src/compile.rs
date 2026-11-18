@@ -21,7 +21,6 @@
 use crate::buffer_plan::plan_buffers;
 use crate::dtype_widen::{
     fold_dense_bf16_row_gathers, fold_dense_contractions, lower_nonlast_reduces,
-    widen_mismatched_matmul_dtypes,
 };
 use crate::graph_validation::ValidationPacketPlan;
 use crate::npu::{NpuHandle, NpuLowering, NpuRegionRefusal, NpuTarget};
@@ -34,7 +33,7 @@ use crate::types::{DispatchPlanError, ScratchDecl};
 use crate::types::{GraphStorage, ValueStorage};
 #[cfg(feature = "test-support")]
 use crate::{Binding, DispatchPlan};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use poot_graph_ir::analysis::{
@@ -144,6 +143,80 @@ impl Target {
                 limits: caps.region,
             },
             Target::Npu(NpuTarget::Vpu { .. }) => ArtifactGranularity::Graph,
+        }
+    }
+}
+
+/// A rewrite of the pass pipeline whose very existence depends on what the target lowers (POOT-1624): it
+/// fits the graph to a device's limits, or rewrites it into a form only a kernel target plans. The pipeline
+/// runs it only where [`Target::lowers`] answers, so a target that lowers none of them (an NPU) neither runs
+/// nor reverts them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Rewrite {
+    /// `legalize`: split or hoist what exceeds the device's grid, workgroup and buffer limits.
+    FitToLimits,
+    /// `select_operand_precision` (and the range detector): narrow operands into the device's matrix units.
+    SelectOperandPrecision,
+    /// `group_expert_rows`: block-align an indexed contraction's rows by expert for a tiling target.
+    GroupExpertRows,
+    /// `fuse_contraction_epilogues`: fold a pointwise tail into the contraction head the generator carries.
+    FuseContractionEpilogues,
+    /// `fuse_index_casts`: fold an index cast into the kernel step that reads or writes the word.
+    FuseIndexCasts,
+    /// `store_narrowed_activations`: store a narrow-read value narrow, rounded by the region that computes it.
+    StoreNarrowedActivations,
+    /// The check that no constant a pass reverted back exceeds the device's single-buffer limit.
+    RecheckConstants,
+}
+
+/// What a kernel target hands a rewrite it lowers: the lowering backend and the limits its device measured.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KernelLowering<'t> {
+    pub(crate) backend: Backend,
+    pub(crate) caps: &'t DeviceCaps,
+}
+
+impl Target {
+    /// What this target lowers of `rewrite`: the backend and limits it reads, or `None` when the target does
+    /// not lower that rewrite. The one declaration of the pass list's target dependence, exhaustive in both
+    /// the target and the rewrite so a new target or a new rewrite must decide.
+    pub(crate) fn lowers(&self, rewrite: Rewrite) -> Option<KernelLowering<'_>> {
+        match (self, rewrite) {
+            (
+                Target::Gpu { backend, caps },
+                Rewrite::FitToLimits
+                | Rewrite::SelectOperandPrecision
+                | Rewrite::GroupExpertRows
+                | Rewrite::FuseContractionEpilogues
+                | Rewrite::FuseIndexCasts
+                | Rewrite::StoreNarrowedActivations
+                | Rewrite::RecheckConstants,
+            ) => Some(KernelLowering {
+                backend: *backend,
+                caps,
+            }),
+            // An NPU plans no kernel: it has no grid, single-buffer limit, matrix unit or contraction
+            // lowering, and a rewrite into a kernel-only form commits a graph its planner would then refuse
+            // (POOT-1176).
+            (
+                Target::Npu(_),
+                Rewrite::FitToLimits
+                | Rewrite::SelectOperandPrecision
+                | Rewrite::GroupExpertRows
+                | Rewrite::FuseContractionEpilogues
+                | Rewrite::FuseIndexCasts
+                | Rewrite::StoreNarrowedActivations
+                | Rewrite::RecheckConstants,
+            ) => None,
+        }
+    }
+
+    /// How many outputs this target's row kernels write: a GPU kernel writes side outputs and per-row scalar
+    /// results, an AIE core binds one output (POOT-1456).
+    pub(crate) fn row_outputs(&self) -> transform::RowOutputs {
+        match self {
+            Target::Gpu { .. } => transform::RowOutputs::Multiple,
+            Target::Npu(_) => transform::RowOutputs::Single,
         }
     }
 }
@@ -695,6 +768,8 @@ pub struct Program {
     numerical_declines: Vec<NumericalRewriteDecline>,
     /// Attention and rope candidates the fusion matchers left alone on a near-miss chain.
     declines: Vec<FusionDecline>,
+    /// Every rewrite root the target could not plan, which pass produced it, and why.
+    reverts: Vec<PassRevert>,
     /// The target this program was compiled for (Card 546a): the contract's `add_entry` refuses a
     /// program compiled for a different target with a typed `LoadError::TargetMismatch`.
     target: Target,
@@ -890,6 +965,15 @@ impl Program {
         &self.declines
     }
 
+    /// Every rewrite root a pass produced that the target refused to plan, in the order the passes ran: the
+    /// pass, the value its root defines in the graph that pass produced, and the typed [`Refusal`] the
+    /// planner gave it. The compiled graph holds the decomposition the pass would have replaced for that root
+    /// (its closure, or the whole pass when the pass cannot be taken apart), so a refused rewrite is read here
+    /// rather than inferred from a missing pass in [`Self::passes`].
+    pub fn reverts(&self) -> &[PassRevert] {
+        &self.reverts
+    }
+
     /// The tier-2 comparison class this program publishes (ADR-0101 decision 2): the strongest of the
     /// traced graph's baseline and what the passes that changed it produced. [`compile`] has
     /// already checked that the compiled graph implies nothing looser. A device result is compared
@@ -925,9 +1009,10 @@ impl Program {
 /// After planning, a target whose artifacts are regions (`Target::granularity`) has its planned equations grouped
 /// into regions by `package` before the buffer plan runs; a kernel target has none.
 ///
-/// Every target runs every pass, in this one order, on every graph, except the GPU-limit stages
-/// (legalization, matmul dtype widening, the contraction epilogue probe and the oversized-constant
-/// re-check): they read [`DeviceCaps`], so an AIE target does not run them.
+/// Every target runs every pass, in this one order, on every graph, except the [`Rewrite`]s: a target runs
+/// those only where [`Target::lowers`] says it lowers them (legalization, operand precision, expert-row
+/// grouping, the contraction epilogue rule, index-cast folding, narrowed storage and the oversized-constant
+/// re-check read [`DeviceCaps`]), so an NPU neither runs nor reverts them.
 pub fn compile(
     g: &Graph,
     target: &Target,
@@ -963,9 +1048,12 @@ pub fn compile(
     };
     #[cfg(not(any(test, feature = "test-support")))]
     let capped: Option<DeviceCaps> = None;
-    let gpu = match target {
-        Target::Gpu { backend, caps } => Some((*backend, capped.as_ref().unwrap_or(caps))),
-        Target::Npu(_) => None,
+    // What the target lowers is the target's declaration (`Target::lowers`), one answer per rewrite; the
+    // pipeline below asks it and has no GPU branch of its own.
+    let lowers = |rewrite| {
+        target
+            .lowers(rewrite)
+            .map(|lowering| (lowering.backend, capped.as_ref().unwrap_or(lowering.caps)))
     };
     let npu = options.npu.as_ref().map(NpuHandle::lowering);
     let mut pipeline = PassPipeline::new(g, target, options.limits, npu);
@@ -1013,7 +1101,7 @@ pub fn compile(
     )?);
     pipeline.reject_escapes(restored)?;
     pipeline.run("fold_dense_contractions", fold_dense_contractions)?;
-    if let Some((backend, caps)) = gpu {
+    if let Some((backend, caps)) = lowers(Rewrite::FitToLimits) {
         pipeline.try_run("legalize", |g| {
             transform::legalize(g, backend, caps, &options.limits)
         })?;
@@ -1024,15 +1112,6 @@ pub fn compile(
         lower_nonlast_growth(pipeline.graph()),
     )?;
     pipeline.run("lower_nonlast_reduces", lower_nonlast_reduces)?;
-    if let Some((_, caps)) = gpu {
-        pipeline.reserve(
-            "widen_mismatched_matmul_dtypes",
-            widen_growth(pipeline.graph()),
-        )?;
-        pipeline.run("widen_mismatched_matmul_dtypes", |g| {
-            widen_mismatched_matmul_dtypes(g, caps)
-        })?;
-    }
     // Card 673: admit every validation witness here, on the unfused graph. `fuse` folds a witness
     // producer chain into one `OpKind::Fused` region the structural classifier does not see through,
     // so the walk must run before it. Every backend reaches this through `compile`; a noncanonical
@@ -1043,7 +1122,7 @@ pub fn compile(
     // contraction's precision into its head. It is required, not an optimization: a narrowed op the planner
     // cannot lower is the planner's typed refusal, never a silent revert to the exact op, so the numerics a
     // program publishes are the policy's, whichever schedule the planner picks.
-    if let Some((_, caps)) = gpu {
+    if let Some((_, caps)) = lowers(Rewrite::SelectOperandPrecision) {
         let units = FragmentUnits::of(caps);
         #[cfg(any(test, feature = "test-support"))]
         let units = match options.fragment_only {
@@ -1080,7 +1159,7 @@ pub fn compile(
     // tile is one expert's rows. After the precision is selected (the block's cost model reads it) and before the
     // epilogue rule (a fused head carries the grouping). Required: the planner refuses a per-row indexed
     // contraction past the Gemv rows, so a target that tiles must group.
-    if let Some((backend, caps)) = gpu {
+    if let Some((backend, caps)) = lowers(Rewrite::GroupExpertRows) {
         let limits = options.limits.body();
         pipeline.require("group_expert_rows", |g| {
             let views = compute_views(g, target.id());
@@ -1109,29 +1188,28 @@ pub fn compile(
         })?;
     }
     // The contraction epilogue rule runs on the typed, dtype-prepared graph, right before `fuse` would claim
-    // the same pointwise chains for a standalone region: a head fuses only where the planner's generated
-    // lowering carries an epilogue (`epilogue_head_lowers`), so no head trades a faster schedule for it. Like
-    // `fuse`.
-    pipeline.run("fuse_contraction_epilogues", |g| {
-        transform::fuse_contraction_epilogues(g, |graph, head| match gpu {
-            Some((_, caps)) => planner::epilogue_head_lowers(graph, head, caps),
-            // The planner refuses every contraction for an AIE target, so no head lowers there.
-            None => false,
-        })
-    })?;
+    // the same pointwise chains for a standalone region: a head fuses only where its planned request's generator
+    // carries an epilogue (`epilogue_head_lowers`), so no head trades a faster schedule for it. Like `fuse`.
+    if lowers(Rewrite::FuseContractionEpilogues).is_some() {
+        pipeline.run("fuse_contraction_epilogues", |g| {
+            // Each head is planned as the planner will plan it, over the graph's strided views (a transposed
+            // expert stack is read through its view): computed once for the pass, which reads one graph.
+            let views = std::cell::OnceCell::new();
+            transform::fuse_contraction_epilogues(g, |graph, head| {
+                let views = views.get_or_init(|| compute_views(graph, target.id()));
+                planner::epilogue_head_lowers(graph, head, target, views, &options.limits.body())
+            })
+        })?;
+    }
     // A target whose row kernels write one row-width value fuses without side outputs or per-row scalar results
     // (POOT-1456): an AIE core binds one output.
-    let rows = match target {
-        Target::Gpu { .. } => transform::RowOutputs::Multiple,
-        Target::Npu(_) => transform::RowOutputs::Single,
-    };
-    pipeline.run("fuse", |g| transform::fuse(g, rows))?;
+    pipeline.run("fuse", |g| transform::fuse(g, target.row_outputs()))?;
     pipeline.run("fuse_widening_casts", transform::fuse_widening_casts)?;
     // After `fuse`: the casts it left between an I32 word and the float pointwise kernels that read it or
     // the exact-I32 kernels that write it become steps of those kernels (POOT-1108). GPU targets only: the
     // folded cast is a kernel step, and on a target that plans no kernel the rewrite commits an invalid graph
     // (a `ge` over an I32 and an F32 operand) instead of leaving the planner its typed refusal (POOT-1176).
-    if gpu.is_some() {
+    if lowers(Rewrite::FuseIndexCasts).is_some() {
         pipeline.run("fuse_index_casts", transform::fuse_index_casts)?;
     }
     // After `fuse`, which takes an I32 pack's concat and unit-last lane slices as one region's `pack` and
@@ -1142,7 +1220,7 @@ pub fn compile(
     // POOT-1448: a value whose every reader narrows it is stored narrow, rounded once by the region that computes
     // it, on the final regions (after every fusion). It probes the planner before it commits each value, so its
     // graph is final: a value the target cannot store narrow stays f32, and nothing is reverted.
-    if gpu.is_some() {
+    if lowers(Rewrite::StoreNarrowedActivations).is_some() {
         let limits = options.limits.body();
         pipeline.require("store_narrowed_activations", |g| {
             transform::store_narrowed_activations(g, |graph, eqns| {
@@ -1162,10 +1240,15 @@ pub fn compile(
             })
         })?;
     }
-    let (graph, numerics, passes) = pipeline.finish()?;
+    let PassOutcome {
+        graph,
+        numerics,
+        passes,
+        reverts,
+    } = pipeline.finish()?;
     // `legalize` fitted every constant, but a later pass's revert of an unplannable split (`after_apply`) can
     // put an oversized one back: re-check the graph the planner receives, never trust the pass's own result.
-    if let Some((_, caps)) = gpu {
+    if let Some((_, caps)) = lowers(Rewrite::RecheckConstants) {
         transform::refuse_oversized_constants(&graph, caps.max_buffer_bytes)?;
     }
     let planned = plan_graph(
@@ -1209,6 +1292,7 @@ pub fn compile(
         passes,
         numerical_declines,
         declines,
+        reverts,
         target: *target,
         state_commit,
         validation,
@@ -1246,6 +1330,8 @@ struct PassPipeline<'t> {
     recorded: NumericsProperty,
     /// The passes that changed the graph, in the order they ran.
     passes: Vec<&'static str>,
+    /// The roots every pass's revert refused, in the order the passes ran.
+    reverts: Vec<PassRevert>,
     limits: CompileLimits,
     budget: GraphBudget,
 }
@@ -1263,6 +1349,7 @@ impl<'t> PassPipeline<'t> {
             npu,
             recorded: implied_numerics(g),
             passes: Vec::new(),
+            reverts: Vec::new(),
             limits,
             budget: GraphBudget::of(&limits),
         }
@@ -1348,13 +1435,23 @@ impl<'t> PassPipeline<'t> {
         out: Graph,
     ) -> Result<HashMap<ValueId, Refusal>, CompileError> {
         self.budget.admit(pass, &out)?;
-        let (out, restored) = revert_unplannable_rewrites(
+        let Reverted {
+            graph: out,
+            restored,
+            refused,
+        } = revert_unplannable_rewrites(
             &self.graph,
             out,
             self.target,
             &self.limits.body(),
             self.npu,
         )?;
+        self.reverts
+            .extend(refused.into_iter().map(|(root, refusal)| PassRevert {
+                pass,
+                root,
+                refusal,
+            }));
         self.record(pass, out);
         Ok(restored)
     }
@@ -1382,7 +1479,7 @@ impl<'t> PassPipeline<'t> {
 
     /// The compiled graph, the tier-2 class it publishes and the passes that changed it. Fails closed when
     /// the graph implies a looser class than the recorded passes and the baseline allow.
-    fn finish(self) -> Result<(Graph, Tier2Class, Vec<&'static str>), NumericsError> {
+    fn finish(self) -> Result<PassOutcome, NumericsError> {
         let implied = implied_numerics(&self.graph);
         if implied > self.recorded {
             return Err(NumericsError::UnderDeclared {
@@ -1391,8 +1488,35 @@ impl<'t> PassPipeline<'t> {
                 implied,
             });
         }
-        Ok((self.graph, self.recorded.tier2_class(), self.passes))
+        Ok(PassOutcome {
+            graph: self.graph,
+            numerics: self.recorded.tier2_class(),
+            passes: self.passes,
+            reverts: self.reverts,
+        })
     }
+}
+
+/// What the pass pipeline hands the planner: the graph, the tier-2 class it publishes, the passes that
+/// changed it and the roots the target refused along the way.
+struct PassOutcome {
+    graph: Graph,
+    numerics: Tier2Class,
+    passes: Vec<&'static str>,
+    reverts: Vec<PassRevert>,
+}
+
+/// One rewrite root the target refused: `pass` produced an equation defining `root` that the planner could
+/// not plan, for `refusal`, and the program kept the decomposition instead. `root` is a value of the graph
+/// `pass` produced, which is the traced graph's own id for every value the pass kept.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PassRevert {
+    /// The pass whose rewrite was reverted.
+    pub pass: &'static str,
+    /// The value the refused root defines.
+    pub root: ValueId,
+    /// The planner's typed refusal of that root.
+    pub refusal: Refusal,
 }
 
 /// The most a pass can add to a graph, from a bound its caller derived from the graph alone.
@@ -1419,22 +1543,6 @@ fn lower_nonlast_growth(g: &Graph) -> Growth {
     Growth {
         values: added,
         eqns: added,
-    }
-}
-
-/// What `widen_mismatched_matmul_dtypes` can add: one cast per widened table of a `Gather`/`Slice`, and
-/// at most two (one per operand) for a `MatMul` or `Binary`.
-fn widen_growth(g: &Graph) -> Growth {
-    let casts = g.eqns().iter().fold(0usize, |casts, eqn| {
-        casts.saturating_add(match eqn.op {
-            OpKind::Gather { axis: 0 } | OpKind::Slice { .. } => 1,
-            OpKind::MatMul { .. } | OpKind::Binary(_) => 2,
-            _ => 0,
-        })
-    });
-    Growth {
-        values: casts,
-        eqns: casts,
     }
 }
 
@@ -1482,6 +1590,16 @@ fn escaped_value(error: &PackedDequantProductionError) -> ValueId {
     }
 }
 
+/// What [`revert_unplannable_rewrites`] returns: the graph the planner receives, the typed refusal behind each
+/// equation the revert restored, and every refused root in probe order.
+struct Reverted {
+    graph: Graph,
+    /// Keyed by every equation the revert restored; empty for a whole-pass revert.
+    restored: HashMap<ValueId, Refusal>,
+    /// One entry per refused root, whether the revert took the pass apart or reverted it whole.
+    refused: Vec<(ValueId, Refusal)>,
+}
+
 /// Plan every equation `after` rewrote (a new op at an existing output, or a new output) for `target`, the
 /// way `crate::plan_graph` plans (the graph's own strided views), and put back the decomposition of each
 /// one the target refuses.
@@ -1489,15 +1607,20 @@ fn escaped_value(error: &PackedDequantProductionError) -> ValueId {
 /// Every rewriting pass replaces a region's root equation in place (same output value) and leaves or drops
 /// the members it absorbed. A refused root is restored from `before`, together with every member that
 /// `after` dropped and the restored equations read. Equations are emitted in `before`'s order, which is
-/// topological for both graphs because a rewritten root reads only values defined before its region. A
-/// pass that defines an output `before` never had, or gives an output it had another type, cannot be taken
-/// apart this way, so a refusal there reverts the whole pass.
+/// topological for both graphs because a rewritten root reads only values defined before its region.
+///
+/// A pass that also adds or retypes values is taken apart the same way, root by root. A refused equation the
+/// pass added restores the equations of `before` that read it, and the added equations nothing reads any
+/// more are dropped. A value the pass retyped drags every equation that reads or defines it back to `before`
+/// with the restored root, the value table following, so neither side is ever typed against the other. Only
+/// a refusal that reaches something with no `before` form to restore (a retyped input, an added equation
+/// that is itself a graph output or that a restored value's new type feeds) reverts the whole pass.
 ///
 /// Alongside the restored graph, returns the typed refusal behind it, keyed by every equation the revert
 /// restored (card 669): each refused root's closure maps to its own [`Refusal`], the first root in probe
 /// order owning a value two refused roots restored together. A whole-pass revert restores `before`
-/// wholesale, attributing no individual equation to any one refusal, so it records nothing - an escape
-/// there is the restored graph's own, not this revert's. [`PassPipeline::reject_escapes`] reports the
+/// wholesale, attributing no individual equation to any one refusal, so `restored` stays empty - an escape
+/// there is the restored graph's own, not this revert's - but `refused` still lists every refused root. [`PassPipeline::reject_escapes`] reports the
 /// recorded refusal when the escape gate finds one of these restored values escaping; `compile` threads
 /// the map there as a local and no other site reads it.
 fn revert_unplannable_rewrites(
@@ -1506,7 +1629,7 @@ fn revert_unplannable_rewrites(
     target: &Target,
     limits: &poot_kernelgen::BodyLimits,
     npu: Option<&dyn NpuLowering>,
-) -> Result<(Graph, HashMap<ValueId, Refusal>), CompileError> {
+) -> Result<Reverted, CompileError> {
     let before_at: HashMap<ValueId, usize> = before
         .eqns()
         .iter()
@@ -1538,31 +1661,42 @@ fn revert_unplannable_rewrites(
         }
     }
     if refused.is_empty() {
-        return Ok((after, HashMap::new()));
+        return Ok(Reverted {
+            graph: after,
+            restored: HashMap::new(),
+            refused,
+        });
     }
-    // A value `after` retyped is read by equations this revert keeps from `after` (a view whose op is
-    // unchanged) and by ones it restores from `before`: neither side is well typed with the other, so the
-    // pass cannot be taken apart root by root.
-    let retypes = after.eqns().iter().any(|eqn| {
-        before_at
-            .get(&eqn.out)
-            .is_some_and(|_| before.aval(eqn.out) != after.aval(eqn.out))
-    });
-    if retypes
-        || after
-            .eqns()
-            .iter()
-            .any(|eqn| !before_at.contains_key(&eqn.out))
-    {
-        return Ok((before.clone(), HashMap::new()));
-    }
-
     let after_at: HashMap<ValueId, usize> = after
         .eqns()
         .iter()
         .enumerate()
         .map(|(i, eqn)| (eqn.out, i))
         .collect();
+    // A value `after` retyped is typed one way by the equations this revert keeps from `after` and the
+    // other by the ones it restores from `before`: neither side is well typed with the other, so a
+    // restored equation drags in every neighbour that reads or defines such a value.
+    let retyped = |value: ValueId| {
+        before
+            .values()
+            .get(value)
+            .is_some_and(|meta| meta.aval != *after.aval(value))
+    };
+    let escapes: HashSet<ValueId> = after.liveness_roots().collect();
+    let whole = |refused| Reverted {
+        graph: before.clone(),
+        restored: HashMap::new(),
+        refused,
+    };
+    // The equations of `after` that read each value.
+    let mut readers: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for eqn in after.eqns() {
+        for operand in &eqn.inputs {
+            if let Operand::Value(input) = operand {
+                readers.entry(*input).or_default().push(eqn.out);
+            }
+        }
+    }
     // A multi-output region and its side output projections are one rewrite (POOT-1456): restoring either
     // restores both, so no projection is left reading a region the revert took apart.
     let mut grouped: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
@@ -1575,8 +1709,26 @@ fn revert_unplannable_rewrites(
         }
     }
     let mut restored: HashMap<ValueId, Refusal> = HashMap::new();
-    for (root, refusal) in refused {
-        let mut pending = vec![root];
+    for (root, refusal) in &refused {
+        // A refused equation `after` added defines a value `before` never had, so nothing of it is
+        // restored: the equations of `before` that read it (through any added ones) are, and the added
+        // ones nobody reads afterwards are dropped below.
+        let mut pending = Vec::new();
+        let mut seen = HashSet::new();
+        let mut frontier = vec![*root];
+        while let Some(value) = frontier.pop() {
+            if !seen.insert(value) {
+                continue;
+            }
+            if before_at.contains_key(&value) {
+                pending.push(value);
+            } else {
+                if escapes.contains(&value) {
+                    return Ok(whole(refused));
+                }
+                frontier.extend(readers.get(&value).into_iter().flatten().copied());
+            }
+        }
         while let Some(out) = pending.pop() {
             if restored.contains_key(&out) {
                 continue;
@@ -1584,27 +1736,135 @@ fn revert_unplannable_rewrites(
             restored.insert(out, refusal.clone());
             pending.extend(grouped.get(&out).into_iter().flatten().copied());
             for operand in &before.eqns()[before_at[&out]].inputs {
-                if let Operand::Value(input) = operand
-                    && before_at.contains_key(input)
-                    && !after_at.contains_key(input)
+                let Operand::Value(input) = operand else {
+                    continue;
+                };
+                if before_at.contains_key(input)
+                    && (!after_at.contains_key(input) || retyped(*input))
                 {
                     pending.push(*input);
+                } else if retyped(*input) {
+                    // A retyped value with no producer to restore: the pass cannot be taken apart.
+                    return Ok(whole(refused));
+                }
+            }
+            // Whoever `after` kept reading this value as the type it now has is restored with it.
+            if retyped(out) {
+                for reader in readers.get(&out).into_iter().flatten() {
+                    if !before_at.contains_key(reader) {
+                        return Ok(whole(refused));
+                    }
+                    pending.push(*reader);
                 }
             }
         }
     }
-    let eqns = before
+    // The equations `after` added that nothing reads any more, because every reader of theirs was restored
+    // away, go with them, together with whatever only they read: restoring one root never leaves a dead
+    // equation of the rewrite behind for the planner to refuse in turn.
+    let mut dropped: HashSet<ValueId> = HashSet::new();
+    let mut live_readers: HashMap<ValueId, usize> = readers
+        .iter()
+        .map(|(value, readers)| (*value, readers.len()))
+        .collect();
+    let mut unread: Vec<ValueId> = Vec::new();
+    for eqn in before.eqns() {
+        if restored.contains_key(&eqn.out)
+            && let Some(eqn) = after_at.get(&eqn.out).map(|&i| &after.eqns()[i])
+        {
+            for operand in &eqn.inputs {
+                if let Operand::Value(input) = operand {
+                    let count = live_readers.entry(*input).or_default();
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        unread.push(*input);
+                    }
+                }
+            }
+        }
+    }
+    while let Some(value) = unread.pop() {
+        let Some(&at) = after_at.get(&value) else {
+            continue;
+        };
+        if before_at.contains_key(&value)
+            || restored.contains_key(&value)
+            || escapes.contains(&value)
+            || !dropped.insert(value)
+        {
+            continue;
+        }
+        for operand in &after.eqns()[at].inputs {
+            if let Operand::Value(input) = operand {
+                let count = live_readers.entry(*input).or_default();
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    unread.push(*input);
+                }
+            }
+        }
+    }
+    // The surviving equations: `before`'s version of every restored one, `after`'s of the rest, and
+    // `after`'s additions that something still reads. Each is emitted after the equations that define its
+    // operands, in `before`'s order where that holds (a root reads only values defined before its region).
+    let mut chosen: HashMap<ValueId, &Eqn> = HashMap::new();
+    for eqn in before.eqns() {
+        if restored.contains_key(&eqn.out) {
+            chosen.insert(eqn.out, eqn);
+        } else if let Some(&at) = after_at.get(&eqn.out) {
+            chosen.insert(eqn.out, &after.eqns()[at]);
+        }
+    }
+    let added: Vec<&Eqn> = after
         .eqns()
         .iter()
-        .filter_map(|eqn| {
-            if restored.contains_key(&eqn.out) {
-                Some(eqn.clone())
-            } else {
-                after_at.get(&eqn.out).map(|&i| after.eqns()[i].clone())
-            }
-        })
+        .filter(|eqn| !before_at.contains_key(&eqn.out) && !dropped.contains(&eqn.out))
         .collect();
-    Ok((crate::passes::with_eqns(&after, eqns)?, restored))
+    for eqn in &added {
+        chosen.insert(eqn.out, eqn);
+    }
+    let candidates = before
+        .eqns()
+        .iter()
+        .map(|eqn| eqn.out)
+        .chain(added.iter().map(|eqn| eqn.out));
+    let mut emitted: HashSet<ValueId> = HashSet::new();
+    let mut eqns: Vec<Eqn> = Vec::with_capacity(chosen.len());
+    for candidate in candidates {
+        let mut stack = vec![(candidate, false)];
+        while let Some((out, operands_done)) = stack.pop() {
+            let Some(eqn) = chosen.get(&out) else {
+                continue;
+            };
+            if operands_done {
+                if emitted.insert(out) {
+                    eqns.push((*eqn).clone());
+                }
+                continue;
+            }
+            if emitted.contains(&out) {
+                continue;
+            }
+            stack.push((out, true));
+            for operand in eqn.inputs.iter().rev() {
+                if let Operand::Value(input) = operand
+                    && !emitted.contains(input)
+                {
+                    stack.push((*input, false));
+                }
+            }
+        }
+    }
+    let mut edit = after.edit();
+    for value in restored.keys() {
+        edit.values_mut()[*value].aval = before.aval(*value).clone();
+    }
+    *edit.eqns_mut() = eqns;
+    Ok(Reverted {
+        graph: edit.commit()?,
+        restored,
+        refused,
+    })
 }
 
 /// An NPU lowering's region refusal as the planner's own typed error: the refused equation's typed refusal, or
@@ -1725,7 +1985,12 @@ mod tests {
                 transform::fuse(g, transform::RowOutputs::Multiple)
             })
             .expect("the fixture pass runs");
-        let (graph, class, passes) = pipeline.finish().expect("the record covers the graph");
+        let PassOutcome {
+            graph,
+            numerics: class,
+            passes,
+            ..
+        } = pipeline.finish().expect("the record covers the graph");
         assert!(
             graph
                 .eqns()
@@ -1899,13 +2164,15 @@ mod tests {
 
     /// `fuse_index_casts` retypes the views between an I32 word's cast and the float region that reads it.
     /// A target that refuses the folded region has the equations it replaced put back, but the views stay
-    /// I32, so the restored `ge` would read an I32 and an F32 operand. A pass that retypes a value is
-    /// reverted whole, so `compile` reaches the planner's typed refusal instead of an invalid graph (POOT-1179).
+    /// I32, so the restored `ge` would read an I32 and an F32 operand. The revert restores the views with
+    /// their original type, so `compile` reaches the planner's typed refusal instead of an invalid graph
+    /// (POOT-1179).
     ///
-    /// Mutation: drop `retypes ||` in `revert_unplannable_rewrites`; `compile` returns the untyped
-    /// `Edit(Invalid(BinaryValueDtypeMismatch { operation: "ge", left: I32, right: F32 }))`.
+    /// Mutation: skip restoring a reverted value's type in `revert_unplannable_rewrites` (the
+    /// `edit.values_mut()[*value].aval = ..` line); `compile` returns the untyped
+    /// `Edit(Invalid(EquationOutputTypeMismatch { operation: "reshape [1, 4096]", stored: I32, inferred: F32 }))`.
     #[test]
-    fn compile_reverts_a_retyping_pass_whole_when_the_target_refuses_its_region() {
+    fn compile_reverts_a_retyped_view_with_its_readers_when_the_target_refuses_its_region() {
         let n = 4096usize;
         let b = Builder::for_tests();
         let a = b
@@ -1944,7 +2211,6 @@ mod tests {
 
         let planned = compile(&g, &wgpu(), &REPLAY).expect("the roomy target folds the cast");
         assert!(planned.passes().any(|pass| pass == "fuse_index_casts"));
-
         let mut narrow = wgpu();
         gpu_caps_mut(&mut narrow).max_workgroup_invocations = 1;
         // The target plans nothing at one invocation per workgroup, so the reverted graph meets the
@@ -1952,6 +2218,234 @@ mod tests {
         let refused = refusal(compile(&g, &narrow, &REPLAY), "a one-invocation workgroup");
         assert_eq!(refused.op, OpKind::Binary(BinOp::GeU));
         assert!(matches!(refused.missing, Capability::KernelResources(_)));
+    }
+
+    /// A BF16 pointwise chain over slots, which `fuse` turns into one region no target has a BF16 body for.
+    fn bf16_chain() -> (Graph, ValueId) {
+        let b = Builder::for_tests();
+        let slot = || {
+            b.slot(Slot::Activation, TensorType::new(vec![4, 8], DType::BF16))
+                .unwrap()
+        };
+        let (x, s, bias) = (slot(), slot(), slot());
+        let scaled = b.binary(BinOp::Mul, x, s).unwrap();
+        let e = b.unary(UnOp::Exp, scaled).unwrap();
+        let out = b.binary(BinOp::Add, e, bias).unwrap();
+        (b.finish(out).unwrap(), out.id())
+    }
+
+    /// POOT-1623 SC-003: `Program::reverts` lists each rewrite the target refused, with the pass that made it,
+    /// the value its root defined and the planner's typed refusal. The target has no BF16 body for the region
+    /// `fuse` forms, so `compile` keeps the decomposition and the revert is on the program; a chain the target
+    /// plans reverts nothing.
+    ///
+    /// Mutation: in `PassPipeline::after_apply`, drop the `self.reverts.extend(..)`; `reverts()` is empty and
+    /// the test panics with `expected one revert, got []`.
+    #[test]
+    fn program_reverts_name_the_pass_the_root_and_the_refusal() {
+        let (g, out) = bf16_chain();
+        let program = compile(&g, &wgpu(), &REPLAY).expect("the decomposition plans");
+        assert_eq!(program.passes().count(), 0, "fusion was reverted");
+        let [revert] = program.reverts() else {
+            panic!("expected one revert, got {:?}", program.reverts());
+        };
+        assert_eq!(revert.pass, "fuse");
+        assert_eq!(revert.root, out);
+        assert_eq!(revert.refusal.eqn, out);
+        assert_eq!(revert.refusal.missing, Capability::DtypeLowering);
+
+        let planned = compile(&pointwise_chain(), &wgpu(), &REPLAY).expect("the chain compiles");
+        assert!(planned.reverts().is_empty(), "{:?}", planned.reverts());
+    }
+
+    /// An XDNA2 target with no measured limit: enough to ask what it lowers.
+    fn xdna2() -> Target {
+        Target::Npu(NpuTarget::Aie {
+            target: poot_target::AieTargetId::Xdna2,
+            caps: poot_target::AieCaps {
+                target: poot_target::AieTargetId::Xdna2,
+                tile_local_bytes: Queried::Unknown,
+                host_bindings: Queried::Unknown,
+                instruction_bytes: Queried::Unknown,
+                memory_budget_bytes: Queried::Unknown,
+                region: poot_target::aie::RegionLimits {
+                    compute_tiles: Queried::Unknown,
+                    tile_input_channels: Queried::Unknown,
+                    tile_output_channels: Queried::Unknown,
+                    host_input_streams: Queried::Unknown,
+                    host_output_streams: Queried::Unknown,
+                },
+                step_widths: poot_target::StepWidths::NONE,
+            },
+        })
+    }
+
+    /// Every [`Rewrite`]. The exhaustive `match` fails to compile when a rewrite is added without a row here.
+    fn every_rewrite() -> [Rewrite; 7] {
+        let all = [
+            Rewrite::FitToLimits,
+            Rewrite::SelectOperandPrecision,
+            Rewrite::GroupExpertRows,
+            Rewrite::FuseContractionEpilogues,
+            Rewrite::FuseIndexCasts,
+            Rewrite::StoreNarrowedActivations,
+            Rewrite::RecheckConstants,
+        ];
+        for rewrite in all {
+            match rewrite {
+                Rewrite::FitToLimits
+                | Rewrite::SelectOperandPrecision
+                | Rewrite::GroupExpertRows
+                | Rewrite::FuseContractionEpilogues
+                | Rewrite::FuseIndexCasts
+                | Rewrite::StoreNarrowedActivations
+                | Rewrite::RecheckConstants => {}
+            }
+        }
+        all
+    }
+
+    /// POOT-1624 SC-001: the target declares what it lowers. A GPU target lowers every rewrite, with its own
+    /// backend and its own measured limits; an NPU lowers none of them, and its row-kernel outputs are one.
+    ///
+    /// Mutation: make the GPU arm of `Target::lowers` answer `None` for `Rewrite::FuseIndexCasts`; the test
+    /// panics with `a GPU target lowers FuseIndexCasts`. Make the NPU arm answer a GPU's lowering for it and
+    /// the test panics with `an NPU target lowers FuseIndexCasts`.
+    #[test]
+    fn a_target_declares_which_rewrites_it_lowers() {
+        let gpu = wgpu();
+        let npu = xdna2();
+        for rewrite in every_rewrite() {
+            let lowering = gpu
+                .lowers(rewrite)
+                .unwrap_or_else(|| panic!("a GPU target lowers {rewrite:?}"));
+            assert_eq!(lowering.backend, gpu_backend(&gpu));
+            assert_eq!(*lowering.caps, gpu_caps(&gpu));
+            assert!(
+                npu.lowers(rewrite).is_none(),
+                "an NPU target lowers {rewrite:?}"
+            );
+        }
+        assert_eq!(gpu.row_outputs(), transform::RowOutputs::Multiple);
+        assert_eq!(npu.row_outputs(), transform::RowOutputs::Single);
+    }
+
+    /// POOT-1624 SC-002: the pass list a GPU target runs is the declared one, on the production path. An
+    /// exact-I32 chain with a float scale folds its cast into the region that reads it on a GPU target: the
+    /// record names `fuse_index_casts`, and no revert is recorded.
+    ///
+    /// Mutation: answer `None` for `Rewrite::FuseIndexCasts` on a GPU target; the record loses the pass and the
+    /// test panics with `the cast folds into its readers`.
+    #[test]
+    fn a_gpu_target_runs_the_declared_index_cast_fold() {
+        let b = Builder::for_tests();
+        let slot = |name| {
+            b.slot_named(Slot::Token, name, TensorType::new(vec![2, 4], DType::I32))
+                .unwrap()
+        };
+        let (a, c) = (slot("a"), slot("c"));
+        let w = b.constant("w", TensorType::f32(vec![2, 4])).unwrap();
+        let hit = b.binary(BinOp::Ge, a, c).unwrap();
+        let out = b
+            .binary(BinOp::Mul, b.cast(hit, DType::F32).unwrap(), w)
+            .unwrap();
+        let program = compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY).expect("the chain plans");
+        let passes: Vec<&str> = program.passes().collect();
+        assert!(
+            passes.contains(&"fuse_index_casts"),
+            "the cast folds into its readers: {passes:?}"
+        );
+        assert!(program.reverts().is_empty(), "{:?}", program.reverts());
+    }
+
+    /// POOT-1623: a pass that adds a value is reverted one root at a time. `after` is `fuse`'s output for a
+    /// BF16 chain the target cannot plan, plus a rewrite of an unrelated `exp` into `tanh` over a value the
+    /// rewrite adds; the target plans the second and refuses the first. The refused region is restored, the
+    /// added value and the `tanh` stay, and the revert lists the one refusal.
+    ///
+    /// Mutation: at the top of the per-root loop in `revert_unplannable_rewrites` return the whole-pass
+    /// revert when `after` defines a value `before` lacks; `tanh` is lost and the test panics with
+    /// `the rewrite that plans, and the value it added, are kept`.
+    #[test]
+    fn a_refused_root_of_a_pass_that_adds_a_value_reverts_alone() {
+        let b = Builder::for_tests();
+        let slot = |dtype| {
+            b.slot(Slot::Activation, TensorType::new(vec![4, 8], dtype))
+                .unwrap()
+        };
+        let (x, s, bias) = (slot(DType::BF16), slot(DType::BF16), slot(DType::BF16));
+        let z = slot(DType::F32);
+        let region = b
+            .binary(
+                BinOp::Add,
+                b.unary(UnOp::Exp, b.binary(BinOp::Mul, x, s).unwrap())
+                    .unwrap(),
+                bias,
+            )
+            .unwrap();
+        let plain = b.unary(UnOp::Exp, z).unwrap();
+        let out = b
+            .concat(0, &[b.cast(region, DType::F32).unwrap(), plain])
+            .unwrap();
+        let before = b.finish(out).unwrap();
+
+        let fused = transform::fuse(&before, crate::RowOutputs::Multiple).unwrap();
+        assert!(
+            fused
+                .eqns()
+                .iter()
+                .any(|eqn| matches!(eqn.op, OpKind::Fused(_))),
+            "the premise: fusion forms the BF16 region"
+        );
+        let plain_at = fused
+            .eqns()
+            .iter()
+            .position(|eqn| eqn.out == plain.id())
+            .expect("the exp survives fusion");
+        let after = poot_graph_ir::test_support::graph_fixtures::derive(&fused, |draft| {
+            let negated = draft.values_mut().push(poot_graph_ir::ValueMeta::new(
+                TensorType::f32(vec![4, 8]),
+                poot_graph_ir::Storage::Device,
+                None,
+            ));
+            draft.eqns_mut()[plain_at].op = OpKind::Unary(UnOp::Tanh);
+            draft.eqns_mut()[plain_at].inputs = vec![Operand::Value(negated)];
+            draft.eqns_mut().insert(
+                plain_at,
+                Eqn {
+                    op: OpKind::Unary(UnOp::Neg),
+                    inputs: vec![Operand::Value(z.id())],
+                    out: negated,
+                    layer: None,
+                },
+            );
+        })
+        .unwrap();
+
+        let target = wgpu();
+        let reverted = revert_unplannable_rewrites(
+            &before,
+            after,
+            &target,
+            &crate::test_support::roomy_body_limits(),
+            None,
+        )
+        .expect("the revert plans");
+        let ops: Vec<&OpKind> = reverted.graph.eqns().iter().map(|eqn| &eqn.op).collect();
+        assert!(
+            !ops.iter().any(|op| matches!(op, OpKind::Fused(_))),
+            "the refused region is restored: {ops:?}"
+        );
+        assert!(
+            ops.contains(&&OpKind::Unary(UnOp::Tanh)) && ops.contains(&&OpKind::Unary(UnOp::Neg)),
+            "the rewrite that plans, and the value it added, are kept: {ops:?}"
+        );
+        let [(root, refusal)] = reverted.refused.as_slice() else {
+            panic!("expected one refused root, got {:?}", reverted.refused);
+        };
+        assert_eq!(*root, region.id());
+        assert_eq!(refusal.missing, Capability::DtypeLowering);
+        assert!(reverted.restored.contains_key(&region.id()));
     }
 
     /// `compile` plans each equation of the program exactly once: value storage reads the plans `plan_graph`

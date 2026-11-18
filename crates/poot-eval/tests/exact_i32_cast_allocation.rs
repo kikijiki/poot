@@ -11,6 +11,11 @@
 //! enabled per thread, so allocations made on any other thread are not recorded. The check therefore
 //! covers the evaluator's single-threaded cast path only.
 
+#![expect(
+    unsafe_code,
+    reason = "a counting global allocator is an unsafe impl of GlobalAlloc"
+)]
+
 use poot_tensor::DType;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

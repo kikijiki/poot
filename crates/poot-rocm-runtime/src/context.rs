@@ -203,6 +203,12 @@ pub struct RocmContextOptions {
     /// (POOT-1079). Off by default: a profiled replay creates, waits on and reads one signal per
     /// packet instead of one per batch, so it is diagnostic, never throughput evidence.
     pub device_timing: bool,
+    /// What the launcher put in `HSA_ALLOCATE_QUEUE_DEV_MEM`: `None` when it is unset, `Some(true)` when it
+    /// is `1` (ROCr then puts the packet ring in device memory), `Some(false)` for any other value. ROCr
+    /// reads the variable itself, once, when it loads; the library never reads the environment, so the
+    /// process edge that exports (or inherits) it reports it here. The production queue is a system-memory
+    /// ring and refuses any set value; the receipt-only PCIe queue requires `Some(true)`.
+    pub device_ring_override: Option<bool>,
 }
 
 impl Default for RocmContextOptions {
@@ -210,6 +216,7 @@ impl Default for RocmContextOptions {
         Self {
             wait_timeout: std::time::Duration::from_secs(600),
             device_timing: false,
+            device_ring_override: None,
         }
     }
 }
@@ -245,20 +252,6 @@ pub(crate) struct DeviceTiming {
     /// Spans of the dispatches completed since the last [`RocmContext::clear_dispatch_spans`], in
     /// submission order.
     pub(crate) spans: Mutex<Vec<DispatchSpan>>,
-}
-
-/// `POOT_REQUIRE_ROCM=1` turns the "no ROCm device -> tests skip cleanly" convention into a loud
-/// failure: a failed context open panics instead of returning the Err that skip guards convert into a
-/// silent PASS (`just test-device-rocm` sets it). Mirrors `poot-wgpu-runtime::require_gpu_check`.
-pub(crate) fn require_gpu_check<E: std::fmt::Display>(e: E) -> E {
-    require_gpu_check_with(|name| std::env::var(name).ok(), e)
-}
-
-pub(crate) fn require_gpu_check_with<E: std::fmt::Display>(
-    get: impl Fn(&str) -> Option<String>,
-    e: E,
-) -> E {
-    poot_runtime_common::DeviceBackend::Rocm.fail_if_required(get, e)
 }
 
 /// RAII guard pairing a successful `hsa_init()` with `hsa_shut_down()` on every early return out of
@@ -878,8 +871,10 @@ mod caps_tests {
     /// workgroup memory is a guess.
     #[test]
     fn a_live_agent_reports_the_limits_rocminfo_prints() {
-        let Ok(ctx) = RocmContext::new() else {
-            eprintln!("POOT-SKIP a_live_agent_reports_the_limits_rocminfo_prints: no ROCm device");
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Rocm,
+            RocmContext::new(),
+        ) else {
             return;
         };
         let Ok(output) = std::process::Command::new("rocminfo").output() else {

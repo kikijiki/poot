@@ -3,6 +3,11 @@
 //! CUDA driver's JIT through the engine's compile feedback (the engine lowers the probe, [`PtxKernelRegisters`] compiles it); the verdict must be the one `ptxas` and the JIT gave then
 //! (`tests/data/ptxas_sweep_sm120.tsv`). A host without an NVIDIA device skips.
 
+#![expect(
+    unsafe_code,
+    reason = "the row points the kernel cache at its own directory through the environment"
+)]
+
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 

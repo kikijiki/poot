@@ -1,6 +1,6 @@
 use crate::driver::ResourceDispatch;
 use crate::owner::{DeviceOwner, PipelineShape};
-use crate::resources::{allocate_buffer_resources, require_gpu_check_with};
+use crate::resources::allocate_buffer_resources;
 use poot_codegen::CompiledKernel;
 use poot_runtime_common::BufferRole;
 use poot_target::BufferStorage;
@@ -383,7 +383,6 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 e4m3_storage: poot_target::E4m3Storage::None,
                 native_two_byte_floats: false,
                 rounding_conversions: poot_target::RoundingConversions::NONE,
-                widens_bf16_decode_weight: false,
                 peer_transport: false,
                 perf_calibration: poot_target::calibration::Calibrated::Portable,
             },
@@ -1271,27 +1270,6 @@ fn a_cached_key_answers_for_one_kernel_only() {
     );
     assert!(context.pipeline("k", &test_kernel(1)).is_ok());
     assert_eq!(context.pipeline_builds(), 0);
-}
-
-#[test]
-fn vulkan_context_open_is_required_by_its_own_variable_only() {
-    use poot_runtime_common::DeviceBackend;
-    let fails_open = |variable: &'static str| {
-        std::panic::catch_unwind(|| {
-            require_gpu_check_with(|name| (name == variable).then(|| "1".into()), "no device")
-        })
-        .is_err()
-    };
-    assert!(fails_open(DeviceBackend::Vulkan.variable()));
-    for other in DeviceBackend::ALL
-        .into_iter()
-        .filter(|other| *other != DeviceBackend::Vulkan)
-    {
-        assert!(
-            !fails_open(other.variable()),
-            "{other:?} must not require Vulkan"
-        );
-    }
 }
 
 /// POOT-1074: a write at a non-zero byte offset lands there and leaves its neighbours intact; an offset

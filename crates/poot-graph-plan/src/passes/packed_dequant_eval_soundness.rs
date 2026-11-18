@@ -51,20 +51,24 @@ mod allocation {
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             note_allocation(layout.size());
+            // SAFETY: forwarded unchanged under the caller's `GlobalAlloc` contract.
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             note_allocation(layout.size());
+            // SAFETY: forwarded unchanged under the caller's `GlobalAlloc` contract.
             unsafe { System.alloc_zeroed(layout) }
         }
 
         unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: forwarded unchanged under the caller's `GlobalAlloc` contract.
             unsafe { System.dealloc(pointer, layout) }
         }
 
         unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             note_allocation(new_size);
+            // SAFETY: forwarded unchanged under the caller's `GlobalAlloc` contract.
             unsafe { System.realloc(pointer, layout, new_size) }
         }
     }

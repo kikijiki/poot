@@ -714,16 +714,12 @@ pub enum PlanError {
 /// against the budget less this after prepare.
 pub const SUPPORT_RESERVE_BYTES: u64 = 256 << 20;
 
-/// The environment variable that makes the driver log the device memory at each phase of its lifetime.
-pub const DEVICE_MEMORY_LOG_ENV: &str = "POOT_DEVICE_MEMORY_LOG";
-
-/// With [`DEVICE_MEMORY_LOG_ENV`] set (read once), log one `device_memory` event per device at `phase`: what
-/// the runtime reports free and what the process holds by its own counters. Reading these in order finds the
-/// phase where a plan and the device part ways (POOT-1347); the events are `info` on target
-/// `poot_llm::device_memory`, and nothing is read or formatted when the variable is unset.
+/// Log one `device_memory` event per device at `phase`: what the runtime reports free and what the process holds
+/// by its own counters. Reading these in order finds the phase where a plan and the device part ways
+/// (POOT-1347). The events are `info` on target `poot_llm::device_memory`, so the subscriber's filter turns them
+/// on (`RUST_LOG=poot_llm::device_memory=info`); nothing is read or formatted while that target is filtered out.
 pub(crate) fn log_device_memory(executor: &dyn Executor, phase: &str) {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os(DEVICE_MEMORY_LOG_ENV).is_some()) {
+    if !tracing::enabled!(target: "poot_llm::device_memory", tracing::Level::INFO) {
         return;
     }
     let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;

@@ -95,6 +95,7 @@ fn fnv1a(tokens: &[u32]) -> u64 {
 }
 
 fn main() -> Result<()> {
+    poot_llm::driver::report_launch_environment(|name| std::env::var(name).ok());
     let args: Vec<String> = std::env::args().skip(1).collect();
     let values = flags(&args)?;
     let target_dir = values.get("--target").context("--target DIR is required")?;

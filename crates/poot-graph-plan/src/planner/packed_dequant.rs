@@ -202,10 +202,9 @@ fn try_plan_row_gather(
 /// `attention_body` use, `x_groups` riding in `metadata[3]` rather than baked, matching this
 /// kernel family's own shape-in-metadata design). Above `caps.max_grid[1]` too, or on any `usize ->
 /// u32` overflow along the way, `try_plan_contraction` refuses with `Capability::DispatchGridLimit`/
-/// `DispatchSizeOverflow` naming the equation, before any dispatch - `finalize`'s generic wg-bump
-/// never touches this arm (`kernel_mapping::shape_launch` exempts every packed contraction request by
-/// type), since bumping the baked 64-lane workgroup would corrupt the fixed-size LDS tile regardless of
-/// the grid.
+/// `DispatchSizeOverflow` naming the equation, before any dispatch - no widening ever touches this arm
+/// (a packed contraction request owns its launch, `LaunchOwnership::OwnsLaunch`), since widening the baked
+/// 64-lane workgroup would corrupt the fixed-size LDS tile regardless of the grid.
 #[expect(clippy::too_many_arguments)]
 fn try_plan_contraction(
     g: GraphTables<'_>,
@@ -290,8 +289,8 @@ fn try_plan_contraction(
         }
     };
     let epilogue = match epilogue {
-        // The tiled schedule has no epilogue (the generator refuses it by name), and the fuse rule forms one
-        // only over a Gemv head (`epilogue_head_lowers`).
+        // Both schedules carry the epilogue (the Gemv in its column store, the tiled body in the shared tiled
+        // epilogue), so the fuse rule forms one over every packed head (`epilogue_head_lowers`).
         Some(region) => Some(matmul::epilogue_of(
             site,
             g,
@@ -1225,13 +1224,12 @@ mod tests {
     /// `max_grid[0] = 4`, and `try_plan_contraction` folds onto `(x_groups, y_groups) = (4, 2)` rather
     /// than refusing or truncating - `y_groups <= max_grid[1] = 4`, so the fold fits. The plan's `grid`
     /// carries the folded dims and `body.workgroup_size` stays the tiled body's baked `[64, 1, 1]`:
-    /// `finalize`'s generic wg-bump never corrupts the LDS tile for this arm
-    /// (`kernel_mapping::shape_launch` exempts every contraction request by type).
+    /// no widening ever corrupts the LDS tile for this arm (a contraction request owns its launch by type).
     ///
     /// Mutation: in `folded_tile_grid`, drop the `tiles_u32 <= limit_x` fold and always use
     /// `(tiles_u32, 1)` - `grid` goes from `[256, 2, 1]` to `[320, 1, 1]` and this test goes red.
     #[test]
-    fn over_cap_tiled_contraction_folds_onto_a_2d_grid_not_the_wg_bump() {
+    fn over_cap_tiled_contraction_folds_onto_a_2d_grid_and_keeps_its_workgroup() {
         let (m, out) = (80usize, 8usize);
         let tiling = RegisterTiling::choose(
             TiledShape {
@@ -1275,7 +1273,7 @@ mod tests {
         assert_eq!(
             body.workgroup_size,
             [64, 1, 1],
-            "the wg-bump must not touch this arm's baked 64-lane workgroup"
+            "no widening may touch this arm's baked 64-lane workgroup"
         );
         assert_eq!(
             meta.get(3),
@@ -1521,26 +1519,27 @@ mod tests {
 
     /// SC-001 (card 658, GPU-free): the real `wgpu_rdna3_igpu` grid cap, not a
     /// fixture - `blocks = 8, m_per_block = 65536, out_per_block = 2048` is `out_numel = 1,073,741,824 >
-    /// 4,194,240`, past the `out_numel.div_ceil(64) > 65_535` threshold where `finalize`'s generic
-    /// wg-bump would rewrite a one-thread-per-output body's workgroup from 64 to 256 - round 1's own
-    /// reproduction showed a bumped Tiled body computes wrong values at this scale (`element 0: got
+    /// 4,194,240`, past the `out_numel.div_ceil(64) > 65_535` threshold where an elementwise request is widened
+    /// from 64 to 256 lanes - round 1's own reproduction showed a widened Tiled body computes wrong values
+    /// at this scale (`element 0: got
     /// 120.47945 want 570.88153`). `tiles = 8 * ceil(65536/128) * ceil(2048/128) = 65,536` (the 128 x 128
     /// tile the occupancy model gives so long a contraction) exceeds `max_grid[0] = 65_535`, folding to
     /// `(x_groups, y_groups) = (65_535, 2)`. This is the one test
-    /// that actually exercises `kernel_mapping::shape_launch`'s contraction exemption at the scale the
+    /// that actually exercises a contraction request's ownership of its launch at the scale the
     /// hazard fires at - the fold-success/refusal rows above use a `max_grid: [4, 4, 4]` fixture four
-    /// orders of magnitude below it, so disabling the exemption left them green.
+    /// orders of magnitude below it, so a widened launch left them green.
     ///
-    /// Mutation: in `kernel_mapping::shape_launch` set `contraction` to `false` for every request
-    /// (dropping the exemption from `custom_grid`). Red: `body.workgroup_size` comes back `[256, 1, 1]`,
-    /// not `[64, 1, 1]` - the generic bump fired on the 256-lane-baked tiled body. Restored; green.
+    /// Mutation: make `KernelRequest::launch` (poot-kernelgen `request.rs`) declare
+    /// `Elementwise { workgroup_x: 1 }` for `Contraction` requests. Red: planning refuses with
+    /// `WorkgroupNotDeclared { declared: 1, actual: 256 }` - the declared launch does not match the
+    /// tiled body's baked 256 lanes. Restored; green.
     #[test]
     fn over_cap_tiled_contraction_at_real_wgpu_caps_keeps_the_baked_workgroup() {
         let (blocks, m_per_block, out_per_block) = (8usize, 65536usize, 2048usize);
         let out_numel = blocks * m_per_block * out_per_block;
         assert!(
             out_numel > 4_194_240,
-            "fixture must be above the wg-bump threshold: {out_numel}"
+            "fixture must be above the widening threshold: {out_numel}"
         );
         let (graph, index) = over_cap_tiled_eqn(blocks, m_per_block, out_per_block);
         let eqn = &graph.eqns()[index];
@@ -1570,7 +1569,7 @@ mod tests {
         assert_eq!(
             body.workgroup_size,
             [256, 1, 1],
-            "finalize's wg-bump must not touch this arm's baked 256-lane workgroup at real scale"
+            "no widening may touch this arm's baked 256-lane workgroup at real scale"
         );
         assert_eq!(
             grid,

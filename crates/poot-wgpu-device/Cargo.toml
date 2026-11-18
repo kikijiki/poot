@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [features]
 # ADR-0113: `WgpuDevice::has_device_timestamps`, the adapter probe the device-timing rows (here and in

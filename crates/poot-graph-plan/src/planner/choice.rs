@@ -12,7 +12,7 @@ use crate::types::{Launch, ScratchDecl};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use poot_kernelgen::{KernelRequest, generate};
+use poot_kernelgen::{KernelRequest, Workgroup, generate};
 use poot_target::{AieTargetId, Backend, DeviceCaps};
 
 use crate::{
@@ -67,6 +67,9 @@ pub enum KernelChoice {
         meta_schema: u32,
         /// Element type of the runtime index operand the equation binds, if the template reads one.
         index: Option<DType>,
+        /// The workgroup an elementwise template ([`ImportedKernel::is_elementwise`]) runs at, chosen before
+        /// the plan is built from the device's grid cap; `None` for a template that owns its launch.
+        workgroup: Option<Workgroup>,
     },
     /// No launch at all.
     NoDispatch(NoDispatch),
@@ -85,6 +88,16 @@ impl KernelChoice {
         }
     }
 
+    /// Whether this choice is a generated contraction whose generator takes a pointwise epilogue
+    /// ([`poot_kernelgen::ContractionSpec::accepts_epilogue`]): the one answer to "does this head's own schedule
+    /// carry a fused store".
+    pub(crate) fn accepts_epilogue(&self) -> bool {
+        matches!(
+            self,
+            Self::Generated(KernelRequest::Contraction(spec)) if spec.accepts_epilogue()
+        )
+    }
+
     /// The kernel's display label: a generated request names itself
     /// ([`KernelRequest::display_label`]), a shipped template its kernel. Carried by the plan beside its key.
     fn display_label(&self) -> String {
@@ -92,6 +105,24 @@ impl KernelChoice {
             Self::Generated(request) | Self::Serialized { request, .. } => request.display_label(),
             other => other.label(),
         }
+    }
+
+    /// The workgroup X extent this choice declared before its body was generated, for a one-thread-per-element
+    /// kernel; `None` for a kernel that owns its launch ([`poot_kernelgen::LaunchOwnership`]).
+    pub(crate) fn elementwise_workgroup_x(&self) -> Option<u32> {
+        match self {
+            Self::Generated(request) | Self::Serialized { request, .. } => match request.launch() {
+                poot_kernelgen::LaunchOwnership::Elementwise { workgroup_x } => Some(workgroup_x),
+                poot_kernelgen::LaunchOwnership::OwnsLaunch => None,
+            },
+            Self::Imported { workgroup, .. } => workgroup.map(|workgroup| workgroup.lanes() as u32),
+            Self::NoDispatch(_) => None,
+        }
+    }
+
+    /// The plan key of a dispatch that runs this choice on `target`: the hex of its [`Self::digest`].
+    pub(crate) fn key(&self, target: poot_codegen::Target) -> String {
+        self.digest(target).to_string()
     }
 
     /// The digest of this choice's canonical encoding for `target`'s codegen epoch.
@@ -288,7 +319,7 @@ fn build(
         .map(|(_, bound)| bound);
     let mut body = generated.body;
     let choice = KernelChoice::Generated(request);
-    let mut key = choice.digest(backend.into()).to_string();
+    let mut key = choice.key(backend.into());
     if let Some(bound) = narrowed {
         body.index_width = IndexWidth::U32(bound);
         key.push_str(":u32");
@@ -336,7 +367,7 @@ fn build_serialized(
         contract: sequential.contract,
         bindings,
     };
-    let key = choice.digest(target.into()).to_string();
+    let key = choice.key(target.into());
     let label = choice.display_label();
     Ok(Built {
         body: sequential.body,
@@ -431,26 +462,21 @@ impl Planned {
     }
 
     /// Plan a shipped template. `meta` is its metadata buffer (`None` for a kernel that takes none). A
-    /// template whose params break the dispatch calling convention is a typed error, not a panic.
+    /// one-thread-per-element template ([`ImportedKernel::is_elementwise`]) runs at the narrowest workgroup
+    /// that clears the device's grid cap, chosen here and named by the choice. A template whose params break
+    /// the dispatch calling convention is a typed error, not a panic.
     pub(crate) fn imported(
         kernel: ImportedKernel,
         backend: Backend,
+        caps: &DeviceCaps,
         meta: Option<Vec<u32>>,
         grid: [u32; 3],
     ) -> Result<Self, PlanError> {
-        Self::imported_indexed(kernel, backend, meta, grid, None)
-    }
-
-    /// [`Planned::imported`] for a template that reads a runtime index operand of element type `index`.
-    pub(crate) fn imported_indexed(
-        kernel: ImportedKernel,
-        backend: Backend,
-        meta: Option<Vec<u32>>,
-        grid: [u32; 3],
-        index: Option<DType>,
-    ) -> Result<Self, PlanError> {
+        let workgroup = kernel
+            .is_elementwise()
+            .then(|| Workgroup::for_threads(grid[0] as usize, caps));
         let PlannedDispatch { dispatch } =
-            Self::imported_dispatch(kernel, backend, meta, grid, index);
+            Self::imported_dispatch(kernel, backend, meta, grid, None, workgroup);
         let choice = dispatch.choice().clone();
         Ok(Self {
             plan: single_plan(dispatch)?,
@@ -468,7 +494,7 @@ impl Planned {
     ) -> PlannedDispatch {
         let [x, y, z] = kernel.body().workgroup_size;
         let grid = [groups[0] as u32 * x, groups[1] as u32 * y, z];
-        Self::imported_dispatch(kernel, backend, Some(meta), grid, None)
+        Self::imported_dispatch(kernel, backend, Some(meta), grid, None, None)
     }
 
     fn imported_dispatch(
@@ -477,11 +503,15 @@ impl Planned {
         meta: Option<Vec<u32>>,
         grid: [u32; 3],
         index: Option<DType>,
+        workgroup: Option<Workgroup>,
     ) -> PlannedDispatch {
-        let choice = imported_choice(kernel, meta.as_deref(), index);
-        let key = choice.digest(backend.into()).to_string();
+        let choice = imported_choice(kernel, meta.as_deref(), index, workgroup);
+        let key = choice.key(backend.into());
         let label = choice.display_label();
-        let body = kernel.body().clone();
+        let mut body = kernel.body().clone();
+        if let Some(workgroup) = workgroup {
+            body.workgroup_size[0] = workgroup.lanes() as u32;
+        }
         let launch = Launch {
             grid,
             meta: meta.unwrap_or_default(),
@@ -560,11 +590,13 @@ fn imported_choice(
     kernel: ImportedKernel,
     meta: Option<&[u32]>,
     index: Option<DType>,
+    workgroup: Option<Workgroup>,
 ) -> KernelChoice {
     KernelChoice::Imported {
         kernel,
         meta_schema: meta.map_or(0, |meta| meta.len() as u32),
         index,
+        workgroup,
     }
 }
 
@@ -943,7 +975,8 @@ mod tests {
             rows: poot_kernelgen::GemvRows::ONE,
             depth: poot_kernelgen::LoadDepth::ONE,
         };
-        let cast = |numel: usize| KernelRequest::Cast(CastSpec::F32ToBf16 { numel });
+        let cast =
+            |numel: usize| KernelRequest::Cast(CastSpec::F32ToBf16 { numel }, Workgroup::Narrow);
         let rope = |rot: usize| {
             KernelRequest::Rope(RopeSpec {
                 dt: Ty::F32,
@@ -951,9 +984,17 @@ mod tests {
                 cos_shape: vec![1, 2],
                 rot,
                 numel: 4,
+                workgroup: Workgroup::Narrow,
             })
         };
-        let topk = |k: usize| KernelRequest::TopK(TopKSpec { e: 8, k, numel: 2 });
+        let topk = |k: usize| {
+            KernelRequest::TopK(TopKSpec {
+                e: 8,
+                k,
+                numel: 2,
+                workgroup: Workgroup::Narrow,
+            })
+        };
         // The same workgroup width and sequence, the rows shared by one or two lanes: the schedule field is
         // the only difference between two different bodies.
         let scan = |row_split: usize| {
@@ -1119,6 +1160,7 @@ mod tests {
             Some(vec![4]),
             [8, 1, 1],
             None,
+            Some(Workgroup::Narrow),
         );
         let honest = dispatch.clone();
         single_plan(honest).expect("the shipped template follows the calling convention");

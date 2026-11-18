@@ -76,7 +76,6 @@ pub fn wgpu_rdna3_igpu() -> DeviceCaps {
         e4m3_storage: E4m3Storage::PackedLanes,
         native_two_byte_floats: false,
         rounding_conversions: RoundingConversions::NONE,
-        widens_bf16_decode_weight: false,
         peer_transport: false,
         perf_calibration: Calibrated::STRIX_HALO_VULKAN,
     }

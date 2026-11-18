@@ -87,7 +87,7 @@ fn chain_into_a_contraction() -> Graph {
 /// SC-b1: a chain into a dense reader is one dispatch. The slice and the reshape are `Plan::View`, and the transpose
 /// is one `Copy` that reads the slice's source through the composed layout.
 ///
-/// Mutation: `operand_demand` answers `Dense` for a movement's data input; the slice materializes as well and the
+/// Mutation: `movement::layout_demand` answers `Dense` for a movement's data input; the slice materializes as well and the
 /// chain is two dispatches.
 #[test]
 fn a_chain_into_a_dense_reader_is_one_copy() {
@@ -263,7 +263,7 @@ fn materialized_chain_matches_oracle_fuzz() {
 /// view read by the fused negation, the second a view the concat reads through its layout, and the concat's output
 /// equals the oracle's.
 ///
-/// Mutation: `operand_demand` answers `Dense` for a `Concat` part; the second slice materializes and a slice
+/// Mutation: `movement::layout_demand` answers `Dense` for a `Concat` part; the second slice materializes and a slice
 /// dispatch appears.
 #[test]
 fn concat_reads_its_parts_through_layouts() {
@@ -336,7 +336,7 @@ fn concat_reads_its_parts_through_layouts() {
 /// SC-b4: an exact-I32 pointwise reader takes an I32 view. The census `and` case, `and(transpose(x), m)` over I32
 /// words, plans the transpose as a view, and the generated `and` over the root buffer equals the oracle's.
 ///
-/// Mutation: restore the f32-region-only gate for I32 leaves (`operand_demand` answers `Dense` for an I32 operand
+/// Mutation: restore the f32-region-only gate for I32 leaves (`elementwise::layout_demand` answers `Dense` for an I32 operand
 /// of a `Binary`); the transpose dispatches.
 #[test]
 fn an_exact_i32_reader_takes_an_i32_view() {

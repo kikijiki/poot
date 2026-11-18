@@ -8,7 +8,6 @@ use crate::bindings::{
 use crate::buffer::{Pool, RocmAlloc, checked_byte_range, checked_copy, checked_layout};
 use crate::context::{
     Held, HsaShutdownGuard, StagingBuffer, TimeoutLeaks, UploadStrategy, memory_domain_for_pool,
-    require_gpu_check,
 };
 use crate::discovery::{
     GpuPicker, PoolState, agent_isa_name, agent_limits, agent_name, agent_vendor,
@@ -22,8 +21,8 @@ use crate::host_memory::{host_available_bytes, unified_free_bytes};
 use crate::owner::{HsaRuntimeOwner, ResourceOwner};
 use crate::queue::{
     DEVICE_RING_OVERRIDE_AT_FIRST_HSA_LOAD, QueueCreationPlan, QueueLayout, QueueProperties,
-    destroy_queue_reference, device_ring_override_present, queue_error_callback, queue_request,
-    validate_created_queue, validate_queue_plan_provenance, watch_agent_faults,
+    destroy_queue_reference, queue_error_callback, queue_request, validate_created_queue,
+    validate_queue_plan_provenance, watch_agent_faults,
 };
 use crate::replay::replay_graph_chunk_size;
 use crate::{
@@ -48,30 +47,28 @@ impl RocmContext {
     /// [`Self::new`] with an explicit [`RocmContextOptions`] (Card 548): the one
     /// construction-time seam for the bounded-wait ceiling, never an environment read.
     pub fn new_with_options(options: RocmContextOptions) -> Result<Self, RocmError> {
-        Self::new_inner(QueueCreationPlan::SystemMemoryRing, options).map_err(require_gpu_check)
+        Self::new_inner(QueueCreationPlan::SystemMemoryRing, options)
     }
 
     /// Receipt-only constructor: use ROCr's `HSA_ALLOCATE_QUEUE_DEV_MEM=1` device-memory packet ring,
     /// create an ordinary MULTI queue, and retain a `PcieDeviceMemory` publication contract after
     /// proving a non-APU agent and a CPU-to-GPU PCIe pool link.
     ///
-    /// The process must be launched with `HSA_ALLOCATE_QUEUE_DEV_MEM=1` (ROCr reads it once at load);
-    /// without it construction fails with [`RocmError::QueueRingProvenanceConflict`]. The library does
-    /// not set it: mutating the environment can race other threads. Does not change production queue
-    /// construction or Card 276 admission policy.
-    pub fn new_for_pcie_device_ring_publication_receipt() -> Result<Self, RocmError> {
-        Self::new_inner(
-            QueueCreationPlan::PcieDeviceMemoryRingReceipt,
-            RocmContextOptions::default(),
-        )
-        .map_err(require_gpu_check)
+    /// The process must be launched with `HSA_ALLOCATE_QUEUE_DEV_MEM=1` (ROCr reads it once at load) and
+    /// say so in `options.device_ring_override`; without it construction fails with
+    /// [`RocmError::QueueRingProvenanceConflict`]. The library does not set it: mutating the environment
+    /// can race other threads. Does not change production queue construction or Card 276 admission policy.
+    pub fn new_for_pcie_device_ring_publication_receipt(
+        options: RocmContextOptions,
+    ) -> Result<Self, RocmError> {
+        Self::new_inner(QueueCreationPlan::PcieDeviceMemoryRingReceipt, options)
     }
 
     pub(crate) fn new_inner(
         plan: QueueCreationPlan,
         options: RocmContextOptions,
     ) -> Result<Self, RocmError> {
-        let override_now = device_ring_override_present(|name| std::env::var_os(name));
+        let override_now = options.device_ring_override.is_some();
         let override_at_load = *DEVICE_RING_OVERRIDE_AT_FIRST_HSA_LOAD.get_or_init(|| override_now);
         validate_queue_plan_provenance(plan, override_at_load, override_now)?;
         let hsa = Hsa::load()?;
@@ -238,8 +235,7 @@ impl RocmContext {
                     unsafe { amd_agent_u32_info(&hsa.funcs, gpu_agent, HSA_AMD_AGENT_INFO_DOMAIN) };
                 let product_name = product.clone().unwrap_or_else(|| name.clone());
                 let receipt = DeviceRingReceiptProvenance {
-                    allocate_queue_dev_mem: std::env::var_os("HSA_ALLOCATE_QUEUE_DEV_MEM")
-                        .is_some_and(|v| v == "1"),
+                    allocate_queue_dev_mem: options.device_ring_override == Some(true),
                     queue_api: "hsa_queue_create(MULTI) + HSA_ALLOCATE_QUEUE_DEV_MEM=1",
                     queue_type_requested: HSA_QUEUE_TYPE_MULTI,
                     queue_type_returned: 0,

@@ -24,6 +24,11 @@
 //!
 //! Usage: `rocm-check [--add | --agent-list | --pcie-publication-receipt]`
 
+#![expect(
+    unsafe_code,
+    reason = "the receipt mode sets an environment variable before any thread starts"
+)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -32,7 +37,7 @@ use poot_codegen::{
 };
 use poot_kernel_ir::fixtures;
 use poot_rocm_runtime::{
-    DeviceStoreFence, QueuePublicationContract, RocmContext, RocmError,
+    DeviceStoreFence, QueuePublicationContract, RocmContext, RocmContextOptions, RocmError,
     take_issued_device_store_fence_count,
 };
 use poot_runtime_common::{BufferRole, DeviceBackend, fnv1a};
@@ -249,7 +254,10 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
     let host_arch = std::env::consts::ARCH;
     let host_kernel = read_text("/proc/version").unwrap_or_else(|| "unknown".into());
 
-    let ctx = match RocmContext::new_for_pcie_device_ring_publication_receipt() {
+    let ctx = match RocmContext::new_for_pcie_device_ring_publication_receipt(RocmContextOptions {
+        device_ring_override: Some(true),
+        ..RocmContextOptions::default()
+    }) {
         Ok(ctx) => ctx,
         Err(error) if pcie_receipt_may_skip(&error, |name| std::env::var(name).ok()) => {
             println!(

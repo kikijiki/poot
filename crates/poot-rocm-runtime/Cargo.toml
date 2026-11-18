@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 # `CompiledKernel`, the one handle a dispatch takes, and the compiler its tests build fixture kernels with.
@@ -19,6 +20,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
+# `device_skip`: a device test that finds no device skips, or fails when the lane requires the backend.
+poot-runtime-common = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

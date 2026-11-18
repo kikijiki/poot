@@ -1,7 +1,6 @@
 use super::select::{DeviceFacts, pick_device};
 use crate::driver::AshResourceDispatch;
 use crate::features::DeviceFeatures;
-use crate::resources::require_gpu_check;
 use crate::util::bytemuck_cast_i8_to_u8;
 use crate::validation::Validation;
 use crate::{Context, DeviceOwner, RuntimeError, validation};
@@ -40,7 +39,7 @@ impl Context {
 
     /// [`Self::new`] with explicit [`ContextOptions`].
     pub fn new_with_options(options: ContextOptions) -> Result<Self, RuntimeError> {
-        Self::new_inner(options).map_err(require_gpu_check)
+        Self::new_inner(options)
     }
 
     pub(crate) fn new_inner(options: ContextOptions) -> Result<Self, RuntimeError> {
@@ -379,7 +378,6 @@ impl Context {
             e4m3_storage: poot_target::E4m3Storage::PackedLanes,
             native_two_byte_floats: false,
             rounding_conversions: poot_target::RoundingConversions::NONE,
-            widens_bf16_decode_weight: false,
             peer_transport: false,
             perf_calibration,
         };
@@ -700,10 +698,10 @@ mod launch_caps_device_receipt {
     /// (no Vulkan device, or a non-AMD one) is reported as one, not as a pass.
     #[test]
     fn a_live_vulkan_device_reports_its_own_launch_limits() {
-        let Ok(ctx) = Context::new() else {
-            eprintln!(
-                "POOT-SKIP a_live_vulkan_device_reports_its_own_launch_limits: no Vulkan device"
-            );
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Vulkan,
+            Context::new(),
+        ) else {
             return;
         };
         let live = ctx.device_caps();

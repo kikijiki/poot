@@ -1,4 +1,3 @@
-use crate::require::require_gpu_check;
 use crate::timestamps::storage_entry;
 use crate::{
     CachedPipeline, Context, ContextOptions, DeviceHealth, DeviceTimingAccumulator, RuntimeError,
@@ -17,7 +16,7 @@ impl Context {
 
     /// [`Self::new`] with explicit [`ContextOptions`].
     pub fn new_with_options(options: ContextOptions) -> Result<Self, RuntimeError> {
-        pollster::block_on(Self::new_async(false, 0, options)).map_err(require_gpu_check)
+        pollster::block_on(Self::new_async(false, 0, options))
     }
 
     /// A context for the typed Card 552 timing path. `max_in_flight_queries` is the declared bound
@@ -31,7 +30,6 @@ impl Context {
             max_in_flight_queries,
             ContextOptions::default(),
         ))
-        .map_err(require_gpu_check)
     }
 
     /// Whether this context was built with [`Context::new_with_device_timing`] at a positive bound
@@ -128,7 +126,6 @@ impl Context {
             e4m3_storage: poot_target::E4m3Storage::PackedLanes,
             native_two_byte_floats: false,
             rounding_conversions: poot_target::RoundingConversions::NONE,
-            widens_bf16_decode_weight: false,
             peer_transport: false,
             perf_calibration: self.perf_calibration,
         }
@@ -274,13 +271,11 @@ impl Context {
         // class (submission/creation-time errors routed through wgpu's error sink, which does consult this
         // callback, unlike the `Device::poll` fatal path that panics in `wgpu-core`'s formatter): it prints
         // the `Display` and `Debug` forms plus each link of the `source()` chain to stderr, then re-raises
-        // (card 537, SC-003). Gated behind `POOT_WGPU_DEBUG` (one `env::var_os` read at context
-        // creation): wgpu's own default uncaptured-error handler panics, so installing a custom one here
-        // must never turn that into silent continuation - `POOT_WGPU_DEBUG` only adds detail to a fatal
-        // error, it never decides whether one is fatal. Debugging-only per the Scope exception in exactly
-        // this sense: the extra diagnostics never change whether or what panics, only what gets printed
-        // first.
-        if std::env::var_os("POOT_WGPU_DEBUG").is_some() {
+        // (card 537, SC-003). Gated behind `ContextOptions::uncaptured_error_diagnostics`: wgpu's own default uncaptured-error handler panics, so installing a custom one here
+        // must never turn that into silent continuation - the option only adds detail to a fatal
+        // error, it never decides whether one is fatal. Debugging-only: the extra diagnostics never change
+        // whether or what panics, only what gets printed first.
+        if options.uncaptured_error_diagnostics {
             device.on_uncaptured_error(std::sync::Arc::new(|err: wgpu::Error| {
                 eprintln!("[poot-wgpu-debug] uncaptured wgpu error (Display):\n{err}");
                 eprintln!("[poot-wgpu-debug] uncaptured wgpu error (Debug):\n{err:?}");
@@ -716,10 +711,10 @@ mod launch_caps_device_receipt {
     /// device family. A skip (no GPU, or a non-AMD adapter) is reported as one, not as a pass.
     #[test]
     fn a_live_amd_device_reports_the_launch_limits_the_fixture_documents() {
-        let Ok(ctx) = Context::new() else {
-            eprintln!(
-                "POOT-SKIP a_live_amd_device_reports_the_launch_limits_the_fixture_documents: no GPU"
-            );
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            Context::new(),
+        ) else {
             return;
         };
         if ctx.calibration.known().is_none() {
@@ -752,9 +747,9 @@ mod launch_caps_device_receipt {
 mod card537_wgpu_debug_tests {
     use super::*;
 
-    /// SC-003: with `POOT_WGPU_DEBUG` set, an injected wgpu validation error is still fatal -
-    /// the custom `on_uncaptured_error` handler decorates it with diagnostics and re-panics, it never
-    /// swallows it into silent continuation. Skips cleanly without a wgpu device.
+    /// SC-003: with `ContextOptions::uncaptured_error_diagnostics` set, an injected wgpu validation error is
+    /// still fatal - the custom `on_uncaptured_error` handler decorates it with diagnostics and re-panics, it
+    /// never swallows it into silent continuation. Skips cleanly without a wgpu device.
     ///
     /// Mutation (recorded here, never left in the tree): removing the trailing `panic!` from the
     /// `on_uncaptured_error` closure above (the R482-013 bug: log the error, then continue) made this
@@ -762,24 +757,14 @@ mod card537_wgpu_debug_tests {
     /// `false`, the write silently continued); restoring the `panic!` made it green.
     #[test]
     fn wgpu_debug_never_downgrades_a_fatal_uncaptured_error() {
-        // SAFETY: test-only env mutation of a process-global; cargo-nextest gives every #[test] its own
-        // process (poot-wgpu-device's card 537 tests use the same pattern). Must be set before `Context::new()`:
-        // the read happens once, at construction.
-        unsafe {
-            std::env::set_var("POOT_WGPU_DEBUG", "1");
-        }
-        let ctx = match Context::new() {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                eprintln!(
-                    "POOT-SKIP wgpu_debug_never_downgrades_a_fatal_uncaptured_error: no GPU ({e})"
-                );
-                // SAFETY: see the set_var above.
-                unsafe {
-                    std::env::remove_var("POOT_WGPU_DEBUG");
-                }
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            Context::new_with_options(ContextOptions {
+                uncaptured_error_diagnostics: true,
+                ..ContextOptions::default()
+            }),
+        ) else {
+            return;
         };
         // A 4-byte buffer with a 16-byte write is out of range: wgpu validates `write_buffer`'s size
         // against the destination buffer and routes the violation through `on_uncaptured_error`, not a
@@ -794,13 +779,9 @@ mod card537_wgpu_debug_tests {
             ctx.queue.write_buffer(&buf, 0, &[0u8; 16]);
             let _ = ctx.poll_wait();
         }));
-        // SAFETY: see the set_var above.
-        unsafe {
-            std::env::remove_var("POOT_WGPU_DEBUG");
-        }
         assert!(
             caught.is_err(),
-            "an out-of-range write_buffer must still panic with POOT_WGPU_DEBUG set"
+            "an out-of-range write_buffer must still panic with the diagnostics on"
         );
     }
 }

@@ -8,8 +8,6 @@
 //! `unsafe` is denied crate-wide except in `stored/mapping.rs`, the one file mapping behind
 //! [`StoredBytes`] (ADR-0103 amendment of 2026-10-09).
 
-#![deny(unsafe_code)]
-
 mod blocks;
 mod content;
 pub mod decode;

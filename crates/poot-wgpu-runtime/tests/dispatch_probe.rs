@@ -12,6 +12,11 @@
 //! Verify with `cargo test -p poot-wgpu-runtime --test dispatch_probe --no-run` (or `--release`); run the
 //! dispatch tests only in the serial GPU lane (run command in the module docs at the bottom).
 
+#![expect(
+    unsafe_code,
+    reason = "CompiledKernel has one sanctioned unsafe constructor"
+)]
+
 use std::path::PathBuf;
 use std::process::Command;
 

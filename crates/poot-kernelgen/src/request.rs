@@ -31,7 +31,8 @@ use crate::data_movement::{
     movement_body, rope_dt,
 };
 use crate::elementwise::{
-    cast_bf16_to_f32, cast_f16_to_f32, cast_f32_to_bf16, cast_f32_to_f16, cast_i32_to_f32,
+    ELEMENTWISE_2D_WORKGROUP_SIZE, cast_bf16_to_f32, cast_f16_to_f32, cast_f32_to_bf16,
+    cast_f32_to_f16, cast_i32_to_f32,
 };
 use crate::error::BodyStage;
 use crate::fp8::{e4m3fn_packed_to_f32, f32_to_e4m3fn_packed};
@@ -229,20 +230,100 @@ pub fn fold_groups(total: usize, max_x: u32) -> (usize, usize) {
     (x, total.div_ceil(x))
 }
 
+/// The workgroup width of a one-thread-per-element body. The width is part of the request, so a request
+/// that needs the wide workgroup is a different kernel (a different digest) from one that does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Workgroup {
+    /// [`Workgroup::NARROW_LANES`] lanes: the width of a launch whose flat grid fits the target's X cap.
+    Narrow,
+    /// [`ELEMENTWISE_2D_WORKGROUP_SIZE`] lanes (the portable Vulkan maximum): a flat launch past the cap at
+    /// the narrow width, or any launch folded onto a 2-D grid.
+    Wide,
+}
+
+impl Workgroup {
+    /// The lanes of the narrow workgroup.
+    pub const NARROW_LANES: usize = 64;
+
+    /// The narrowest workgroup whose flat grid of `threads` clears `caps.max_grid[0]`. Past what the wide
+    /// workgroup clears, the launch must fold ([`Fold`]).
+    pub fn for_threads(threads: usize, caps: &DeviceCaps) -> Self {
+        if threads.div_ceil(Self::NARROW_LANES) > caps.max_grid[0] as usize {
+            Self::Wide
+        } else {
+            Self::Narrow
+        }
+    }
+
+    /// Lanes per workgroup.
+    pub fn lanes(self) -> usize {
+        match self {
+            Self::Narrow => Self::NARROW_LANES,
+            Self::Wide => ELEMENTWISE_2D_WORKGROUP_SIZE,
+        }
+    }
+
+    /// `body` with this workgroup width.
+    fn shape(self, mut body: Body) -> Body {
+        body.workgroup_size[0] = self.lanes() as u32;
+        body
+    }
+}
+
+/// Who sizes a request's launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchOwnership {
+    /// The generator builds the body and the grid that shapes it together (a row- or head-parallel
+    /// reduction, a tile, a fixed-width workgroup): its workgroup width is the schedule's, and nothing may
+    /// resize it.
+    OwnsLaunch,
+    /// One thread per element: the workgroup is the request's declared width (`workgroup_x` lanes), chosen
+    /// before generation from the target's grid cap, and the body is generated at it.
+    Elementwise {
+        /// The workgroup's X extent the body is generated at.
+        workgroup_x: u32,
+    },
+}
+
 /// Whether a one-thread-per-element kernel folds past the target's X grid cap onto a 2-D grid of
 /// `width`-wide workgroups. The planner decides `two_d` (a policy predicate over the equation and the
-/// device); the body's `x_groups` and the launch grid both follow from it here.
+/// device); the body's workgroup width, `x_groups` and the launch grid all follow from it here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Fold {
     /// Output elements the kernel computes, one thread each.
     pub numel: usize,
     /// Whether the kernel folds onto a 2-D grid; decided by the planner from the device's grid cap.
     pub two_d: bool,
-    /// Threads per workgroup.
+    /// Threads per workgroup: the body is generated at this width. A folded launch is always
+    /// [`Workgroup::Wide`].
     pub width: usize,
 }
 
 impl Fold {
+    /// `numel` threads on the narrowest workgroup that clears `caps.max_grid[0]`, or folded onto a 2-D
+    /// grid of wide workgroups when `two_d`.
+    pub fn new(numel: usize, two_d: bool, caps: &DeviceCaps) -> Self {
+        let workgroup = if two_d {
+            Workgroup::Wide
+        } else {
+            Workgroup::for_threads(numel, caps)
+        };
+        Self {
+            numel,
+            two_d,
+            width: workgroup.lanes(),
+        }
+    }
+
+    /// `numel` threads on the narrow workgroup, launched flat: a launch with no grid cap to clear.
+    pub fn flat(numel: usize) -> Self {
+        Self {
+            numel,
+            two_d: false,
+            width: Workgroup::NARROW_LANES,
+        }
+    }
+
     fn groups(self, caps: &DeviceCaps) -> (usize, usize) {
         fold_groups(self.numel.div_ceil(self.width).max(1), caps.max_grid[0])
     }
@@ -260,12 +341,17 @@ impl Fold {
         }
     }
 
+    /// `body` generated at this fold's workgroup width.
+    fn shape(self, mut body: Body) -> Body {
+        body.workgroup_size[0] = self.width as u32;
+        body
+    }
+
     /// A one-thread-per-output contraction `body` launched on this fold with `width`-lane workgroups on the 1-D
-    /// and the 2-D grid alike: the contraction owns its whole launch, so the planner never reshapes it (it is
-    /// not reshaped). The planner folds onto 2-D before `numel / width` workgroups would pass the X grid cap.
-    fn contraction(self, mut body: Body, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
-        body.workgroup_size = [self.width as u32, 1, 1];
-        with(body, self.launch(caps))
+    /// and the 2-D grid alike: the contraction owns its whole launch, so nothing reshapes it. The planner folds
+    /// onto 2-D before `numel / width` workgroups would pass the X grid cap.
+    fn contraction(self, body: Body, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
+        with(self.shape(body), self.launch(caps))
     }
 }
 
@@ -281,8 +367,8 @@ pub struct ViewOperand {
 /// One generation request. See the module docs.
 #[derive(Clone, Debug, Hash)]
 pub enum KernelRequest {
-    /// A dtype cast between two storage types.
-    Cast(CastSpec),
+    /// A dtype cast between two storage types, one thread per element at the given workgroup width.
+    Cast(CastSpec, Workgroup),
     /// A pointwise region over leaves: any number of per-element steps, one thread per output element. A
     /// single unary, binary or scalar-literal op is the region of one step.
     Pointwise(PointwiseSpec),
@@ -377,6 +463,37 @@ impl KernelRequest {
         }
     }
 
+    /// Who sizes this request's launch: an elementwise request is generated at the workgroup it declares,
+    /// every other request owns its launch.
+    pub fn launch(&self) -> LaunchOwnership {
+        let elementwise = |lanes: usize| LaunchOwnership::Elementwise {
+            workgroup_x: lanes as u32,
+        };
+        match self {
+            Self::Cast(_, workgroup) => elementwise(workgroup.lanes()),
+            Self::Pointwise(spec) => match &spec.form {
+                PointwiseForm::Float { fold } | PointwiseForm::ExactI32 { fold } => {
+                    elementwise(fold.width)
+                }
+                PointwiseForm::ExactI32Packed { workgroup, .. } => elementwise(workgroup.lanes()),
+            },
+            Self::Row(RowSpec::ReduceLast { workgroup, .. }) => elementwise(workgroup.lanes()),
+            Self::Movement(spec) => elementwise(spec.fold.width),
+            Self::Rope(spec) => elementwise(spec.workgroup.lanes()),
+            Self::TopK(spec) => elementwise(spec.workgroup.lanes()),
+            Self::Row(RowSpec::Fused { .. })
+            | Self::Contraction(_)
+            | Self::Attention(_)
+            | Self::AttentionRows(_)
+            | Self::AttentionCombine(_)
+            | Self::Scan(_)
+            | Self::Packed(_)
+            | Self::ExpertGroup(_)
+            | Self::BlockTopK(_)
+            | Self::StableRank(_) => LaunchOwnership::OwnsLaunch,
+        }
+    }
+
     /// How many side outputs the generated body writes, each a param between the reads (and metadata) and the
     /// last write (POOT-1456): a multi-output row kernel's [`RowKernel::side_outputs`], zero for every other request.
     pub fn side_writes(&self) -> usize {
@@ -389,7 +506,7 @@ impl KernelRequest {
     /// The family name, for diagnostics and the plan summary's `choice` column.
     pub fn family(&self) -> &'static str {
         match self {
-            Self::Cast(_) => "cast",
+            Self::Cast(..) => "cast",
             Self::Pointwise(_) => "pointwise",
             Self::Row(_) => "row",
             Self::Contraction(_) => "contraction",
@@ -509,6 +626,21 @@ pub enum CastSpec {
     },
 }
 
+impl CastSpec {
+    /// Threads the cast launches: one per element, or per packed E4M3FN word for [`CastSpec::F32ToE4m3`].
+    pub fn threads(&self) -> usize {
+        match self {
+            Self::F32ToBf16 { numel }
+            | Self::F32ToF16 { numel }
+            | Self::F16ToF32 { numel }
+            | Self::Bf16ToF32 { numel }
+            | Self::I32ToF32 { numel }
+            | Self::E4m3ToF32 { numel, .. } => *numel,
+            Self::F32ToE4m3 { out_shape, .. } => Storage::BYTE_LANES.units(out_shape),
+        }
+    }
+}
+
 /// Which element form a pointwise region computes in.
 #[derive(Clone, Debug, Hash)]
 pub enum PointwiseForm {
@@ -527,6 +659,8 @@ pub enum PointwiseForm {
     ExactI32Packed {
         /// The lanes one packed word is built from; empty for an unpacked region.
         pack: Vec<FusedInput>,
+        /// The workgroup the flat launch runs at.
+        workgroup: Workgroup,
     },
 }
 
@@ -574,6 +708,8 @@ pub enum RowSpec {
         init_bits: u32,
         /// Output elements, one thread each.
         numel: usize,
+        /// The workgroup the flat launch runs at.
+        workgroup: Workgroup,
     },
 }
 
@@ -688,6 +824,21 @@ pub enum ContractionSpec {
 }
 
 impl ContractionSpec {
+    /// Whether this form's generator takes a pointwise epilogue over each output before its store: every form
+    /// does but the decode attention `scores @ V` reduction, which has no per-output store to apply one to.
+    /// The planner asks it of the head's planned request, so a head fuses an epilogue exactly where its own
+    /// schedule carries one.
+    pub fn accepts_epilogue(&self) -> bool {
+        match self {
+            Self::Serial { .. }
+            | Self::DenseGemv { .. }
+            | Self::DenseTiled(_)
+            | Self::Packed(_)
+            | Self::Indexed(_) => true,
+            Self::AttnScoresVGemv { .. } => false,
+        }
+    }
+
     /// The contraction form's name, for [`KernelRequest::display_label`].
     fn form(&self) -> &'static str {
         match self {
@@ -822,6 +973,8 @@ pub struct RopeSpec {
     pub rot: usize,
     /// Output elements, one thread each.
     pub numel: usize,
+    /// The workgroup the flat launch runs at.
+    pub workgroup: Workgroup,
 }
 
 /// Batched argtop-k index extraction: `rank [rows, e]` to `out [rows, k]`.
@@ -833,6 +986,8 @@ pub struct TopKSpec {
     pub k: usize,
     /// Output elements (`rows * k`), one thread each.
     pub numel: usize,
+    /// The workgroup the flat launch runs at.
+    pub workgroup: Workgroup,
 }
 
 /// The block-aligned grouping of MoE rows by expert (POOT-1451): `ids [M]` to the
@@ -943,7 +1098,7 @@ fn recipe_size(req: &KernelRequest) -> Option<BodySize> {
     match req {
         KernelRequest::Pointwise(spec) => {
             let pack_lanes = match &spec.form {
-                PointwiseForm::ExactI32Packed { pack } => pack.len(),
+                PointwiseForm::ExactI32Packed { pack, .. } => pack.len(),
                 PointwiseForm::Float { .. } | PointwiseForm::ExactI32 { .. } => 0,
             };
             Some(pointwise_size(
@@ -964,7 +1119,7 @@ fn recipe_size(req: &KernelRequest) -> Option<BodySize> {
 
 fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
     match req {
-        KernelRequest::Cast(spec) => cast(spec),
+        KernelRequest::Cast(spec, workgroup) => cast(spec, *workgroup),
         KernelRequest::Pointwise(spec) => pointwise(spec, caps),
         KernelRequest::Row(spec) => row(spec, caps),
         KernelRequest::Contraction(spec) => contraction(spec, caps),
@@ -997,10 +1152,10 @@ fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenE
                 &spec.cos_shape,
                 spec.rot,
             )?;
-            with(body, Launch::flat(spec.numel))
+            with(spec.workgroup.shape(body), Launch::flat(spec.numel))
         }
         KernelRequest::TopK(spec) => with(
-            arg_top_k_dt(ENTRY, spec.e, spec.k),
+            spec.workgroup.shape(arg_top_k_dt(ENTRY, spec.e, spec.k)),
             Launch::flat(spec.numel),
         ),
         KernelRequest::ExpertGroup(spec) => with(
@@ -1010,21 +1165,17 @@ fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenE
     }
 }
 
-fn cast(spec: &CastSpec) -> Result<Generated, KernelGenError> {
-    match spec {
-        CastSpec::F32ToBf16 { numel } => with(cast_f32_to_bf16(ENTRY), Launch::flat(*numel)),
-        CastSpec::F32ToF16 { numel } => with(cast_f32_to_f16(ENTRY), Launch::flat(*numel)),
-        CastSpec::F16ToF32 { numel } => with(cast_f16_to_f32(ENTRY), Launch::flat(*numel)),
-        CastSpec::Bf16ToF32 { numel } => with(cast_bf16_to_f32(ENTRY), Launch::flat(*numel)),
-        CastSpec::I32ToF32 { numel } => with(cast_i32_to_f32(ENTRY), Launch::flat(*numel)),
-        CastSpec::F32ToE4m3 { out_shape, row_len } => with(
-            f32_to_e4m3fn_packed(ENTRY, *row_len)?,
-            Launch::flat(Storage::BYTE_LANES.units(out_shape)),
-        ),
-        CastSpec::E4m3ToF32 { row_len, numel } => {
-            with(e4m3fn_packed_to_f32(ENTRY, *row_len)?, Launch::flat(*numel))
-        }
-    }
+fn cast(spec: &CastSpec, workgroup: Workgroup) -> Result<Generated, KernelGenError> {
+    let body = match spec {
+        CastSpec::F32ToBf16 { .. } => cast_f32_to_bf16(ENTRY),
+        CastSpec::F32ToF16 { .. } => cast_f32_to_f16(ENTRY),
+        CastSpec::F16ToF32 { .. } => cast_f16_to_f32(ENTRY),
+        CastSpec::Bf16ToF32 { .. } => cast_bf16_to_f32(ENTRY),
+        CastSpec::I32ToF32 { .. } => cast_i32_to_f32(ENTRY),
+        CastSpec::F32ToE4m3 { row_len, .. } => f32_to_e4m3fn_packed(ENTRY, *row_len)?,
+        CastSpec::E4m3ToF32 { row_len, .. } => e4m3fn_packed_to_f32(ENTRY, *row_len)?,
+    };
+    with(workgroup.shape(body), Launch::flat(spec.threads()))
 }
 
 fn pointwise(spec: &PointwiseSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
@@ -1032,7 +1183,7 @@ fn pointwise(spec: &PointwiseSpec, caps: &DeviceCaps) -> Result<Generated, Kerne
     let layouts = leaf_layouts(&spec.leaves);
     match &spec.form {
         PointwiseForm::Float { fold } => with(
-            fused_views(
+            fold.shape(fused_views(
                 ENTRY,
                 &spec.out_shape,
                 &shapes,
@@ -1040,21 +1191,21 @@ fn pointwise(spec: &PointwiseSpec, caps: &DeviceCaps) -> Result<Generated, Kerne
                 &spec.kernel,
                 fold.x_groups(caps),
                 caps.rounding_conversions,
-            )?,
+            )?),
             fold.launch(caps),
         ),
         PointwiseForm::ExactI32 { fold } => with(
-            fused_i32_views_grid(
+            fold.shape(fused_i32_views_grid(
                 ENTRY,
                 &spec.out_shape,
                 &shapes,
                 &layouts,
                 &spec.kernel,
                 fold.x_groups(caps),
-            )?,
+            )?),
             fold.launch(caps),
         ),
-        PointwiseForm::ExactI32Packed { pack } => {
+        PointwiseForm::ExactI32Packed { pack, workgroup } => {
             let body = fused_i32_views_grid_pack(
                 ENTRY,
                 &spec.out_shape,
@@ -1064,15 +1215,17 @@ fn pointwise(spec: &PointwiseSpec, caps: &DeviceCaps) -> Result<Generated, Kerne
                 None,
                 pack,
             )?;
-            // A row-folded pack launches one thread per packed lane, not one per output element.
-            let threads = if pack.is_empty() {
-                spec.numel
-            } else {
-                (spec.numel / pack.len().max(1)).max(1)
-            };
-            with(body, Launch::flat(threads))
+            let threads = packed_threads(spec.numel, pack.len());
+            with(workgroup.shape(body), Launch::flat(threads))
         }
     }
+}
+
+/// The threads of an exact-I32 region over `numel` outputs whose row-folded pack builds each word from `lanes`
+/// outputs: one per packed word, not one per output element. An unpacked region (`lanes == 0`) launches one
+/// per element.
+pub fn packed_threads(numel: usize, lanes: usize) -> usize {
+    numel.checked_div(lanes).map_or(numel, |words| words.max(1))
 }
 
 fn row(spec: &RowSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
@@ -1105,8 +1258,15 @@ fn row(spec: &RowSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
             cols,
             init_bits,
             numel,
+            workgroup,
         } => with(
-            reduce_last_dt(ENTRY, dt.clone(), *op, *cols, f32::from_bits(*init_bits)),
+            workgroup.shape(reduce_last_dt(
+                ENTRY,
+                dt.clone(),
+                *op,
+                *cols,
+                f32::from_bits(*init_bits),
+            )),
             Launch::flat(*numel),
         ),
     }
@@ -1355,7 +1515,8 @@ fn stable_rank(spec: &StableRankSpec, caps: &DeviceCaps) -> Result<Generated, Ke
 
 fn movement(spec: &MovementSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
     with(
-        movement_body(ENTRY, spec, spec.fold.x_groups(caps))?,
+        spec.fold
+            .shape(movement_body(ENTRY, spec, spec.fold.x_groups(caps))?),
         spec.fold.launch(caps),
     )
 }
@@ -1679,6 +1840,7 @@ fn serialized_row(spec: &RowSpec) -> Result<Scheduled, KernelGenError> {
             cols,
             init_bits,
             numel,
+            workgroup: _,
         } => {
             let contract = match op {
                 // A running sum: `cols` additions in order (the first against the zero accumulator), each
@@ -2002,7 +2164,7 @@ mod tests {
                 "contraction:packed:Q5_K:Blocks:w128c2u1:5120x17408".to_string(),
             ),
             (
-                KernelRequest::Cast(CastSpec::F32ToBf16 { numel: 4 }),
+                KernelRequest::Cast(CastSpec::F32ToBf16 { numel: 4 }, Workgroup::Narrow),
                 "cast".to_string(),
             ),
             (
@@ -2014,6 +2176,7 @@ mod tests {
                     e: 8,
                     k: 2,
                     numel: 2,
+                    workgroup: Workgroup::Narrow,
                 }),
                 "topk".to_string(),
             ),
@@ -2701,6 +2864,7 @@ mod tests {
             e: 8,
             k: 2,
             numel: 4,
+            workgroup: Workgroup::Narrow,
         });
         assert!(recipe_size(&request).is_none());
         let built = generate(&request, &caps, &roomy()).expect("generates under roomy limits");
@@ -2986,6 +3150,7 @@ mod tests {
                     0.0f32.to_bits()
                 },
                 numel: rows,
+                workgroup: Workgroup::Narrow,
             })
         };
         let x: Vec<f32> = (0..rows * cols)
@@ -3150,6 +3315,7 @@ mod tests {
             cols: 4,
             init_bits: 1.0f32.to_bits(),
             numel: 3,
+            workgroup: Workgroup::Narrow,
         });
         assert!(unsupported(&product).contains("sum or a max"));
         let half = KernelRequest::Row(RowSpec::ReduceLast {
@@ -3158,6 +3324,7 @@ mod tests {
             cols: 4,
             init_bits: 0,
             numel: 3,
+            workgroup: Workgroup::Narrow,
         });
         assert!(unsupported(&half).contains("F32"));
         // A transpose is a data movement, but not a gather.
@@ -3341,6 +3508,7 @@ mod tests {
                 e: 8,
                 k: 2,
                 numel: 4,
+                workgroup: Workgroup::Narrow,
             }),
             "no AIE schedule",
         );

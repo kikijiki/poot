@@ -28,6 +28,10 @@
 #![feature(mpsc_is_disconnected)]
 // `Metrics::json` is one `json!` literal of every gauge; its expansion recurses once per key.
 #![recursion_limit = "256"]
+#![expect(
+    unsafe_code,
+    reason = "signal handlers and a non-blocking peer-closed probe"
+)]
 
 mod admin;
 
@@ -59,5 +63,6 @@ mod vision;
 mod startup;
 
 fn main() -> anyhow::Result<()> {
+    poot_llm::driver::report_launch_environment(|name| std::env::var(name).ok());
     startup::run()
 }

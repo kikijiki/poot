@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [features]
 # ADR-0113: `apply_movement` (card 626) has no production caller left (the pre-contract device

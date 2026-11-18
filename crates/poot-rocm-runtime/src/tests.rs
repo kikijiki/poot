@@ -11,7 +11,7 @@ use crate::bindings::{
 use crate::buffer::{Pool, RocmAlloc, checked_copy, checked_layout};
 use crate::context::{
     DevicePoison, Held, StagingBuffer, TimeoutLeaks, UploadStrategy, memory_domain_for_pool,
-    require_gpu_check_with, ticks_to_duration,
+    ticks_to_duration,
 };
 use crate::discovery::agent_isa_name;
 use crate::error::{check, describe};
@@ -19,14 +19,13 @@ use crate::hsaco::{ModuleConstruction, kernel_symbol_matches};
 use crate::owner::ResourceOwner;
 use crate::queue::{
     QueueCreationPlan, QueueProperties, QueueRequest, QueueRingProvenance, QueueRole,
-    destroy_queue_reference, device_ring_override_present, queue_request, validate_created_queue,
-    validate_queue_plan_provenance,
+    destroy_queue_reference, queue_request, validate_created_queue, validate_queue_plan_provenance,
 };
 use poot_runtime_common::{BufferRole, MemoryCounters, UPLOAD_CHUNK_BYTES, fnv1a};
 use poot_target::MemoryDomain;
 use poot_target::{BufferStorage, ElementKind};
 use std::cell::Cell;
-use std::ffi::{OsString, c_void};
+use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -67,11 +66,6 @@ fn queue_role_and_ring_provenance_are_independent_contracts() {
 
 #[test]
 fn device_ring_provenance_fails_closed_unless_the_override_held_throughout() {
-    assert!(!device_ring_override_present(|_| None));
-    assert!(device_ring_override_present(|_| Some("1".into())));
-    assert!(device_ring_override_present(|_| Some("0".into())));
-    assert!(device_ring_override_present(|_| Some(OsString::new())));
-
     let receipt = QueueCreationPlan::PcieDeviceMemoryRingReceipt;
     validate_queue_plan_provenance(receipt, true, true).unwrap();
     for (override_at_load, override_now) in [(false, false), (true, false), (false, true)] {
@@ -507,27 +501,6 @@ fn ownership_resources_are_send() {
     assert_send::<HsacoModule>();
 }
 
-#[test]
-fn rocm_context_open_is_required_by_its_own_variable_only() {
-    use poot_runtime_common::DeviceBackend;
-    let fails_open = |variable: &'static str| {
-        std::panic::catch_unwind(|| {
-            require_gpu_check_with(|name| (name == variable).then(|| "1".into()), "no device")
-        })
-        .is_err()
-    };
-    assert!(fails_open(DeviceBackend::Rocm.variable()));
-    for other in DeviceBackend::ALL
-        .into_iter()
-        .filter(|other| *other != DeviceBackend::Rocm)
-    {
-        assert!(
-            !fails_open(other.variable()),
-            "{other:?} must not require Rocm"
-        );
-    }
-}
-
 fn test_buffer(elements: usize, storage: BufferStorage) -> RocmBuffer {
     let byte_capacity =
         checked_layout("test_buffer", elements, storage).expect("valid test buffer");
@@ -778,15 +751,10 @@ fn bind_kernarg_refuses_more_buffers_than_the_segment_holds() {
 fn native_buffer_contract_roundtrip_rocm() {
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
-        Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: native_buffer_contract_roundtrip_rocm (no HSA library): {msg}"
-            );
-            return;
-        }
-        Err(RocmError::NoGpuAgent) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: native_buffer_contract_roundtrip_rocm (no GPU agent)"
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
             );
             return;
         }
@@ -936,13 +904,11 @@ fn agent_enumeration_works() {
                 ctx.isa_name
             );
         }
-        Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: agent_enumeration_works (no HSA library): {msg}"
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
             );
-        }
-        Err(RocmError::NoGpuAgent) => {
-            tracing::info!("POOT-SKIP poot-rocm-runtime: agent_enumeration_works (no GPU agent)");
         }
         Err(e) => panic!("agent_enumeration_works failed: {e}"),
     }
@@ -955,16 +921,10 @@ fn agent_enumeration_works() {
 fn vram_budget_bytes_reports_a_plausible_value() {
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
-        Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: vram_budget_bytes_reports_a_plausible_value (no HSA \
-                 library): {msg}"
-            );
-            return;
-        }
-        Err(RocmError::NoGpuAgent) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: vram_budget_bytes_reports_a_plausible_value (no GPU agent)"
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
             );
             return;
         }
@@ -1017,12 +977,11 @@ fn a_unified_memory_device_leaves_the_host_its_floor() {
 fn open_context_or_skip(test: &str) -> Option<RocmContext> {
     match RocmContext::new() {
         Ok(ctx) => Some(ctx),
-        Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!("POOT-SKIP poot-rocm-runtime: {test} (no HSA library): {msg}");
-            None
-        }
-        Err(RocmError::NoGpuAgent) => {
-            tracing::info!("POOT-SKIP poot-rocm-runtime: {test} (no GPU agent)");
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
+            );
             None
         }
         Err(e) => panic!("{test} failed: {e}"),
@@ -1038,12 +997,11 @@ fn open_context_with_one_second_wait_bound_or_skip(test: &str) -> Option<RocmCon
         ..RocmContextOptions::default()
     }) {
         Ok(ctx) => Some(ctx),
-        Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!("POOT-SKIP poot-rocm-runtime: {test} (no HSA library): {msg}");
-            None
-        }
-        Err(RocmError::NoGpuAgent) => {
-            tracing::info!("POOT-SKIP poot-rocm-runtime: {test} (no GPU agent)");
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
+            );
             None
         }
         Err(e) => panic!("{test} failed: {e}"),
@@ -1636,15 +1594,10 @@ fn a_small_write_pins_a_small_ring_slot() {
 fn wait_completion_bounded_wakes_when_signal_drops() {
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
-        Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: wait_completion_bounded_wakes_when_signal_drops (no HSA library): {msg}"
-            );
-            return;
-        }
-        Err(RocmError::NoGpuAgent) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: wait_completion_bounded_wakes_when_signal_drops (no GPU agent)"
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
             );
             return;
         }
@@ -1823,15 +1776,10 @@ fn completion_wait_policy_stops_at_a_reported_device_fault() {
 fn enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count() {
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
-        Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no HSA library): {msg}"
-            );
-            return;
-        }
-        Err(RocmError::NoGpuAgent) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no GPU agent)"
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
             );
             return;
         }
@@ -2149,15 +2097,10 @@ fn each_creation_plan_publishes_through_its_own_ring_contract() {
 fn device_caps_matches_a_direct_hsa_query() {
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
-        Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: device_caps_matches_a_direct_hsa_query (no HSA library): {msg}"
-            );
-            return;
-        }
-        Err(RocmError::NoGpuAgent) => {
-            tracing::info!(
-                "POOT-SKIP poot-rocm-runtime: device_caps_matches_a_direct_hsa_query (no GPU agent)"
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
             );
             return;
         }

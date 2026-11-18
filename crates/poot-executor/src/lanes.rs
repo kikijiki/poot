@@ -63,18 +63,31 @@ pub(crate) fn first_non_finite_f16(bytes: &[u8]) -> Option<(usize, u16)> {
         .find(|&(_, bits)| bits & 0x7c00 == 0x7c00)
 }
 
+/// The magnitude bits (sign dropped) of the smallest BF16 f16 cannot hold: 2^16 = 65536, which rounds to an f16
+/// infinity. The largest finite BF16 below it, 65280, is exact in f16, so no value rounds up to infinity at the
+/// boundary; every larger magnitude, an infinity and every NaN have magnitude bits at or above it.
+const BF16_FIRST_PAST_F16: u16 = 0x4780;
+
+/// Elements tested together without a branch, so the loop over a block is a vector reduction; the block that
+/// holds an offender is then searched for the first one.
+const SCAN_BLOCK: usize = 256;
+
 /// The first element of BF16 `bytes` f16 cannot hold (an infinity or NaN, or a value that rounds past 65504), as
-/// `(index, bf16 bits)`: the check of a [`poot_graph_ir::ValueBound::FiniteIn`] declaration on a BF16 weight.
+/// `(index, bf16 bits)`: the check of a [`poot_graph_ir::ValueBound::FiniteIn`] declaration on a BF16 weight. A
+/// bit test on the magnitude (see [`BF16_FIRST_PAST_F16`]), the same elements the f16 conversion turns into an
+/// infinity or NaN, pinned over every bit pattern by `the_f16_range_bit_test_is_the_conversions_refusal`.
 pub(crate) fn first_past_f16_range(bytes: &[u8]) -> Option<(usize, u16)> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| u16::from_le_bytes(*c))
+    let elements = bytes.as_chunks::<2>().0;
+    let magnitude = |c: &[u8; 2]| u16::from_le_bytes(*c) & 0x7fff;
+    elements
+        .chunks(SCAN_BLOCK)
         .enumerate()
-        .find(|&(_, bits)| {
-            let half = poot_quant::scalar::f32_to_f16(poot_quant::scalar::bf16_to_f32(bits));
-            half & 0x7c00 == 0x7c00
+        .find(|(_, block)| block.iter().map(magnitude).max() >= Some(BF16_FIRST_PAST_F16))
+        .and_then(|(at, block)| {
+            let offset = block
+                .iter()
+                .position(|c| magnitude(c) >= BF16_FIRST_PAST_F16)?;
+            Some((at * SCAN_BLOCK + offset, u16::from_le_bytes(block[offset])))
         })
 }
 
@@ -265,8 +278,8 @@ mod tests {
 
     /// POOT-1458, now the check of a `FiniteIn(F16)` bound: an element of a BF16 weight that f16 cannot hold (65536,
     /// an infinity, a NaN) is found by index, and 65280 (the largest bf16 below the f16 limit) and the f16
-    /// subnormals pass. Mutation: compare the rounded bits with `0x7c00` only for an exact infinity's mantissa
-    /// (`== 0x7c00` on the whole value, so a NaN passes); the NaN element is accepted and this row goes red.
+    /// subnormals pass. Mutation: raise `BF16_FIRST_PAST_F16` to `0x7f80` (an exact infinity's magnitude, so a
+    /// 65536 and a NaN pass); those elements are accepted and this row goes red.
     #[test]
     fn a_bf16_weight_past_the_f16_range_is_found_by_index() {
         let words = |bits: &[u16]| {
@@ -288,6 +301,44 @@ mod tests {
                 "{bits:#06x}"
             );
         }
+    }
+
+    /// The magnitude bit test is the f16 conversion's refusal, element for element: for every one of the 65536 BF16
+    /// bit patterns, the test accepts exactly the values whose rounding to f16 is finite (the oracle is the
+    /// rounding the narrowed contraction itself stages with, [`poot_quant::scalar::f32_to_f16`]). Mutation: lower
+    /// `BF16_FIRST_PAST_F16` to `0x477f`; 65280, which f16 holds, is refused and this row goes red.
+    #[test]
+    fn the_f16_range_bit_test_is_the_conversions_refusal() {
+        for bits in 0..=u16::MAX {
+            let half = poot_quant::scalar::f32_to_f16(poot_quant::scalar::bf16_to_f32(bits));
+            let refused = half & 0x7c00 == 0x7c00;
+            assert_eq!(
+                first_past_f16_range(&bits.to_le_bytes()),
+                refused.then_some((0, bits)),
+                "{bits:#06x}"
+            );
+        }
+    }
+
+    /// The first offender is found by its index in the whole slice, across the scan's blocks: an early finite
+    /// block, a later block holding two offenders reports the first of them, and a trailing odd byte is no element.
+    /// Mutation: report the index within its block (`offset` alone); the index is wrong and this row goes red.
+    #[test]
+    fn the_first_past_range_element_is_indexed_across_scan_blocks() {
+        let mut elements = vec![0x3f80u16; 3 * super::SCAN_BLOCK + 5];
+        elements[2 * super::SCAN_BLOCK + 7] = 0x4780;
+        elements[3 * super::SCAN_BLOCK + 1] = 0xff80;
+        let mut bytes: Vec<u8> = elements.iter().flat_map(|b| b.to_le_bytes()).collect();
+        assert_eq!(
+            first_past_f16_range(&bytes),
+            Some((2 * super::SCAN_BLOCK + 7, 0x4780))
+        );
+        bytes.push(0xff);
+        assert_eq!(
+            first_past_f16_range(&bytes),
+            Some((2 * super::SCAN_BLOCK + 7, 0x4780))
+        );
+        assert_eq!(first_past_f16_range(&[0x80, 0x47][..1]), None);
     }
 
     /// Dense E4M3FN storage still has no encoding: only the packed lane does.

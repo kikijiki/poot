@@ -304,7 +304,7 @@ fn an_imported_kernel_over_the_lds_budget_is_refused_before_any_load() {
 }
 
 /// `a + b` over `n` f32 elements: one thread per element, so a device whose grid cap is below
-/// `n / 64` workgroups gets its workgroup widened to 256 by `finalize`.
+/// `n / 64` workgroups gets its request declared at the wide 256-lane workgroup.
 fn add_graph(n: usize) -> poot_graph_ir::Graph {
     let b = Builder::for_tests();
     let x = b.constant("x", TensorType::f32(vec![n])).unwrap();
@@ -313,14 +313,16 @@ fn add_graph(n: usize) -> poot_graph_ir::Graph {
     b.finish(out).unwrap()
 }
 
-/// The finalizer's workgroup bump changes the kernel a request builds, so the plan key must change with
-/// it: two devices whose grid caps differ plan different bodies for the same request and must never share
-/// a key (a kernel cache keyed by it would serve one device the other's body).
+/// The workgroup an elementwise request declares changes the kernel it builds, so the plan key must change
+/// with it, by the request's own digest and not a suffix: two devices whose grid caps differ plan different
+/// bodies for the same equation and must never share a key (a kernel cache keyed by it would serve one device
+/// the other's body).
 ///
-/// Mutation: delete the `key.push_str(..)` in `shape_launch`. The widened plan then keeps the unwidened
-/// plan's key, and the key assertion fails with equal keys beside different workgroup shapes.
+/// Mutation: replace `Fold`'s derived `Hash` (poot-kernelgen `request.rs`) with one that omits `width`. The
+/// widened request then digests to the unwidened one's key, and the last assertion fails with equal keys beside
+/// different workgroup shapes.
 #[test]
-fn a_finalizer_workgroup_bump_is_reflected_in_the_plan_key() {
+fn a_widened_workgroup_is_named_by_the_plan_key() {
     let backend = Backend::SpirvVulkan;
     let n = 1024 * 64 + 1;
     let plain = target(backend, default_caps_for(backend));
@@ -343,7 +345,7 @@ fn a_finalizer_workgroup_bump_is_reflected_in_the_plan_key() {
     );
     assert_eq!(
         tight_wg[0], 256,
-        "the tight device widens it to fit the grid cap"
+        "the tight device declares the wide workgroup to fit the grid cap"
     );
     assert_ne!(
         plain_key, tight_key,

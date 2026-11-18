@@ -8,6 +8,11 @@
 //! `poot_eval::test_support`, `poot_quant::test_support`, `poot_kernel_ir::test_support`,
 //! `poot_codegen::test_support` and `poot_runtime_common::device_skip`.
 
+#![expect(
+    unsafe_code,
+    reason = "the contained child sets a parent-death signal and closes inherited descriptors in the forked child"
+)]
+
 pub mod checkpoints;
 pub mod contained_child;
 pub mod device_caps;

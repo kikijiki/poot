@@ -169,6 +169,8 @@ fn bounded_drain_subprocess_child() {
     SHUTDOWN.store(false, Ordering::SeqCst);
     DRAIN_FIXTURE_RELEASE.store(false, Ordering::SeqCst);
     reset_drain_cancellation();
+    // SAFETY: each handler is an `extern "C" fn(c_int)` that only stores to an atomic, which is
+    // async-signal-safe, and it stays valid for the life of this fixture process.
     unsafe {
         libc::signal(
             libc::SIGTERM,
@@ -202,6 +204,8 @@ fn bounded_drain_subprocess_child() {
                 }
                 configure_response_writes(&stream, Duration::from_secs(1)).unwrap();
                 let send_buffer: libc::c_int = 4096;
+                // SAFETY: the descriptor is owned by `stream`, and the option value points at a live
+                // `c_int` whose size is passed alongside it.
                 let configured = unsafe {
                     libc::setsockopt(
                         stream.as_raw_fd(),
@@ -344,6 +348,7 @@ impl BoundedDrainChild {
     }
 
     fn signal(&self, signal: libc::c_int) {
+        // SAFETY: signalling a pid this fixture spawned and still owns.
         let result = unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
         assert_eq!(result, 0, "signal bounded-drain child");
     }

@@ -770,12 +770,11 @@ fn assert_trap_traps_on_ptx() {
         "assert_trap",
     );
 
-    let ctx = match poot_ptx_runtime::PtxContext::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("POOT-SKIP assert_trap_traps_on_ptx: no PTX device ({e})");
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        poot_ptx_runtime::PtxContext::new(),
+    ) else {
+        return;
     };
 
     // Green: every idx in range.

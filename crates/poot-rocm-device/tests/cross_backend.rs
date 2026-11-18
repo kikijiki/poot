@@ -2200,8 +2200,9 @@ fn a_serial_matmul_epilogue_matches_the_oracle_on_rocm() {
 
 /// POOT-1036 (ROCm, the generated tiled GEMM over an f32 `[K, N]` weight): a plain `MatMul` head at `M > 1`
 /// with the same chain fuses into one `ContractionEpilogue { head: MatMul }` at a single partial row-tile
-/// (`M == 5`) and at many (`M == 160`); the device result meets the oracle. Mutation: drop the
-/// `Tileable` arm of `epilogue_head_lowers`; the head stays apart from its chain and this row goes red.
+/// (`M == 5`) and at many (`M == 160`); the device result meets the oracle. Mutation: make
+/// `ContractionSpec::accepts_epilogue` answer `false` for `DenseTiled`; the head stays apart from its chain and this
+/// row goes red.
 #[test]
 fn a_tiled_matmul_epilogue_matches_the_oracle_on_rocm() {
     let Some((target, mut rocm)) = try_rocm() else {

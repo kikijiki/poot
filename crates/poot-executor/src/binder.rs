@@ -207,6 +207,9 @@ enum WriteFault {
     /// Card 1007: a packed-F16 weight holds an infinity or NaN, which the generated bodies' in-register
     /// binary16 decode does not represent.
     NonFiniteF16 { index: usize, bits: u16 },
+    /// POOT-1618: a BF16 weight whose graph declares it finite in f16 ([`ValueBound::FiniteIn`]) holds a value f16
+    /// cannot hold, found by the read that uploads it.
+    PastF16Range { index: usize, bits: u16 },
 }
 
 impl From<PayloadReadError> for WriteFault {
@@ -256,6 +259,9 @@ pub(crate) struct WeightWriter {
     data_len: usize,
     /// Drop each range's page cache once it is read ([`Device::unified_memory`](crate::Device::unified_memory)).
     evict: bool,
+    /// Check, in the read that uploads each range, that every BF16 element is finite once rounded to f16
+    /// ([`ValueBound::FiniteIn`], POOT-1618): the bound's one pass over the bytes is the upload's own read.
+    finite_in_f16: bool,
     fault: Mutex<Option<WriteFault>>,
 }
 
@@ -307,7 +313,23 @@ impl WeightWriter {
             Some(WriteFault::NonFiniteF16 { index, bits }) => {
                 Err(LoadError::NonFiniteF16Weight { name, index, bits })
             }
+            Some(WriteFault::PastF16Range { index, bits }) => {
+                Err(LoadError::WeightPastF16Range { name, index, bits })
+            }
         }
+    }
+
+    /// Whether the read that uploads `bytes` can check `bound` itself (`finite_in_f16` of [`WeightBinder::writer`]):
+    /// a BF16 weight's f16-finite bound. Any other bound, or a bound on a stored form it does not apply to, is
+    /// [`WeightBinder::check_bound`]'s, which refuses the mismatch by type.
+    pub(crate) fn can_check(bytes: &ConstBytes, bound: ValueBound) -> bool {
+        matches!(
+            (bytes.stored, bound),
+            (
+                StoredAs::Dense(DType::BF16),
+                ValueBound::FiniteIn(FragmentDtype::F16)
+            )
+        )
     }
 
     /// Stored-stream bytes `range` into `out`; a slab gap is zeros.
@@ -345,6 +367,14 @@ impl WeightWriter {
                     && let Some((index, bits)) = first_non_finite_f16(into)
                 {
                     return Err(WriteFault::NonFiniteF16 {
+                        index: lo / 2 + index,
+                        bits,
+                    });
+                }
+                if self.finite_in_f16
+                    && let Some((index, bits)) = first_past_f16_range(into)
+                {
+                    return Err(WriteFault::PastF16Range {
                         index: lo / 2 + index,
                         bits,
                     });
@@ -1010,6 +1040,7 @@ impl WeightBinder {
         shape: &[usize],
         storage: BufferStorage,
         evict: bool,
+        finite_in_f16: bool,
     ) -> Result<WeightWriter, EncodeError> {
         let encoding = match bytes.stored {
             StoredAs::Dense(dtype) => {
@@ -1040,6 +1071,7 @@ impl WeightBinder {
             shape: shape.to_vec(),
             data_len,
             evict,
+            finite_in_f16,
             fault: Mutex::new(None),
         })
     }
@@ -1292,7 +1324,7 @@ mod tests {
     /// (what [`WeightWriter`] reads, whole).
     fn stored_stream(binder: &WeightBinder, bytes: &ConstBytes) -> Vec<u8> {
         let writer = binder
-            .writer(bytes, &[], BufferStorage::i32(), false)
+            .writer(bytes, &[], BufferStorage::i32(), false, false)
             .expect("a packed source has an encoding");
         let mut out = vec![0u8; bytes.stored_len()];
         writer
@@ -1411,7 +1443,7 @@ mod tests {
             .const_bytes(ValueId::new(0), name.as_str(), &declared, None)
             .expect("the stacked source binds");
         let writer = binder
-            .writer(&bytes, &[], BufferStorage::i32(), false)
+            .writer(&bytes, &[], BufferStorage::i32(), false, false)
             .expect("a packed source has an encoding");
         let transport: Vec<u8> = poot_quant::packed_source_words(&stored_stream(&binder, &bytes))
             .into_iter()
@@ -1470,7 +1502,7 @@ mod tests {
             .const_bytes(ValueId::new(0), &id.const_name(), &declared, None)
             .expect("the narrowed table binds");
         let writer = binder
-            .writer(&bytes, &[3, 2], BufferStorage::i32(), false)
+            .writer(&bytes, &[3, 2], BufferStorage::i32(), false, false)
             .expect("an I32 table lands verbatim");
         let expected: Vec<u8> = words
             .iter()

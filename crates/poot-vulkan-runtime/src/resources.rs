@@ -1,23 +1,6 @@
 use crate::{DeviceOwner, RuntimeError};
 use ash::vk;
 
-/// Card 537 (ADR-0104 decision 5): a test-harness convention, not a production execution choice - see
-/// `poot_wgpu_runtime::require::require_gpu_check`'s matching note (the wgpu counterpart this mirrors).
-///
-/// `POOT_REQUIRE_VULKAN=1` turns the "no Vulkan device: tests skip" convention into a failure: a
-/// failed context open panics instead of returning the Err that skip guards turn into a silent pass
-/// (`just test-device-vulkan` sets it). Failure path only; mirrors `poot-wgpu-runtime::require_gpu_check`.
-pub(crate) fn require_gpu_check<E: std::fmt::Display>(e: E) -> E {
-    require_gpu_check_with(|name| std::env::var(name).ok(), e)
-}
-
-pub(crate) fn require_gpu_check_with<E: std::fmt::Display>(
-    get: impl Fn(&str) -> Option<String>,
-    e: E,
-) -> E {
-    poot_runtime_common::DeviceBackend::Vulkan.fail_if_required(get, e)
-}
-
 pub(crate) struct BufferResources {
     pub(crate) buffer: vk::Buffer,
     pub(crate) memory: vk::DeviceMemory,

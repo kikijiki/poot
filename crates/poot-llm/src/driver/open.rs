@@ -5,6 +5,7 @@
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use poot_executor::{
     Coordinator, DetailedTiming, DeviceError, Engine, ExecError, Executor, TimingOptions,
@@ -169,12 +170,43 @@ fn vulkan() -> Result<Box<dyn Executor>, DriverError> {
     Ok(Box::new(Engine::new(device)))
 }
 
-fn rocm(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
-    let device = match timing {
-        Timing::Counters => poot_rocm_device::device::RocmDevice::new(),
-        Timing::Detailed(_) => poot_rocm_device::device::RocmDevice::new_with_device_timing(),
+/// How the process was launched, as its edge reported it ([`report_launch_environment`]).
+static LAUNCH: OnceLock<LaunchEnvironment> = OnceLock::new();
+
+/// The launch facts a device open needs and the library must not read from the environment itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LaunchEnvironment {
+    /// `HSA_ALLOCATE_QUEUE_DEV_MEM`: unset, `1`, or another value (ROCr reads it once, at load).
+    hsa_allocate_queue_dev_mem: Option<bool>,
+}
+
+impl LaunchEnvironment {
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            hsa_allocate_queue_dev_mem: lookup("HSA_ALLOCATE_QUEUE_DEV_MEM")
+                .map(|value| value == "1"),
+        }
     }
-    .map_err(|e| open_failed("rocm", e))?;
+}
+
+/// Report how this process was launched, from `lookup` over its environment (`|name| std::env::var(name).ok()`).
+/// Every process edge that opens an executor (a binary's `main`) calls this once before the first
+/// [`open_executor`]; the first report wins. A process that exports `HSA_ALLOCATE_QUEUE_DEV_MEM` is then
+/// refused by the ROCm production queue, which assumes a system-memory ring. Library code never reads the
+/// environment: a process that does not report is treated as launched without the variable.
+pub fn report_launch_environment(lookup: impl Fn(&str) -> Option<String>) {
+    let _ = LAUNCH.set(LaunchEnvironment::from_lookup(lookup));
+}
+
+fn rocm(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
+    let ring = LAUNCH
+        .get()
+        .copied()
+        .unwrap_or_default()
+        .hsa_allocate_queue_dev_mem;
+    let device =
+        poot_rocm_device::device::RocmDevice::open(matches!(timing, Timing::Detailed(_)), ring)
+            .map_err(|e| open_failed("rocm", e))?;
     Ok(engine(device, timing))
 }
 
@@ -310,5 +342,27 @@ mod name_tests {
         let refused = "metal".parse::<BackendChoice>().unwrap_err();
         assert_eq!(refused, UnknownBackend("metal".to_string()));
         assert!(refused.to_string().contains("\"metal\""), "{refused}");
+    }
+}
+
+#[cfg(test)]
+mod launch_environment_tests {
+    use super::LaunchEnvironment;
+
+    /// The ring variable is reported as unset, set to `1`, or set to something else; nothing else is read.
+    #[test]
+    fn the_ring_variable_is_reported_as_the_edge_found_it() {
+        let launch = |value: Option<&'static str>| {
+            LaunchEnvironment::from_lookup(|name| {
+                (name == "HSA_ALLOCATE_QUEUE_DEV_MEM")
+                    .then_some(value)
+                    .flatten()
+                    .map(str::to_owned)
+            })
+            .hsa_allocate_queue_dev_mem
+        };
+        assert_eq!(launch(None), None);
+        assert_eq!(launch(Some("1")), Some(true));
+        assert_eq!(launch(Some("0")), Some(false));
     }
 }

@@ -12,8 +12,8 @@ use super::{
 };
 use crate::planner::{GraphTables, Layout, Lowering, OutputBuffer, StorageDtypes};
 use crate::predicates::{
-    ELEMENTWISE_2D_WIDTH, compose_movement, is_elementwise_2d_in, scatter_update_plan,
-    view_source_shape,
+    ELEMENTWISE_2D_WIDTH, LayoutDemand, compose_movement, is_elementwise_2d_in,
+    scatter_update_plan, view_source_shape,
 };
 use crate::refusal::Site;
 use crate::{Binding, Sink, Source};
@@ -96,6 +96,26 @@ pub(super) fn admits_dtypes(
     Ok(())
 }
 
+/// What this family needs of the layout it reads a value operand through. A `Transpose`, `Slice`, `Broadcast` or
+/// `Reshape` reads its data through the composed layout of the chain it ends, and a `Concat` reads each part
+/// through its own, both over element storage (f32 or I32 words; a two-byte element is read dense). A gather,
+/// a scatter, a dynamic update and the collectives read their operands flat.
+pub(super) fn layout_demand(g: GraphTables<'_>, eqn: &Eqn, value: ValueId) -> LayoutDemand {
+    let words = matches!(g.aval(value).dtype, DType::F32 | DType::I32);
+    match &eqn.op {
+        OpKind::Transpose { .. }
+        | OpKind::Slice { .. }
+        | OpKind::Broadcast { .. }
+        | OpKind::Reshape { .. }
+        | OpKind::Concat { .. }
+            if words =>
+        {
+            LayoutDemand::Any
+        }
+        _ => LayoutDemand::Dense,
+    }
+}
+
 /// Plan one data-movement equation (including the e4m3fn packed forms) and refuse the collectives.
 /// `output` says whether the output buffer already holds an update's base (a donated state), in which
 /// case the update writes only its window.
@@ -140,7 +160,7 @@ pub(super) fn plan(
         let two_d = is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps);
         Planned::generated(
             site,
-            KernelRequest::Movement(spec.folded(two_d)),
+            KernelRequest::Movement(spec.launched(two_d, caps)),
             backend,
             caps,
         )
@@ -345,7 +365,7 @@ pub(super) fn plan(
                     let two_d = spec.threads() > caps.max_grid[0] as usize * ELEMENTWISE_2D_WIDTH;
                     let write = Planned::generated_dispatch(
                         site,
-                        KernelRequest::Movement(spec.folded(two_d)),
+                        KernelRequest::Movement(spec.launched(two_d, caps)),
                         backend,
                         caps,
                     )?;

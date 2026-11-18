@@ -185,6 +185,7 @@
             pkgs.jq            # JSON queries in scripts/test-model-free.sh
             pkgs.cargo-nextest # test runner
             pkgs.cargo-machete # unused-dependency check (`just machete`)
+            pkgs.cargo-deny    # supply-chain policy: advisories, bans, licences, sources (`just deny`, deny.toml)
 
             pkgs.prettier # markdown autoformatter (`just docs-fix`)
             pkgs.lychee   # broken-link checker for the docs (`just docs-check`)

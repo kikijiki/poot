@@ -258,6 +258,10 @@ fn host_wrapper(func: &ItemFn) -> syn::Result<TokenStream2> {
 }
 
 #[cfg(test)]
+#[expect(
+    unsafe_code,
+    reason = "the test mutates the process environment, which is unsafe in edition 2024"
+)]
 mod card537_no_env_input_tests {
     use super::*;
 
@@ -289,10 +293,12 @@ mod card537_no_env_input_tests {
             std::env::remove_var("POOT_KERNEL_BUILD");
         }
         let without = host_wrapper(&add_fn()).expect("host_wrapper (env unset)");
+        // SAFETY: as above.
         unsafe {
             std::env::set_var("POOT_KERNEL_BUILD", "1");
         }
         let with = host_wrapper(&add_fn()).expect("host_wrapper (env set)");
+        // SAFETY: as above.
         unsafe {
             std::env::remove_var("POOT_KERNEL_BUILD");
         }

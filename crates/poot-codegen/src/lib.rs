@@ -13,18 +13,25 @@
 //! The rustc-bearing MIR import (Stable MIR -> Body) is the separate `pootc` crate; this crate is the
 //! rustc-free emit + llc half, host-testable with hand-built fixtures.
 //!
-//! Card 537 (ADR-0104 decision 5): every `env::var`/`env::var_os` read in this crate (`Toolchain`'s
-//! `POOT_LLC`/`POOT_AIE_LLC`/`POOT_AMD_CLANG`/`POOT_ROCM_DEVICE_LIBS`, and `cache.rs`'s
-//! `POOT_KERNEL_CACHE`/`POOT_KERNEL_CACHE_DIR`) resolves a toolchain binary's path or the kernel-cache's
-//! location/kill-switch - never what a kernel computes. `compile`'s output for a given `Body` and
-//! [`Target`] does not depend on any of them (a different `POOT_LLC` selects a different `llc` binary, not
-//! a different compiled artifact for the same input and toolchain version; `epoch` folds the resolved tool
-//! and its version into the cache key precisely so a toolchain change cannot silently serve a stale
-//! artifact). Kept per the Scope exception for a read that is a toolchain path or a cache kill-switch.
+//! # The process environment
+//!
+//! `environment.rs` is the one file of this crate that reads the process environment: the compiler's tools
+//! (`POOT_LLC`, `POOT_AIE_LLC`, `POOT_AIE_IRON`, `POOT_AMD_CLANG`, `POOT_ROCM_DEVICE_LIBS`) and the cache location
+//! (`POOT_KERNEL_CACHE`, `POOT_KERNEL_CACHE_DIR`, `XDG_CACHE_HOME`, `HOME`). They resolve a tool's path or the
+//! cache's place on the machine, never what a kernel computes: `epoch` folds the resolved tool and its version
+//! into every cache key, so a different tool never serves another tool's artifact. Everything else takes them as
+//! values ([`Toolchain`], [`CacheEnv`]) built from a lookup function, so a test presents an environment without
+//! mutating the process's.
+
+#![expect(
+    unsafe_code,
+    reason = "CompiledKernel has one sanctioned unsafe constructor; the compiler and the NPU lowering are its only callers (POOT-1207)"
+)]
 
 mod cache;
 mod debranch;
 mod emit;
+mod environment;
 mod handle;
 mod kernel;
 mod spirv_postprocess;
@@ -36,8 +43,8 @@ use std::path::Path;
 use std::process::Command;
 
 pub use cache::{
-    ArtifactTooLarge, CODEGEN_SRC_HASH, CachedArtifact, KernelCache, KernelId, KernelKey, WorkDir,
-    epoch as kernel_cache_epoch,
+    ArtifactTooLarge, CODEGEN_SRC_HASH, CacheEnv, CachedArtifact, KernelCache, KernelId, KernelKey,
+    WorkDir, epoch as kernel_cache_epoch,
 };
 pub use emit::emit_llvm_ir;
 pub use handle::{
@@ -81,7 +88,7 @@ pub struct Capability {
     /// A strided (non-row-major) value operand can be read directly by a kernel body, with no
     /// materialize copy first (spec 132's `compute_views`). The AIE core has no view-capable kernel
     /// bodies today (R469-022): strided reads there still materialize. NVPTX's kernel bodies for every
-    /// layout-reading op kind (`operand_demand` in `poot-graph-plan/src/predicates.rs`) are the same backend-neutral
+    /// layout-reading op kind (`operand_demand` in `poot-graph-plan/src/planner.rs`) are the same backend-neutral
     /// `poot-kernelgen` bodies wgpu/ROCm already read strided operands through, compiled for
     /// `Target::Nvptx` like any other kernel; `false` here just meant PTX paid an extra materialize copy
     /// for no codegen reason (R-546-9, card 549).
@@ -301,7 +308,7 @@ pub struct Toolchain {
 impl Toolchain {
     /// The toolchain the process environment describes.
     pub fn from_env() -> Self {
-        Self::from_env_with(|name| std::env::var(name).ok())
+        Self::from_env_with(environment::lookup)
     }
 
     /// The toolchain `lookup` describes: the environment lookup is injected so tests can present an environment

@@ -20,7 +20,7 @@
 //! On NixOS the loader finds the drivers, IGC and the NPU compiler only through `LD_LIBRARY_PATH`;
 //! `nix develop .#npu-intel` puts them there.
 
-#![deny(clippy::undocumented_unsafe_blocks)]
+#![expect(unsafe_code, reason = "raw Level Zero FFI")]
 
 mod buffer;
 mod context;

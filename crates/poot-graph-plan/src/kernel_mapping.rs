@@ -1,12 +1,12 @@
 //! Mapping graph-level fused operations to kernel-IR operations, and the one finalizer every planned
 //! kernel passes through before it can run.
 //!
-//! [`finalize`] shapes the launch (workgroup bump, 2-D fold, the plan key that names it) and then proves the kernel fits the device:
+//! [`finalize`] checks that every dispatch is the kernel its choice names at the launch its request declared, and then proves the kernel fits the device:
 //! generated and imported kernels alike are checked against the measured [`DeviceCaps`] by
 //! [`validate_kernel_resources`], so no plan that cannot run reaches a loader.
 
 use crate::planner::Planned;
-use crate::predicates::{ELEMENTWISE_2D_WIDTH, GraphTables, is_elementwise_2d_in};
+use crate::predicates::GraphTables;
 use crate::refusal::{FusedStepGap, Site, refusal_at};
 use crate::types::DispatchPlanError;
 use poot_kernelgen::KernelRequirements;
@@ -21,13 +21,11 @@ use poot_graph_ir::op::BinOp as GBinOp;
 use poot_graph_ir::op::FusedOp;
 use poot_graph_ir::op::FusedOperand;
 use poot_graph_ir::op::LocalId;
-use poot_graph_ir::op::OpKind;
 use poot_graph_ir::op::UnOp as GUnOp;
 use poot_kernel_ir::BinOp;
 use poot_kernel_ir::MathOp;
 use poot_kernel_ir::UnOp;
 use poot_kernelgen as kg;
-use poot_kernelgen::KernelRequest;
 use poot_tensor::DType;
 
 /// A region-local id -> a kernel value: `< n_inputs` is a leaf, otherwise a prior step.
@@ -237,7 +235,7 @@ pub(crate) fn map_unary(site: Site<'_>, op: GUnOp) -> Result<kg::FusedScalarOp, 
     }
 }
 
-/// The one GPU finalizer: shape the launch of `planned`, then check every kernel it dispatches against
+/// The one GPU finalizer: check the launch of `planned` is the one its choice declared, then check every kernel it dispatches against
 /// `caps`. Takes the plan by `&mut` so the launch-owning families run it at their own tail while the
 /// dispatcher runs it after its match. An AIE target finalizes through [`finalize_aie`].
 #[expect(clippy::too_many_arguments)]
@@ -252,7 +250,8 @@ pub(crate) fn finalize(
     caps: &DeviceCaps,
 ) -> Result<(), PlanError> {
     check_operand_bindings(planned, eqn)?;
-    shape_launch(planned, g, eqn, out_shape, out_numel, backend, odt, caps)?;
+    check_launch_ownership(planned, backend)?;
+    check_e4m3_dispatch_ceiling(planned, g, eqn, out_shape, out_numel, backend, odt, caps)?;
     validate_planned_resources(planned, g, eqn, backend, caps)
 }
 
@@ -317,11 +316,6 @@ fn choice_requirements(choice: &KernelChoice) -> KernelRequirements {
     }
 }
 
-/// The workgroup shape of a single-dispatch plan.
-fn single_workgroup(plan: &Plan) -> Option<[u32; 3]> {
-    plan.single().map(|dispatch| dispatch.body().workgroup_size)
-}
-
 /// Check every kernel `planned` dispatches: its measured body against `caps`, and the requirements its own
 /// choice declares. Imported and generated kernels take the same path.
 fn validate_planned_resources(
@@ -360,12 +354,51 @@ fn validate_planned_resources(
     Ok(())
 }
 
-/// Shape the launch of a planned equation: the wgpu grid-cap workgroup bump, the elementwise 2-D fold
-/// override, and the typed E4M3FN packed-dispatch ceiling check. A bump changes the body the plan's
-/// key names, so it also changes the key.
+/// A planned dispatch is the kernel its choice names, at the launch its request declared: its key is the
+/// choice's digest (a body narrowed to 32-bit indices says so with `:u32`), and an elementwise kernel's
+/// workgroup is the width the choice declared before the body was generated. Nothing reshapes a launch after
+/// planning: a body widened, or a key suffixed, behind the request's back is two devices sharing a key for two
+/// different kernels, and is refused here.
+fn check_launch_ownership(planned: &Planned, backend: Backend) -> Result<(), PlanError> {
+    for (dispatch, planned_dispatch) in planned.plan.dispatches().iter().enumerate() {
+        let choice = planned_dispatch.choice();
+        let named = choice.key(backend.into());
+        let narrowed = matches!(
+            planned_dispatch.body().index_width,
+            poot_kernel_ir::IndexWidth::U32(_)
+        );
+        let expected = if narrowed {
+            format!("{named}:u32")
+        } else {
+            named
+        };
+        if planned_dispatch.key() != expected {
+            return Err(DispatchPlanError::KeyNotChoice {
+                dispatch,
+                key: planned_dispatch.key().to_owned(),
+                expected,
+            }
+            .into());
+        }
+        if let Some(declared) = choice.elementwise_workgroup_x() {
+            let actual = planned_dispatch.body().workgroup_size[0];
+            if actual != declared {
+                return Err(DispatchPlanError::WorkgroupNotDeclared {
+                    dispatch,
+                    declared,
+                    actual,
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The typed E4M3FN packed-dispatch ceiling check.
 #[expect(clippy::too_many_arguments)]
-fn shape_launch(
-    planned: &mut Planned,
+fn check_e4m3_dispatch_ceiling(
+    planned: &Planned,
     g: GraphTables<'_>,
     eqn: &Eqn,
     out_shape: &[usize],
@@ -374,71 +407,9 @@ fn shape_launch(
     odt: DType,
     caps: &DeviceCaps,
 ) -> Result<(), PlanError> {
-    let workgroup_before = single_workgroup(&planned.plan);
+    let plan = &planned.plan;
     let ids = value_ids(eqn);
     let has_e4m3fn_input = ids.iter().any(|&id| g.aval(id).dtype == DType::E4M3FN);
-    // wgpu/Vulkan caps gridDim.x at 65535. A 1-thread-per-element kernel (grid = out_numel) at a large
-    // output exceeds it, e.g. the Q=N prefill's attention scores [1,Hq,N,N] and the wide
-    // matmuls/elementwise at long prompts, which made the wgpu prefill panic (`GridCap`) at N >= ~512.
-    // Bump the baked workgroup size so gridDim = ceil(out_numel/wg) stays under the cap (the global
-    // thread id is workgroup-size-aware, so a larger wg is correct; 256 is the portable Vulkan max and
-    // covers outputs up to ~16.7M elems). FusedRow/Flash own their own wg+grid (row/head parallel), so
-    // leave those untouched. NVPTX has no such cap, but the larger wg is harmless there.
-    // The bump applies to the one-thread-per-output kernels (the default `out_numel` grid), whether
-    // they dispatch as a single plain dispatch or as a metadata dispatch (the card-044
-    // transpose/slice/broadcast layout swaps via the imported index_remap). It must not touch the ops
-    // that size their own launch.
-    //
-    // Every contraction request owns its launch, by type: its generator builds the body
-    // and the grid that shapes it together, and a Gemv, tiled or attention-GEMV body sizes its LDS
-    // reduction or tile by its baked width, so a bump would corrupt it; the one-thread-per-output
-    // contraction bodies run on `Fold`'s fixed-width workgroups. The rest are named below: the row- and
-    // head-parallel ops, whose launch is the template's.
-    let contraction = matches!(
-        &planned.choice,
-        KernelChoice::Generated(KernelRequest::Contraction(_))
-    );
-    let plan = &mut planned.plan;
-    let custom_grid = contraction
-        || matches!(
-            eqn.op,
-            OpKind::FusedRow(_)
-            | OpKind::Attention(_)
-            | OpKind::Scan(_)
-            | OpKind::BlockTopK(_)
-            | OpKind::StableRank(_)
-            | OpKind::SelectedAttention(_)
-            // Card 551a: every SampleToken body is one fixed-64-lane workgroup per row (the LDS
-            // reduce arrays are sized for exactly 64 lanes); the generic bump below would silently
-            // corrupt that reduction by redispatching at workgroup_size[0] = 256.
-            | OpKind::SampleToken { .. }
-        )
-        || is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps);
-    if !contraction && is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps) {
-        // card 159 Inc 3: the imported scatter_update/dyn_update_slice kernels bake their own
-        // `x_groups` from `out.len()` assuming a fixed `WORKGROUP_SIZE = 256` (see
-        // `is_elementwise_2d`), so the dispatch wg must always be 256, unconditionally (not the
-        // conditional 64-or-256 bump below, which would leave small dispatches at the kernel's stock 64
-        // and desync the two `x_groups` derivations once `out_numel` crosses the 65535*64 threshold at
-        // wg=64 but not yet 65535*256 at wg=256).
-        if let Some(dispatch) = plan.single_mut() {
-            dispatch.set_workgroup_x(ELEMENTWISE_2D_WIDTH as u32);
-        }
-    } else if !custom_grid && let Some(dispatch) = plan.single_mut() {
-        let wg0 = dispatch.body().workgroup_size[0].max(1) as usize;
-        if out_numel.div_ceil(wg0) > caps.max_grid[0] as usize {
-            dispatch.set_workgroup_x(256);
-        }
-    }
-    if single_workgroup(plan) != workgroup_before
-        && let Some(dispatch) = plan.single_mut()
-    {
-        // The choice digest names the body the generator built; the bump above made it a different
-        // kernel on this device, so the key must say so (two devices with different grid caps must not
-        // share a key for two different bodies).
-        let [x, y, z] = dispatch.body().workgroup_size;
-        dispatch.append_key(&format!("+wg{x}x{y}x{z}"));
-    }
     // The E4M3FN pack and unpack casts use a one-dimensional global index. Unlike the movement bodies and
     // the dense elementwise kernels, they have no 2-D folded form for dispatches beyond the target's x-grid
     // (`caps.max_grid[0]`). Reject such a launch while planning, before compilation or buffer allocation. Use

@@ -41,6 +41,11 @@
 //!   stream and dispatches through XRT: <https://github.com/nod-ai/iree-amd-aie>
 //! - mlir-aie's host runtime, the dispatch sequence the shim follows: <https://github.com/Xilinx/mlir-aie>
 
+#![expect(
+    unsafe_code,
+    reason = "the XRT and Level Zero FFI and the sanctioned CompiledKernel constructor"
+)]
+
 mod aie_bundle;
 mod aie_compile;
 mod aie_recipe;

@@ -46,7 +46,11 @@ pub(crate) fn device(config: XdnaConfig) -> Option<(File, XdnaDevice)> {
     for variable in ["POOT_AIE_LLC", "POOT_AIE_IRON"] {
         if get(variable).is_none() {
             let missing = format!("${variable} is unset (run under `nix develop .#npu`)");
-            let reason = DeviceBackend::Npu.fail_if_required(get, missing);
+            let reason = poot_runtime_common::device_skip::fail_if_required(
+                DeviceBackend::Npu,
+                get,
+                missing,
+            );
             eprintln!("POOT-SKIP: NPU toolchain unavailable: {reason}");
             return None;
         }

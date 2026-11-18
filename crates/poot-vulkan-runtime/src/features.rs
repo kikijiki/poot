@@ -248,10 +248,10 @@ mod tests {
     /// `vkCreateDevice`. Mutation: remove `.robust_buffer_access(true)` from `enabled_core`.
     #[test]
     fn the_enabled_core_features_include_robust_buffer_access() {
-        let Ok(ctx) = crate::Context::new() else {
-            eprintln!(
-                "POOT-SKIP the_enabled_core_features_include_robust_buffer_access: no Vulkan device"
-            );
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Vulkan,
+            crate::Context::new(),
+        ) else {
             return;
         };
         // SAFETY: `ctx.physical_device` is valid for `ctx.instance`.

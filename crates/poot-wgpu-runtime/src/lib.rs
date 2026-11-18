@@ -47,13 +47,12 @@
 //! [`CompiledKernel::args`] before doing anything else (SC-002), returning
 //! [`RuntimeError::KernelArgs`] on a mismatch.
 
-#![deny(clippy::undocumented_unsafe_blocks)]
+#![expect(unsafe_code, reason = "wgpu-hal interop and raw buffer views")]
 
 mod buffer;
 mod context;
 mod error;
 mod pipeline;
-mod require;
 mod timestamps;
 
 use crate::context::counters::Counter;

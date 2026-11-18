@@ -231,11 +231,11 @@ fn attention_gemv_case(hq: usize, cap: usize, d: usize) -> (Fixture, Vec<f32>, V
 
 /// Card 727 SC-005 on wgpu: a contraction whose body sizes its LDS reduction by its baked width
 /// (the decode attention GEMV) keeps that width through the planner at an output past `128 x` the X grid cap,
-/// where the generic bump would raise a one-thread-per-output body to 256 lanes, and its result
+/// where the widening would raise a one-thread-per-output body to 256 lanes, and its result
 /// equals the f64 reference on every element.
 ///
-/// Mutation: in `kernel_mapping::shape_launch` drop the request-type exemption (`contraction = false`); the
-/// workgroup becomes 256 while the body's LDS tree still folds 128 lanes, and the row goes red.
+/// Mutation: make `KernelRequest::launch` (poot-kernelgen `request.rs`) declare `Elementwise { workgroup_x: 1 }`
+/// for `Contraction` requests; planning refuses with `WorkgroupNotDeclared` and the row goes red.
 #[test]
 fn a_contraction_keeps_its_lds_width_through_the_planner_on_wgpu() {
     let _g = gpu_lock();

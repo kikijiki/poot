@@ -133,7 +133,9 @@ pub use handle::{LoadOptions, ModelHandle};
 use ledger::{Held, Reservation};
 pub use lora::{AdapterRef, AdapterSet, AdapterSource, AdapterSpec, GenerationId, LoraIdx};
 pub use oneshot::{ChatOptions, ChatSession, OneShotError, Sampling, TextRequest, generate_text};
-pub use open::{BackendChoice, open_executor, open_group, open_timed_executor};
+pub use open::{
+    BackendChoice, open_executor, open_group, open_timed_executor, report_launch_environment,
+};
 use placement::{Placed, Placement};
 pub use prefix_cache::{PrefixOutcome, PrefixSkip};
 pub use programs::PlannedPrograms;

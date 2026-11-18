@@ -8,6 +8,11 @@
 //!
 //! Usage: `ptx-check <DIR>` where DIR holds `add.ptx`, `square.ptx`, `matmul.ptx`, ...
 
+#![expect(
+    unsafe_code,
+    reason = "CompiledKernel has one sanctioned unsafe constructor"
+)]
+
 use std::cell::{Cell, RefCell};
 
 use poot_codegen::{

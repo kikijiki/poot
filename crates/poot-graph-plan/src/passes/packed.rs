@@ -169,6 +169,20 @@ pub(super) fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
     }
 }
 
+/// The descriptor and carrier operands a packed equation reads, when it is one.
+fn claimed_carriers(eqn: &Eqn) -> Option<(poot_quant::PackedWeight, &[Operand])> {
+    match &eqn.op {
+        OpKind::PackedDequant { descriptor } => Some((*descriptor, &eqn.inputs)),
+        OpKind::PackedContraction {
+            descriptor, rows, ..
+        } => Some((*descriptor, &eqn.inputs[rows.leading_operands()..])),
+        OpKind::PackedRowGather { descriptor } => {
+            Some((*descriptor, &eqn.inputs[..eqn.inputs.len() - 1]))
+        }
+        _ => None,
+    }
+}
+
 /// Validate one `PackedDequant`/`PackedContraction` equation's carrier operands and return them in
 /// `descriptor.sources()` order.
 ///
@@ -233,7 +247,13 @@ fn validate_packed_carriers(
                 destination: "carried state",
             });
         }
-        if consumers[carrier].as_slice() != [equation] {
+        // Only claims over these very carriers may read them: the dequant itself, or one contraction per reader
+        // of a dequant that was claimed once per consumer.
+        let shared = consumers[carrier].contains(&equation)
+            && consumers[carrier].iter().all(|&reader| {
+                claimed_carriers(&g.eqns()[reader]) == Some((descriptor, carrier_inputs))
+            });
+        if !shared {
             return Err(PackedDequantProductionError::CarrierConsumerCount {
                 context,
                 carrier,
@@ -256,324 +276,385 @@ fn validate_packed_carriers(
     Ok(carriers)
 }
 
-/// One recognized packed-contraction chain, ready to replace its terminal `MatMul`.
-struct PackedContractionCandidate {
-    member_indices: Vec<usize>,
-    /// The dequant's carrier operands, in `descriptor.sources()` order.
+/// The element layout a chain of `Reshape` and `Transpose` leaves over a row-major dequant: one
+/// `(size, stride)` per dimension, strides in elements of the dequant's own `[out, k]` buffer. Movement
+/// composes onto the view without a copy exactly when [`DenseView::reshaped`] finds strides for the new
+/// shape, which is the condition for a contraction to address the dequant through its descriptor.
+#[derive(Clone, Debug)]
+struct DenseView {
+    dims: Vec<(usize, usize)>,
+}
+
+impl DenseView {
+    /// The view of a row-major `[out, k]` tensor.
+    fn row_major(shape: [usize; 2]) -> Self {
+        Self {
+            dims: vec![(shape[0], shape[1]), (shape[1], 1)],
+        }
+    }
+
+    /// The view after `Transpose { perm }`, or `None` when `perm` is not a permutation of the dims.
+    fn transposed(&self, perm: &[usize]) -> Option<Self> {
+        if perm.len() != self.dims.len() {
+            return None;
+        }
+        let dims = perm
+            .iter()
+            .map(|&axis| self.dims.get(axis).copied())
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { dims })
+    }
+
+    /// The view after `Reshape { shape }`, or `None` when the new shape does not compose onto these
+    /// strides without moving elements (a reshape across a transposed pair, for example).
+    fn reshaped(&self, shape: &[usize]) -> Option<Self> {
+        if shape.contains(&0) || self.dims.iter().any(|&(size, _)| size == 0) {
+            return None;
+        }
+        let old: Vec<(usize, usize)> = self.dims.iter().copied().filter(|d| d.0 != 1).collect();
+        let new_sizes: Vec<usize> = shape.iter().copied().filter(|&size| size != 1).collect();
+        let mut new_strides = vec![0; new_sizes.len()];
+        let (mut old_at, mut new_at) = (0, 0);
+        while old_at < old.len() && new_at < new_sizes.len() {
+            let (mut old_end, mut new_end) = (old_at + 1, new_at + 1);
+            let (mut old_product, mut new_product) = (old[old_at].0, new_sizes[new_at]);
+            while old_product != new_product {
+                if old_product < new_product {
+                    old_product *= old.get(old_end)?.0;
+                    old_end += 1;
+                } else {
+                    new_product *= new_sizes.get(new_end)?;
+                    new_end += 1;
+                }
+            }
+            // The old dims of one group must be contiguous with each other to be re-split or merged.
+            if old[old_at..old_end]
+                .windows(2)
+                .any(|pair| pair[0].1 != pair[1].1 * pair[1].0)
+            {
+                return None;
+            }
+            let mut stride = old[old_end - 1].1;
+            for at in (new_at..new_end).rev() {
+                new_strides[at] = stride;
+                stride *= new_sizes[at];
+            }
+            (old_at, new_at) = (old_end, new_end);
+        }
+        if old_at != old.len() || new_at != new_sizes.len() {
+            return None;
+        }
+        let mut strides = new_strides.into_iter();
+        let dims = shape
+            .iter()
+            .map(|&size| {
+                (
+                    size,
+                    if size == 1 {
+                        1
+                    } else {
+                        strides.next().unwrap_or(1)
+                    },
+                )
+            })
+            .collect();
+        Some(Self { dims })
+    }
+
+    /// The view with its size-1 dims dropped: their strides address nothing.
+    fn significant(&self) -> Vec<(usize, usize)> {
+        self.dims.iter().copied().filter(|d| d.0 != 1).collect()
+    }
+
+    /// Whether this view addresses the dequant the way `expected` does.
+    fn addresses(&self, expected: &[(usize, usize)]) -> bool {
+        self.significant() == expected
+    }
+}
+
+/// The movement between a `PackedDequant` and the value a contraction reads, composed onto one view.
+struct WeightChain {
+    dequant: usize,
+    descriptor: poot_quant::PackedWeight,
+    /// The `Reshape` and `Transpose` equations between the dequant and the contraction.
+    movement: Vec<usize>,
+    view: DenseView,
+}
+
+/// Walk back from `weight` through `Reshape` and `Transpose` to a `PackedDequant`, composing the movement onto
+/// the dequant's `[out, k]` view. `None` when the producer chain is anything else or the movement does not
+/// compose. Consumer counts are not this walk's business: [`claim_packed_contractions`] checks that every
+/// reader of the chain is itself part of a claim.
+fn weight_chain(
+    g: &Graph,
+    producer: &HashMap<ValueId, usize>,
+    mut weight: ValueId,
+) -> Option<WeightChain> {
+    let mut movement = Vec::new();
+    let (dequant, descriptor) = loop {
+        let &index = producer.get(&weight)?;
+        match &g.eqns()[index].op {
+            OpKind::PackedDequant { descriptor } => break (index, *descriptor),
+            OpKind::Reshape { .. } | OpKind::Transpose { .. } => {
+                movement.push(index);
+                weight = value_input(&g.eqns()[index], 0)?;
+            }
+            _ => return None,
+        }
+    };
+    movement.reverse();
+    let mut view = DenseView::row_major(descriptor.shape());
+    for &index in &movement {
+        view = match &g.eqns()[index].op {
+            OpKind::Reshape { shape } => view.reshaped(shape)?,
+            OpKind::Transpose { perm } => view.transposed(perm)?,
+            _ => unreachable!("only Reshape and Transpose are pushed"),
+        };
+    }
+    Some(WeightChain {
+        dequant,
+        descriptor,
+        movement,
+        view,
+    })
+}
+
+impl WeightChain {
+    /// The row-block count of the contraction whose right operand this view is, when the view addresses the
+    /// dequant as `[k, out]` (`blocks == 1`) or as `[blocks, k, out / blocks]` (`blocks > 1`, the block-diagonal
+    /// view): both are the transposed product `x @ W^T` over the stored `[out, k]` rows.
+    fn right_operand_blocks(&self) -> Option<usize> {
+        let [out, k] = self.descriptor.shape();
+        let first = self.view.dims.first().map(|&(size, _)| size);
+        [Some(1), first]
+            .into_iter()
+            .flatten()
+            .filter(|&blocks| blocks != 0 && out % blocks == 0)
+            .find(|&blocks| {
+                let block_out = out / blocks;
+                let mut expected = Vec::new();
+                if blocks != 1 {
+                    expected.push((blocks, block_out * k));
+                }
+                expected.extend([(k, 1), (block_out, k)]);
+                expected.retain(|dim| dim.0 != 1);
+                self.view.addresses(&expected)
+            })
+    }
+
+    /// Whether this view is the dequant's own `[out, k]` rows: the left operand of the transposed product
+    /// `(W @ x^T)^T`.
+    fn is_stored_rows(&self) -> bool {
+        let [out, k] = self.descriptor.shape();
+        let mut expected = vec![(out, k), (k, 1)];
+        expected.retain(|dim| dim.0 != 1);
+        self.view.addresses(&expected)
+    }
+}
+
+/// One contraction claimed over a dequant's carriers: the equation that becomes the `PackedContraction`
+/// and the equations the claim consumes, not counting the dequant (several claims can share one).
+struct PackedClaim {
+    /// The equation whose output the `PackedContraction` now produces.
+    root: usize,
+    /// The movement (and, for the transposed product, the inner matmul and activation transpose) it consumes.
+    consumed: Vec<usize>,
+    dequant: usize,
+    activation: ValueId,
+    blocks: usize,
     sources: Vec<ValueId>,
     descriptor: poot_quant::PackedWeight,
+}
+
+/// Claim the contraction `root` reads through `chain` when the typed contraction reproduces `root`'s output.
+fn claim_through(
+    g: &Graph,
+    consumers: &ValueTable<Vec<usize>>,
+    chain: &WeightChain,
+    activation: ValueId,
     blocks: usize,
-}
-
-/// Recognize `packed_graphs::packed_linear`'s canonical chain: `PackedDequant -> Transpose([1,0]) -> optional
-/// Reshape -> MatMul`. The optional reshape (`packed_linear`'s `alias_weight_shape`) follows the
-/// transpose, so this chain can only express an ordinary `[out, k]` dequant - never a view that needs to
-/// split the stored rows into blocks before the transpose (Card 385).
-fn recognize_canonical_packed_chain(
-    g: &Graph,
-    producer: &HashMap<ValueId, usize>,
-    consumers: &ValueTable<Vec<usize>>,
-    mut weight: ValueId,
-) -> Option<PackedContractionCandidate> {
-    let mut member_indices = Vec::new();
-    if let Some(&reshape_index) = producer.get(&weight)
-        && matches!(g.eqns()[reshape_index].op, OpKind::Reshape { .. })
-    {
-        if consumers[weight].len() != 1 || is_graph_escape(g, weight) {
-            return None;
-        }
-        member_indices.push(reshape_index);
-        weight = value_input(&g.eqns()[reshape_index], 0)?;
-    }
-    let &transpose_index = producer.get(&weight)?;
-    let OpKind::Transpose { perm } = &g.eqns()[transpose_index].op else {
-        return None;
-    };
-    if perm.as_slice() != [1, 0] || consumers[weight].len() != 1 || is_graph_escape(g, weight) {
-        return None;
-    }
-    let dequant_out = value_input(&g.eqns()[transpose_index], 0)?;
-    let &dequant_index = producer.get(&dequant_out)?;
-    let OpKind::PackedDequant { descriptor } = g.eqns()[dequant_index].op else {
-        return None;
-    };
-    if consumers[dequant_out].len() != 1 || is_graph_escape(g, dequant_out) {
-        return None;
-    }
+    root: usize,
+    mut consumed: Vec<usize>,
+) -> Option<PackedClaim> {
     let sources = validate_packed_carriers(
         g,
-        dequant_index,
-        descriptor,
-        &g.eqns()[dequant_index].inputs,
+        chain.dequant,
+        chain.descriptor,
+        &g.eqns()[chain.dequant].inputs,
         consumers,
     )
     .ok()?;
-    member_indices.extend([transpose_index, dequant_index]);
-    Some(PackedContractionCandidate {
-        member_indices,
-        sources,
-        descriptor,
-        blocks: 1,
-    })
-}
-
-/// Recognize `packed_graphs::packed_block_diagonal_linear`'s chain: `PackedDequant -> Reshape([blocks, out /
-/// blocks, k]) -> Transpose([0,2,1]) -> MatMul`. The reshape runs before the transpose, the mirror of
-/// the canonical chain above; it reaches the grouped `[blocks, in_per_group, out / blocks]` view a
-/// stored `[out, k]` pair cannot otherwise expose (Card 385). `blocks` is read from the reshape in the
-/// graph; a value that disagrees with `descriptor` is caught by the shared infer-and-compare gate in
-/// the caller.
-fn recognize_blocked_packed_chain(
-    g: &Graph,
-    producer: &HashMap<ValueId, usize>,
-    consumers: &ValueTable<Vec<usize>>,
-    weight: ValueId,
-) -> Option<PackedContractionCandidate> {
-    let &transpose_index = producer.get(&weight)?;
-    let OpKind::Transpose { perm } = &g.eqns()[transpose_index].op else {
-        return None;
+    let op = OpKind::PackedContraction {
+        descriptor: chain.descriptor,
+        rows: ContractionRows::Blocks(blocks),
+        precision: poot_graph_ir::OperandPrecision::Exact,
     };
-    if perm.as_slice() != [0, 2, 1] || consumers[weight].len() != 1 || is_graph_escape(g, weight) {
+    let inputs: Vec<poot_graph_ir::types::TensorType> = std::iter::once(g.aval(activation).clone())
+        .chain(sources.iter().map(|&source| g.aval(source).clone()))
+        .collect();
+    if op.infer(&inputs).ok().as_ref() != Some(g.aval(g.eqns()[root].out)) {
         return None;
     }
-    let reshape_out = value_input(&g.eqns()[transpose_index], 0)?;
-    let &reshape_index = producer.get(&reshape_out)?;
-    let OpKind::Reshape { shape } = &g.eqns()[reshape_index].op else {
-        return None;
-    };
-    if shape.len() != 3 || consumers[reshape_out].len() != 1 || is_graph_escape(g, reshape_out) {
-        return None;
-    }
-    let blocks = shape[0];
-    let dequant_out = value_input(&g.eqns()[reshape_index], 0)?;
-    let &dequant_index = producer.get(&dequant_out)?;
-    let OpKind::PackedDequant { descriptor } = g.eqns()[dequant_index].op else {
-        return None;
-    };
-    if consumers[dequant_out].len() != 1 || is_graph_escape(g, dequant_out) {
-        return None;
-    }
-    let sources = validate_packed_carriers(
-        g,
-        dequant_index,
-        descriptor,
-        &g.eqns()[dequant_index].inputs,
-        consumers,
-    )
-    .ok()?;
-    Some(PackedContractionCandidate {
-        member_indices: vec![transpose_index, reshape_index, dequant_index],
-        sources,
-        descriptor,
-        blocks,
-    })
-}
-
-/// Recognize the reversed spelling of `packed_graphs::packed_linear`'s canonical chain: `y = x @ W^T`
-/// written as `y = (W @ x^T)^T` instead. `packed_graphs::packed_linear`'s canonical `PackedDequant` output is
-/// already `[out, k]` (the dense sibling below needs a `Transpose` to reach that layout, but a packed
-/// dequant starts there), so this spelling needs no transpose on the weight side at all: the dequant
-/// (or dequant-then-reshape, matching the canonical chain's optional alias reshape) feeds the *first*
-/// `MatMul` operand directly, `x^T` is the second, and the whole product is transposed back. Returns the
-/// recognized candidate and the original (untransposed) activation; the caller still runs the shared
-/// infer-and-compare gate against the outer `Transpose`'s declared output, so a near-miss (a shape that
-/// does not actually correspond to `x @ W^T`) is declined there exactly like the other two chains.
-fn recognize_transposed_canonical_packed_chain(
-    g: &Graph,
-    producer: &HashMap<ValueId, usize>,
-    consumers: &ValueTable<Vec<usize>>,
-    mut weight: ValueId,
-    activation_t: ValueId,
-) -> Option<(PackedContractionCandidate, ValueId)> {
-    let &at_index = producer.get(&activation_t)?;
-    let OpKind::Transpose { perm } = &g.eqns()[at_index].op else {
-        return None;
-    };
-    if perm.as_slice() != [1, 0]
-        || consumers[activation_t].len() != 1
-        || is_graph_escape(g, activation_t)
-    {
-        return None;
-    }
-    let activation = value_input(&g.eqns()[at_index], 0)?;
-
-    let mut member_indices = vec![at_index];
-    if let Some(&reshape_index) = producer.get(&weight)
-        && matches!(g.eqns()[reshape_index].op, OpKind::Reshape { .. })
-    {
-        if consumers[weight].len() != 1 || is_graph_escape(g, weight) {
-            return None;
-        }
-        member_indices.push(reshape_index);
-        weight = value_input(&g.eqns()[reshape_index], 0)?;
-    }
-    let &dequant_index = producer.get(&weight)?;
-    let OpKind::PackedDequant { descriptor } = g.eqns()[dequant_index].op else {
-        return None;
-    };
-    if consumers[weight].len() != 1 || is_graph_escape(g, weight) {
-        return None;
-    }
-    let sources = validate_packed_carriers(
-        g,
-        dequant_index,
-        descriptor,
-        &g.eqns()[dequant_index].inputs,
-        consumers,
-    )
-    .ok()?;
-    member_indices.push(dequant_index);
-    Some((
-        PackedContractionCandidate {
-            member_indices,
-            sources,
-            descriptor,
-            blocks: 1,
-        },
+    consumed.extend(&chain.movement);
+    Some(PackedClaim {
+        root,
+        consumed,
+        dequant: chain.dequant,
         activation,
-    ))
+        blocks,
+        sources,
+        descriptor: chain.descriptor,
+    })
 }
 
-/// Replace only the exact single-consumer packed-linear compositions this module's builders emit (the
-/// canonical dense chain, Card 385's block-diagonal chain, and the reversed `(W x^T)^T` spelling of the
-/// canonical chain). This pass runs before transpose/view analysis and leaves a following
-/// ordinary bias Add untouched.
+/// Every contraction that reads a `PackedDequant` through movement that composes onto its weight view: `x @ W^T`
+/// (plain or block-diagonal, through any `Reshape`/`Transpose` chain that composes to the `[k, out]` or
+/// `[blocks, k, out / blocks]` view) and the transposed product `(W @ x^T)^T`.
+fn find_packed_claims(
+    g: &Graph,
+    producer: &HashMap<ValueId, usize>,
+    consumers: &ValueTable<Vec<usize>>,
+) -> Vec<PackedClaim> {
+    let mut claims: Vec<PackedClaim> = Vec::new();
+    for (index, eqn) in g.eqns().iter().enumerate() {
+        if !eqn.op.is_plain_matmul() || eqn.inputs.len() != 2 {
+            continue;
+        }
+        let (Some(activation), Some(weight)) = (value_input(eqn, 0), value_input(eqn, 1)) else {
+            continue;
+        };
+        let Some(chain) = weight_chain(g, producer, weight) else {
+            continue;
+        };
+        let Some(blocks) = chain.right_operand_blocks() else {
+            continue;
+        };
+        claims.extend(claim_through(
+            g,
+            consumers,
+            &chain,
+            activation,
+            blocks,
+            index,
+            Vec::new(),
+        ));
+    }
+    for (index, outer) in g.eqns().iter().enumerate() {
+        let OpKind::Transpose { perm } = &outer.op else {
+            continue;
+        };
+        if perm.as_slice() != [1, 0] {
+            continue;
+        }
+        let Some(product) = value_input(outer, 0) else {
+            continue;
+        };
+        let Some(&inner_index) = producer.get(&product) else {
+            continue;
+        };
+        let inner = &g.eqns()[inner_index];
+        if !inner.op.is_plain_matmul()
+            || inner.inputs.len() != 2
+            || claims.iter().any(|claim| claim.root == inner_index)
+        {
+            continue;
+        }
+        let (Some(weight), Some(activation_t)) = (value_input(inner, 0), value_input(inner, 1))
+        else {
+            continue;
+        };
+        let Some(&at_index) = producer.get(&activation_t) else {
+            continue;
+        };
+        let at = &g.eqns()[at_index];
+        let (OpKind::Transpose { perm: at_perm }, Some(activation)) = (&at.op, value_input(at, 0))
+        else {
+            continue;
+        };
+        if at_perm.as_slice() != [1, 0] {
+            continue;
+        }
+        let Some(chain) = weight_chain(g, producer, weight) else {
+            continue;
+        };
+        if !chain.is_stored_rows() {
+            continue;
+        }
+        claims.extend(claim_through(
+            g,
+            consumers,
+            &chain,
+            activation,
+            1,
+            index,
+            vec![inner_index, at_index],
+        ));
+    }
+    claims
+}
+
+/// Replace every packed dequant whose readers are all contractions that compose onto its weight view by one
+/// `PackedContraction` per reader, over the same carriers. This is the planner-facing claim: the weight is
+/// never widened and no standalone dequant is lowered (POOT-ADR-0103). The rule is that the movement chain
+/// between the dequant and the contraction composes to an `[out, k]` (or blocked) view the descriptor
+/// addresses. A dequant with any other reader, or whose chain or product escapes the graph, is left alone for
+/// [`reject_packed_dequant_escapes`] to refuse. This pass runs before transpose/view analysis and leaves a
+/// following ordinary bias Add untouched.
 ///
 /// Generic over the validation channel: a validation value is a liveness root, so a member that a witness
-/// observes is a graph escape and its composition is left unrecognized.
+/// observes is a graph escape and its claim is left unrecognized.
 pub fn recognize_packed_contractions(g: &Graph) -> Result<Graph, EditError> {
     let consumers = packed_consumer_map(g);
     let mut producer = HashMap::new();
     for (index, eqn) in g.eqns().iter().enumerate() {
         producer.insert(eqn.out, index);
     }
+    let claims = find_packed_claims(g, &producer, &consumers);
+
+    let mut dequants: Vec<usize> = claims.iter().map(|claim| claim.dequant).collect();
+    dequants.sort_unstable();
+    dequants.dedup();
     let mut replacements: HashMap<usize, Eqn> = HashMap::new();
     let mut removed = HashSet::new();
-
-    for (matmul_index, matmul) in g.eqns().iter().enumerate() {
-        if !matmul.op.is_plain_matmul() || matmul.inputs.len() != 2 {
+    for dequant in dequants {
+        let group: Vec<&PackedClaim> = claims.iter().filter(|c| c.dequant == dequant).collect();
+        // Every equation of the group, and every one of them whose output the group reads.
+        let inside: HashSet<usize> = group
+            .iter()
+            .flat_map(|claim| claim.consumed.iter().copied().chain([claim.root]))
+            .chain([dequant])
+            .collect();
+        let consumed: HashSet<usize> = inside
+            .iter()
+            .copied()
+            .filter(|index| !group.iter().any(|claim| claim.root == *index))
+            .collect();
+        let closed = consumed.iter().all(|&index| {
+            let out = g.eqns()[index].out;
+            !is_graph_escape(g, out) && consumers[out].iter().all(|reader| inside.contains(reader))
+        });
+        if !closed {
             continue;
         }
-        let (Some(activation), Some(weight)) = (value_input(matmul, 0), value_input(matmul, 1))
-        else {
-            continue;
-        };
-        let Some(candidate) = recognize_canonical_packed_chain(g, &producer, &consumers, weight)
-            .or_else(|| recognize_blocked_packed_chain(g, &producer, &consumers, weight))
-        else {
-            continue;
-        };
-        let candidate_op = OpKind::PackedContraction {
-            descriptor: candidate.descriptor,
-            rows: ContractionRows::Blocks(candidate.blocks),
-            precision: poot_graph_ir::OperandPrecision::Exact,
-        };
-        let candidate_inputs: Vec<poot_graph_ir::types::TensorType> =
-            std::iter::once(g.aval(activation).clone())
-                .chain(
-                    candidate
-                        .sources
-                        .iter()
-                        .map(|&source| g.aval(source).clone()),
-                )
-                .collect();
-        if candidate_op.infer(&candidate_inputs).ok().as_ref() != Some(g.aval(matmul.out)) {
-            continue;
+        removed.extend(consumed);
+        for claim in group {
+            let root = &g.eqns()[claim.root];
+            replacements.insert(
+                claim.root,
+                Eqn {
+                    op: OpKind::PackedContraction {
+                        descriptor: claim.descriptor,
+                        rows: ContractionRows::Blocks(claim.blocks),
+                        precision: poot_graph_ir::OperandPrecision::Exact,
+                    },
+                    inputs: std::iter::once(Operand::Value(claim.activation))
+                        .chain(claim.sources.iter().map(|&source| Operand::Value(source)))
+                        .collect(),
+                    out: root.out,
+                    layer: root.layer,
+                },
+            );
         }
-        removed.extend(candidate.member_indices.iter().copied());
-        replacements.insert(
-            matmul_index,
-            Eqn {
-                op: candidate_op,
-                inputs: std::iter::once(Operand::Value(activation))
-                    .chain(
-                        candidate
-                            .sources
-                            .iter()
-                            .map(|&source| Operand::Value(source)),
-                    )
-                    .collect(),
-                out: matmul.out,
-                layer: matmul.layer,
-            },
-        );
-    }
-
-    for (transpose_index, transpose_eqn) in g.eqns().iter().enumerate() {
-        if replacements.contains_key(&transpose_index) || removed.contains(&transpose_index) {
-            continue;
-        }
-        let OpKind::Transpose { perm } = &transpose_eqn.op else {
-            continue;
-        };
-        if perm.as_slice() != [1, 0] {
-            continue;
-        }
-        let Some(product) = value_input(transpose_eqn, 0) else {
-            continue;
-        };
-        let Some(&inner_matmul_index) = producer.get(&product) else {
-            continue;
-        };
-        if replacements.contains_key(&inner_matmul_index) || removed.contains(&inner_matmul_index) {
-            continue;
-        }
-        let inner_matmul = &g.eqns()[inner_matmul_index];
-        if !inner_matmul.op.is_plain_matmul() || inner_matmul.inputs.len() != 2 {
-            continue;
-        }
-        if consumers[product].len() != 1 || is_graph_escape(g, product) {
-            continue;
-        }
-        let (Some(weight), Some(activation_t)) =
-            (value_input(inner_matmul, 0), value_input(inner_matmul, 1))
-        else {
-            continue;
-        };
-        let Some((candidate, activation)) = recognize_transposed_canonical_packed_chain(
-            g,
-            &producer,
-            &consumers,
-            weight,
-            activation_t,
-        ) else {
-            continue;
-        };
-        let candidate_op = OpKind::PackedContraction {
-            descriptor: candidate.descriptor,
-            rows: ContractionRows::Blocks(candidate.blocks),
-            precision: poot_graph_ir::OperandPrecision::Exact,
-        };
-        let candidate_inputs: Vec<poot_graph_ir::types::TensorType> =
-            std::iter::once(g.aval(activation).clone())
-                .chain(
-                    candidate
-                        .sources
-                        .iter()
-                        .map(|&source| g.aval(source).clone()),
-                )
-                .collect();
-        if candidate_op.infer(&candidate_inputs).ok().as_ref() != Some(g.aval(transpose_eqn.out)) {
-            continue;
-        }
-        removed.insert(inner_matmul_index);
-        removed.extend(candidate.member_indices.iter().copied());
-        replacements.insert(
-            transpose_index,
-            Eqn {
-                op: candidate_op,
-                inputs: std::iter::once(Operand::Value(activation))
-                    .chain(
-                        candidate
-                            .sources
-                            .iter()
-                            .map(|&source| Operand::Value(source)),
-                    )
-                    .collect(),
-                out: transpose_eqn.out,
-                layer: transpose_eqn.layer,
-            },
-        );
     }
 
     let eqns = g
@@ -993,5 +1074,91 @@ mod tests {
             2,
             "activation plus the one Blocks carrier"
         );
+    }
+
+    /// SC-001 (first half): a packed weight with a `Reshape` between the dequant and the matmul. `[out, k]` is
+    /// reshaped to `[1, out, k]` and transposed `[0, 2, 1]`: movement that composes onto the weight view although
+    /// it is none of the spellings `packed_linear` and `packed_block_diagonal_linear` emit. Mutation: make
+    /// `DenseView::reshaped` refuse every reshape; the dequant is left unclaimed and production rejects it as
+    /// `Unmatched`.
+    #[test]
+    fn a_reshape_between_dequant_and_matmul_composes_onto_the_weight_view() {
+        let descriptor = PackedWeight::try_new(WeightFormat::Q4_0, [3, 64]).unwrap();
+        let b = Builder::for_tests();
+        let activation = b
+            .constant("activation", TensorType::f32(vec![1, 2, 64]))
+            .unwrap();
+        let mut plan = b.append_plan(0).unwrap();
+        let blocks = plan
+            .input(
+                "layer.packed_blocks_source",
+                TensorType::new(
+                    descriptor
+                        .source_shape(poot_quant::SourceRole::Blocks)
+                        .to_vec(),
+                    DType::I8,
+                ),
+                Storage::Const,
+            )
+            .unwrap();
+        let dequant = plan
+            .equation(
+                OpKind::PackedDequant { descriptor },
+                vec![Operand::Value(blocks.id())],
+            )
+            .unwrap();
+        let lifted = plan
+            .equation(
+                OpKind::Reshape {
+                    shape: vec![1, 3, 64],
+                },
+                vec![Operand::Value(dequant.id())],
+            )
+            .unwrap();
+        let weight = plan
+            .equation(
+                OpKind::Transpose {
+                    perm: vec![0, 2, 1],
+                },
+                vec![Operand::Value(lifted.id())],
+            )
+            .unwrap();
+        let output = plan
+            .equation(
+                OpKind::matmul(),
+                vec![Operand::Value(activation.id()), Operand::Value(weight.id())],
+            )
+            .unwrap();
+        plan.declare_result(output).unwrap();
+        let mut prepared = b.preflight_append(plan).unwrap();
+        let committed = b.commit_append(&mut prepared).unwrap();
+        let g = b.finish(committed).unwrap();
+
+        let recognized = prepare_packed_dequant_production(&g).unwrap();
+        assert_eq!(
+            recognized.eqns().len(),
+            1,
+            "no standalone dequant may survive: {recognized:?}"
+        );
+        assert!(matches!(
+            recognized.eqns()[0].op,
+            OpKind::PackedContraction {
+                rows: ContractionRows::Blocks(1),
+                ..
+            }
+        ));
+        assert_eq!(recognized.aval(recognized.result()).shape, vec![1, 2, 3]);
+    }
+
+    /// Movement that does not compose onto the stored rows is not claimed: reshaping the transposed `[k, out]`
+    /// view to `[out, k]` would have to move elements. Mutation: skip the contiguity check in
+    /// `DenseView::reshaped`; the first assertion goes red.
+    #[test]
+    fn a_reshape_across_a_transposed_pair_does_not_compose() {
+        let stored = DenseView::row_major([3, 64]);
+        let transposed = stored.transposed(&[1, 0]).unwrap();
+        assert!(transposed.reshaped(&[3, 64]).is_none());
+        assert!(transposed.reshaped(&[64, 3]).is_some());
+        assert!(stored.reshaped(&[3, 8, 8]).is_some());
     }
 }

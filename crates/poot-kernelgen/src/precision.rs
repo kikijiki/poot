@@ -814,10 +814,10 @@ mod rocm_sweep {
     fn sweep_on_rocm(sweep: Sweep, patterns: u64) -> Option<(u32, u32)> {
         let ctx = match RocmContext::new() {
             Ok(ctx) => ctx,
-            Err(RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("the {sweep:?} sweep on ROCm: no ROCm device"),
+            Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+                poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                    poot_runtime_common::DeviceBackend::Rocm,
+                    Err(error),
                 );
                 return None;
             }
@@ -905,16 +905,10 @@ mod ptx_sweep {
     /// `sweep` over the first `patterns` bit patterns on PTX: `(mismatches, an example)`, or `None` (a reported
     /// skip) with no NVIDIA device.
     fn sweep_on_ptx(sweep: Sweep, patterns: u64) -> Option<(u32, u32)> {
-        let ctx = match PtxContext::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("the {sweep:?} sweep on PTX: no PTX device ({error})"),
-                );
-                return None;
-            }
-        };
+        let ctx = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Ptx,
+            PtxContext::new(),
+        )?;
         let body = sweep_body(sweep);
         let dir = std::env::temp_dir().join("poot-kernelgen-f16-sweep-ptx");
         std::fs::create_dir_all(&dir).unwrap();

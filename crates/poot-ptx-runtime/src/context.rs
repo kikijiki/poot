@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use cudarc::driver::{result, sys};
 use poot_codegen::{CompiledKernel, KernelCode};
-use poot_runtime_common::{BufferRole, DeviceBackend, fnv1a};
+use poot_runtime_common::{BufferRole, fnv1a};
 use poot_target::{ElementKind, MemoryDomain};
 
 use super::buffer::{PtxBuffer, allocate_owned, checked_copy};
@@ -52,20 +52,6 @@ pub struct PtxContext {
 // sharing a live `&PtxContext`, is the only supported cross-thread use, R471-010 - see the crate
 // doc), so no `RefCell` here is ever aliased from two threads at once.
 unsafe impl Send for PtxContext {}
-
-/// `POOT_REQUIRE_PTX=1` turns the "no PTX device -> tests skip cleanly" convention into a loud failure:
-/// a failed context open panics instead of returning the Err the skip guards convert into a silent pass
-/// (`just test-device-ptx` sets it). Mirrors `poot-wgpu-runtime::require_gpu_check`.
-fn require_gpu_check<E: std::fmt::Display>(e: E) -> E {
-    require_gpu_check_with(|name| std::env::var(name).ok(), e)
-}
-
-pub(crate) fn require_gpu_check_with<E: std::fmt::Display>(
-    get: impl Fn(&str) -> Option<String>,
-    e: E,
-) -> E {
-    DeviceBackend::Ptx.fail_if_required(get, e)
-}
 
 /// The device-capability descriptor the planner reads (card 522): a single buffer is safe up to the
 /// device's total VRAM (`cuMemGetInfo`'s total; no narrower ceiling is known for this backend), and the LDS,
@@ -168,7 +154,6 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         e4m3_storage: poot_target::E4m3Storage::Native,
         native_two_byte_floats: true,
         rounding_conversions: poot_target::RoundingConversions::F16,
-        widens_bf16_decode_weight: true,
         peer_transport: true,
         perf_calibration: poot_target::calibration::Calibrated::of_cuda_compute_capability(
             attrs.compute_capability_major,
@@ -195,7 +180,7 @@ impl PtxContext {
     /// call into a context makes its own primary context current first, so none relies on the
     /// constructing thread's current-context state.
     pub fn open(ordinal: usize) -> Result<Self, PtxError> {
-        Self::build_ordinal(ordinal).map_err(require_gpu_check)
+        Self::build_ordinal(ordinal)
     }
 
     /// Make this context's primary context current on the calling thread. Every driver-touching method

@@ -195,6 +195,25 @@ pub enum ImportedKernel {
 }
 
 impl ImportedKernel {
+    /// Whether this template is one thread per output element, with a global index that follows its
+    /// workgroup size: the planner generates its launch at the narrowest workgroup that clears the device's
+    /// grid cap. Every other template owns its launch (a workgroup per row or chunk, whose reduction is sized
+    /// for the shipped width), and nothing resizes it.
+    pub(crate) fn is_elementwise(self) -> bool {
+        match self {
+            Self::PackedBf16RowGather
+            | Self::PackedBf16ToF32
+            | Self::PackedE4m3RowGather
+            | Self::RandomUniform => true,
+            Self::ArgmaxChunk
+            | Self::ArgmaxCombine
+            | Self::SampleGumbelArgmaxBatched
+            | Self::SampleTruncatedGumbelArgmaxBatched
+            | Self::SampleToppGumbelArgmaxBatched
+            | Self::CopyWords => false,
+        }
+    }
+
     /// Parse (once per process) and return this kernel's imported `Body`. Tries each family's
     /// generated arm in turn; exactly one ever matches (`kernel_assets!`'s per-family match is
     /// exhaustive over that family's own variants).

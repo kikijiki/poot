@@ -6,6 +6,7 @@ use super::{
 };
 use crate::planner::{GraphTables, StorageDtypes};
 use crate::refusal::Site;
+use poot_kernelgen::Workgroup;
 use poot_target::{Backend, DeviceCaps};
 
 /// Whether this family lowers these storage dtypes: a cast reads and writes E4M3FN only on a device that
@@ -43,8 +44,10 @@ pub(super) fn plan(
             // the same way. A same-dtype cast is the identity, so it aliases like Reshape. Unwired
             // pairs are rejected by name.
             let in_dt = g.aval(ids[0]).dtype;
-            let cast =
-                |spec: CastSpec| Planned::generated(site, KernelRequest::Cast(spec), backend, caps);
+            let cast = |spec: CastSpec| {
+                let workgroup = Workgroup::for_threads(spec.threads(), caps);
+                Planned::generated(site, KernelRequest::Cast(spec, workgroup), backend, caps)
+            };
             match (in_dt, *to) {
                 (a, b) if a == b => Planned::alias(ids[0]),
                 (DType::F32, DType::E4M3FN) => {
@@ -86,6 +89,7 @@ pub(super) fn plan(
                 (DType::BF16, DType::F32) if packed_source => Planned::imported(
                     ImportedKernel::PackedBf16ToF32,
                     backend,
+                    caps,
                     None,
                     [out_numel as u32, 1, 1],
                 )?,

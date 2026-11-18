@@ -500,7 +500,7 @@ mod family_tests {
     /// SC-008: the decode plan of the OLMoE fixture, whose experts are stored `[E, N, K]` and read
     /// through `transpose(w, [0, 2, 1])`, launches no `transpose` kernel (the indexed contraction
     /// reads the stored orientation in place) on every backend. Mutation: drop the indexed arm of
-    /// `operand_demand` (`predicates.rs`); a per-step `transpose` dispatch appears and this row
+    /// `moe::layout_demand` (`poot-graph-plan`); a per-step `transpose` dispatch appears and this row
     /// goes red.
     #[test]
     fn expert_transposes_are_views_the_indexed_contraction_reads() {

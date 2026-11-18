@@ -4,6 +4,11 @@
 //! These are consumers of the IR, not part of it. They live above `poot-graph-ir` (which stays
 //! model-agnostic: IR, builder, transforms, op compositions) and below `poot-llm` (its driver), so the
 //! lower executor crates can exercise them in tests without depending on the driver.
+#![expect(
+    unsafe_code,
+    reason = "the image assembler fills a MaybeUninit buffer row by row and then assumes it initialised"
+)]
+
 mod architectures;
 pub mod components;
 pub mod io;

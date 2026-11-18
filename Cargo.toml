@@ -112,6 +112,9 @@ wildcard_imports = "deny"
 # An outer `#[allow]` hides a lint that stops firing; `#[expect]` fails once the lint is gone (R2-L13-014). Inner
 # `#![allow]` attributes, which clippy leaves alone, remain the way to share a test support module across binaries.
 allow_attributes = "deny"
+# Every `unsafe` block needs a `// SAFETY:` comment naming the contract it relies on. Paired with `unsafe_code` below:
+# a crate that holds unsafe declares it once at its root and every block in it is then reviewed.
+undocumented_unsafe_blocks = "deny"
 
 # A held `#[expect(dead_code, reason = "held for POOT-N")]` must fail once its item gains a caller: the
 # expectation is then unfulfilled, and `unfulfilled_lint_expectations` is warn-by-default. Deny it everywhere.
@@ -122,6 +125,10 @@ missing_docs = "deny"
 deprecated = "deny"
 unfulfilled_lint_expectations = "deny"
 unreachable_pub = "deny"
+# `unsafe` is denied everywhere; a crate that needs it opens it at its root with `#![expect(unsafe_code, reason =
+# "...")]`, so a new `unsafe` block in a safe crate fails the lint and a crate that stops needing unsafe fails the
+# expectation (R2-C8-006).
+unsafe_code = "deny"
 
 [workspace.dependencies]
 # internal

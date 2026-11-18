@@ -239,12 +239,6 @@ pub(crate) fn packed_contraction(
                 conversions,
             )
         }
-        Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } if epilogue.is_some() => {
-            Err(KernelGenError::Unsupported {
-                request: "packed_contraction",
-                reason: "a packed tiled contraction has no epilogue",
-            })
-        }
         Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
             contraction_register_tiled(
                 name,
@@ -255,6 +249,7 @@ pub(crate) fn packed_contraction(
                     precision,
                     TiledExtents::of_meta(GENERATOR, meta)?,
                 )?,
+                epilogue,
                 read,
                 conversions,
             )
@@ -611,16 +606,18 @@ fn contraction_gemv_planar(
 
 /// `out[row, col] = sum over k of activation[row, k] * decode(weight_row(row, col), k)`, `M > 1`:
 /// [`Schedule::RegisterTiled`], the block-diagonal loop nest of [`tiled_body`] over `format`'s
-/// descriptor-driven decode. A workgroup cooperatively stages one activation tile and one decoded weight tile
-/// into LDS per K round (each lane decodes `slots` weight elements through [`DecodePlan`] or [`PlanarPlan`],
-/// never a per-format unpack) and every lane accumulates a register tile of the output; the tile geometry,
-/// masks and fold-aware grid are [`tiled_body`]'s. Params `(activation, words.., metadata, out)` - activation
-/// first, matching `OpKind::PackedContraction`'s own operand order; a block-storage format has one `words`
-/// source, a planar one `PlanarPlan::source_count()`.
+/// descriptor-driven decode, with `epilogue` applied to each output before its store (the shared tiled epilogue
+/// the dense and indexed schedules run). A workgroup cooperatively stages one activation tile and one decoded
+/// weight tile into LDS per K round (each lane decodes `slots` weight elements through [`DecodePlan`] or
+/// [`PlanarPlan`], never a per-format unpack) and every lane accumulates a register tile of the output; the tile
+/// geometry, masks and fold-aware grid are [`tiled_body`]'s. Params `(activation, words.., epilogue leaves..,
+/// metadata, out)` - activation first, matching `OpKind::PackedContraction`'s own operand order; a block-storage
+/// format has one `words` source, a planar one `PlanarPlan::source_count()`.
 fn contraction_register_tiled(
     name: &str,
     format: WeightFormat,
     launch: TiledLaunch,
+    epilogue: Option<&Epilogue>,
     read: ProductRead,
     conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
@@ -632,22 +629,40 @@ fn contraction_register_tiled(
         }
         _ => (1, Some(DecodePlan::of(&descriptor)?.on(conversions)), None),
     };
+    let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
+    let lanes = match epilogue {
+        Some(epilogue) => {
+            epilogue.refuse_narrow_store("packed_contraction")?;
+            epilogue.lanes("packed_contraction")?
+        }
+        None => Vec::new(),
+    };
     let mut params = vec![ld(Ty::Unit, false), ld(slice_f32(false), false)];
     for _ in 0..source_count {
         params.push(ld(slice_dtype(Ty::U32, false), false));
+    }
+    if let Some(epilogue) = epilogue {
+        params.extend(lanes.iter().map(|&lane| epilogue.leaf_param(lane)));
     }
     params.push(ld(slice_dtype(Ty::U32, false), false));
     params.push(ld(slice_f32(true), true));
     let sources: Vec<Source> = (0..source_count as u32)
         .map(|idx| Source::plain(local(2 + idx)))
         .collect();
+    let leaves: Vec<Local> = (0..leaf_count)
+        .map(|j| local(2 + (source_count + j) as u32))
+        .collect();
     let spec = TiledBody {
         name,
         params,
         activation: local(1),
-        metadata: local(2 + source_count as u32),
-        out: local(3 + source_count as u32),
-        epilogue: None,
+        metadata: local(2 + (source_count + leaf_count) as u32),
+        out: local(3 + (source_count + leaf_count) as u32),
+        epilogue: epilogue.map(|epilogue| BoundEpilogue {
+            epilogue,
+            leaves: &leaves,
+            lanes: &lanes,
+        }),
         grouped: None,
         read,
     };

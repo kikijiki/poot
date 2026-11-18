@@ -1842,6 +1842,7 @@ fn non_release_build(profile: &str, debug_assertions: bool) -> Option<String> {
 }
 
 fn main() -> anyhow::Result<()> {
+    poot_llm::driver::report_launch_environment(|name| std::env::var(name).ok());
     let args: Vec<String> = std::env::args().collect();
     let config = match parse_args(&args)? {
         Invocation::RooflineFit(files) => {

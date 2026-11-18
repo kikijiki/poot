@@ -16,13 +16,10 @@ use poot_wgpu_runtime::{Context, KernelBuffer};
 const STAGE: usize = 16;
 
 fn ctx() -> Option<Context> {
-    match Context::new() {
-        Ok(c) => Some(c),
-        Err(e) => {
-            poot_test_util::skip_report("poot-kernelgen", &format_args!("no wgpu context: {e}"));
-            None
-        }
-    }
+    poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        Context::new(),
+    )
 }
 
 /// Finite values around every edge of the f16 narrowing: ties and their neighbours, the range edge, subnormals,

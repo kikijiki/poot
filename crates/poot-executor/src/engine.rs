@@ -19,12 +19,12 @@ use poot_runtime_common::{BufferRole, DeviceIdentity};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use poot_graph_ir::{
-    BoundaryId, Eqn, OpKind, Operand, Slot, SlotKey, StateRole, Storage, TensorType, ValueId,
-    ValueMeta, ValueTable,
+    BoundaryId, Eqn, OpKind, Operand, Slot, SlotKey, StateRole, Storage, TensorType, ValueBound,
+    ValueId, ValueMeta, ValueTable,
 };
 use poot_graph_plan::RegisterFeedback;
 use poot_graph_plan::multi_device::PlanNodeId;
@@ -168,6 +168,29 @@ struct Residency {
 struct ResidentWeight<D: Device> {
     buffer: D::Buffer,
     elems: usize,
+    /// The bounds ([`ValueBound`]) these bytes are known to satisfy: checked once by whichever bind uploaded or
+    /// first met them, never again for an executable that declares the same bound over the same bytes (the
+    /// residency key names the bytes by store generation, so a replaced payload is a different weight).
+    verified: Mutex<Vec<ValueBound>>,
+}
+
+impl<D: Device> ResidentWeight<D> {
+    fn is_verified(&self, bound: ValueBound) -> bool {
+        self.verified
+            .lock()
+            .expect("verdicts are not held across a panic")
+            .contains(&bound)
+    }
+
+    fn record_verified(&self, bound: ValueBound) {
+        let mut verified = self
+            .verified
+            .lock()
+            .expect("verdicts are not held across a panic");
+        if !verified.contains(&bound) {
+            verified.push(bound);
+        }
+    }
 }
 
 /// The device copy that carries the token one chained step picked into the next step's token slot,
@@ -1304,7 +1327,7 @@ impl<D: Device> Engine<D> {
                     .binder
                     // A refill re-reads these bytes every time the pool pages an expert in: the page cache is
                     // what keeps those reads off the disk, so it is not dropped here.
-                    .writer(&bytes, &full.shape, storage, false)
+                    .writer(&bytes, &full.shape, storage, false, false)
                     .map_err(|error| encode_error(error, &bytes, &weight.name, storage))?;
                 Some(writer)
             }
@@ -2174,12 +2197,13 @@ impl<D: Device> Engine<D> {
         name: &str,
         aval: &TensorType,
         storage: BufferStorage,
+        finite_in_f16: bool,
     ) -> Result<binder::WeightWriter, ExecError> {
         let evict = self.device.unified_memory();
         let writer = self
             .loaded(exe)?
             .binder
-            .writer(bytes, &aval.shape, storage, evict)
+            .writer(bytes, &aval.shape, storage, evict, finite_in_f16)
             .map_err(|error| encode_error(error, bytes, name, storage))?;
         self.weight_bytes_read += bytes.stored_len() as u64;
         Ok(writer)
@@ -2208,11 +2232,7 @@ impl<D: Device> Engine<D> {
         let aval = &meta.aval;
         let loaded = self.loaded(exe)?;
         let bytes = loaded.binder.const_bytes(value, name, aval, chunk)?;
-        // Before the residency lookup: the bytes may be resident under another executable that
-        // declared no bound, and this graph's declaration is what its consumers rely on.
-        if let Some(bound) = meta.bound() {
-            loaded.binder.check_bound(name, &bytes, bound)?;
-        }
+        let bound = meta.bound();
         let key = Residency {
             runs: bytes
                 .spans
@@ -2222,6 +2242,15 @@ impl<D: Device> Engine<D> {
             storage,
         };
         if let Some(resident) = self.residency.get(&key).and_then(Weak::upgrade) {
+            // The bytes may be resident under another executable that declared no bound or another one, and this
+            // graph's declaration is what its consumers rely on: a resident copy that has not met it is checked
+            // here, and one that has is not read again.
+            if let Some(bound) = bound
+                && !resident.is_verified(bound)
+            {
+                self.loaded(exe)?.binder.check_bound(name, &bytes, bound)?;
+                resident.record_verified(bound);
+            }
             let elems = resident.elems;
             let loaded = self.loaded(exe)?;
             loaded.weights.push(resident);
@@ -2255,8 +2284,22 @@ impl<D: Device> Engine<D> {
         // regardless of this value's declared I8/RawBytes logical dtype, padded by one zero word
         // (`poot_quant::packed_source_words`, the one definition of this layout).
         let packed_words = bytes.stored_len().div_ceil(4) + 1;
-        let writer = match self.device.weight_upload() {
-            WeightUpload::Bytes => Some(self.weight_writer(exe, &bytes, name, aval, storage)?),
+        // The bound's one pass over the bytes is the upload's own read where the upload reads them and the bound is
+        // one the writer checks; otherwise (a bound on an index table, a device that uploads sizes only) it is
+        // a read of its own, so no bound goes unchecked.
+        let upload = self.device.weight_upload();
+        let fused = bound.filter(|&bound| {
+            matches!(upload, WeightUpload::Bytes) && binder::WeightWriter::can_check(&bytes, bound)
+        });
+        if let Some(bound) = bound
+            && fused.is_none()
+        {
+            self.loaded(exe)?.binder.check_bound(name, &bytes, bound)?;
+        }
+        let writer = match upload {
+            WeightUpload::Bytes => {
+                Some(self.weight_writer(exe, &bytes, name, aval, storage, fused.is_some())?)
+            }
             WeightUpload::SizeOnly => None,
         };
         let label = self.device.backend_name();
@@ -2286,7 +2329,11 @@ impl<D: Device> Engine<D> {
             // The upload's one read of the bytes also checked them: a refused weight is not published.
             writer.finish(name)?;
         }
-        let resident = Arc::new(ResidentWeight { buffer, elems });
+        let resident = Arc::new(ResidentWeight {
+            buffer,
+            elems,
+            verified: Mutex::new(bound.into_iter().collect()),
+        });
         self.residency.insert(key, Arc::downgrade(&resident));
         let loaded = self.loaded(exe)?;
         loaded.weights.push(resident);
@@ -4857,21 +4904,24 @@ mod f16_packed_weight_upload_tests {
     /// contraction over `h`, both ids viewing `t` (so the planner keeps the embedding a device constant, an
     /// untied one would be hosted), compiled under each of `precisions` in turn (every program declares the
     /// precision the policy admits, so a `Narrow` head narrows) and added as an entry of one engine over one
-    /// store. Returns the engine's weight allocations.
+    /// store. Returns the engine's weight allocations and the bytes the store served.
     fn add_tied_head(
         bits: &[u16],
         precisions: &[MatmulPrecision],
-    ) -> Result<Vec<(BufferStorage, usize)>, ExecError> {
+    ) -> Result<(Vec<(BufferStorage, usize)>, u64), ExecError> {
         let embed = WeightId::model(WeightRole::Embed);
         let head = WeightId::model(WeightRole::Head);
         let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        // A file the store maps, so its read counter sees every pass over the bytes.
+        let path = poot_test_util::unique_temp_path("tied_head.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        let mapped = StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap();
         let mut store = WeightStore::builder();
         store
             .insert(
                 "t",
                 WeightEntry::Dense(
-                    DenseWeight::try_new(DType::BF16, vec![VOCAB, K], StoredBytes::from(bytes))
-                        .unwrap(),
+                    DenseWeight::try_new(DType::BF16, vec![VOCAB, K], mapped).unwrap(),
                 ),
             )
             .unwrap();
@@ -4926,13 +4976,14 @@ mod f16_packed_weight_upload_tests {
             let exe = engine.load_weights(Arc::clone(&store), Arc::clone(&map))?;
             engine.add_entry(exe, &program)?;
         }
-        Ok(engine
+        let allocations = engine
             .device
             .allocations
             .iter()
             .filter(|(role, ..)| *role == BufferRole::Weight)
             .map(|&(_, storage, elems)| (storage, elems))
-            .collect())
+            .collect();
+        Ok((allocations, store.bytes_read()))
     }
 
     /// bf16 words spread over f16's normal and subnormal ranges, both signs.
@@ -4960,18 +5011,22 @@ mod f16_packed_weight_upload_tests {
             &[MatmulPrecision::Exact, MatmulPrecision::Narrow],
         ] {
             assert_eq!(
-                add_tied_head(&tied_bits(), precisions).expect("the entries load"),
+                add_tied_head(&tied_bits(), precisions)
+                    .expect("the entries load")
+                    .0,
                 one_copy,
                 "{precisions:?}"
             );
         }
     }
 
-    /// POOT-1535: the f16-finite bound is checked at bind, before the residency lookup, so a weight an exact program
-    /// already uploaded is still refused when a narrow program binds it: an element past f16's range (bf16 65536) is
-    /// a typed refusal, not an infinity in the head's products. Mutation: in `Engine::weight_buffer` check the bound
-    /// only on a residency miss (`&& self.residency.is_empty()`); the narrow program finds the resident copy, loads,
-    /// and this row goes red (`Ok`).
+    /// POOT-1535: the f16-finite bound is checked at bind, so a weight an exact program already uploaded is still
+    /// refused when a narrow program binds it, and one a narrow program uploads is refused by the upload's own read
+    /// (POOT-1618): an element past f16's range (bf16 65536) is a typed refusal, not an infinity in the head's
+    /// products. Mutation (resident copy): in `Engine::weight_buffer`'s residency-hit branch skip the check (`&&
+    /// false` on its condition); the narrow program finds the resident copy, loads, and the `[Exact, Narrow]` case
+    /// goes red (`Ok`). Mutation (upload): drop the `finite_in_f16` test in `WeightWriter::read_stream`; the
+    /// `[Narrow]` case goes red.
     #[test]
     fn a_weight_past_f16_range_is_refused_when_a_narrow_program_binds_it_after_an_exact_one() {
         let mut bits = tied_bits();
@@ -4997,6 +5052,77 @@ mod f16_packed_weight_upload_tests {
         }
         // The exact program alone computes no f16 value and loads.
         add_tied_head(&bits, &[MatmulPrecision::Exact]).expect("an exact program refuses nothing");
+    }
+
+    /// POOT-1618: a program that binds a weight a program before it already checked does not read it again. The tied
+    /// head is uploaded as the embedding (no bound) and then met as the head (bound): one read of its own for the
+    /// verdict, and a second narrow program, which finds the copy resident and already checked, none. Before, every
+    /// program that declared the bound read all of the bytes again before the residency lookup (qwen3-4b: 14.5 GB
+    /// scanned of an 8 GB checkpoint, each read from a disk the upload had just evicted). Mutation: in
+    /// `ResidentWeight::is_verified` return `false`; the second program reads the table a third time and the
+    /// `[Narrow, Narrow]` case goes red.
+    #[test]
+    fn a_resident_weight_is_read_once_for_every_program_that_declares_its_bound() {
+        let table_bytes = (VOCAB * K * 2) as u64;
+        for precisions in [
+            &[MatmulPrecision::Narrow][..],
+            &[MatmulPrecision::Narrow, MatmulPrecision::Narrow],
+            &[MatmulPrecision::Exact, MatmulPrecision::Narrow],
+        ] {
+            let (_, read) = add_tied_head(&tied_bits(), precisions).expect("the entries load");
+            assert_eq!(read, 2 * table_bytes, "{precisions:?}");
+        }
+    }
+
+    /// POOT-1618: where the bound's weight is the first to reach the device, the upload's own read is the check: a
+    /// narrowed BF16 projection reads its bytes once (the input's and the weight's, nothing twice), and an element past
+    /// f16's range is refused by its index from that read. Mutation (one pass): pass `false` for `finite_in_f16` in
+    /// `Engine::weight_buffer`; the check becomes a read of its own and the count goes red. Mutation (the refusal):
+    /// drop the `finite_in_f16` test in `WeightWriter::read_stream`; the refusal goes red (`Ok`).
+    #[test]
+    fn a_narrowed_weight_is_checked_by_the_read_that_uploads_it() {
+        let x_len = 4 * K * 4;
+        let load = |bits: &[u16]| {
+            let path = poot_test_util::unique_temp_path("bound_fused.bin");
+            let mut file: Vec<u8> = (0..4 * K).flat_map(|i| (i as f32).to_le_bytes()).collect();
+            file.extend(bits.iter().flat_map(|b| b.to_le_bytes()));
+            std::fs::write(&path, &file).unwrap();
+            let mapped = StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap();
+            let mut next = 0;
+            let store = projection_store(bits, DType::BF16, |bytes| {
+                let view = mapped.slice(next..next + bytes.len()).unwrap();
+                next += bytes.len();
+                view
+            });
+            let mut engine = Engine::new(UploadRecorder::default());
+            let loaded = load_projection(
+                &mut engine,
+                Arc::clone(&store),
+                DType::BF16,
+                MatmulPrecision::Narrow,
+            );
+            (loaded, store.bytes_read())
+        };
+        let bits: Vec<u16> = (0..N * K).map(|i| 0x3c00 + 37 * i as u16 % 0x300).collect();
+        let (loaded, read) = load(&bits);
+        loaded.expect("a finite weight loads");
+        assert_eq!(read, (x_len + bits.len() * 2) as u64, "each byte read once");
+        let mut past = bits.clone();
+        past[7] = 0x4780; // +65536
+        match load(&past).0 {
+            Err(ExecError::Load(error)) => assert!(
+                matches!(
+                    *error,
+                    LoadError::WeightPastF16Range {
+                        index: 7,
+                        bits: 0x4780,
+                        ..
+                    }
+                ),
+                "{error}"
+            ),
+            other => panic!("expected WeightPastF16Range, got {other:?}"),
+        }
     }
 
     /// `RssFile` of this process in bytes: the file-backed pages (a mapped checkpoint's) in its page tables.

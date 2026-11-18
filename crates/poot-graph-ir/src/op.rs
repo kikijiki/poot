@@ -1661,10 +1661,9 @@ fn check_same_dtype(a: &TensorType, b: &TensorType) -> Result<(), ShapeError> {
 /// `MatMul` on purpose, so this is a stated exception, not a gap. ([`MatMulAccumulate::F32`] narrows it further:
 /// two operands of one narrow float dtype.) `poot_graph_plan`'s `fold_dense_contractions`
 /// folds exactly that pair (behind a `Transpose`) into `DenseContraction` (its own `weight` dtype table is
-/// `DenseContraction` weight dtype); the planner's own
-/// `poot_graph_plan::widen_mismatched_matmul_dtypes` (card 273) either widens that exact pair with a Cast
-/// or, when `matmul_tensor_core_eligible` says so, runs the mismatched pair directly on a WMMA/coopmat
-/// kernel built for it (a BF16 `[K, N]` decode projection, `matmul_bf16_column_gemv`, stays mixed and is refused). Every other pairing (F16 x BF16, I32 x
+/// `DenseContraction` weight dtype); the planner
+/// refuses any mixed pair that is not folded that way by name (`Capability::DtypeLowering`): no pass
+/// widens a weight with a Cast (POOT-1628). Every other pairing (F16 x BF16, I32 x
 /// F32, a BF16 activation x F32 weight, two different storage/packed dtypes, ...) is rejected.
 fn matmul_operand_dtypes_allowed(a: DType, b: DType) -> bool {
     (a.class() == DTypeClass::Arithmetic && a == b)
@@ -4721,7 +4720,7 @@ mod tests {
             );
         }
         // Allowed: the stated F32-activation x BF16/F16-weight exception (fold_dense_contractions,
-        // to_f16, poot_graph_plan::widen_mismatched_matmul_dtypes).
+        // to_f16).
         for weight_dt in [DType::BF16, DType::F16] {
             assert!(
                 OpKind::matmul()

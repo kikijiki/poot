@@ -49,10 +49,10 @@ pub use error::{BodyResource, BodyStage, KernelGenError};
 pub use request::{
     AieOp, BodyUse, CastSpec, ContractionSpec, DenseTiledContraction, ErrorBound, ExpertGroupSpec,
     Fold, FragmentUse, Generated, IndexedContraction, KernelRequest, KernelRequirements, Launch,
-    MatmulShapes, NumericalContract, PackedContraction, PackedRequest, PackedRows, PointwiseForm,
-    PointwiseSpec, RopeSpec, RowSpec, SerializedAccess, SerializedBinding, SerializedGenerated,
-    TopKSpec, UnmeasurableLds, ViewOperand, fold_groups, generate, index_bound,
-    serialized_schedule,
+    LaunchOwnership, MatmulShapes, NumericalContract, PackedContraction, PackedRequest, PackedRows,
+    PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, SerializedAccess, SerializedBinding,
+    SerializedGenerated, TopKSpec, UnmeasurableLds, ViewOperand, Workgroup, fold_groups, generate,
+    index_bound, packed_threads, serialized_schedule,
 };
 pub use scan::{ScanKernel, ScanSpec};
 pub use stable_rank::{STABLE_RANK_MAX_LANES, StableRankSpec};

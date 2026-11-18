@@ -3,8 +3,8 @@
 //! that plans it, with the target's buffer cap honored (POOT-572 SC-006).
 //!
 //! The head is `MatMul(F32 activation, Transpose(BF16 weight)) -> F32`. Asserting on the traced graph
-//! (card 376) cannot see what preparation does: `widen_mismatched_matmul_dtypes` used to put a
-//! `Cast(BF16 -> F32)` on the head weight, a 5.09 GB F32 copy of a 2.54 GB matrix at the pinned dims.
+//! (card 376) cannot see what preparation does: a pass that put a `Cast(BF16 -> F32)` on the head weight would make a
+//! 5.09 GB F32 copy of a 2.54 GB matrix at the pinned dims.
 //!
 //! The family is the registry's `qwen35` fixture (`Model::trace`, no per-mode tracer): the planning
 //! decisions under test (a BF16 contraction over the checkpoint constant, a row gather over the BF16
@@ -262,51 +262,6 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_embedding_table() {
                 eqn.op.name()
             );
         }
-    }
-}
-
-/// FR-009. PTX and ROCm keep the widening cast (a lowering there needs its own hardware receipt).
-/// Their pipelines never run the fold, so the head stays a `MatMul`. The ROCm typed packed walk is a
-/// separate pipeline (card 450 ROCm): it runs the fold and lowers the row gather on AmdGcn, so this
-/// row prepares WITHOUT the fold - exactly what `RocmGraphExecutor::prepare_dtypes` does - and pins
-/// the resident answer, not the typed walk's.
-///
-/// Card 1011: nothing retypes the embedding. A `Gather` consumer is not a packed reader, so on both
-/// backends the table stays BF16 in its native two-byte lane (no 5.09 GB F32 copy at pinned dims, no
-/// cast back to BF16 for the gather).
-#[test]
-fn ptx_and_rocm_preparation_is_untouched_by_this_card() {
-    let (model, _) = qwen35();
-    let traced = decode_graph(&*model);
-    for backend in [Backend::Nvptx, Backend::AmdGcn(AmdArch::gfx1151())] {
-        let prepared = poot_graph_plan::dtype_widen::widen_mismatched_matmul_dtypes(
-            &traced,
-            &poot_test_util::device_caps::default_caps_for(backend),
-        )
-        .unwrap();
-        assert!(
-            !prepared
-                .eqns()
-                .iter()
-                .any(|eqn| matches!(eqn.op, OpKind::DenseContraction { .. })),
-            "no DenseContraction may reach {backend:?}, whose planner rejects it by name"
-        );
-        assert!(
-            !prepared
-                .eqns()
-                .iter()
-                .any(|eqn| matches!(eqn.op, OpKind::DenseRowGather { .. })),
-            "no DenseRowGather may reach {backend:?}, whose planner rejects it by name"
-        );
-        let table = value_named(&prepared, &embedding());
-        assert_eq!(prepared.aval(table).dtype, DType::BF16);
-        assert!(
-            !prepared.eqns().iter().any(|eqn| {
-                matches!(eqn.op, OpKind::Cast { to: DType::BF16 })
-                    && operand_value(eqn, 0) == Some(table)
-            }),
-            "{backend:?}: the BF16 embedding table is gathered as stored, not widened and cast back"
-        );
     }
 }
 

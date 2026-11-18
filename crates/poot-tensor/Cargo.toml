@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [features]
 # Test-only API: `HostTensor::reshaped`, used by the CPU oracle and tests, and `HostTensor::zeros_of`, a test's

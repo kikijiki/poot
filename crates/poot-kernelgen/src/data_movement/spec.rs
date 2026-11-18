@@ -2,9 +2,9 @@
 //! element to the input element it copies.
 
 use poot_kernel_ir::Ty;
+use poot_target::DeviceCaps;
 
 use crate::KernelGenError;
-use crate::elementwise::ELEMENTWISE_2D_WORKGROUP_SIZE;
 use crate::helpers::Layout;
 use crate::request::Fold;
 
@@ -263,13 +263,9 @@ impl MovementSpec {
             out_shape,
             op,
             written: None,
-            fold: Fold {
-                numel: 0,
-                two_d: false,
-                width: ELEMENTWISE_2D_WORKGROUP_SIZE,
-            },
+            fold: Fold::flat(0),
         };
-        spec.fold.numel = spec.threads();
+        spec.fold = Fold::flat(spec.threads());
         spec
     }
 
@@ -280,9 +276,10 @@ impl MovementSpec {
         self
     }
 
-    /// This request launched on a 2-D grid of [`ELEMENTWISE_2D_WORKGROUP_SIZE`]-lane workgroups when `two_d`.
-    pub fn folded(mut self, two_d: bool) -> Self {
-        self.fold.two_d = two_d;
+    /// This request launched for `caps`: on a 2-D grid of wide workgroups when `two_d`, else flat on the
+    /// narrowest workgroup whose grid clears the target's X cap ([`Fold::new`]).
+    pub fn launched(mut self, two_d: bool, caps: &DeviceCaps) -> Self {
+        self.fold = Fold::new(self.fold.numel, two_d, caps);
         self
     }
 

@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [features]
 # ADR-0113: `test_support` holds the graph fixtures no production code calls (card 671), shared by the graph,

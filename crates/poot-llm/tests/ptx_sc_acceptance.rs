@@ -6,6 +6,11 @@
 //!
 //! Skips cleanly with no NVIDIA GPU; `POOT_REQUIRE_PTX=1` turns that skip into a failure.
 
+#![expect(
+    unsafe_code,
+    reason = "the wrapper devices reinterpret their dispatch arguments as the wrapped device's"
+)]
+
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -553,6 +558,9 @@ impl Device for FaultyOnceDevice {
         }
         self.inner.dispatch(Dispatch {
             kernel: d.kernel,
+            // SAFETY: the wrapper's `Buffer` and `Kernel` are `PtxDevice`'s own associated types, so
+            // `Arg<'_, Self>` and `Arg<'_, PtxDevice>` are the same type and the slice keeps its layout and
+            // lifetime; only the nominal generic parameter differs.
             inputs: unsafe {
                 std::mem::transmute::<
                     &[poot_executor::Arg<'_, Self>],
@@ -725,6 +733,9 @@ impl Device for FaultyOnceSyncDevice {
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), Self::Error> {
         self.inner.dispatch(Dispatch {
             kernel: d.kernel,
+            // SAFETY: the wrapper's `Buffer` and `Kernel` are `PtxDevice`'s own associated types, so
+            // `Arg<'_, Self>` and `Arg<'_, PtxDevice>` are the same type and the slice keeps its layout and
+            // lifetime; only the nominal generic parameter differs.
             inputs: unsafe {
                 std::mem::transmute::<
                     &[poot_executor::Arg<'_, Self>],

@@ -5,24 +5,27 @@ use super::{
     FusedRegion, Graph, KernelRequest, MatmulShapes, OpKind, Operand, PlanError, Planned, Scalar,
     ValueId, WeightLayout, fty_ty, kg, out_numel_saturating, value_ids,
 };
+use crate::Target;
 use crate::dtype_widen::ConstLanes;
 use crate::kernel_mapping::{
     check_widening_step, float_region_leaf_storage, map_fused_op, narrowing_store_op,
 };
-use crate::planner::{GraphTables, StorageDtypes};
+use crate::planner::kg::Layout;
+use crate::planner::{GraphTables, OutputBuffer, StorageDtypes};
 use crate::predicates::{
-    indexed_matmul_lowers, is_batched_tileable_matmul_in, is_decode_attn_gemv_in,
-    is_tileable_matmul_in, lds_gemv_width, packed_contraction_m_per_block, serial_matmul_fold,
+    is_batched_tileable_matmul_in, is_decode_attn_gemv_in, is_tileable_matmul_in, lds_gemv_width,
+    serial_matmul_fold,
 };
 use crate::refusal::{FusedStepGap, Pins, Site};
-use poot_graph_ir::{ContractionRows, FragmentDtype, LocalId, OperandPrecision};
+use poot_graph_ir::{FragmentDtype, LocalId, OperandPrecision};
 use poot_target::{Backend, DeviceCaps};
+use std::collections::HashMap;
 
 /// The launch of a `Tiled` contraction of `tiles` workgroups of `tile * tile` threads: the tiles laid out on the X
 /// extent, or, above `caps.max_grid[0]`, folded onto a 2-D `(x_groups, y_groups)` grid the body reconstructs as
 /// `gy * x_groups + gx` (`x_groups` rides in the kernel's metadata). Beyond `caps.max_grid[1]` too, or on any
-/// `usize -> u32` overflow, a typed refusal naming the equation, before any dispatch: `finalize`'s generic
-/// workgroup bump never touches a tiled body (it would corrupt the fixed-size LDS tile).
+/// `usize -> u32` overflow, a typed refusal naming the equation, before any dispatch: a contraction
+/// request owns its launch, so no widening ever touches a tiled body (it would corrupt the fixed-size LDS tile).
 pub(super) struct FoldedTileGrid {
     /// The X extent in tiles; the metadata word the body reads.
     pub(super) x_groups: u32,
@@ -63,9 +66,8 @@ pub(super) fn folded_tile_grid(
     })
 }
 
-/// How a plain `MatMul` is lowered. The one decision [`plan`] and the contraction-epilogue fuse rule
-/// ([`epilogue_head_lowers`]) share, so a head fuses exactly when the serial kernel is its plan anyway. Every
-/// route is a generated contraction: the request in the plan's `KernelChoice` is the route, and the launch
+/// How a plain `MatMul` is lowered. The one decision [`plan`] makes for a `MatMul` and for a `ContractionEpilogue`
+/// over one, so the fused head keeps the schedule it had alone. Every route is a generated contraction: the request in the plan's `KernelChoice` is the route, and the launch
 /// shaping reads that, not a second derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MatMulRoute {
@@ -99,48 +101,21 @@ pub(super) fn matmul_route(
     }
 }
 
-/// Whether `eqn`, a contraction head, has an epilogue lowering that is also the plan it would get without one:
-/// the epilogue fuse rule forms a [`OpKind::ContractionEpilogue`] only over such a head, so no head loses a faster schedule (a tensor-core,
-/// tiled or attention-GEMV `MatMul`) to gain a fused store. The generated Gemv, serial and tiled bodies carry an
-/// epilogue; a `MatMul` head's fragment, GEMV and batched-weight tiled schedules do not.
-pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> bool {
-    let tables = GraphTables::from(g);
-    let out_shape = &g.aval(eqn.out).shape;
-    let out_numel = out_numel_saturating(out_shape);
-    match &eqn.op {
-        OpKind::MatMul { .. } => {
-            out_shape.len() >= 2
-                && matches!(
-                    matmul_route(tables, eqn, out_shape, out_numel, caps),
-                    MatMulRoute::Tileable | MatMulRoute::Serial
-                )
-        }
-        // A dense head takes the generated Gemv at `M == 1` and the generated tiled GEMM above it, and both carry
-        // an epilogue, so every dense head lowers (the weight dtypes the dense planner admits).
-        OpKind::DenseContraction { .. } => true,
-        // Every indexed schedule (Gemv and the register-tiled schedule over the grouped rows) carries an epilogue.
-        OpKind::IndexedMatMul { .. } => indexed_matmul_lowers(tables, eqn),
-        // The packed Gemv (one activation row per block) carries an epilogue; the block-diagonal tiled schedule does not.
-        OpKind::PackedContraction {
-            descriptor, rows, ..
-        } => {
-            crate::packed_block_float::admit_packed(
-                crate::packed_block_float::PACKED_LOWERING,
-                *descriptor,
-                crate::packed_block_float::PackedKernelOpKind::Contraction,
-                caps,
-            )
-            .is_ok()
-                && match rows {
-                    ContractionRows::Blocks(blocks) => {
-                        packed_contraction_m_per_block(tables, eqn, *descriptor, *blocks) == 1
-                    }
-                    // An indexed table carries an epilogue on both its schedules (Gemv and the register-tiled schedule over the grouped rows).
-                    ContractionRows::Indexed { .. } => true,
-                }
-        }
-        _ => false,
-    }
+/// Whether `eqn`, a contraction head, takes an epilogue without losing its schedule: the head is planned as it
+/// stands (no epilogue), and its request's generator says whether it carries one
+/// ([`KernelChoice::accepts_epilogue`](super::KernelChoice)). The epilogue fuse rule forms a
+/// [`OpKind::ContractionEpilogue`] only over such a head, and the fused equation plans the same schedule with the
+/// epilogue in its store, so no head trades a faster schedule for a fused store. A head the planner refuses is
+/// never fused: it would be refused with its epilogue too.
+pub(crate) fn epilogue_head_lowers(
+    g: &Graph,
+    eqn: &Eqn,
+    target: &Target,
+    views: &HashMap<ValueId, Layout>,
+    limits: &BodyLimits,
+) -> bool {
+    super::plan_eqn_compiled(g, eqn, target, views, limits, None, OutputBuffer::Fresh)
+        .is_ok_and(|planned| planned.choice.accepts_epilogue())
 }
 
 /// The kernelgen [`kg::Epilogue`] of a `ContractionEpilogue`'s `region` over output shape `out_shape` and
@@ -340,9 +315,9 @@ pub(super) fn plan(
                 }))
             };
             // Every route plans a kernel whose single element type covers operands and output, so a mixed
-            // operand/output matmul has no lowering: `widen_mismatched_matmul_dtypes` casts every such operand
-            // before planning, and one that reaches here (a BF16 `[K, N]` decode projection) is refused by name
-            // rather than read as f32 words.
+            // operand/output matmul has no lowering: no pass widens an operand (POOT-1628), so every such matmul that
+            // reaches here (a BF16 `[K, N]` decode projection, a prefill matmul over a BF16 weight) is refused by
+            // name on every backend rather than read as f32 words.
             if ids[..2].iter().any(|&id| g.aval(id).dtype != odt) {
                 return Err(site.refuse(Capability::DtypeLowering));
             }
@@ -429,14 +404,32 @@ pub(super) fn plan(
                 // Only the dense tiled body stores a narrowed output (POOT-1448).
                 false,
             )?;
-            if matmul_route(g, eqn, out_shape, out_numel, caps) == MatMulRoute::Tileable {
-                // The route `matmul_route` gives the unfused head: the generated tiled GEMM, storing the
-                // epilogue's result per output element.
-                let (a, nn) = (shape(ids[0]), out_shape[out_shape.len() - 1]);
+            // The route the unfused head takes: the generated tiled GEMM stores the epilogue's result per output
+            // element, over the shared `[K, N]` weight or, per batch entry, over its own slab.
+            let (a, nn) = (shape(ids[0]), out_shape[out_shape.len() - 1]);
+            let r = out_shape.len();
+            let tiled = match matmul_route(g, eqn, out_shape, out_numel, caps) {
+                MatMulRoute::Tileable => Some(kn_f32_shape(
+                    precision,
+                    1,
+                    out_numel / nn.max(1),
+                    nn,
+                    a[a.len() - 1],
+                )),
+                MatMulRoute::BatchedTileable => Some(kn_f32_shape(
+                    precision,
+                    out_shape[..r - 2].iter().product(),
+                    out_shape[r - 2],
+                    nn,
+                    a[a.len() - 1],
+                )),
+                MatMulRoute::AttnGemv | MatMulRoute::Serial => None,
+            };
+            if let Some(tiled) = tiled {
                 return dense_tiled_plan(
                     site,
                     backend,
-                    kn_f32_shape(precision, 1, out_numel / nn.max(1), nn, a[a.len() - 1]),
+                    tiled,
                     kg::DenseTiledWeight::KnF32,
                     Some(epilogue),
                     precision,

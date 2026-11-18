@@ -151,8 +151,8 @@ pub enum CollectiveKind {
 /// multi-output region writes ([`Binding::side_writes`]), then the last written buffer. `binding` and
 /// `choice` are private and the rest is `pub(crate)`: a dispatch is built only by the planner, and a
 /// [`DispatchPlan`] validates its bindings against the kernel body and launch before any other crate sees
-/// it. Outside this crate the fields read through accessors; the only change after validation is the
-/// planner's own launch shaping (`set_workgroup_x`, `append_key`), which cannot change the params.
+/// it. Outside this crate the fields read through accessors. Nothing resizes a launch after it is built: its
+/// request declared the launch, and `finalize` refuses a dispatch whose body or key is not the choice's.
 #[derive(Clone, Debug)]
 pub struct Dispatch {
     /// Shared between the dispatches of one graph that run the same kernel ([`SharedBodies`]): a generated body
@@ -231,16 +231,6 @@ impl Dispatch {
             .iter()
             .map(|&extent| u128::from(extent))
             .product()
-    }
-
-    /// The planner's launch shaping: bump the workgroup's x extent. Params are unchanged.
-    pub(crate) fn set_workgroup_x(&mut self, x: u32) {
-        Arc::make_mut(&mut self.body).workgroup_size[0] = x;
-    }
-
-    /// The planner's launch shaping: name a changed body in the key.
-    pub(crate) fn append_key(&mut self, suffix: &str) {
-        self.key.push_str(suffix);
     }
 
     /// [`Program::shrink_first_launch_by_one_workgroup`]: the grid, `by` threads smaller on x.
@@ -392,6 +382,28 @@ pub enum DispatchPlanError {
     /// The plan has no dispatch.
     #[error("a dispatch plan needs at least one dispatch")]
     Empty,
+    /// A dispatch's key is not the digest of its choice: its launch was reshaped after the request declared it.
+    #[error("dispatch {dispatch} has key {key}, but its choice names {expected}")]
+    KeyNotChoice {
+        /// Index of the dispatch within the plan.
+        dispatch: usize,
+        /// The key the dispatch carries.
+        key: String,
+        /// The key its choice digests to.
+        expected: String,
+    },
+    /// An elementwise dispatch's body is not at the workgroup width its choice declared.
+    #[error(
+        "dispatch {dispatch} runs at workgroup width {actual}, but its choice declared {declared}"
+    )]
+    WorkgroupNotDeclared {
+        /// Index of the dispatch within the plan.
+        dispatch: usize,
+        /// The workgroup X extent the choice declared before the body was generated.
+        declared: u32,
+        /// The workgroup X extent the body carries.
+        actual: u32,
+    },
     /// A dispatch binds a different number of params than its kernel has.
     #[error(
         "dispatch {dispatch} binds {bound} params (reads, metadata, write) but its kernel has {params}"
@@ -698,13 +710,6 @@ impl DispatchPlan {
             .iter_mut()
             .try_for_each(|dispatch| bodies.share(dispatch, eqn))
     }
-
-    pub(crate) fn single_mut(&mut self) -> Option<&mut Dispatch> {
-        match self.dispatches.as_mut_slice() {
-            [dispatch] => Some(dispatch),
-            _ => None,
-        }
-    }
 }
 
 /// The shape of one launch: the total thread count and the optional metadata buffer.
@@ -799,14 +804,6 @@ impl Plan {
         match self {
             Plan::Dispatches(dispatches) => dispatches.share_bodies(bodies, eqn),
             _ => Ok(()),
-        }
-    }
-
-    /// [`Plan::single`], mutably.
-    pub(crate) fn single_mut(&mut self) -> Option<&mut Dispatch> {
-        match self {
-            Plan::Dispatches(dispatches) => dispatches.single_mut(),
-            _ => None,
         }
     }
 

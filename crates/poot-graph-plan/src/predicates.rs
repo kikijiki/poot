@@ -6,7 +6,7 @@
 //! a chunked [`Plan`] for ops whose dispatch can exceed a single-launch cap (RADV 2^15-tile miscompile,
 //! iGPU display-watchdog TDR; see each function's doc).
 
-use crate::planner::Planned;
+use crate::planner::{Planned, operand_demand};
 use crate::refusal::Site;
 use poot_kernelgen::Layout;
 use poot_tensor::DType;
@@ -123,45 +123,6 @@ impl LayoutDemand {
                     })
             }
         }
-    }
-}
-
-/// The layout demand of value operand `position` of `eqn` (an index into `eqn.inputs`): the one function behind
-/// view promotion, the bar loop, the planner families and the compile invariant. A literal reads nothing.
-///
-/// Every pointwise op reads its leaves through their layouts (the pointwise synthesizer, `fused_views`): an
-/// elementwise `Binary`, a `Unary`, a `Fused` region of f32 or exact-I32 leaves, a `FusedRow` of f32 leaves. A
-/// movement reads its data through the composed layout of the chain it ends, and a `Concat` reads each part
-/// through its own: both over element storage (f32 or I32 words; a packed payload and a two-byte element are read
-/// dense). The indexed contraction reads its stacked weight (operand 1 only) strided, so a `Transpose` of the
-/// stack is never materialized. Everything else reads its operands flat.
-pub(crate) fn operand_demand(g: GraphTables<'_>, eqn: &Eqn, position: usize) -> LayoutDemand {
-    let Some(Operand::Value(value)) = eqn.inputs.get(position) else {
-        return LayoutDemand::Dense;
-    };
-    let words = matches!(g.aval(*value).dtype, DType::F32 | DType::I32);
-    match &eqn.op {
-        OpKind::Binary(_) | OpKind::Unary(_) | OpKind::Fused(_) if words => LayoutDemand::Any,
-        OpKind::FusedRow(_) if g.aval(*value).dtype == DType::F32 => LayoutDemand::Any,
-        OpKind::Transpose { .. }
-        | OpKind::Slice { .. }
-        | OpKind::Broadcast { .. }
-        | OpKind::Reshape { .. }
-        | OpKind::Concat { .. }
-            if words =>
-        {
-            LayoutDemand::Any
-        }
-        // The stacked weight is read in place only where it is read once: as the activation, the ids or an
-        // epilogue leaf it is read flat.
-        OpKind::IndexedMatMul { .. }
-        | OpKind::ContractionEpilogue {
-            head: ContractionHead::Indexed { .. },
-            ..
-        } if position == 1 && value_ids(eqn).iter().filter(|&&v| v == *value).count() == 1 => {
-            LayoutDemand::IndexedWeight
-        }
-        _ => LayoutDemand::Dense,
     }
 }
 
@@ -554,8 +515,8 @@ pub(crate) fn gemv_launch(outputs: usize, caps: &DeviceCaps) -> GemvLaunch {
 }
 
 /// Workgroup width of a one-thread-per-element kernel folded onto a 2-D grid: always 256 (the portable
-/// Vulkan max). A folded body derives its global index from this width, so the dispatch must not use the
-/// generic 64-or-256 wg-bump.
+/// Vulkan max). A folded body derives its global index from this width, so its request declares exactly this
+/// workgroup ([`poot_kernelgen::Fold::new`]).
 pub(crate) const ELEMENTWISE_2D_WIDTH: usize = 256;
 
 /// The workgroup width a scatter-update chunk is sized in: a generated body's default width, so a chunk's
@@ -610,7 +571,7 @@ pub(crate) fn scatter_update_plan(
         let fold_ceiling = caps.max_grid[0] as usize * ELEMENTWISE_2D_WIDTH;
         let whole = Planned::generated_dispatch(
             site,
-            KernelRequest::Movement(spec(None).folded(units > fold_ceiling)),
+            KernelRequest::Movement(spec(None).launched(units > fold_ceiling, caps)),
             backend,
             caps,
         )?;
@@ -1204,19 +1165,25 @@ pub(crate) fn is_tileable_matmul_in(g: GraphTables<'_>, eqn: &Eqn) -> bool {
 /// batch entry reads its own weight slab. The dispatch-cap chunking is the tiled choice's own, so no size
 /// declines it.
 pub(crate) fn is_batched_tileable_matmul_in(g: GraphTables<'_>, eqn: &Eqn) -> bool {
-    if !matches!(eqn.op, OpKind::MatMul { .. }) {
-        return false;
-    }
+    // A `ContractionEpilogue` over a `MatMul` head is judged by its head operands, as in `is_tileable_matmul_in`.
+    let head_operands = match &eqn.op {
+        OpKind::MatMul { .. } => 2,
+        OpKind::ContractionEpilogue {
+            head: head @ ContractionHead::MatMul { .. },
+            ..
+        } => head.operands(),
+        _ => return false,
+    };
     let out = &g.aval(eqn.out).shape;
     let r = out.len();
     if r < 3 || out[r - 2] <= 1 || out.iter().product::<usize>() == 0 {
         return false;
     }
-    let ids = value_ids(eqn);
-    if ids.len() < 2 || g.aval(eqn.out).dtype != DType::F32 {
+    let ids = &value_ids(eqn)[..head_operands];
+    if ids.len() != 2 || g.aval(eqn.out).dtype != DType::F32 {
         return false;
     }
-    if ids[..2].iter().any(|&id| g.aval(id).dtype != DType::F32) {
+    if ids.iter().any(|&id| g.aval(id).dtype != DType::F32) {
         return false;
     }
     let (a, b) = (&g.aval(ids[0]).shape, &g.aval(ids[1]).shape);
@@ -1437,8 +1404,8 @@ pub(crate) fn is_elementwise_2d_in(
 /// The `M` (activation rows per block) a `PackedContraction` equation's own shapes imply: `numel/k`
 /// for a dense (`blocks == 1`) contraction, else `activation_shape[1]` (`OpKind::PackedContraction`'s
 /// own rank-3 `[blocks, M, K]` shape, `op.rs`'s `infer`), which `packed_dequant::try_plan_contraction`'s
-/// schedule choice reads. The launch it plans is exempt from the workgroup bump by its request type
-/// (Card 727), not by re-deriving this shape.
+/// schedule choice reads. The launch it plans is never widened, by its request type
+/// ([`poot_kernelgen::LaunchOwnership::OwnsLaunch`], Card 727), not by re-deriving this shape.
 pub(crate) fn packed_contraction_m_per_block(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -1476,11 +1443,11 @@ pub(crate) fn elementwise_fold(
     out_numel: usize,
     caps: &DeviceCaps,
 ) -> kg::Fold {
-    kg::Fold {
-        numel: out_numel,
-        two_d: is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps),
-        width: ELEMENTWISE_2D_WIDTH,
-    }
+    kg::Fold::new(
+        out_numel,
+        is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps),
+        caps,
+    )
 }
 
 /// The most lanes one row of the parallel [`OpKind::FusedRow`] kernel uses.

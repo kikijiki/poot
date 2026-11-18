@@ -236,8 +236,8 @@ fn a_serial_matmul_epilogue_matches_the_oracle_on_wgpu() {
 /// non-checkpoint route (`is_tileable_matmul_in`), with the same four-step chain fuses into one
 /// `ContractionEpilogue { head: MatMul }` dispatch, at a single partial row-tile (`M == 5`) and at many
 /// (`M == 160`); the device result meets the oracle.
-/// Mutation: drop the `is_tileable_matmul_in` arm of `epilogue_head_lowers` (`Tileable` no longer lowers); the head
-/// and its chain stay apart and this row goes red.
+/// Mutation: make `ContractionSpec::accepts_epilogue` answer `false` for `DenseTiled`; the head and its chain stay
+/// apart and this row goes red.
 #[test]
 fn a_tiled_matmul_epilogue_matches_the_oracle_on_wgpu() {
     let _gpu_guard = gpu_lock();

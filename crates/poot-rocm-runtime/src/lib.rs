@@ -43,7 +43,7 @@
 //! }
 //! ```
 
-#![deny(clippy::undocumented_unsafe_blocks)]
+#![expect(unsafe_code, reason = "raw HSA FFI and device memory")]
 
 mod bindings;
 

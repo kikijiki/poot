@@ -308,7 +308,7 @@ pub(super) fn plan(
         //
         // One thread per output element and no metadata buffer: the row width is derived in-kernel as
         // `out.len() / index.len()`, like the f32 `gather0:imported` arm above: the generic
-        // one-thread-per-output grid (the wg-bump below still applies).
+        // one-thread-per-output grid (the choice declares the workgroup the device's grid cap needs).
         //
         // AmdGcn is the ROCm typed packed walk's lane (card 450 ROCm): it uploads the same packed u32
         // lanes through `poot_rocm_device::upload_typed_input`, so the very body runs there. Its receipt
@@ -322,6 +322,7 @@ pub(super) fn plan(
         } => Planned::imported(
             ImportedKernel::PackedBf16RowGather,
             backend,
+            caps,
             None,
             [out_numel as u32, 1, 1],
         )?,
@@ -338,6 +339,7 @@ pub(super) fn plan(
         } => Planned::imported(
             ImportedKernel::PackedE4m3RowGather,
             backend,
+            caps,
             None,
             [out_numel as u32, 1, 1],
         )?,

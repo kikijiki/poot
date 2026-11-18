@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 # A leaf crate: nothing here depends on a compiler or runtime crate, so every other poot crate may depend
 # on it and none of them creates a cycle by doing so (card 522).

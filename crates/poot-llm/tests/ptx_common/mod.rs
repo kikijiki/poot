@@ -7,6 +7,10 @@
 //! `tests/ptx_common/mod.rs` compiles once per test binary that declares `mod ptx_common;`; each binary uses a
 //! different subset of these helpers, so the blanket allow below is
 //! the only way to share them (a per-binary `dead_code` is never meaningful here).
+#![expect(
+    unsafe_code,
+    reason = "the wrapper device reinterprets its dispatch arguments as the wrapped device's"
+)]
 #![allow(
     dead_code,
     reason = "compiled once per test binary, each using a different subset"
@@ -271,11 +275,11 @@ impl Device for PtxDeviceProxy<'_> {
         self.0.begin()
     }
     fn dispatch(&mut self, d: poot_executor::Dispatch<'_, Self>) -> Result<(), Self::Error> {
-        // SAFETY-free reinterpretation: `Self::Buffer`/`Self::Kernel` are literally `PtxDevice`'s own
-        // associated types (see above), so a `Dispatch<Self>` is layout-identical to a
-        // `Dispatch<PtxDevice>`; only the generic parameter differs.
         self.0.dispatch(poot_executor::Dispatch {
             kernel: d.kernel,
+            // SAFETY: the wrapper's `Buffer` and `Kernel` are `PtxDevice`'s own associated types, so
+            // `Arg<'_, Self>` and `Arg<'_, PtxDevice>` are the same type and the slice keeps its layout and
+            // lifetime; only the nominal generic parameter differs.
             inputs: unsafe {
                 std::mem::transmute::<
                     &[poot_executor::Arg<'_, Self>],

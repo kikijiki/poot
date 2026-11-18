@@ -1,5 +1,10 @@
 //! Backend-neutral helpers shared by poot GPU runtimes.
 
+#![expect(
+    unsafe_code,
+    reason = "dlopen of device libraries and the raw Vulkan probe"
+)]
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod device_skip;
 mod dl;
@@ -118,11 +123,9 @@ pub fn checked_copy_range(
 ///
 /// Device tests skip when their backend cannot open. A skip reads as a pass, so a broken environment
 /// (no driver, wrong shell, no GPU) reports green while running nothing. `POOT_REQUIRE_<BACKEND>=1`
-/// turns that skip into a panic. This type is the one place that reads the switch: context opens
-/// ([`Self::fail_if_required`]) decide through [`Self::required`]; device tests build their own skip
-/// path on top of [`Self::fail_if_required`] (see `poot_runtime_common::device_skip`, card 671 - this
-/// crate's own `skip_unavailable`/`open_or_skip` had no production caller, only that device-test
-/// pattern).
+/// turns that skip into a panic. Whether a backend is required is decided by [`Self::required`] over an
+/// environment lookup the caller passes in; device constructors never ask (they return their error), and the
+/// device tests' skip helpers (`device_skip`, test-only) panic on it.
 /// `scripts/with-required-backend.sh` sets exactly one backend's variable per lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceBackend {
@@ -178,33 +181,6 @@ impl DeviceBackend {
     /// Whether this backend is required: its own variable is `1`.
     pub fn required(self, get: impl Fn(&str) -> Option<String>) -> bool {
         get(self.variable()).is_some_and(|value| value == "1")
-    }
-
-    /// Panic when this backend is required. The one place the failure message is written.
-    fn panic_if_required(
-        self,
-        get: impl Fn(&str) -> Option<String>,
-        reason: &dyn std::fmt::Display,
-    ) {
-        if self.required(get) {
-            panic!(
-                "required {} device unavailable instead of skipping ({}=1): {reason}",
-                self.label(),
-                self.variable(),
-            );
-        }
-    }
-
-    /// Pass a failed context open through, or panic when the backend is required. Context-open code
-    /// wraps its error in this so a skip guard further up never sees an `Err` it would turn into a
-    /// silent pass. `get` reads the environment (injected so a test can set only one variable).
-    pub fn fail_if_required<E: std::fmt::Display>(
-        self,
-        get: impl Fn(&str) -> Option<String>,
-        error: E,
-    ) -> E {
-        self.panic_if_required(get, &error);
-        error
     }
 }
 
@@ -430,21 +406,6 @@ mod tests {
 #[cfg(test)]
 mod device_backend_tests {
     use super::DeviceBackend;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    /// An environment that sets exactly the named variables to `1`.
-    fn env_with(names: &'static [&'static str]) -> impl Fn(&str) -> Option<String> {
-        move |name| names.contains(&name).then(|| "1".to_string())
-    }
-
-    fn panic_message(run: impl FnOnce()) -> Option<String> {
-        let payload = catch_unwind(AssertUnwindSafe(run)).err()?;
-        let message = payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()));
-        Some(message.expect("device backend panics carry a message"))
-    }
 
     /// A backend is required by its own variable and by nothing else, not another backend's variable. This
     /// is the isolation `scripts/with-required-backend.sh` relies on.
@@ -504,24 +465,5 @@ mod device_backend_tests {
                 backend.variable()
             );
         }
-    }
-
-    /// The context-open guard hands the error back untouched unless the backend is required.
-    #[test]
-    fn fail_if_required_passes_the_error_through_unless_required() {
-        assert_eq!(
-            DeviceBackend::Rocm.fail_if_required(|_| None, "no agent"),
-            "no agent"
-        );
-        let message = panic_message(|| {
-            DeviceBackend::Rocm.fail_if_required(env_with(&["POOT_REQUIRE_ROCM"]), "no agent");
-        })
-        .expect("a required backend must fail the open");
-        assert!(
-            message.contains("required ROCm device unavailable"),
-            "{message}"
-        );
-        assert!(message.contains("POOT_REQUIRE_ROCM=1"), "{message}");
-        assert!(message.contains("no agent"), "{message}");
     }
 }

@@ -60,12 +60,11 @@ fn coopmat_tile_dispatches_and_matches_cpu_on_radv() {
 
     // (2) the real dispatch half: run the compiled coopmat tile on the actual Vulkan adapter and
     // compare against the CPU oracle.
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            poot_test_util::skip_report("poot-kernelgen", &format_args!("no wgpu context: {e}"));
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        Context::new(),
+    ) else {
+        return;
     };
     let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let a_data: Vec<f32> = (0..256).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();

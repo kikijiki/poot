@@ -271,7 +271,7 @@ fn transposes(program: &Program) -> usize {
 /// POOT-646 SC-002: the checkpoint-order program plans one indexed contraction reading the stored `[E, N, K]`
 /// weight (`WeightLayout::Nk`) and no `transpose` dispatch, on every backend, at the Gemv and the register-tiled shapes.
 ///
-/// Mutation: drop the indexed arm of `operand_demand` (`predicates.rs`); the `Transpose` is materialized, a
+/// Mutation: drop the indexed arm of `moe::layout_demand`; the `Transpose` is materialized, a
 /// `transpose` dispatch appears, the request reads `Kn` and this row goes red.
 #[test]
 fn checkpoint_order_experts_plan_one_contraction_and_no_transpose() {
@@ -379,7 +379,7 @@ fn an_unreadable_weight_view_is_copied_not_refused() {
 /// POOT-646: the routed gate weighting fuses into one `ContractionEpilogue { head: Indexed }` that reads the
 /// checkpoint-order `[E, N, K]` weight in place: no `transpose` dispatch, and the request's layout is `Nk`.
 ///
-/// Mutation: drop the `ContractionEpilogue` arm of `operand_demand` (`predicates.rs`); the `Transpose` is
+/// Mutation: drop the `ContractionEpilogue` arm of `moe::layout_demand`; the `Transpose` is
 /// materialized and this row goes red.
 #[test]
 fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {

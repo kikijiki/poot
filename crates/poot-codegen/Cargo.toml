@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [features]
 # ADR-0113: `test_support::scripted_toolchain` has no production caller, only the executor and compiler tests

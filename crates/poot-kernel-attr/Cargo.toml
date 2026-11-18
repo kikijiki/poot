@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 description = "The #[kernel] attribute: renames a kernel fn into poot's reserved namespace so it survives to MIR for pootc to import (invariant 8)."
 
 [lib]

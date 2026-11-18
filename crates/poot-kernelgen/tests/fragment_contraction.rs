@@ -61,13 +61,10 @@ fn f32s(bytes: &[u8]) -> Vec<f32> {
 
 fn wgpu_device() -> Option<Device> {
     use poot_wgpu_runtime::Context;
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            poot_test_util::skip_report("poot-kernelgen", &format_args!("no wgpu context: {e}"));
-            return None;
-        }
-    };
+    let ctx = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        Context::new(),
+    )?;
     let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let dir = work_dir("fragment_contraction_wgpu");
     Some(Device {
@@ -103,13 +100,10 @@ fn wgpu_device() -> Option<Device> {
 fn vulkan_device() -> Option<Device> {
     use poot_runtime_common::BufferRole;
     use poot_vulkan_runtime::Context;
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            poot_test_util::skip_report("poot-kernelgen", &format_args!("no Vulkan device: {e}"));
-            return None;
-        }
-    };
+    let ctx = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        Context::new(),
+    )?;
     let caps = poot_test_util::device_caps::vulkan_rdna3_igpu();
     let dir = work_dir("fragment_contraction_vulkan");
     Some(Device {
@@ -157,8 +151,11 @@ fn rocm_device() -> Option<Device> {
     use poot_target::ElementKind;
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
-        Err(RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent) => {
-            poot_test_util::skip_report("poot-kernelgen", &"no ROCm device");
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
+            );
             return None;
         }
         Err(error) => panic!("{error}"),

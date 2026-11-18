@@ -9,7 +9,7 @@ use super::{
 use crate::dtype_widen::ConstLanes;
 use crate::planner::{GraphTables, Layout, StorageDtypes, finalize};
 use crate::predicates::{
-    IndexedRows, gemv_wins, indexed_gemv_in, indexed_matmul_lowers, view_source,
+    IndexedRows, LayoutDemand, gemv_wins, indexed_gemv_in, indexed_matmul_lowers, view_source,
 };
 use crate::refusal::{Pins, Site};
 use poot_graph_ir::ExpertRows;
@@ -19,6 +19,23 @@ use poot_target::{Backend, BufferStorage, DeviceCaps};
 /// bodies (`indexed_matmul_lowers`), so a 2-byte float or a packed E4M3FN payload is refused by name.
 pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
     dtypes.refuse_unwired()
+}
+
+/// What this family needs of the layout it reads operand `position` (the value `value`) through. The indexed
+/// contraction reads its stacked weight (operand 1 only) strided, so a `Transpose` of the stack is never
+/// materialized; the weight is read in place only where it is read once. As the activation, the ids or an
+/// epilogue leaf it is read flat, and so is everything `ArgTopK` and the expert grouping read.
+pub(super) fn layout_demand(eqn: &Eqn, position: usize, value: ValueId) -> LayoutDemand {
+    match &eqn.op {
+        OpKind::IndexedMatMul { .. }
+        | OpKind::ContractionEpilogue {
+            head: ContractionHead::Indexed { .. },
+            ..
+        } if position == 1 && value_ids(eqn).iter().filter(|&&v| v == value).count() == 1 => {
+            LayoutDemand::IndexedWeight
+        }
+        _ => LayoutDemand::Dense,
+    }
 }
 
 /// Plan one MoE-family equation (IndexedMatMul, its `ContractionEpilogue`, or ArgTopK).
@@ -77,6 +94,7 @@ pub(super) fn plan(
                     e,
                     k: *k,
                     numel: out_numel,
+                    workgroup: kg::Workgroup::for_threads(out_numel, caps),
                 }),
                 backend,
                 caps,

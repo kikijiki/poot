@@ -28,12 +28,11 @@ fn f16_encode(data: &[f32]) -> Vec<u8> {
 
 #[test]
 fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
-    let ctx = match PtxContext::new() {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("POOT-SKIP wmma_tile_dispatches_and_matches_cpu_on_ptx: no PTX device ({e})");
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
 
     let body = poot_kernel_ir::test_support::wmma_tile("k");
@@ -214,14 +213,11 @@ fn attention_spec(
 /// key at all: the unguarded recurrence computed `exp(-inf - -inf) = NaN` for both.
 #[test]
 fn attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx() {
-    let ctx = match PtxContext::new() {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!(
-                "POOT-SKIP attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx: no PTX device ({e})"
-            );
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
     let (hq, n_rep, cap, d) = (2usize, 1usize, 2usize, 4usize);
     let spec = attention_spec(
@@ -257,12 +253,11 @@ fn attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx() {
 /// two-pass attention.
 #[test]
 fn attention_fixture_bank_matches_cpu_on_ptx() {
-    let ctx = match PtxContext::new() {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("POOT-SKIP attention_fixture_bank_matches_cpu_on_ptx: no PTX device ({e})");
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
     let scale = |d: usize| kg::ScoreTransform::Scale {
         scale_bits: (1.0 / (d as f32).sqrt()).to_bits(),
@@ -375,14 +370,11 @@ fn attention_fixture_bank_matches_cpu_on_ptx() {
 /// row's own keys.
 #[test]
 fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
-    let ctx = match PtxContext::new() {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!(
-                "POOT-SKIP attention_split_key_and_live_bound_match_cpu_on_ptx: no PTX device ({e})"
-            );
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
     let (batch, hq, lk, dk, dv, shared) = (4usize, 2usize, 100usize, 192usize, 128usize, 64usize);
     let head = dk - shared;

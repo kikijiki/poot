@@ -5,7 +5,7 @@ use crate::bindings::{
 };
 use crate::context::{DevicePoison, PoisonState};
 use crate::{DeviceFault, HsaStatus, QueueHostLink, QueueRingMemory, RocmError, bindings, ffi};
-use std::ffi::{OsString, c_void};
+use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock, Weak};
 
 /// Immutable purpose of the context's sole HSA queue.
@@ -59,10 +59,6 @@ pub(crate) struct QueueLayout {
 /// coherent-device facts without changing that creator.
 fn system_memory_ring_publication_facts() -> (Option<QueueRingMemory>, Option<QueueHostLink>) {
     (Some(QueueRingMemory::HostCoherent), None)
-}
-
-pub(crate) fn device_ring_override_present(get: impl Fn(&str) -> Option<OsString>) -> bool {
-    get("HSA_ALLOCATE_QUEUE_DEV_MEM").is_some()
 }
 
 pub(crate) static DEVICE_RING_OVERRIDE_AT_FIRST_HSA_LOAD: OnceLock<bool> = OnceLock::new();

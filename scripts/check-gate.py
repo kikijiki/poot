@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Self-test of `just gate`, the local merge gate (card 1218, SC-005).
 
-`just gate` is `fmt-check`, `clippy` and `test`. This proves the two properties a reviewer cannot see by reading
+`just gate` is `fmt-check`, `clippy`, `deny` and `test`. This proves the two properties a reviewer cannot see by reading
 the recipe once:
 
-  1. the gate runs all three steps, in order, each failing the recipe: `just --dry-run gate` prints the format
-     check, the clippy run with `-D warnings` and the model-free lane, in that order;
+  1. the gate runs all four steps, in order, each failing the recipe: `just --dry-run gate` prints the format
+     check, the clippy run with `-D warnings`, the cargo-deny supply-chain check (POOT-1252) and the model-free
+     lane, in that order;
   2. the format step is not vacuous: the real `fmt-check` recipe, run in a fixture crate with a rustfmt diff, fails,
      and in the same crate formatted, passes.
 
@@ -46,7 +47,12 @@ def gate_steps() -> list[str]:
 
 def check_steps() -> int:
     lines = gate_steps()
-    wanted = ["cargo fmt --all --check", "-- -D warnings", "scripts/test-model-free.sh run"]
+    wanted = [
+        "cargo fmt --all --check",
+        "-- -D warnings",
+        "cargo deny --locked --workspace check",
+        "scripts/test-model-free.sh run",
+    ]
     at = -1
     for needle in wanted:
         found = next((i for i, line in enumerate(lines) if i > at and needle in line), None)
@@ -54,7 +60,7 @@ def check_steps() -> int:
             print(f"gate: `just gate` does not run `{needle}` after step {at}", file=sys.stderr)
             return 1
         at = found
-    print("gate: `just gate` runs fmt-check, clippy -D warnings and the model-free lane, in order")
+    print("gate: `just gate` runs fmt-check, clippy -D warnings, cargo deny and the model-free lane, in order")
     return 0
 
 

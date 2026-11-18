@@ -124,6 +124,21 @@ impl RocmDevice {
         })?)
     }
 
+    /// A device on the default GPU for a process that was launched with `device_ring_override` in
+    /// `HSA_ALLOCATE_QUEUE_DEV_MEM` (see `RocmContextOptions::device_ring_override`); `device_timing` is as in
+    /// [`Self::new_with_device_timing`]. The production open path: the process edge reports the launch, the
+    /// library never reads the environment.
+    pub fn open(
+        device_timing: bool,
+        device_ring_override: Option<bool>,
+    ) -> Result<Self, RocmGpuError> {
+        Self::from_context(RocmContext::new_with_options(RocmContextOptions {
+            device_timing,
+            device_ring_override,
+            ..RocmContextOptions::default()
+        })?)
+    }
+
     /// A device over an already-opened `ctx`: derives the GPU architecture from the context's ISA name.
     ///
     /// # Errors

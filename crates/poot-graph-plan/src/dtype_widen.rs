@@ -1,17 +1,9 @@
-//! Card 235: the mixed-operand-dtype decode `MatMul` planner gap.
+//! Dtype preparation for compile: the folds that read a BF16 weight in place and the lane a BF16 const uploads to.
 //!
-//! `plan_eqn`'s `OpKind::MatMul` arm rejects any matmul whose operand dtype does not
-//! match the output dtype: every matmul body reads one element type. The loader types every
-//! projection weight `DType::BF16` for any natively-bf16 safetensors checkpoint (independent of `to_mixed_bf16`), so a decode matmul's weight is BF16 while the
-//! activation/output stay F32, and the planner's guard panics on every backend for such a checkpoint.
-//!
-//! [`widen_mismatched_matmul_dtypes`] fixes this: a graph transform that inserts an explicit `Cast`
-//! widening a mismatched operand back to the output dtype, so `plan_eqn`'s guard fires only on the one
-//! mismatch this pass leaves on purpose ([`matmul_bf16_column_gemv`]).
-//!
-//! This lives in `poot-graph-plan`, not `poot-graph-ir`, because the decode-projection check needs
-//! [`poot_target::DeviceCaps`] and `poot-graph-ir` cannot depend on this crate
-//! (`poot-graph-plan` already depends on it).
+//! No pass here widens an operand. A matmul or binary whose operand dtype differs from its output dtype has no
+//! lowering (every body reads one element type), so the planner refuses it by name with
+//! `Capability::DtypeLowering` on every backend; nothing inserts a `Cast` that would materialize a widened copy
+//! of a weight (POOT-1628).
 //!
 //! Card 1011: a BF16 const is never widened. Its declared dtype is its stored dtype on every backend, and the lane
 //! its bytes upload to (packed `u32` words or native two-byte BF16) is decided by [`bf16_const_lane`] and read by
@@ -22,9 +14,8 @@ use crate::Target;
 use poot_graph_ir::graph::{Storage, ValueMeta};
 use poot_graph_ir::op::{ContractionHead, LocalId, OpKind};
 use poot_graph_ir::types::{DTypeClass, DTypeClassExt, TensorType};
-use poot_graph_ir::{EditError, Eqn, Graph, GraphEdit, Operand, ValueId, ValueTable};
+use poot_graph_ir::{EditError, Eqn, Graph, Operand, ValueId, ValueTable};
 use poot_kernelgen::Layout;
-use poot_target::DeviceCaps;
 use poot_tensor::DType;
 
 use std::collections::{HashMap, HashSet};
@@ -105,35 +96,6 @@ pub(crate) fn bf16_const_lane(
         // An AIE core has no BF16 lane: the const stays unpacked and the BF16 consumers refuse; neither does a VPU.
         Target::Npu(_) => Bf16ConstLane::Native,
     }
-}
-
-/// Whether this matmul is a decode projection over a BF16 `[K, N]` weight on a device whose BF16 lane is packed
-/// (`caps.widens_bf16_decode_weight` is false): `F32 act x BF16 weight -> F32 out`, `M == 1`, a rank-2 weight.
-///
-/// Such a projection has no lowering. A one-workgroup-per-column Gemv over `[K, N]` reads the weight at a stride
-/// of `N` elements per lane (card 035), and the column-tile body that used to avoid that is retired; the
-/// supported orientation is the checkpoint's `[N, K]` read through a `Transpose`, which `compile` folds into the
-/// dense Gemv. [`widen_mismatched_matmul_dtypes`] leaves the mixed-dtype matmul in the graph so that `plan_eqn`
-/// refuses it with `Capability::DtypeLowering`, rather than materializing a widened F32 copy of the weight.
-///
-/// A device with `widens_bf16_decode_weight` (NVPTX) is a deliberate asymmetry: it keeps the widening cast (it has two-byte BF16 storage and no packed lane),
-/// so a `[K, N]` BF16 decode weight is materialized as an F32 copy there, doubling its bytes. That is a backend
-/// capability difference, not a bug, and there is no PTX hardware row for `[K, N]` BF16 decode (the supported
-/// `[N, K]` orientation is the dense Gemv on every backend).
-pub fn matmul_bf16_column_gemv(
-    caps: &DeviceCaps,
-    a_dtype: DType,
-    b_dtype: DType,
-    odt: DType,
-    m: usize,
-    weight_rank: usize,
-) -> bool {
-    !caps.widens_bf16_decode_weight
-        && a_dtype == DType::F32
-        && b_dtype == DType::BF16
-        && odt == DType::F32
-        && m == 1
-        && weight_rank == 2
 }
 
 /// Whether `op` reads its operand `position` as packed BF16 lanes on a typed value walk. One row per kernel
@@ -730,155 +692,6 @@ pub(crate) fn lower_nonlast_reduces(g: &Graph) -> Result<Graph, EditError> {
     out.commit()
 }
 
-/// Widen a `MatMul`/`Binary` operand whose dtype does not match the eqn's output dtype
-/// back to the output dtype via an explicit `Cast`: every matmul and binary body reads one element type. The
-/// one mismatch left in place is the BF16 `[K, N]` decode projection ([`matmul_bf16_column_gemv`]).
-///
-/// Idempotent and a no-op on any graph with no mismatched-dtype eqn. The pass only inserts `Cast`
-/// equations; it never changes a value's declared dtype, and no other pass retypes a const either (Card
-/// 1011). A BF16 const stays BF16 on every backend, and the `Cast{BF16 -> F32}` this pass puts in front of
-/// it reads the lane the storage plan gave the const ([`bf16_const_is_packed`]).
-///
-/// Card 235: needed before decode capture on every backend: a mismatched-dtype decode matmul is always
-/// widened by this pass (except the BF16-weight decode GEMV, which reads the weight packed).
-///
-/// `Binary` is covered because a bf16 decode graph's RMSNorm `x * gamma` compiles to a plain
-/// `Binary(Mul)` against a `Const` weight whose dtype can differ from the activation's; the operand is
-/// widened to the eqn's output dtype by an explicit `Cast`.
-///
-/// `Gather { axis: 0 }` is also covered (first operand only: the table, never the index). A token-embedding
-/// lookup is `gather(embed_const, token)`, a raw `Storage::Const` table operand. `plan_eqn`'s `Gather` arm
-/// (unlike `MatMul`'s) has no operand/output dtype-mismatch guard: it picks the kernel's element type from the
-/// output dtype (`kg::gather_axis0_dt(_, fty(odt), _)`), so a Const whose dtype differs from the output's,
-/// read through that kernel, is silent corruption, not a `plan_eqn` rejection (`bf16 GRAPH MISMATCH (8/8)` in
-/// `probe_bf16_graph`).
-///
-/// `Slice` is covered the same way (evidence: `ptx_prefill_check_bf16`'s per-eqn scan): RoPE's
-/// `cos`/`sin` tables are `TensorType::f32(...)` unconditionally at trace (like every norm gamma and
-/// bias), and `rope_prefill`'s `cos[0..n]`/`sin[0..n]` is a direct
-/// `Slice` of that raw Const. `plan_eqn`'s `Slice` arm has the same no-guard shape as `Gather`'s (a
-/// zero-cost `Plan::View` or an imported kernel, both keyed off `fty(odt)` alone), with the same
-/// silent corruption (`slice ax=0 0..5 ... maxabs=2.59e38 nonfinite=20/320`). The non-axis-0 general
-/// `Gather` is out of scope (no known real trace uses a raw Const as its data operand there).
-/// `Unary`/`Cast`/`Reduce`/`Transpose`/`Reshape`/`Concat` etc. are not covered: no known real trace
-/// feeds them a raw Const directly (always through a Gather/Slice/compute op first); add them the same
-/// way if one does.
-pub fn widen_mismatched_matmul_dtypes(g: &Graph, caps: &DeviceCaps) -> Result<Graph, EditError> {
-    // Card 273: widen a single-value-operand movement op (`Gather{axis:0}`, `Slice`) whose one operand
-    // is directly a mismatched-dtype `Storage::Const`: inserts a Cast on that operand only, so the
-    // eqn's output dtype and every downstream consumer are untouched. Both ops can plan to a zero-cost
-    // `Plan::View`/imported-kernel path that reads the operand's real device bytes at the eqn's output
-    // elem width (`fty(odt)`) with no mismatch guard, so a Const read at an element width its dtype does not
-    // have is silent corruption (`probe_bf16_graph` for Gather, `ptx_prefill_check_bf16` for
-    // Slice on `rope.cos`/`rope.sin`, both `TensorType::f32(...)` at trace regardless of `proj_dtype`).
-    let widen_single_operand = |out: &mut GraphEdit, eqn: &Eqn| -> bool {
-        let table_id = match eqn.inputs.first() {
-            Some(Operand::Value(v)) => *v,
-            _ => return false,
-        };
-        let odt = g.aval(eqn.out).dtype;
-        if g.aval(table_id).dtype == odt {
-            return false;
-        }
-        let aval = TensorType::new(out.aval(table_id).shape.clone(), odt);
-        let nv = out
-            .values_mut()
-            .push(ValueMeta::new(aval, Storage::Device, None));
-        out.eqns_mut().push(Eqn {
-            op: OpKind::Cast { to: odt },
-            inputs: vec![Operand::Value(table_id)],
-            out: nv,
-            layer: eqn.layer,
-        });
-        let mut inputs = eqn.inputs.clone();
-        inputs[0] = Operand::Value(nv);
-        out.eqns_mut().push(Eqn {
-            op: eqn.op.clone(),
-            inputs,
-            out: eqn.out,
-            layer: eqn.layer,
-        });
-        true
-    };
-
-    let mut out = g.edit();
-    out.eqns_mut().clear();
-    for eqn in g.eqns() {
-        if matches!(eqn.op, OpKind::Gather { axis: 0 } | OpKind::Slice { .. }) {
-            if !widen_single_operand(&mut out, eqn) {
-                out.eqns_mut().push(eqn.clone());
-            }
-            continue;
-        }
-        let is_matmul = matches!(eqn.op, OpKind::MatMul { .. });
-        let widenable = is_matmul || matches!(eqn.op, OpKind::Binary(_));
-        let (a_id, b_id) = match (eqn.inputs.first(), eqn.inputs.get(1)) {
-            (Some(Operand::Value(a)), Some(Operand::Value(b))) if widenable => (*a, *b),
-            _ => {
-                out.eqns_mut().push(eqn.clone());
-                continue;
-            }
-        };
-        let odt = g.aval(eqn.out).dtype;
-        let a_dt = g.aval(a_id).dtype;
-        let b_dt = g.aval(b_id).dtype;
-        if a_dt == odt && b_dt == odt {
-            out.eqns_mut().push(eqn.clone());
-            continue;
-        }
-        if is_matmul {
-            let out_shape = &g.aval(eqn.out).shape;
-            let r = out_shape.len();
-            if r < 2 {
-                // MatMul always infers a rank >= 2 output (see OpKind::infer); defensive only.
-                out.eqns_mut().push(eqn.clone());
-                continue;
-            }
-            let m = out_shape[r - 2];
-            // A BF16 `[K, N]` decode projection has no lowering: a widening Cast would materialize an F32
-            // copy of the weight, so it stays mixed and `plan_eqn` refuses it by name.
-            if matmul_bf16_column_gemv(caps, a_dt, b_dt, odt, m, g.aval(b_id).shape.len()) {
-                out.eqns_mut().push(eqn.clone());
-                continue;
-            }
-        }
-        let cast_to = |out: &mut GraphEdit, id: ValueId, dt: DType| -> ValueId {
-            if out.aval(id).dtype == dt {
-                return id;
-            }
-            let aval = TensorType::new(out.aval(id).shape.clone(), dt);
-            let nv = out
-                .values_mut()
-                .push(ValueMeta::new(aval, Storage::Device, None));
-            out.eqns_mut().push(Eqn {
-                op: OpKind::Cast { to: dt },
-                inputs: vec![Operand::Value(id)],
-                out: nv,
-                layer: eqn.layer,
-            });
-            nv
-        };
-        let mut inputs = eqn.inputs.clone();
-        let na = cast_to(&mut out, a_id, odt);
-        inputs[0] = Operand::Value(na);
-        let nb = cast_to(&mut out, b_id, odt);
-        inputs[1] = Operand::Value(nb);
-        // Widened to the output dtype, a matmul's operands already carry its accumulate dtype.
-        let op = if is_matmul {
-            OpKind::matmul()
-        } else {
-            eqn.op.clone()
-        };
-        out.eqns_mut().push(Eqn {
-            op,
-            inputs,
-            out: eqn.out,
-            layer: eqn.layer,
-        });
-    }
-    out.commit()
-}
-
 #[cfg(test)]
 mod tests {
     use poot_graph_ir::{Builder, Graph, Storage, TensorType};
@@ -913,7 +726,7 @@ mod tests {
     /// dtype it was traced with, so the executor uploads the stored words. A BF16 activation has no lowering on
     /// some targets; there `compile` refuses by name (`Refusal`) instead of retyping anything to plan it.
     ///
-    /// Mutation: retype every BF16 const to F32 at the top of `widen_mismatched_matmul_dtypes`; every row
+    /// Mutation: retype every BF16 const to F32 at the top of `fold_dense_contractions`; every row
     /// of this test goes red naming the const.
     #[test]
     fn compile_never_retypes_a_bf16_const() {
@@ -989,7 +802,6 @@ mod tests {
 mod compile_preparation_tests {
     use poot_graph_ir::{Builder, OpKind, RedOp, TensorType};
     use poot_target::{AmdArch, Backend};
-    use poot_tensor::DType;
 
     use crate::test_support::compiled_graph;
 
@@ -1031,40 +843,6 @@ mod compile_preparation_tests {
                     .iter()
                     .any(|eqn| matches!(eqn.op, OpKind::Transpose { .. })),
                 "{backend:?}: `lower_nonlast_reduces` moves the reduced axis to the end with a transpose"
-            );
-        }
-    }
-
-    /// Card 1011: a prefill matmul (`m = 4`, not the decode GEMV) over a BF16 weight no backend folds into a
-    /// packed contraction keeps the weight BF16. Nothing retypes it to F32: the widening is the planned
-    /// `Cast{BF16 -> F32}` equation in front of the matmul, which a packed or native cast body reads.
-    #[test]
-    fn a_bf16_weight_stays_bf16_and_is_cast_in_the_graph() {
-        let b = Builder::for_tests();
-        let x = b
-            .constant("x", TensorType::new(vec![4, 8], DType::F32))
-            .unwrap();
-        let weight = b
-            .constant("weight", TensorType::new(vec![8, 16], DType::BF16))
-            .unwrap();
-        let out = b.matmul(x, weight).unwrap();
-        let g = b.finish(out).unwrap();
-
-        for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
-            let prepared = compiled_graph(
-                &g,
-                backend,
-                &poot_test_util::device_caps::default_caps_for(backend),
-                poot_graph_ir::MatmulPrecision::Exact,
-            )
-            .unwrap();
-            assert_eq!(prepared.aval(weight.id()).dtype, DType::BF16, "{backend:?}");
-            assert!(
-                prepared.eqns().iter().any(|eqn| matches!(
-                    eqn.op,
-                    OpKind::Cast { to: DType::F32 }
-                ) && matches!(eqn.inputs.as_slice(), [poot_graph_ir::Operand::Value(v)] if *v == weight.id())),
-                "{backend:?}: the weight reaches the matmul through an explicit Cast"
             );
         }
     }

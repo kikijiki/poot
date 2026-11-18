@@ -1458,15 +1458,11 @@ mod row_gather_tests {
         use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
         use poot_wgpu_runtime::{Context, KernelBuffer};
 
-        let ctx = match Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            Context::new(),
+        ) else {
+            return;
         };
 
         for GatherCase {
@@ -1614,15 +1610,11 @@ mod row_gather_tests {
         use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
         use poot_wgpu_runtime::{Context, KernelBuffer};
 
-        let ctx = match Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            Context::new(),
+        ) else {
+            return;
         };
 
         let out_rows = 5;
@@ -2229,14 +2221,23 @@ mod contraction_tests {
     /// The bias, tanh, scale and residual chain of the fuse rule: `tanh(head + bias) * 0.5 + residual`, as the
     /// kernelgen epilogue the planner builds from a `ContractionEpilogue` over a packed head.
     pub(super) fn bias_activation_residual_chain(out: usize) -> crate::contraction::Epilogue {
+        bias_activation_residual_chain_over(1, out)
+    }
+
+    /// [`bias_activation_residual_chain`] over a `[rows, out]` output: the bias is `[out]`, the residual the output's
+    /// own shape.
+    pub(super) fn bias_activation_residual_chain_over(
+        rows: usize,
+        out: usize,
+    ) -> crate::contraction::Epilogue {
         use crate::contraction::{
             Epilogue, EpilogueInput as In, EpilogueLeaf, EpilogueStep as Step,
         };
         use crate::fused::FusedScalarOp as Op;
         Epilogue {
             dt: poot_kernel_ir::Ty::F32,
-            out_shape: vec![1, out],
-            leaves: [vec![out], vec![1, out]]
+            out_shape: vec![rows, out],
+            leaves: [vec![out], vec![rows, out]]
                 .into_iter()
                 .map(|shape| EpilogueLeaf {
                     shape,
@@ -2329,28 +2330,75 @@ mod contraction_tests {
         }
     }
 
-    /// The tiled schedule has no epilogue: an epilogue on it is a typed refusal, never a body that drops it.
+    /// The block-diagonal tiled schedule applies the epilogue once to each completed sum of every output element
+    /// (POOT-1626): the result equals the reference contraction with the chain applied on the host, over a ragged row
+    /// tile and column edge and over two blocks. The leaves ride between the weight words and the metadata, the
+    /// bias along the columns and the residual per output element.
+    ///
+    /// Mutation: drop the epilogue in `contraction_register_tiled` (`epilogue: None` in its `TiledBody`): the output
+    /// is the plain product and this row goes red (`Q8_0 tiled epilogue element 0: got 11.417626 want 0`).
     #[test]
-    fn a_tiled_packed_contraction_refuses_an_epilogue_by_name() {
-        let epilogue = bias_activation_residual_chain(4);
-        let error = packed_contraction(
-            "tiled_epilogue",
+    fn a_tiled_packed_contraction_applies_its_epilogue_once_to_each_completed_sum() {
+        let (blocks, m_per_block, out_per_block) = (2, 7, 11);
+        let rows = blocks * m_per_block;
+        let bias: Vec<f32> = (0..out_per_block).map(|i| 0.3 - i as f32 * 0.07).collect();
+        let residual: Vec<f32> = (0..rows * out_per_block)
+            .map(|i| i as f32 * 0.011 - 0.5)
+            .collect();
+        for format in [
             poot_quant::format::WeightFormat::Q8_0,
-            register_tiled(2, 32),
-            &[],
-            Some(&epilogue),
-            crate::PackedRows::Blocks,
-            poot_graph_ir::OperandPrecision::Exact,
-            poot_target::RoundingConversions::NONE,
-        )
-        .expect_err("a packed tiled contraction has no epilogue");
-        assert_eq!(
-            error,
-            crate::KernelGenError::Unsupported {
-                request: "packed_contraction",
-                reason: "a packed tiled contraction has no epilogue",
-            }
-        );
+            poot_quant::format::WeightFormat::Q4_K,
+        ] {
+            let (k, bytes, activation, head) =
+                contraction_fixture(format, blocks, m_per_block, out_per_block);
+            // The head sums are O(10); scale them so tanh does not saturate every element.
+            let activation: Vec<f32> = activation.iter().map(|v| v * 0.02).collect();
+            let head: Vec<f32> = head.iter().map(|v| v * 0.02).collect();
+            // The output is `[rows, out_per_block]` over both blocks: the bias leaf is `[out_per_block]`, one value
+            // per column, and the residual the output's own shape.
+            let expected: Vec<f32> = (0..rows * out_per_block)
+                .map(|i| apply_chain(head[i], bias[i % out_per_block], residual[i]))
+                .collect();
+            let epilogue = bias_activation_residual_chain_over(rows, out_per_block);
+            let schedule = register_tiled(2, 32);
+            let body = packed_contraction(
+                &format!("tiled_epilogue_{format:?}"),
+                format,
+                schedule,
+                &[k as u32, out_per_block as u32],
+                Some(&epilogue),
+                crate::PackedRows::Blocks,
+                poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
+            )
+            .unwrap_or_else(|error| panic!("{format:?}: {error}"));
+            body.verify().expect("the epilogue body verifies");
+            let words = pack_words(&bytes);
+            let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0, 0];
+            let mut buffers = [
+                Buffer::from_f32s(&activation),
+                Buffer::from_u32s(&words),
+                Buffer::from_f32s(&bias),
+                Buffer::from_f32s(&residual),
+                Buffer::from_u32s(&metadata),
+                Buffer::from_f32s(&vec![0.0; rows * out_per_block]),
+            ];
+            run(
+                &body,
+                workgroups_covering(
+                    &body,
+                    schedule.grid_threads(blocks, m_per_block, out_per_block),
+                ),
+                &mut buffers,
+            )
+            .unwrap_or_else(|error| panic!("{format:?}: interpreter: {error}"));
+            assert_close(
+                format,
+                "tiled epilogue",
+                &buffers[5].to_f32s().unwrap(),
+                &expected,
+            );
+        }
     }
 
     /// SC-002 (card 542b, GPU-free rehearsal): `Contraction` `Schedule::RegisterTiled` (`lanes = 2` of two
@@ -2635,15 +2683,11 @@ mod contraction_tests {
 
     #[test]
     fn contraction_gemv_matches_reference_blocks_1_and_2_on_wgpu() {
-        let ctx = match poot_wgpu_runtime::Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            poot_wgpu_runtime::Context::new(),
+        ) else {
+            return;
         };
         for format in block32() {
             for schedule in GEMV_SCHEDULES {
@@ -2659,15 +2703,11 @@ mod contraction_tests {
     /// (`rows_and_depth_do_not_change_a_rows_sum`).
     #[test]
     fn a_gemv_with_rows_and_depth_matches_reference_on_wgpu() {
-        let ctx = match poot_wgpu_runtime::Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            poot_wgpu_runtime::Context::new(),
+        ) else {
+            return;
         };
         for format in device_rows_and_depth_formats() {
             for (rows, depth) in DEVICE_ROWS_AND_DEPTH {
@@ -2679,15 +2719,11 @@ mod contraction_tests {
 
     #[test]
     fn contraction_gemv_matches_reference_blocks_1_and_2_on_wgpu_kquant() {
-        let ctx = match poot_wgpu_runtime::Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            poot_wgpu_runtime::Context::new(),
+        ) else {
+            return;
         };
         for format in kquant() {
             for schedule in GEMV_SCHEDULES {
@@ -2701,15 +2737,11 @@ mod contraction_tests {
     /// counterpart of `runs_over_a_piecewise_layout_decode_like_the_reference`.
     #[test]
     fn runs_over_a_piecewise_layout_decode_like_the_reference_on_wgpu() {
-        let ctx = match poot_wgpu_runtime::Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            poot_wgpu_runtime::Context::new(),
+        ) else {
+            return;
         };
         for format in piecewise() {
             for schedule in piecewise_run_schedules() {
@@ -2724,15 +2756,11 @@ mod contraction_tests {
     /// `contraction_tiled_matches_reference_aligned_and_ragged` (`blocks == 1` only; see its doc).
     #[test]
     fn contraction_tiled_matches_reference_aligned_and_ragged_on_wgpu() {
-        let ctx = match poot_wgpu_runtime::Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            poot_wgpu_runtime::Context::new(),
+        ) else {
+            return;
         };
         for format in block32().into_iter().chain(kquant()) {
             run_wgpu_case(&ctx, format, register_tiled(2, 32), 1, 4, 4);
@@ -2748,15 +2776,11 @@ mod contraction_tests {
     /// bounded and correct on real hardware.
     #[test]
     fn contraction_tiled_matches_reference_block_diagonal_ragged_on_wgpu() {
-        let ctx = match poot_wgpu_runtime::Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            poot_wgpu_runtime::Context::new(),
+        ) else {
+            return;
         };
         for format in block32().into_iter().chain(kquant()) {
             run_wgpu_case(&ctx, format, register_tiled(2, 32), 3, 7, 5);
@@ -2764,7 +2788,7 @@ mod contraction_tests {
     }
 
     /// SC-001 (card 658 review F1/F2, device tier 2, wgpu/RADV): the real-hardware counterpart of
-    /// `packed_dequant::tests::over_cap_tiled_contraction_folds_onto_a_2d_grid_not_the_wg_bump` - a
+    /// `packed_dequant::tests::over_cap_tiled_contraction_folds_onto_a_2d_grid_and_keeps_its_workgroup` - a
     /// `Schedule::RegisterTiled` dispatch folded onto a 2-D `(x_groups, y_groups)` grid (`tiles =
     /// ceil(12/4)*ceil(4/8) = 3` over a synthetic `x_groups` cap of 2, folding to `(2, 2)`, the smallest
     /// shape that exercises a real `GroupY > 0` workgroup) matches the CPU oracle on real hardware, not
@@ -2778,15 +2802,11 @@ mod contraction_tests {
     /// fold's second row (`GroupY == 1`), which the mutated body never reaches. Restored; green again.
     #[test]
     fn contraction_tiled_folded_grid_matches_reference_on_wgpu() {
-        let ctx = match poot_wgpu_runtime::Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            poot_wgpu_runtime::Context::new(),
+        ) else {
+            return;
         };
         let (blocks, m_per_block, out_per_block, tile) = (1usize, 12usize, 4usize, 2u32);
         let ts = tile as usize;
@@ -3118,12 +3138,11 @@ mod rocm_tests {
     fn open_or_skip(test: &str) -> Option<RocmContext> {
         match RocmContext::new() {
             Ok(ctx) => Some(ctx),
-            Err(RocmError::LibraryNotFound(msg)) => {
-                eprintln!("POOT-SKIP poot-kernelgen: {test} (no HSA library): {msg}");
-                None
-            }
-            Err(RocmError::NoGpuAgent) => {
-                eprintln!("POOT-SKIP poot-kernelgen: {test} (no GPU agent)");
+            Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+                poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                    poot_runtime_common::DeviceBackend::Rocm,
+                    Err(error),
+                );
                 None
             }
             Err(error) => panic!("{test}: {error}"),
@@ -3594,6 +3613,80 @@ mod rocm_tests {
         }
     }
 
+    /// POOT-1626 (device tier 2, ROCm/HSA): the real-hardware counterpart of
+    /// `a_tiled_packed_contraction_applies_its_epilogue_once_to_each_completed_sum`: the block-diagonal tiled schedule
+    /// with the bias, tanh, scale and residual epilogue equals the reference product with the chain applied on the
+    /// host, over two blocks of a ragged row tile and column edge.
+    #[test]
+    fn a_tiled_packed_contraction_applies_its_epilogue_on_rocm() {
+        let Some(ctx) = open_or_skip("a_tiled_packed_contraction_applies_its_epilogue_on_rocm")
+        else {
+            return;
+        };
+        let (blocks, m_per_block, out_per_block) = (2, 7, 11);
+        let rows = blocks * m_per_block;
+        let bias: Vec<f32> = (0..out_per_block).map(|i| 0.3 - i as f32 * 0.07).collect();
+        let residual: Vec<f32> = (0..rows * out_per_block)
+            .map(|i| i as f32 * 0.011 - 0.5)
+            .collect();
+        for format in [
+            poot_quant::format::WeightFormat::Q8_0,
+            poot_quant::format::WeightFormat::Q4_K,
+        ] {
+            let (k, bytes, activation, head) =
+                contraction_fixture(format, blocks, m_per_block, out_per_block);
+            let activation: Vec<f32> = activation.iter().map(|v| v * 0.02).collect();
+            let head: Vec<f32> = head.iter().map(|v| v * 0.02).collect();
+            let expected: Vec<f32> = (0..rows * out_per_block)
+                .map(|i| {
+                    super::contraction_tests::apply_chain(
+                        head[i],
+                        bias[i % out_per_block],
+                        residual[i],
+                    )
+                })
+                .collect();
+            let epilogue =
+                super::contraction_tests::bias_activation_residual_chain_over(rows, out_per_block);
+            let schedule = register_tiled(2, 32);
+            let name = format!("tiled_epilogue_rocm_{format:?}");
+            let body = packed_contraction(
+                &name,
+                format,
+                schedule,
+                &[k as u32, out_per_block as u32],
+                Some(&epilogue),
+                crate::PackedRows::Blocks,
+                poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
+            )
+            .unwrap_or_else(|error| panic!("{format:?}: {error}"));
+            let words = pack_words(&bytes);
+            let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0, 0];
+            let grid = (
+                schedule.grid_threads(blocks, m_per_block, out_per_block) as u32,
+                1,
+                1,
+            );
+            let got = dispatch_and_download(
+                &ctx,
+                &name,
+                &body,
+                &[
+                    Arg::F32(&activation),
+                    Arg::U32(&words),
+                    Arg::F32(&bias),
+                    Arg::F32(&residual),
+                    Arg::U32(&metadata),
+                    Arg::Out(rows * out_per_block),
+                ],
+                grid,
+                (body.workgroup_size[0], 1, 1),
+            );
+            assert_close(format, "tiled epilogue (ROCm)", &got, &expected);
+        }
+    }
+
     /// SC-002 (card 542c, device tier 2): `Contraction` (Gemv, RegisterTiled) for every planar format is
     /// within tier-2 tolerance of the reference on real ROCm/HSA hardware. Each is built twice, as a device that
     /// does not keep the binary16 conversion decodes it and as the ROCm caps' `RoundingConversions::F16` does
@@ -3751,15 +3844,11 @@ mod planar_wgpu_tests {
     /// `K = 20` (a four-value run and a `K` tail of 4) and `K = 32`, dispatched on the local RADV device as a
     /// workgroup of `lanes` lanes, matches the reference.
     fn wide_tile_matches_reference_on_radv(caps: &poot_target::DeviceCaps, lanes: u32) {
-        let ctx = match Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                poot_test_util::skip_report(
-                    "poot-kernelgen",
-                    &format_args!("no wgpu context: {error}"),
-                );
-                return;
-            }
+        let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Wgpu,
+            Context::new(),
+        ) else {
+            return;
         };
         for k in [20usize, 32] {
             let case = wide_tile(k, caps);

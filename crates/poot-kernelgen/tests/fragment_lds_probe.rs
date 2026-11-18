@@ -356,12 +356,11 @@ fn f32s(bytes: &[u8]) -> Vec<f32> {
 #[test]
 fn fragment_probes_match_the_host_reference_on_wgpu() {
     use poot_wgpu_runtime::{Context, DeviceBuffer};
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            poot_test_util::skip_report("poot-kernelgen", &format_args!("no wgpu context: {e}"));
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        Context::new(),
+    ) else {
+        return;
     };
     if !have("llc") {
         poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
@@ -415,12 +414,11 @@ fn fragment_probes_match_the_host_reference_on_wgpu() {
 #[test]
 fn fragment_probes_match_the_host_reference_on_vulkan() {
     use poot_vulkan_runtime::{Context, DeviceBuffer};
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            poot_test_util::skip_report("poot-kernelgen", &format_args!("no Vulkan device: {e}"));
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        Context::new(),
+    ) else {
+        return;
     };
     if !have("llc") {
         poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
@@ -474,8 +472,11 @@ fn fragment_probes_match_the_host_reference_on_rocm() {
     use poot_rocm_runtime::{RocmContext, RocmError};
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
-        Err(RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent) => {
-            poot_test_util::skip_report("poot-kernelgen", &"no ROCm device");
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
+            );
             return;
         }
         Err(error) => panic!("{error}"),
@@ -541,8 +542,10 @@ fn fragment_probes_match_the_host_reference_on_rocm() {
 #[test]
 fn fragment_probes_match_the_host_reference_on_ptx() {
     use poot_ptx_runtime::PtxContext;
-    let Ok(ctx) = PtxContext::new() else {
-        poot_test_util::skip_report("poot-kernelgen", &"no PTX device");
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
         return;
     };
     let upload = |storage: BufferStorage, bytes: &[u8]| {

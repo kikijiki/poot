@@ -1370,7 +1370,8 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
 /// POOT-1036 (PTX, the generated tiled GEMM over an f32 `[K, N]` weight): a plain `MatMul` head at `M > 1` with a
 /// bias and a residual fuses into one `ContractionEpilogue { head: MatMul }` (a single partial row-tile at `M == 5`,
 /// many at `M == 160`), and the device result meets the CPU oracle.
-/// Mutation: drop the `Tileable` arm of `epilogue_head_lowers`; the head stays apart and this row goes red.
+/// Mutation: make `ContractionSpec::accepts_epilogue` answer `false` for `DenseTiled`; the head stays apart and this
+/// row goes red.
 /// Runs on the PTX pod.
 #[test]
 fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {

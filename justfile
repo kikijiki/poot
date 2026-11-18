@@ -54,14 +54,14 @@ models_dir := env("POOT_MODELS_DIR", home_directory() / "models")
 # device, and tests named `*_real_dims`, stay out; they run in the lanes below.
 
 # The local merge gate (owner ruling Q8, 2026-10-18: no CI for the code, every check runs on this box or the laptop):
-# format check, clippy with every warning an error, then the model-free lane. Each step fails the recipe; none is
+# format check, clippy with every warning an error, the cargo-deny supply-chain policy, then the model-free lane. Each step fails the recipe; none is
 # skipped. It is the merge gate for code and does NOT run the docs checks (`just docs-check`), the website checks
 # (`just site-check`, `just site-audit`; the cd-docs workflow runs `scripts/site-check.sh` before it publishes), the
 # device lanes (`just test-device-*`) or the checkpoint lanes (`just test-checkpoint*`, `just test-real-dims*`): a change
 # to what one of those covers runs it by hand.
-gate: fmt-check clippy test
+gate: fmt-check clippy deny test
 
-# the gate's own self-test: it runs fmt-check, clippy -D warnings and the model-free lane in order, and fmt-check fails a
+# the gate's own self-test: it runs fmt-check, clippy -D warnings, cargo deny and the model-free lane in order, and fmt-check fails a
 # fixture crate with a rustfmt diff (scripts/check-gate.py)
 gate-check:
     python3 scripts/check-gate.py --self-test
@@ -241,6 +241,13 @@ crates-stale-names:
 # it finds a hunk a conflict resolution dropped and names the card that added it
 merge-lost-lines-check:
     scripts/merge-lost-lines --self-test
+
+# the supply-chain policy of deny.toml over every locked crate: security advisories (the RustSec database is
+# fetched; a fetch that fails fails the recipe), yanked crates, licences, banned crates and registries. Cargo
+# resolves the patched wgpu-hal directory, so it is unpacked first.
+deny:
+    scripts/wgpu-hal-patched.sh
+    cargo deny --locked --workspace check
 
 # fail on a dependency a manifest declares and its crate never uses
 machete:

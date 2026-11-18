@@ -408,10 +408,6 @@ pub struct DeviceCaps {
     /// (POOT-1458): a generated body rounds an operand to such a dtype with two casts, and to any other in integer
     /// arithmetic. None on SPIR-V; f16 on AMDGPU and NVPTX.
     pub rounding_conversions: RoundingConversions,
-    /// Whether a BF16 `[K, N]` decode projection is widened to F32 before it is planned (the device has native
-    /// two-byte storage and no packed reader for it) instead of being refused (the lane is packed and
-    /// a widening copy of the weight would double its bytes).
-    pub widens_bf16_decode_weight: bool,
     /// Whether the device's runtime has a peer-to-peer transport to another device of its kind (point-to-point
     /// copies and the collectives built on them). Without it a stage cut between two such devices has nothing
     /// to carry its boundary.
@@ -511,7 +507,6 @@ impl DeviceCaps {
             e4m3_storage: E4m3Storage::None,
             native_two_byte_floats: true,
             rounding_conversions: RoundingConversions::F16,
-            widens_bf16_decode_weight: false,
             peer_transport: false,
             // The arch is the live agent's to say ([`calibration::Calibrated::of_hsa_arch`]); a device with no
             // arch plans with the portable prior.
@@ -543,7 +538,6 @@ impl DeviceCaps {
             e4m3_storage: E4m3Storage::Native,
             native_two_byte_floats: true,
             rounding_conversions: RoundingConversions::F16,
-            widens_bf16_decode_weight: true,
             peer_transport: true,
             // sm_80 is not a measured device ([`calibration::Calibrated::of_cuda_compute_capability`]).
             perf_calibration: calibration::Calibrated::Portable,

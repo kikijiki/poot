@@ -61,7 +61,7 @@ poot-kernelgen	packed::contraction_tests::a_gemv_refuses_a_narrowed_precision	ke
 poot-kernelgen	packed::contraction_tests::a_gemv_with_rows_and_depth_matches_reference_on_wgpu	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_launch_whose_rows_straddle_a_block_computes_nan	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_narrowed_packed_contraction_rounds_the_decoded_weight_and_the_activation	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
-poot-kernelgen	packed::contraction_tests::a_tiled_packed_contraction_refuses_an_epilogue_by_name	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::a_tiled_packed_contraction_applies_its_epilogue_once_to_each_completed_sum	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_two_byte_aligned_run_reads_its_span_plus_one_word	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_vector_activation_read_matches_the_scalar_read_bit_for_bit	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_vector_activation_read_over_a_partial_group_run_is_refused	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -111,6 +111,7 @@ poot-kernelgen	packed::planar_contraction_tests::contraction_tiled_matches_refer
 poot-kernelgen	packed::planar_contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged_for_every_planar_format	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::planar_contraction_tests::contraction_tiled_matches_reference_for_every_planar_format	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::rocm_tests::a_gemv_with_rows_and_depth_matches_reference_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::rocm_tests::a_tiled_packed_contraction_applies_its_epilogue_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::rocm_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::rocm_tests::contraction_gemv_matches_reference_blocks_1_and_2_on_rocm_kquant	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::rocm_tests::contraction_matches_reference_for_every_planar_format_on_rocm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -305,6 +306,7 @@ poot-kernelgen::rope_interp	rope_body_interprets_to_reference_partial	kernelgen 
 poot-kernelgen::run	attention_decode_validates_and_matches_cpu	kernelgen `run` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::run	attention_prefill_validates_and_matches_cpu	kernelgen `run` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::run	attn_scores_v_gemv_lds_matches_naive_batched_matmul	kernelgen `run` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::run	batched_dense_tiled_epilogue_is_bit_exact_against_the_unfused_chain	kernelgen `run` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::run	binary_mul	kernelgen `run` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::run	binary_scalar_add	kernelgen `run` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::run	broadcast_bias_and_colvec	kernelgen `run` test binary (emit, interpreter or dispatch rows); the lane runs the package whole

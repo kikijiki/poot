@@ -12,7 +12,7 @@ use crate::kernel_mapping::{
     map_row_value, map_unary, narrowing_store_op,
 };
 use crate::planner::{GraphTables, Layout, StorageDtypes};
-use crate::predicates::{ELEMENTWISE_2D_WIDTH, elementwise_fold, row_parallel_width};
+use crate::predicates::{LayoutDemand, elementwise_fold, row_parallel_width};
 use crate::refusal::Site;
 use poot_graph_ir::LocalId;
 use poot_graph_ir::op::{FusedOp, FusedOperand};
@@ -33,6 +33,20 @@ pub(super) fn admits_dtypes(op: &OpKind, dtypes: StorageDtypes) -> Result<(), Ca
             Err(Capability::DtypeLowering)
         }
         _ => Ok(()),
+    }
+}
+
+/// What this family needs of the layout it reads operand `position` (the value `value`) through. Every pointwise
+/// op reads its leaves through their layouts (the pointwise synthesizer, `fused_views`): an elementwise `Binary`,
+/// a `Unary`, a `Fused` region of f32 or exact-I32 leaves, a `FusedRow` of f32 leaves. A two-byte leaf, a
+/// `Select` and a `Rope` read flat, and so does a reduction.
+pub(super) fn layout_demand(g: GraphTables<'_>, eqn: &Eqn, value: ValueId) -> LayoutDemand {
+    let dtype = g.aval(value).dtype;
+    let words = matches!(dtype, DType::F32 | DType::I32);
+    match &eqn.op {
+        OpKind::Binary(_) | OpKind::Unary(_) | OpKind::Fused(_) if words => LayoutDemand::Any,
+        OpKind::FusedRow(_) if dtype == DType::F32 => LayoutDemand::Any,
+        _ => LayoutDemand::Dense,
     }
 }
 
@@ -80,19 +94,15 @@ pub(super) fn plan(
     };
     let ids = value_ids(eqn);
     let fty = fty_ty;
-    // The 2-D fold decision (card 159, card 181 Bug 2): past the wg-bump's own ceiling
-    // (`is_elementwise_2d`), a one-thread-per-element kernel folds onto the same 2-D grid the imported
-    // scatter/DUS/index_remap kernels use; a flat X dispatch cannot clear wgpu's `gridDim.x` cap however
-    // large `workgroup_size` gets. `finalize` bakes `workgroup_size[0] = ELEMENTWISE_2D_WIDTH` whenever
-    // the predicate holds; `generate` derives the matching `x_groups` and grid from the same decision.
+    // The launch decision (card 159, card 181 Bug 2): past the grid cap at the narrow workgroup, a
+    // one-thread-per-element kernel runs at the wide one, and past it at the wide one (`is_elementwise_2d`)
+    // it folds onto a 2-D grid, because a flat X dispatch cannot clear wgpu's `gridDim.x` cap however large
+    // `workgroup_size` gets. The fold carries the width, so `generate` bakes the body's workgroup and derives
+    // the matching `x_groups` and grid from the same decision.
     let fold = match lowering {
         Lowering::Gpu { caps, .. } => elementwise_fold(g, eqn, out_shape, out_numel, caps),
         // A sequential loop has no grid to fold onto.
-        Lowering::Aie(_) => kg::Fold {
-            numel: out_numel,
-            two_d: false,
-            width: ELEMENTWISE_2D_WIDTH,
-        },
+        Lowering::Aie(_) => kg::Fold::flat(out_numel),
     };
     let generate = |request: KernelRequest| Planned::lowered(site, request, lowering);
     let planned = match &eqn.op {
@@ -275,6 +285,7 @@ pub(super) fn plan(
                 cos_shape: shape(ids[1]),
                 rot: *rot,
                 numel: out_numel,
+                workgroup: lowering.workgroup(out_numel),
             }))?
         }
         OpKind::Reduce { op, axis, .. } => {
@@ -292,6 +303,7 @@ pub(super) fn plan(
                 cols: a[*axis],
                 init_bits: init.to_bits(),
                 numel: out_numel,
+                workgroup: lowering.workgroup(out_numel),
             }))?
         }
         OpKind::Fused(region) => {
@@ -356,12 +368,14 @@ pub(super) fn plan(
             };
             // Card 159's row-fold pack (`region.pack`) launches one thread per packed lane.
             let form = if exact_region {
+                let packed_threads = kg::packed_threads(out_numel, region.pack.len());
                 PointwiseForm::ExactI32Packed {
                     pack: region
                         .pack
                         .iter()
                         .map(|&id| map_fused_local(id, region.n_inputs))
                         .collect(),
+                    workgroup: lowering.workgroup(packed_threads),
                 }
             } else {
                 PointwiseForm::Float { fold }

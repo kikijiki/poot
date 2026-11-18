@@ -4,6 +4,11 @@
 //! lives in `tests/packed_serving.rs::packed_e4m3_per_channel_decode_through_the_contract_is_bit_exact`;
 //! SC-009 is the required-device-lane gate, not a test here).
 
+#![expect(
+    unsafe_code,
+    reason = "one row sets an environment variable to show it is not read"
+)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

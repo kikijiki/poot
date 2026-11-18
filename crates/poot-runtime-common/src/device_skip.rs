@@ -2,16 +2,32 @@
 //! production caller, only device-row tests across the GPU backend crates - dead under the strict dead-pub
 //! rule: a test reference is never a use).
 //!
-//! Reconstructed here from [`DeviceBackend::fail_if_required`] and [`DeviceBackend::label`], the two pieces of
-//! the original methods that already had (and keep) a production caller: `fail_if_required` panics with the
-//! exact "required {label} device unavailable instead of skipping" message when the backend is required,
-//! otherwise hands the error straight back - which is exactly what the deleted methods did before printing
-//! their own `SKIP:` line.
+//! [`fail_if_required`] panics with the exact "required {label} device unavailable instead of skipping" message
+//! when the backend is required, otherwise hands the error straight back; the skip helpers print their own
+//! `POOT-SKIP:` line after it. Device constructors never read the switch: a test opens through these helpers.
 //!
 //! `skip_unavailable`/`skip_unavailable_with` (the no-value-to-pass-through twins of these) were deleted by
 //! card 548: ROCm's own device-row tests (`poot-rocm-device/src/tests/helpers.rs`) were their last caller.
 
 use crate::DeviceBackend;
+
+/// Pass `error` back, or panic when `backend` is required: the failure message of every required device that is
+/// not there. A skip guard that handed the error on would turn a broken environment into a silent pass.
+/// `get` reads the environment (injected so a test can set only one variable).
+pub fn fail_if_required<E: std::fmt::Display>(
+    backend: DeviceBackend,
+    get: impl Fn(&str) -> Option<String>,
+    error: E,
+) -> E {
+    if backend.required(get) {
+        panic!(
+            "required {} device unavailable instead of skipping ({}=1): {error}",
+            backend.label(),
+            backend.variable(),
+        );
+    }
+    error
+}
 
 /// Pass a successfully opened device through, or skip (panicking first when `backend` is required).
 pub fn open_or_skip<T, E: std::fmt::Display>(
@@ -30,7 +46,7 @@ pub fn open_or_skip_with<T, E: std::fmt::Display>(
     match opened {
         Ok(device) => Some(device),
         Err(error) => {
-            let error = backend.fail_if_required(get, error);
+            let error = fail_if_required(backend, get, error);
             eprintln!("POOT-SKIP: {} device unavailable: {error}", backend.label());
             None
         }
@@ -49,7 +65,7 @@ pub fn skip_unsupported_with(
     get: impl Fn(&str) -> Option<String>,
     what: &str,
 ) {
-    let what = backend.fail_if_required(get, what);
+    let what = fail_if_required(backend, get, what);
     eprintln!("POOT-SKIP: {} device lacks {what}", backend.label());
 }
 
@@ -96,6 +112,35 @@ mod tests {
             env_with(&["POOT_REQUIRE_WGPU"]),
             "TIMESTAMP_QUERY",
         );
+    }
+
+    /// The skip guard hands the error back untouched unless the backend is required.
+    #[test]
+    fn fail_if_required_passes_the_error_through_unless_required() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        assert_eq!(
+            fail_if_required(DeviceBackend::Rocm, |_| None, "no agent"),
+            "no agent"
+        );
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            fail_if_required(
+                DeviceBackend::Rocm,
+                env_with(&["POOT_REQUIRE_ROCM"]),
+                "no agent",
+            );
+        }))
+        .expect_err("a required backend must fail the open");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .expect("device backend panics carry a message");
+        assert!(
+            message.contains("required ROCm device unavailable"),
+            "{message}"
+        );
+        assert!(message.contains("POOT_REQUIRE_ROCM=1"), "{message}");
+        assert!(message.contains("no agent"), "{message}");
     }
 
     #[test]

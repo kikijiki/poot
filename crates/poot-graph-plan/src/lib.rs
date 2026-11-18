@@ -78,8 +78,8 @@ mod storage_analysis;
 pub use buffer_plan::{ArenaSlotId, BufferPlan};
 pub use compile::{
     ArtifactGranularity, CastRangeError, CompileError, CompileLimits, CompileOptions,
-    ExpansionError, ExpertIdsError, ExpertIdsGap, GraphResource, LoraError, LoraPlan, Program,
-    Region, SlotSchema, Target, compile,
+    ExpansionError, ExpertIdsError, ExpertIdsGap, GraphResource, LoraError, LoraPlan, PassRevert,
+    Program, Region, SlotSchema, Target, compile,
 };
 pub use entry_arena::EntryArena;
 pub use imported::ImportedKernel;

@@ -4,6 +4,8 @@
 //! cancellation path is reimplemented here, and the server has no test hook: the drain bound is observed
 //! from outside, over its sockets.
 
+#![expect(unsafe_code, reason = "the row signals the server child it spawned")]
+
 use poot_test_util::contained_child::ContainChild;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -216,6 +218,7 @@ impl ProductionServer {
     }
 
     fn signal(&self, signal: libc::c_int) {
+        // SAFETY: signalling a pid this fixture spawned and still owns.
         let result = unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
         assert_eq!(result, 0, "signal production server");
     }

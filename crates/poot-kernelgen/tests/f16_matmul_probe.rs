@@ -98,15 +98,11 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
 
     // (2) SC-002 half 2: the GPU dispatch matches the CPU f32 oracle within f16 tolerance. This is
     // executor-equivalence, real dispatch - the part that needs an actual Vulkan adapter.
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            poot_test_util::skip_report(
-                "poot-kernelgen",
-                &format_args!("no wgpu context, dispatch half: {e}"),
-            );
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        Context::new(),
+    ) else {
+        return;
     };
     let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1 - 0.3).collect();

@@ -38,6 +38,7 @@ struct DeviceArgs {
 }
 
 fn main() -> Result<()> {
+    poot_llm::driver::report_launch_environment(|name| std::env::var(name).ok());
     let cli = Cli::parse();
     let verbose = matches!(&cli.command, Command::Generate(args) if args.verbose());
     tracing_subscriber::fmt()

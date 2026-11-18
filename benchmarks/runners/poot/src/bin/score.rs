@@ -145,7 +145,8 @@ fn request(prompt: &[u32], max_new: usize, sampler: Sampler, ignore_eos: bool) -
 }
 
 fn main() -> anyhow::Result<()> {
-    // `RUST_LOG=poot_llm::device_memory=info` with `POOT_DEVICE_MEMORY_LOG=1` prints the device memory per phase.
+    poot_llm::driver::report_launch_environment(|name| std::env::var(name).ok());
+    // `RUST_LOG=poot_llm::device_memory=info` prints the device memory per phase.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

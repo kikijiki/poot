@@ -4,6 +4,11 @@
 //! `#[ignore]`d: they need the Intel NPU, the Level Zero loader, the NPU driver and its compiler on the library
 //! path, none of which the model-free lane has. Run them on the Lunar Lake laptop with `just test-device-l0`.
 
+#![expect(
+    unsafe_code,
+    reason = "loading a native graph blob is an unsafe Level Zero call"
+)]
+
 use std::time::Duration;
 
 use poot_l0_runtime::{GraphDirection, GraphIr, GraphPrecision, L0Context, L0Error};

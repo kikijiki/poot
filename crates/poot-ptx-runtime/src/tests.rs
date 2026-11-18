@@ -1,7 +1,7 @@
 use super::*;
 use crate::buffer::test_only::checked_buffer;
 use crate::buffer::{allocate_owned, checked_copy, checked_layout};
-use crate::context::{KernelArgs, require_gpu_check_with};
+use crate::context::KernelArgs;
 use crate::driver::CudaDriver;
 use crate::graph::{CaptureRetention, ModuleConstruction, create_event_pair, instantiate_graph};
 use crate::owner::{PtxOwner, construct_owner};
@@ -12,31 +12,6 @@ use poot_target::BufferStorage;
 use poot_target::ElementKind;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-mod require_backend_tests {
-    use super::require_gpu_check_with;
-
-    #[test]
-    fn ptx_context_open_is_required_by_its_own_variable_only() {
-        use poot_runtime_common::DeviceBackend;
-        let fails_open = |variable: &'static str| {
-            std::panic::catch_unwind(|| {
-                require_gpu_check_with(|name| (name == variable).then(|| "1".into()), "no device")
-            })
-            .is_err()
-        };
-        assert!(fails_open(DeviceBackend::Ptx.variable()));
-        for other in DeviceBackend::ALL
-            .into_iter()
-            .filter(|other| *other != DeviceBackend::Ptx)
-        {
-            assert!(
-                !fails_open(other.variable()),
-                "{other:?} must not require Ptx"
-            );
-        }
-    }
-}
 
 use std::cell::{Cell, RefCell};
 use std::sync::Mutex;
@@ -1328,14 +1303,11 @@ fn allocation_arithmetic_is_checked_before_native_allocation() {
 /// allocation is refused and the first expectation goes red.
 #[test]
 fn a_buffer_past_u32_elements_allocates_and_its_tail_is_writable() {
-    let ctx = match PtxContext::new() {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            eprintln!(
-                "POOT-SKIP a_buffer_past_u32_elements_allocates_and_its_tail_is_writable: {error}"
-            );
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
     let elements = u32::MAX as usize + 2;
     let buffer = ctx
@@ -1425,14 +1397,11 @@ fn lifecycle_kernel() -> poot_codegen::CompiledKernel {
 
 #[test]
 fn card305_ptx_lifecycle_repeated_contexts_and_surviving_children() {
-    let observer = match PtxContext::new() {
-        Ok(context) => context,
-        Err(error) => {
-            eprintln!(
-                "POOT-SKIP card305_ptx_lifecycle_repeated_contexts_and_surviving_children: {error}"
-            );
-            return;
-        }
+    let Some(observer) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
     let expected = [2.0, 3.0, 4.0, 5.0];
     let mut free_samples = Vec::with_capacity(32);
@@ -1541,12 +1510,11 @@ fn card305_ptx_lifecycle_repeated_contexts_and_surviving_children() {
 
 #[test]
 fn native_buffer_contract_roundtrip_ptx() {
-    let ctx = match PtxContext::new() {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            eprintln!("POOT-SKIP native_buffer_contract_roundtrip_ptx: {error}");
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
 
     let f32_buffer = ctx.upload_f32(&[1.0, 2.0, 3.0, 4.0]).expect("upload f32");
@@ -1661,14 +1629,11 @@ fn no_contract_nvptx_kernel(marked: bool) -> poot_codegen::CompiledKernel {
 /// must not silently skip.
 #[test]
 fn no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows() {
-    let ctx = match PtxContext::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "POOT-SKIP no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows (no PTX device): {e}"
-            );
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
     let rows = no_contract_fma_sensitive_rows(64);
     let a: Vec<f32> = rows.iter().map(|r| r.0).collect();
@@ -1721,8 +1686,10 @@ fn no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows() {
 /// which is the row's required red signal (a deletion/soundness row is proven by the compiler, ADR-0090).
 #[test]
 fn ptx_buffer_and_its_context_move_into_another_thread() {
-    let Ok(ctx) = PtxContext::new() else {
-        eprintln!("POOT-SKIP ptx_buffer_and_its_context_move_into_another_thread: no NVIDIA GPU");
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
         return;
     };
     let buffer = ctx.upload_f32(&[1.0, 2.0, 3.0, 4.0]).expect("upload f32");
@@ -1744,12 +1711,11 @@ fn ptx_buffer_and_its_context_move_into_another_thread() {
 /// Mutation: ignore `range.byte_offset` in `PtxContext::write_with`; the neighbour check goes red.
 #[test]
 fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() {
-    let ctx = match PtxContext::new() {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            eprintln!("POOT-SKIP a_write_at_an_offset_leaves_its_neighbours_intact: {error}");
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
     let words =
         |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
@@ -1854,8 +1820,10 @@ fn a_sticky_device_fault_is_device_lost_and_the_next_call_is_poisoned() {
 /// `Driver` error instead of `Poisoned` (red). Skips with no CUDA device.
 #[test]
 fn an_out_of_bounds_store_is_device_lost_and_poisons_the_context() {
-    let Ok(ctx) = PtxContext::new() else {
-        eprintln!("POOT-SKIP an_out_of_bounds_store_is_device_lost: no NVIDIA GPU");
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
         return;
     };
     let body = poot_kernel_ir::fixtures::add_kernel();
@@ -1900,8 +1868,10 @@ fn an_out_of_bounds_store_is_device_lost_and_poisons_the_context() {
 /// other word are wrong and this row goes red. Skips with no CUDA device.
 #[test]
 fn u32x4_vector_load_matches_scalar_loads_on_ptx() {
-    let Ok(ctx) = PtxContext::new() else {
-        eprintln!("POOT-SKIP u32x4_vector_load_matches_scalar_loads_on_ptx: no NVIDIA GPU");
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
         return;
     };
     let dir = std::env::temp_dir().join("poot-ptx-runtime-vector-load-test");
@@ -1958,8 +1928,10 @@ fn subgroup_shuffle_xor_matches_the_interpreter_on_ptx() {
     };
     const THREADS: u32 = 512;
     const WORKGROUP: u32 = 128;
-    let Ok(ctx) = PtxContext::new() else {
-        eprintln!("POOT-SKIP subgroup_shuffle_xor_matches_the_interpreter_on_ptx: no NVIDIA GPU");
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
         return;
     };
     let dir = std::env::temp_dir().join("poot-ptx-runtime-subgroup-shuffle-test");

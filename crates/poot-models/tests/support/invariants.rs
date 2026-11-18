@@ -24,7 +24,7 @@ pub(crate) fn writes_one_element_per_thread(dispatch: &Dispatch) -> bool {
             !matches!(spec.form, PointwiseForm::ExactI32Packed { .. })
         }
         KernelChoice::Generated(
-            KernelRequest::Cast(_)
+            KernelRequest::Cast(..)
             | KernelRequest::Movement(_)
             | KernelRequest::Rope(_)
             | KernelRequest::TopK(_)

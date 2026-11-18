@@ -224,15 +224,11 @@ enum Opened {
 fn open(engine: Engine) -> Option<Opened> {
     match engine {
         Engine::Oracle => Some(Opened::Oracle),
-        Engine::Rocm => match open_executor(BackendChoice::Rocm) {
-            Ok(exec) => Some(Opened::Rocm(exec)),
-            Err(error) => {
-                poot_test_util::missing_prerequisite(&format_args!(
-                    "ROCm device unavailable: {error}"
-                ));
-                None
-            }
-        },
+        Engine::Rocm => poot_runtime_common::device_skip::open_or_skip(
+            poot_runtime_common::DeviceBackend::Rocm,
+            open_executor(BackendChoice::Rocm),
+        )
+        .map(Opened::Rocm),
     }
 }
 

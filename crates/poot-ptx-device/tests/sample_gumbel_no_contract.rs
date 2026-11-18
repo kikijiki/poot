@@ -72,14 +72,11 @@ fn gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle() {
         .expect("Gumbel asset must compile to NVPTX");
     let kernel = kernel_handle(&body, &artifact).unwrap();
 
-    let ctx = match PtxContext::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "POOT-SKIP gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle: no PTX device ({e})"
-            );
-            return;
-        }
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
+        return;
     };
 
     // vocab=2: index 0 is the FMA-sensitive term; index 1 is the fixed competitor whose own two-step

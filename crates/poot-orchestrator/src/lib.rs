@@ -15,6 +15,8 @@
 //! The binary is a thin `main`; the crate is a library so the pod-name types have doctests that prove a
 //! pod cannot be created under a name `reap` does not own.
 
+#![expect(unsafe_code, reason = "killpg on a spawned process group")]
+
 mod cuda;
 mod db;
 mod image_resolve;

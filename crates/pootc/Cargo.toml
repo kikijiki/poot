@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 description = "poot's rustc driver: compiles a crate normally (host code via rustc's own backend) and imports #[kernel] fns from Stable MIR into poot-kernel-ir. Invariant 8 (real Rust, real rustc)."
 
 [[bin]]

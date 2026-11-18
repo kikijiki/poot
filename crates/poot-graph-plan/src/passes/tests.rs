@@ -48,7 +48,7 @@ fn packed_graph() -> Result<Graph, poot_graph_ir::BuilderError> {
     Ok(b.finish(output).unwrap())
 }
 
-fn packed_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderError> {
+fn packed_graph_with_second_matmul() -> Result<Graph, poot_graph_ir::BuilderError> {
     let base = packed_graph()?;
     let mut graph = base.edit();
     let dequant = base.eqns()[0].out;
@@ -76,6 +76,54 @@ fn packed_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderErr
     graph.eqns_mut().push(Eqn {
         op: OpKind::Binary(BinOp::Add),
         inputs: vec![Operand::Value(first_output), Operand::Value(second_output)],
+        out: combined,
+        layer: None,
+    });
+    graph.set_result(combined);
+    Ok(graph.commit().unwrap())
+}
+
+/// The packed linear plus a `Reduce` over its dequant output, added to the result: a reader of the dequant
+/// that no packed contraction can claim.
+fn packed_graph_with_non_contraction_reader() -> Result<Graph, poot_graph_ir::BuilderError> {
+    let base = packed_graph()?;
+    let mut graph = base.edit();
+    let dequant = base.eqns()[0].out;
+    let original_output = base.result();
+    let reduced = graph.values_mut().push(poot_graph_ir::ValueMeta::new(
+        TensorType::f32(vec![3]),
+        Storage::Device,
+        None,
+    ));
+    graph.eqns_mut().push(Eqn {
+        op: OpKind::Reduce {
+            op: RedOp::Sum,
+            axis: 1,
+            keepdim: false,
+        },
+        inputs: vec![Operand::Value(dequant)],
+        out: reduced,
+        layer: None,
+    });
+    let broadcast = graph.values_mut().push(poot_graph_ir::ValueMeta::new(
+        TensorType::f32(vec![2, 3]),
+        Storage::Device,
+        None,
+    ));
+    graph.eqns_mut().push(Eqn {
+        op: OpKind::Broadcast { shape: vec![2, 3] },
+        inputs: vec![Operand::Value(reduced)],
+        out: broadcast,
+        layer: None,
+    });
+    let combined = graph.values_mut().push(poot_graph_ir::ValueMeta::new(
+        TensorType::f32(vec![2, 3]),
+        Storage::Device,
+        None,
+    ));
+    graph.eqns_mut().push(Eqn {
+        op: OpKind::Binary(BinOp::Add),
+        inputs: vec![Operand::Value(original_output), Operand::Value(broadcast)],
         out: combined,
         layer: None,
     });
@@ -207,9 +255,16 @@ fn packed_dequant_fusion_matches_only_exact_linear() -> Result<(), poot_graph_ir
         Err(PackedDequantProductionError::TransposePermutation { .. })
     ));
 
-    let extra_consumer = packed_graph_with_extra_consumer()?;
+    // A second matmul over the same dequant is a second claim over the same carriers, not an escape.
+    let second_matmul = packed_graph_with_second_matmul()?;
+    let claimed = prepare_packed_dequant_production(&second_matmul).unwrap();
+    let (claims, dequants) = claimed_and_dequants(&claimed);
+    assert_eq!((claims.len(), dequants), (2, 0), "{claimed:?}");
+
+    // A reader that is no contraction leaves the dequant to the escape gate.
+    let other_reader = packed_graph_with_non_contraction_reader()?;
     assert!(matches!(
-        prepare_packed_dequant_production(&extra_consumer),
+        prepare_packed_dequant_production(&other_reader),
         Err(PackedDequantProductionError::ConsumerCount { .. })
     ));
     Ok(())
@@ -258,7 +313,7 @@ fn packed_block_diagonal_graph() -> Result<Graph, poot_graph_ir::BuilderError> {
 /// A second full branch off the same `PackedDequant` output (reshape/transpose/matmul cloned from
 /// the original, then summed into the graph's output). This gives the dequant a second live consumer
 /// without hand-computing any new tensor shape.
-fn packed_block_diagonal_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderError> {
+fn packed_block_diagonal_graph_with_second_branch() -> Result<Graph, poot_graph_ir::BuilderError> {
     let base = packed_block_diagonal_graph()?;
     let mut graph = base.edit();
     let dequant = base.eqns()[0].out;
@@ -304,17 +359,51 @@ fn packed_block_diagonal_graph_with_extra_consumer() -> Result<Graph, poot_graph
     Ok(graph.commit().unwrap())
 }
 
+/// The contractions `graph` holds after packed production, and the dequants it still holds.
+fn claimed_and_dequants(graph: &Graph) -> (Vec<&OpKind>, usize) {
+    let claims = graph
+        .eqns()
+        .iter()
+        .map(|eqn| &eqn.op)
+        .filter(|op| matches!(op, OpKind::PackedContraction { .. }))
+        .collect();
+    let dequants = graph
+        .eqns()
+        .iter()
+        .filter(|eqn| matches!(eqn.op, OpKind::PackedDequant { .. }))
+        .count();
+    (claims, dequants)
+}
+
+/// SC-001 (second half): a dequant read by two block-diagonal matmuls is claimed once per reader over the
+/// same carriers, with no standalone dequant left. Mutation: require the dequant's output to have a single
+/// reader in the closure check of `recognize_packed_contractions` (the old one-consumer rule); production
+/// then rejects the dequant as `ConsumerCount` and this row goes red.
 #[test]
-fn packed_block_diagonal_production_rejects_extra_dequant_consumer()
+fn packed_block_diagonal_dequant_read_twice_is_claimed_once_per_reader()
 -> Result<(), poot_graph_ir::BuilderError> {
-    // The recognizer's admission of the blocked chain must still respect the single-consumer rule
-    // every packed chain shares: a second live consumer off the same dequant is a graph escape, not a
-    // second contraction to fold.
-    let extra_consumer = packed_block_diagonal_graph_with_extra_consumer()?;
-    assert!(matches!(
-        prepare_packed_dequant_production(&extra_consumer),
-        Err(PackedDequantProductionError::ConsumerCount { .. })
-    ));
+    let graph = packed_block_diagonal_graph_with_second_branch()?;
+    let claimed = prepare_packed_dequant_production(&graph).unwrap();
+    let (claims, dequants) = claimed_and_dequants(&claimed);
+    assert_eq!(dequants, 0, "no standalone dequant may survive");
+    assert_eq!(claims.len(), 2);
+    assert!(claims.iter().all(|op| matches!(
+        op,
+        OpKind::PackedContraction {
+            rows: poot_graph_ir::ContractionRows::Blocks(4),
+            ..
+        }
+    )));
+    let carriers: Vec<&[Operand]> = claimed
+        .eqns()
+        .iter()
+        .filter(|eqn| matches!(eqn.op, OpKind::PackedContraction { .. }))
+        .map(|eqn| &eqn.inputs[1..])
+        .collect();
+    assert_eq!(
+        carriers[0], carriers[1],
+        "both claims read the same carriers"
+    );
     Ok(())
 }
 
@@ -400,9 +489,11 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
         matches!(error, PackedDequantProductionError::CarrierStorage { .. })
     }));
 
-    cases.push(("live-out", packed_graph_with_extra_consumer()?, |error| {
-        matches!(error, PackedDequantProductionError::ConsumerCount { .. })
-    }));
+    cases.push((
+        "live-out",
+        packed_graph_with_non_contraction_reader()?,
+        |error| matches!(error, PackedDequantProductionError::ConsumerCount { .. }),
+    ));
 
     for (label, state_out) in [("dequant state", dequant), ("transpose state", transpose)] {
         let graph = derive(&base, |draft| {

@@ -116,6 +116,7 @@ pub(super) fn plan(
         OpKind::RandomUniform { cols } => Planned::imported(
             ImportedKernel::RandomUniform,
             backend,
+            caps,
             Some(vec![*cols as u32]),
             [out_numel as u32, 1, 1],
         )?,
@@ -135,6 +136,7 @@ pub(super) fn plan(
             Planned::imported(
                 kernel,
                 backend,
+                caps,
                 Some(vec![vocab as u32]),
                 [(rows * 64) as u32, 1, 1],
             )?

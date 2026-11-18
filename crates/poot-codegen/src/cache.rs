@@ -82,8 +82,8 @@ pub const CODEGEN_SRC_HASH: &str = env!("POOT_CODEGEN_SRC_HASH");
 
 /// Resolve which compiler binary [`compile`] would invoke for `target`, without running it. `"unset"` when the
 /// target's toolchain is not configured: `compile` fails for it, so the epoch only needs a stable value.
-fn resolve_tool(target: Target) -> String {
-    Toolchain::from_env()
+fn resolve_tool(target: Target, toolchain: &Toolchain) -> String {
+    toolchain
         .binary(target)
         .map_or_else(|_| "unset".to_string(), str::to_owned)
 }
@@ -118,10 +118,10 @@ fn query_tool_version(tool: &str) -> String {
 
 /// The canonical, newline-joined epoch string for `target` (card 211, "Cache key"). Separate from
 /// [`epoch`] so the `EPOCH` sidecar file can hold the readable form.
-fn epoch_canonical(target: Target) -> String {
-    let tool = resolve_tool(target);
+fn epoch_canonical(target: Target, toolchain: &Toolchain) -> String {
+    let tool = resolve_tool(target, toolchain);
     let tool_version = tool_version(&tool);
-    let device_libs = std::env::var("POOT_ROCM_DEVICE_LIBS").unwrap_or_default();
+    let device_libs = toolchain.rocm_device_libs.as_deref().unwrap_or_default();
     let flags = target.llc_args().join(" ");
     format!(
         "poot-kernel-cache-v1\ncodegen_src={}\ntool={tool}\ntool_version={tool_version}\ndevice_libs={device_libs}\nflags={flags}",
@@ -131,11 +131,17 @@ fn epoch_canonical(target: Target) -> String {
 
 /// The toolchain/codegen epoch for `target`: a 16-hex-digit fingerprint of the compiler binary and
 /// version, linked device libs, codegen flags, and `poot-codegen`'s own source. Artifacts from a
-/// different epoch are never consulted (see `kernel_cache_root`).
+/// different epoch are never consulted (see `kernel_cache_root`). The tools are the process environment's
+/// ([`Toolchain::from_env`]).
 pub fn epoch(target: Target) -> String {
+    epoch_with(target, &Toolchain::from_env())
+}
+
+/// [`epoch`] for the tools of `toolchain`.
+fn epoch_with(target: Target, toolchain: &Toolchain) -> String {
     format!(
         "{:016x}",
-        poot_runtime_common::fnv1a_bytes(epoch_canonical(target).as_bytes())
+        poot_runtime_common::fnv1a_bytes(epoch_canonical(target, toolchain).as_bytes())
     )
 }
 
@@ -316,41 +322,55 @@ fn prune_kind_root_once(root: &Path, current: &str) {
     }
 }
 
-/// `POOT_KERNEL_CACHE=0` (also `off`/`false`, case-insensitive) disables the shared cache, without a
-/// rebuild.
-fn kill_switch_active() -> bool {
-    match std::env::var("POOT_KERNEL_CACHE") {
-        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "false"),
-        Err(_) => false,
-    }
+/// What the environment says about where the shared kernel cache lives: the kill switch and the directories its
+/// root is searched in. Built from the process environment ([`Self::from_env`]) or from any lookup function, so
+/// a test presents an environment without mutating the process's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheEnv {
+    /// `POOT_KERNEL_CACHE` is `0`, `off` or `false` (case-insensitive): the shared cache is disabled, without a
+    /// rebuild.
+    disabled: bool,
+    /// `$POOT_KERNEL_CACHE_DIR`, used verbatim as the base directory.
+    dir: Option<PathBuf>,
+    /// `$XDG_CACHE_HOME`: the base is `<it>/poot/kernels`.
+    xdg_cache_home: Option<PathBuf>,
+    /// `$HOME`: the base is `<it>/.cache/poot/kernels`.
+    home: Option<PathBuf>,
 }
 
-/// Base directory for the shared cache (before the `<kind>/<epoch>/<mcpu>` split), independent of
-/// `target`. Order: `$POOT_KERNEL_CACHE_DIR` verbatim, else `$XDG_CACHE_HOME/poot/kernels`, else
-/// `$HOME/.cache/poot/kernels`. `None` when none of them is set: a shared temp directory is not a place
-/// to keep executable kernels, so there is no further fallback.
-fn resolve_base_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("POOT_KERNEL_CACHE_DIR")
-        && !dir.is_empty()
-    {
-        return Some(PathBuf::from(dir));
+impl CacheEnv {
+    /// The cache location the process environment describes.
+    pub fn from_env() -> Self {
+        Self::from_env_with(crate::environment::lookup)
     }
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
-        && !xdg.is_empty()
-    {
-        return Some(PathBuf::from(xdg).join("poot").join("kernels"));
+
+    /// The cache location `lookup` describes. An empty value counts as unset.
+    pub fn from_env_with(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let path = |name: &str| lookup(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        Self {
+            disabled: lookup("POOT_KERNEL_CACHE")
+                .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "false")),
+            dir: path("POOT_KERNEL_CACHE_DIR"),
+            xdg_cache_home: path("XDG_CACHE_HOME"),
+            home: path("HOME"),
+        }
     }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-    {
-        return Some(
-            PathBuf::from(home)
-                .join(".cache")
-                .join("poot")
-                .join("kernels"),
-        );
+
+    /// Base directory for the shared cache (before the `<kind>/<epoch>/<mcpu>` split), independent of
+    /// `target`. Order: the explicit directory verbatim, else `$XDG_CACHE_HOME/poot/kernels`, else
+    /// `$HOME/.cache/poot/kernels`. `None` when none of them is set: a shared temp directory is not a place
+    /// to keep executable kernels, so there is no further fallback.
+    fn base_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = &self.dir {
+            return Some(dir.clone());
+        }
+        if let Some(xdg) = &self.xdg_cache_home {
+            return Some(xdg.join("poot").join("kernels"));
+        }
+        self.home
+            .as_ref()
+            .map(|home| home.join(".cache").join("poot").join("kernels"))
     }
-    None
 }
 
 /// The user id this process runs as: the owner of its own `/proc/self`. `None` where that cannot be read,
@@ -401,11 +421,16 @@ fn ensure_private_dir(path: &Path, uid: u32) -> std::io::Result<()> {
 /// `None` is a disabled cache, not a degraded one: `POOT_KERNEL_CACHE=0`/`off`/`false`, no base directory
 /// in the environment, or a base that cannot be created or is not the user's own. The cause is logged with
 /// `tracing::warn!`. Nothing is written anywhere else.
-fn kernel_cache_root(kind: &str, target: Target) -> Option<PathBuf> {
-    if kill_switch_active() {
+fn kernel_cache_root(
+    kind: &str,
+    target: Target,
+    toolchain: &Toolchain,
+    env: &CacheEnv,
+) -> Option<PathBuf> {
+    if env.disabled {
         return None;
     }
-    let Some(base_dir) = resolve_base_dir() else {
+    let Some(base_dir) = env.base_dir() else {
         tracing::warn!(
             "no kernel cache directory (POOT_KERNEL_CACHE_DIR, XDG_CACHE_HOME, HOME all unset); the cache is disabled"
         );
@@ -416,7 +441,7 @@ fn kernel_cache_root(kind: &str, target: Target) -> Option<PathBuf> {
         return None;
     };
 
-    let epoch_hex = epoch(target);
+    let epoch_hex = epoch_with(target, toolchain);
     let arch_component = match target {
         Target::AmdGcn(arch) => arch.mcpu().to_string(),
         other => format!("{other:?}"),
@@ -439,7 +464,7 @@ fn kernel_cache_root(kind: &str, target: Target) -> Option<PathBuf> {
         refresh_epoch_sidecar(&epoch_file);
     } else {
         // Best effort: a diagnostic sidecar; a failed write must not stop compilation.
-        let _ = std::fs::write(&epoch_file, epoch_canonical(target));
+        let _ = std::fs::write(&epoch_file, epoch_canonical(target, toolchain));
     }
     prune_kind_root_once(&base, &epoch_hex);
     Some(dir)
@@ -586,11 +611,18 @@ pub struct KernelCache {
 
 impl KernelCache {
     /// The cache under the shared persistent root for `target` (see `kernel_cache_root`), or a disabled
-    /// cache when that root cannot be a safe, private directory.
+    /// cache when that root cannot be a safe, private directory. The tools and the root come from the process
+    /// environment ([`Toolchain::from_env`], [`CacheEnv::from_env`]).
     pub fn open(target: Target) -> Self {
+        Self::open_in(target, &Toolchain::from_env(), &CacheEnv::from_env())
+    }
+
+    /// [`Self::open`] for explicit `toolchain` and `env`: the epoch folds in `toolchain`'s tool for `target`
+    /// and the root is searched where `env` says.
+    pub fn open_in(target: Target, toolchain: &Toolchain, env: &CacheEnv) -> Self {
         Self {
-            dir: kernel_cache_root(cache_kind(target), target),
-            epoch: epoch(target),
+            dir: kernel_cache_root(cache_kind(target), target, toolchain, env),
+            epoch: epoch_with(target, toolchain),
             target,
         }
     }
@@ -818,19 +850,42 @@ mod tests {
     use crate::AmdArch;
     use std::sync::Mutex;
 
-    // Every test mutates process-global env vars. nextest isolates tests per process; the lock guards
-    // against `cargo test`, which runs them as threads in one process.
+    // Only the one test that points `TMPDIR` at a directory it can inspect mutates the process environment;
+    // nextest isolates tests per process, and the lock guards against `cargo test`, which runs them as threads
+    // in one process. Every other test presents its environment as values.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn unset_all_cache_env() {
-        for var in [
-            "POOT_KERNEL_CACHE_DIR",
-            "XDG_CACHE_HOME",
-            "POOT_KERNEL_CACHE",
-        ] {
-            // SAFETY: single-threaded per nextest process; ENV_LOCK covers `cargo test` threads.
-            unsafe { std::env::remove_var(var) };
-        }
+    /// The cache location of an environment that sets exactly `vars`.
+    fn cache_env(vars: &[(&str, &Path)]) -> CacheEnv {
+        CacheEnv::from_env_with(|name| {
+            vars.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| value.to_str().expect("a unicode path").to_string())
+        })
+    }
+
+    /// The cache location of an environment whose explicit cache directory is `dir`.
+    fn cache_dir_env(dir: &Path) -> CacheEnv {
+        cache_env(&[("POOT_KERNEL_CACHE_DIR", dir)])
+    }
+
+    /// The tools of an environment that sets exactly `vars`.
+    fn toolchain_of(vars: &[(&str, &str)]) -> Toolchain {
+        Toolchain::from_env_with(|name| {
+            vars.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| (*value).to_string())
+        })
+    }
+
+    /// The tools of an environment that sets none of them.
+    fn bare_toolchain() -> Toolchain {
+        toolchain_of(&[])
+    }
+
+    /// [`KernelCache::open_in`] with no tool configured and the cache under `dir`.
+    fn open_under(dir: &Path, target: Target) -> KernelCache {
+        KernelCache::open_in(target, &bare_toolchain(), &cache_dir_env(dir))
     }
 
     fn unique_tmp(name: &str) -> PathBuf {
@@ -842,14 +897,22 @@ mod tests {
 
     #[test]
     fn cache_root_prefers_poot_kernel_cache_dir() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
         let want = unique_tmp("prefers-explicit-dir");
         let _ = std::fs::remove_dir_all(&want);
-        unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &want) };
+        let xdg = unique_tmp("prefers-explicit-dir-xdg");
+        let env = cache_env(&[
+            ("POOT_KERNEL_CACHE_DIR", &want),
+            ("XDG_CACHE_HOME", &xdg),
+            ("HOME", &xdg),
+        ]);
 
-        let dir = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()))
-            .expect("an explicit, creatable directory is a cache root");
+        let dir = kernel_cache_root(
+            "rocm",
+            Target::AmdGcn(AmdArch::gfx1151()),
+            &bare_toolchain(),
+            &env,
+        )
+        .expect("an explicit, creatable directory is a cache root");
         assert!(
             dir.starts_with(&want),
             "POOT_KERNEL_CACHE_DIR must take priority over XDG/HOME: got {dir:?}, want under {want:?}"
@@ -859,26 +922,27 @@ mod tests {
             "kernel_cache_root must create the directory it returns"
         );
 
-        unsafe { std::env::remove_var("POOT_KERNEL_CACHE_DIR") };
         let _ = std::fs::remove_dir_all(&want);
     }
 
     #[test]
     fn cache_root_honors_xdg_cache_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
         let want = unique_tmp("xdg-cache-home");
         let _ = std::fs::remove_dir_all(&want);
-        unsafe { std::env::set_var("XDG_CACHE_HOME", &want) };
+        let env = cache_env(&[("XDG_CACHE_HOME", &want), ("HOME", &want)]);
 
-        let dir = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()))
-            .expect("a creatable XDG cache home is a cache root");
+        let dir = kernel_cache_root(
+            "rocm",
+            Target::AmdGcn(AmdArch::gfx1151()),
+            &bare_toolchain(),
+            &env,
+        )
+        .expect("a creatable XDG cache home is a cache root");
         assert!(
             dir.starts_with(want.join("poot").join("kernels")),
             "must root under $XDG_CACHE_HOME/poot/kernels when POOT_KERNEL_CACHE_DIR is unset: {dir:?}"
         );
 
-        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
         let _ = std::fs::remove_dir_all(&want);
     }
 
@@ -889,27 +953,28 @@ mod tests {
     #[test]
     fn an_unwritable_cache_dir_disables_the_cache_and_still_compiles() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
         // A path under a regular file always fails `create_dir_all` with ENOTDIR, without needing root
         // or chmod.
         let blocker = unique_tmp("unwritable-blocker-file");
         std::fs::write(&blocker, b"not a directory").unwrap();
         let impossible = blocker.join("sub").join("dir");
-        unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &impossible) };
         let temp = unique_tmp("unwritable-temp-dir");
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let outer_temp = std::env::var_os("TMPDIR");
+        // SAFETY: nextest gives every test its own process and `ENV_LOCK` serializes `cargo test` threads, so
+        // nothing else reads or writes the environment while this one does.
         unsafe { std::env::set_var("TMPDIR", &temp) };
 
-        let cache = KernelCache::open(Target::Nvptx);
+        let cache = open_under(&impossible, Target::Nvptx);
         let compiled = cache.load_or_compile(&sample_body("unwritable_cache"), ROOMY);
 
         match outer_temp {
+            // SAFETY: as above.
             Some(outer) => unsafe { std::env::set_var("TMPDIR", outer) },
+            // SAFETY: as above.
             None => unsafe { std::env::remove_var("TMPDIR") },
         }
-        unsafe { std::env::remove_var("POOT_KERNEL_CACHE_DIR") };
         let left: Vec<_> = std::fs::read_dir(&temp)
             .unwrap()
             .flatten()
@@ -930,14 +995,12 @@ mod tests {
     /// With no cache location in the environment at all the cache is disabled, not placed in `temp_dir()`.
     #[test]
     fn no_cache_location_in_the_environment_disables_the_cache() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
-        let home = std::env::var_os("HOME");
-        unsafe { std::env::remove_var("HOME") };
-        let root = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()));
-        if let Some(home) = home {
-            unsafe { std::env::set_var("HOME", home) };
-        }
+        let root = kernel_cache_root(
+            "rocm",
+            Target::AmdGcn(AmdArch::gfx1151()),
+            &bare_toolchain(),
+            &CacheEnv::from_env_with(|_| None),
+        );
         assert_eq!(root, None);
     }
 
@@ -946,17 +1009,17 @@ mod tests {
     #[test]
     fn cache_directories_are_private_and_never_symlinks() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
         let base = unique_tmp("private-dirs");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("rocm")).unwrap();
         std::fs::set_permissions(base.join("rocm"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
-        unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &base) };
+        let env = cache_dir_env(&base);
+        let toolchain = bare_toolchain();
         let target = Target::AmdGcn(AmdArch::gfx1151());
 
-        let dir = kernel_cache_root("rocm", target).expect("an existing own directory is usable");
+        let dir = kernel_cache_root("rocm", target, &toolchain, &env)
+            .expect("an existing own directory is usable");
         for private in [
             dir.as_path(),
             dir.parent().unwrap(),
@@ -971,79 +1034,88 @@ mod tests {
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, base.join("ptx")).unwrap();
         assert_eq!(
-            kernel_cache_root("ptx", Target::Nvptx),
+            kernel_cache_root("ptx", Target::Nvptx, &toolchain, &env),
             None,
             "a symlinked kind directory is not the user's own"
         );
 
-        unsafe { std::env::remove_var("POOT_KERNEL_CACHE_DIR") };
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
     fn the_kill_switch_disables_the_cache() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
+        let base = unique_tmp("kill-switch");
         for value in ["0", "off", "FALSE"] {
-            unsafe { std::env::set_var("POOT_KERNEL_CACHE", value) };
+            let env = CacheEnv::from_env_with(|name| match name {
+                "POOT_KERNEL_CACHE" => Some(value.to_string()),
+                "POOT_KERNEL_CACHE_DIR" => Some(base.to_str().unwrap().to_string()),
+                _ => None,
+            });
             assert_eq!(
-                kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151())),
+                kernel_cache_root(
+                    "rocm",
+                    Target::AmdGcn(AmdArch::gfx1151()),
+                    &bare_toolchain(),
+                    &env
+                ),
                 None,
                 "POOT_KERNEL_CACHE={value}"
             );
             assert!(
-                KernelCache::open(Target::SpirvVulkan).dir().is_none(),
+                KernelCache::open_in(Target::SpirvVulkan, &bare_toolchain(), &env)
+                    .dir()
+                    .is_none(),
                 "POOT_KERNEL_CACHE={value}"
             );
         }
-        unsafe { std::env::remove_var("POOT_KERNEL_CACHE") };
+        assert!(
+            !base.exists(),
+            "a disabled cache creates nothing under its configured directory"
+        );
     }
 
     #[test]
     fn epoch_changes_when_amd_clang_path_changes() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
-        unsafe { std::env::remove_var("POOT_AMD_CLANG") };
         let target = Target::AmdGcn(AmdArch::gfx1151());
 
-        unsafe { std::env::set_var("POOT_AMD_CLANG", "/nix/store/aaaa-clang/bin/clang") };
-        let epoch_a = epoch(target);
-        unsafe { std::env::set_var("POOT_AMD_CLANG", "/nix/store/bbbb-clang/bin/clang") };
-        let epoch_b = epoch(target);
+        let epoch_a = epoch_with(
+            target,
+            &toolchain_of(&[("POOT_AMD_CLANG", "/nix/store/aaaa-clang/bin/clang")]),
+        );
+        let epoch_b = epoch_with(
+            target,
+            &toolchain_of(&[("POOT_AMD_CLANG", "/nix/store/bbbb-clang/bin/clang")]),
+        );
 
         assert_ne!(
             epoch_a, epoch_b,
             "a toolchain path change (e.g. a flake bump) must change the epoch"
         );
-        unsafe { std::env::remove_var("POOT_AMD_CLANG") };
     }
 
     #[test]
     fn epoch_changes_when_device_libs_change() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
-        unsafe { std::env::remove_var("POOT_ROCM_DEVICE_LIBS") };
         let target = Target::AmdGcn(AmdArch::gfx1151());
 
-        let epoch_unset = epoch(target);
-        unsafe { std::env::set_var("POOT_ROCM_DEVICE_LIBS", "/nix/store/xxxx/amdgcn/bitcode") };
-        let epoch_set = epoch(target);
+        let epoch_unset = epoch_with(target, &bare_toolchain());
+        let epoch_set = epoch_with(
+            target,
+            &toolchain_of(&[("POOT_ROCM_DEVICE_LIBS", "/nix/store/xxxx/amdgcn/bitcode")]),
+        );
 
         assert_ne!(
             epoch_unset, epoch_set,
             "a device-libs path change must change the epoch"
         );
-        unsafe { std::env::remove_var("POOT_ROCM_DEVICE_LIBS") };
     }
 
     #[test]
     fn epoch_changes_when_llc_args_change() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
         // `llc_args()` for AmdGcn embeds `-mcpu=<mcpu>`, so two archs differ in the folded-in flags.
-        let epoch_1151 = epoch(Target::AmdGcn(AmdArch::gfx1151()));
-        let epoch_1100 = epoch(Target::AmdGcn(AmdArch::new("gfx1100", 32)));
+        let toolchain = bare_toolchain();
+        let epoch_1151 = epoch_with(Target::AmdGcn(AmdArch::gfx1151()), &toolchain);
+        let epoch_1100 = epoch_with(Target::AmdGcn(AmdArch::new("gfx1100", 32)), &toolchain);
 
         assert_ne!(
             epoch_1151, epoch_1100,
@@ -1117,31 +1189,31 @@ mod tests {
     /// a different key, so the artifact stored before the change is not consulted.
     #[test]
     fn changing_epoch_inputs_misses_the_shared_cache() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
         let base = unique_tmp("epoch-inputs");
         let _ = std::fs::remove_dir_all(&base);
-        unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &base) };
+        let env = cache_dir_env(&base);
         let body = sample_body("epoch_inputs");
 
         for target in TARGETS {
-            unsafe { std::env::set_var("POOT_LLC", "/nix/store/aaaa-llvm/bin/llc") };
-            let before = KernelCache::open(target);
+            let before = KernelCache::open_in(
+                target,
+                &toolchain_of(&[("POOT_LLC", "/nix/store/aaaa-llvm/bin/llc")]),
+                &env,
+            );
             before.store(&before.key(&body), b"artifact").unwrap();
             assert!(load(&before, &before.key(&body)).is_some());
 
-            unsafe { std::env::set_var("POOT_LLC", "/nix/store/bbbb-llvm/bin/llc") };
-            let after = KernelCache::open(target);
+            let after = KernelCache::open_in(
+                target,
+                &toolchain_of(&[("POOT_LLC", "/nix/store/bbbb-llvm/bin/llc")]),
+                &env,
+            );
             assert_ne!(before.dir(), after.dir(), "{target:?}");
             assert_eq!(
                 load(&after, &after.key(&body)),
                 None,
                 "{target:?}: a toolchain change must miss the older epoch's entry"
             );
-        }
-        unsafe {
-            std::env::remove_var("POOT_LLC");
-            std::env::remove_var("POOT_KERNEL_CACHE_DIR");
         }
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1375,14 +1447,12 @@ mod tests {
 
     #[test]
     fn scratch_path_parent_equals_artifact_path_parent() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
         let want = unique_tmp("scratch-parent");
         let _ = std::fs::remove_dir_all(&want);
-        unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &want) };
 
         let target = Target::AmdGcn(AmdArch::gfx1151());
-        let dir = kernel_cache_root("rocm", target).expect("an explicit, creatable directory");
+        let dir = kernel_cache_root("rocm", target, &bare_toolchain(), &cache_dir_env(&want))
+            .expect("an explicit, creatable directory");
         let artifact_path = crate::artifact_path(&dir, "some_kernel_abc123", target);
         let (scratch_ll, scratch_tmp) = crate::compile_scratch_paths(&artifact_path, 12345, 0);
 
@@ -1398,7 +1468,6 @@ mod tests {
             "scratch .tmp must live in the same dir as the published artifact, same reason"
         );
 
-        unsafe { std::env::remove_var("POOT_KERNEL_CACHE_DIR") };
         let _ = std::fs::remove_dir_all(&want);
     }
 
@@ -1591,8 +1660,6 @@ mod tests {
     fn a_removal_failure_does_not_fail_the_cache_that_triggered_the_prune() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = ENV_LOCK.lock().unwrap();
-        unset_all_cache_env();
         let base = unique_tmp("prune-failure");
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("rocm");
@@ -1605,13 +1672,11 @@ mod tests {
             .map(|i| make_epoch(&root, &format!("keep{i:02}"), DAY * (2 + i as u32), now))
             .collect();
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
-        unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &base) };
 
         let target = Target::AmdGcn(AmdArch::gfx1151());
-        let cache = KernelCache::open(target);
+        let cache = open_under(&base, target);
 
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
-        unsafe { std::env::remove_var("POOT_KERNEL_CACHE_DIR") };
         assert!(
             stuck.join("entry.hsaco").exists(),
             "the fixture must really make the removal fail (a root user ignores permissions)"

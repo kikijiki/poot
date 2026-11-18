@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 # Implements nothing backend-specific: depends on poot-tensor, poot-graph-plan, poot-quant and
 # poot-target only, never poot-eval or a runtime/device crate (card 546a Scope).

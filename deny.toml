@@ -1,0 +1,61 @@
+# cargo-deny policy for the workspace (POOT-1252, R2-C8-007). `just deny` runs it and `just gate` includes it;
+# the merge gate has no CI, so this runs on the box or the laptop that merges.
+#
+# Four checks, each fail-closed:
+#   advisories  the RustSec database (fetched on every run: a run that cannot fetch it fails) and yanked crates;
+#   licenses    every locked crate carries a licence on the allow list below;
+#   bans        no crate the workspace has ruled out, and no wildcard requirement;
+#   sources     every crate comes from crates.io or from a path inside the repository.
+# Duplicate crate versions are not checked here: `crates/poot-test-util/tests/dependency_direction.rs` (rule 5)
+# already fails a duplicate with no row naming what pulls the extra version.
+
+[graph]
+# The platforms the workspace builds for. Windows and macOS crates are in the lockfile for the dependencies that
+# name them but are not built.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+# Advisories the workspace has read and accepts, each with the reason and what ends the exception.
+ignore = [
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30 bundles the C SQLite poot-orchestrator's run database links (rusqlite 0.32); the orchestrator is a tool that opens only its own database file. Fixed in libsqlite3-sys 0.39, which needs a rusqlite major bump of the orchestrator's queries; ends with that bump." },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix is unmaintained and has no safe upgrade; it is indicatif's formatting helper behind tokenizers' `progressbar` feature, which formats byte counts in a progress bar. Ends when tokenizers or indicatif drops it." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained and has no safe upgrade; it is a compile-time macro helper with no runtime code in the binaries. Ends when its dependents move to another macro crate." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Duplicate versions are rule 5 of the dependency-direction test, with a reason per row.
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+# No crate is banned outright yet. `onig` (a C regex engine, linked through tokenizers 0.20's default features)
+# stays: tokenizers 0.20.4 has no feature that replaces it for a native build (its only alternative, `fancy-regex`,
+# sits behind `unstable_wasm`, which also turns on `getrandom/js`), and a different regex engine could change how a
+# checkpoint's pre-tokenizer splits text.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

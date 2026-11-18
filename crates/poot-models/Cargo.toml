@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [features]
 # ADR-0113: the tracer-built fixtures (`test_support::{dense, weight_map, pipeline, fixtures}`) the crates above

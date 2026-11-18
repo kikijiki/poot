@@ -11,8 +11,9 @@ mod cast;
 pub(crate) use cast::cast_i32_to_f32;
 pub use cast::{cast_bf16_to_f32, cast_f16_to_f32, cast_f32_to_bf16, cast_f32_to_f16};
 
-/// Workgroup width of a pointwise kernel on the 2-D grid fold: always 256 (the portable Vulkan maximum). It
-/// mirrors `poot-graph-plan::ELEMENTWISE_2D_WIDTH` (kernelgen sits below poot-graph-plan, so it cannot reference
-/// it). `plan_eqn` bakes `body.workgroup_size[0]` to that constant, and the two must agree for the dispatch to
-/// reconstruct the same `i`; a unit test cross-checks them.
+/// Workgroup width of a pointwise kernel on the 2-D grid fold, and of the wide flat launch: always 256 (the
+/// portable Vulkan maximum). A folded body derives its global index from this width, and the request's
+/// [`crate::Workgroup`] or [`crate::Fold`] bakes `body.workgroup_size[0]` to it when it generates the body, so
+/// the dispatch reconstructs the same `i`. It mirrors `poot-graph-plan::ELEMENTWISE_2D_WIDTH` (kernelgen sits
+/// below poot-graph-plan, so it cannot reference it); a unit test cross-checks them.
 pub(crate) const ELEMENTWISE_2D_WORKGROUP_SIZE: usize = 256;

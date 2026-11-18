@@ -414,8 +414,8 @@ fn biased_residual_projection(m: usize, weight: DType) -> Graph {
 /// single partial row-tile at `M = 5`, many at `M = 160`). The epilogue carries both steps and both leaves in the
 /// store, so no standalone add is dispatched and no head result round-trips through memory.
 ///
-/// Mutation: make `epilogue_head_lowers` answer `dense_decode_gemv_in(..).is_some()` for a dense head (the
-/// pre-1032 gate); at `M > 1` the rule leaves the head and both adds apart and this row goes red.
+/// Mutation: make `ContractionSpec::accepts_epilogue` answer `false` for `DenseTiled`; at `M > 1` the rule leaves the
+/// head and both adds apart and this row goes red.
 #[test]
 fn a_biased_residual_dense_head_is_one_epilogue_contraction_at_every_m() {
     for backend in backends() {
@@ -459,8 +459,8 @@ fn a_biased_residual_dense_head_is_one_epilogue_contraction_at_every_m() {
 /// generated tiled GEMM) with a bias and a residual plans ONE `ContractionEpilogue { head: MatMul }` whose
 /// the register-tiled `[K, N]` GEMM carries both steps and both leaves, on every backend.
 ///
-/// Mutation: make `epilogue_head_lowers` accept only `MatMulRoute::Serial` for a `MatMul` head (the pre-1036
-/// gate); the head and both adds stay apart and this row goes red.
+/// Mutation: make `ContractionSpec::accepts_epilogue` answer `false` for `DenseTiled`; the head and both adds stay
+/// apart and this row goes red.
 #[test]
 fn a_biased_residual_tiled_matmul_head_is_one_epilogue_contraction() {
     for backend in backends() {
@@ -538,28 +538,31 @@ fn biased_residual_matmul(xs: Vec<usize>, ws: Vec<usize>, head_dtype: DType) -> 
     b.finish(out).unwrap()
 }
 
-/// POOT-1036: only an f32 `[K, N]` `MatMul` head above one row takes the generated tiled GEMM with an epilogue.
-/// Every other `MatMul` head keeps the plan it would get without one, so no head loses its schedule to a fused store:
-/// an F16 or BF16 head is not tileable (the body is f32-only) and fuses on its serial dtype-generic body (BF16 is
-/// refused on SPIR-V, which has no scalar bf16); a rank-3 weight takes the generated batched-weight tiled GEMM on
-/// every backend, which carries no epilogue, so its chain stays apart; an `M == 1` head is not tileable either and
-/// fuses on the serial body, like any other head off the tiled route.
+/// POOT-1036, POOT-1626: only an f32 `[K, N]` `MatMul` head above one row takes the generated tiled GEMM with an
+/// epilogue, over the one weight every row shares or, for a rank-3 weight, over each batch entry's own slab (the
+/// batched GEMM's generator carries the epilogue like the shared-weight one: the fuse rule asks the head's planned
+/// request, not its route). Every other `MatMul` head keeps the plan it would get without one, so no head loses
+/// its schedule to a fused store: an F16 or BF16 head is not tileable (the body is f32-only) and fuses on its
+/// serial dtype-generic body (BF16 is refused on SPIR-V, which has no scalar bf16); an `M == 1` head is not
+/// tileable either and fuses on the serial body, like any other head off the tiled route.
 ///
 /// Mutation: drop the F32-operand clause, the rank-2-weight clause or the `M > 1` clause of
-/// `is_tileable_matmul_in` (each lets the matcher admit the head onto the tiled GEMM); the matching case then plans
-/// the register-tiled `[K, N]` GEMM or loses its kept chain and this row goes red.
+/// `is_tileable_matmul_in` (each lets the matcher admit the head onto the shared-weight tiled GEMM); the matching
+/// case then plans it or loses its kept serial body and this row goes red. Or drop the batched arm of the epilogue
+/// planner (`MatMulRoute::BatchedTileable` in `matmul::plan`'s `ContractionEpilogue` arm): the rank-3 head fuses
+/// onto the serial body and the batched row goes red.
 #[test]
 fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
     /// What a case plans on a backend.
     enum Plan {
-        /// Head and chain stay apart (`matmul` then `fused`).
-        ChainKept,
         /// One `ContractionEpilogue` on the serial body.
         SerialEpilogue,
+        /// One `ContractionEpilogue` on the batched-weight tiled GEMM, one block per batch entry.
+        BatchedTiledEpilogue,
         /// The planner refuses the head by name.
         Refused,
     }
-    use Plan::{ChainKept, Refused, SerialEpilogue};
+    use Plan::{BatchedTiledEpilogue, Refused, SerialEpilogue};
     let cases = [
         (
             "f16 head",
@@ -574,7 +577,11 @@ fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
         (
             "rank-3 weight",
             biased_residual_matmul(vec![2, 5, K], vec![2, K, N], DType::F32),
-            [ChainKept, ChainKept, ChainKept],
+            [
+                BatchedTiledEpilogue,
+                BatchedTiledEpilogue,
+                BatchedTiledEpilogue,
+            ],
         ),
         (
             "M == 1",
@@ -588,12 +595,12 @@ fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
             let label = format!("{name} on {backend:?}");
             let program = match (compile(graph, &target(backend), &options), expected) {
                 (Err(CompileError::Plan(_)), Refused) => continue,
-                (Ok(program), ChainKept | SerialEpilogue) => program,
+                (Ok(program), SerialEpilogue | BatchedTiledEpilogue) => program,
                 (other, _) => panic!("{label}: unexpected compile result {:?}", other.err()),
             };
             for (eqn, _) in program.planned() {
-                // Only the batched-weight GEMM (no epilogue) is a tiled head here; the shared-weight GEMM with an
-                // epilogue is what these cases must never plan.
+                // Only the batched-weight GEMM carries an epilogue here; the shared-weight GEMM with an epilogue is
+                // what these cases must never plan.
                 if let KernelChoice::Generated(KernelRequest::Contraction(
                     ContractionSpec::DenseTiled(spec),
                 )) = program.kernel_choice(eqn)
@@ -601,7 +608,7 @@ fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
                     let out_numel: usize = program.graph().aval(eqn.out).shape.iter().product();
                     let per_block = (spec.meta[1] * spec.meta[2]) as usize;
                     assert!(
-                        spec.epilogue.is_none() && out_numel > per_block,
+                        out_numel > per_block,
                         "{label}: {:?} took the shared-weight tiled GEMM or an epilogue on it",
                         op_names(&program)
                     );
@@ -610,27 +617,35 @@ fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
             let fused = count(&program, |op| {
                 matches!(op, OpKind::ContractionEpilogue { .. })
             });
+            assert_eq!(fused, 1, "{label}: {:?}", op_names(&program));
+            assert_eq!(program.planned().count(), 1, "{label}: one dispatch");
+            let fused_request = request(&program, |op| {
+                matches!(op, OpKind::ContractionEpilogue { .. })
+            });
             match expected {
-                ChainKept => {
-                    assert_eq!(fused, 0, "{label}: {:?}", op_names(&program));
-                    assert_eq!(program.planned().count(), 2, "{label}: head and chain");
-                }
-                SerialEpilogue => {
-                    assert_eq!(fused, 1, "{label}: {:?}", op_names(&program));
-                    assert!(
-                        matches!(
-                            request(&program, |op| matches!(
-                                op,
-                                OpKind::ContractionEpilogue { .. }
-                            )),
-                            KernelRequest::Contraction(ContractionSpec::Serial {
+                SerialEpilogue => assert!(
+                    matches!(
+                        fused_request,
+                        KernelRequest::Contraction(ContractionSpec::Serial {
+                            epilogue: Some(_),
+                            ..
+                        })
+                    ),
+                    "{label}: the serial body carries the epilogue"
+                ),
+                BatchedTiledEpilogue => assert!(
+                    matches!(
+                        fused_request,
+                        KernelRequest::Contraction(ContractionSpec::DenseTiled(
+                            DenseTiledContraction {
+                                weight: DenseTiledWeight::KnF32,
                                 epilogue: Some(_),
                                 ..
-                            })
-                        ),
-                        "{label}: the serial body carries the epilogue"
-                    );
-                }
+                            }
+                        ))
+                    ),
+                    "{label}: the batched-weight tiled GEMM carries the epilogue: {fused_request:?}"
+                ),
                 Refused => unreachable!("a refusal continues above"),
             }
         }
@@ -787,7 +802,8 @@ fn a_grouped_bf16_projection_keeps_its_checkpoint_weight_under_narrow() {
 }
 
 /// POOT-1048: the blocked weight is a real value when something else reads it (here a reduction), so the fold
-/// leaves the `Reshape`, `Transpose` and `MatMul` as traced instead of dropping a reshape a second reader needs.
+/// leaves the `Reshape`, `Transpose` and `MatMul` as traced (a typed refusal on every backend, with no widening pass)
+/// instead of folding into a grouped contraction that drops a reshape a second reader needs.
 ///
 /// Mutation: drop the consumer-count check on the reshape's value in `fold_dense_contractions`; the reshape is
 /// dropped under its second reader and this row goes red.
@@ -808,34 +824,19 @@ fn a_blocked_weight_with_a_second_consumer_is_not_folded() {
     });
     let options = exact_options();
     for backend in backends() {
-        // Unfolded, the BF16 chain has no lowering on the packed-lane wgpu target (a typed refusal of a bf16
-        // equation of it); the native-BF16 targets plan the chain as traced. Never a grouped contraction.
-        match (backend, compile(&g, &target(backend), &options)) {
-            (Backend::SpirvVulkan, Err(CompileError::Plan(plan))) => {
+        // Unfolded, the BF16 chain has no lowering on any backend: the mixed F32 x BF16 matmul (or, on the
+        // packed-lane wgpu target, a bf16 equation of it) is a typed refusal and no pass widens the weight
+        // (POOT-1628). Never a grouped contraction, which would plan.
+        match compile(&g, &target(backend), &options) {
+            Err(CompileError::Plan(plan)) => {
                 let plan = plan.to_string();
                 assert!(
-                    plan.contains("bf16") && plan.contains("is refused on Gpu(SpirvVulkan)"),
+                    plan.contains("bf16")
+                        && plan.contains(&format!("is refused on Gpu({backend:?})")),
                     "{backend:?}: {plan}"
                 )
             }
-            (Backend::SpirvVulkan, other) => {
-                panic!("{backend:?}: expected a bf16 refusal, got {other:?}")
-            }
-            (_, Ok(program)) => {
-                let label = format!("{backend:?}: {:?}", op_names(&program));
-                assert_eq!(count(&program, is_grouped_bf16), 0, "{label}");
-                assert_eq!(
-                    count(&program, |op| matches!(op, OpKind::Reshape { .. })),
-                    1,
-                    "{label}"
-                );
-                assert_eq!(
-                    count(&program, |op| matches!(op, OpKind::MatMul { .. })),
-                    1,
-                    "{label}"
-                );
-            }
-            (_, Err(error)) => panic!("{backend:?}: {error}"),
+            other => panic!("{backend:?}: expected a bf16 refusal, got {other:?}"),
         }
     }
 }

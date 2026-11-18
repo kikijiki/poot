@@ -202,18 +202,6 @@ impl AieTools {
     }
 }
 
-/// The path a configured tool name runs from, or `None` when no such file exists.
-fn locate(name: &str) -> Option<PathBuf> {
-    if name.contains('/') {
-        return Path::new(name).is_file().then(|| PathBuf::from(name));
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(name))
-            .find(|candidate| candidate.is_file())
-    })
-}
-
 /// FNV-1a of a tool's bytes, memoized per path for the process (a toolchain is not swapped under a
 /// running process).
 fn content_hash(path: &Path) -> std::io::Result<u64> {
@@ -264,7 +252,12 @@ fn resolve_stage(
     supports: impl Fn(&Path) -> Result<bool, AieCompileError>,
 ) -> Result<AieToolIdentity, AieCompileError> {
     let missing = || AieCompileError::ToolchainMissing { stage, variable };
-    let path = configured.and_then(locate).ok_or_else(missing)?;
+    // A configured tool is the path the toolchain exports (`$POOT_AIE_LLC`, `$POOT_AIE_IRON`); a name that is
+    // not a file is a missing toolchain, never a search of `PATH`.
+    let path = configured
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(missing)?;
     let version = query(stage, variable, &path, &["--version"])?
         .lines()
         .next()

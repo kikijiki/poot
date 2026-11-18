@@ -1,7 +1,7 @@
 //! Unit tests for the planner: dispatch-predicate gating, cache-key stability, strided-view promotion,
 //! real-config dispatch-count regressions.
 
-use crate::dtype_widen::{bf16_const_feeds_only_packed_readers, widen_mismatched_matmul_dtypes};
+use crate::dtype_widen::bf16_const_feeds_only_packed_readers;
 use crate::graph_validation::ValidationPacketSource;
 use crate::planner::{Planned, fty_ty};
 use crate::predicates::{
@@ -18,7 +18,7 @@ use poot_graph_ir::{
 use poot_kernel_ir::{BinOp, Body, Ty};
 use poot_kernelgen::{
     CastSpec, ContractionSpec, DenseTiledContraction, DenseTiledWeight, FusedInput, FusedScalarOp,
-    KernelRequest, LeafTy, PointwiseForm, PointwiseSpec, Schedule,
+    KernelRequest, LaunchOwnership, LeafTy, PointwiseForm, PointwiseSpec, Schedule,
 };
 use poot_target::{AmdArch, Backend, DeviceCaps, Queried, TargetId};
 use poot_tensor::DType as GDt;
@@ -1048,7 +1048,7 @@ fn try_matmul_plan(g: &Graph, backend: Backend) -> Result<Plan, PlanError> {
 
 /// A biased matmul whose weight dtype differs from its activation's is not a contraction epilogue: the
 /// fuse rule only forms one over a head whose operands and result share a dtype (a mixed pairing is the
-/// decode-GEMV arm's contract, and `widen_mismatched_matmul_dtypes` casts the rest), so
+/// decode-GEMV arm's contract, and the planner refuses the rest), so
 /// the graph keeps its matmul and its add. Mutation: drop the dtype check in `epilogue_head`; the mixed
 /// matmul fuses and this row goes red.
 #[test]
@@ -2061,17 +2061,17 @@ fn e4m3fn_materializing_dispatch_rejects_a_grid_beyond_wgpu_x_limit() {
     }
 }
 
-/// SC-003 (card 546b): the planner's generic one-thread-per-output workgroup
-/// bump (`finalize`, `planner.rs`) reads the dispatch cap from the caller's own `DeviceCaps.max_grid`,
+/// SC-003 (card 546b): the planner's choice of an elementwise request's workgroup
+/// (`Workgroup::for_threads`) reads the dispatch cap from the caller's own `DeviceCaps.max_grid`,
 /// never a baked wgpu-specific `65_535` literal - a fixture whose `max_grid` is far below the real
 /// wgpu cap must still get a dispatch that respects IT.
 ///
-/// MUTATION (recorded here, never left in the tree): restore the `65_535` literal `finalize` used to
-/// compare `out_numel.div_ceil(wg0)` against. At this fixture's `max_grid = 1024`, `out_numel =
-/// 1024*64 + 1` needs 16385 default-width groups - under the restored 65535 the bump never fires
-/// (`wg0` stays the kernel's stock 64), so the planned dispatch of `16385 > 1024` workgroups on X
-/// silently exceeds this fixture's real cap and the row goes red (the `wg0 == 256` assertion fails,
-/// `wg0 == 64` instead). Restored: green again.
+/// MUTATION (recorded here, never left in the tree): restore the `65_535` literal in
+/// `Workgroup::for_threads`'s comparison of `threads.div_ceil(64)`. At this fixture's `max_grid = 1024`,
+/// `out_numel = 1024*64 + 1` needs 1025 default-width groups - under the restored 65535 the widening never
+/// fires (`wg0` stays the narrow 64), so the planned dispatch of `1025 > 1024` workgroups on X silently
+/// exceeds this fixture's real cap and the row goes red (the `wg0 == 256` assertion fails, `wg0 == 64`
+/// instead). Restored: green again.
 #[test]
 fn sc003_grid_cap_bump_respects_custom_device_caps_not_hardcoded_65535() {
     let small_caps = poot_target::DeviceCaps {
@@ -2079,7 +2079,7 @@ fn sc003_grid_cap_bump_respects_custom_device_caps_not_hardcoded_65535() {
         ..default_caps_for(Backend::SpirvVulkan)
     };
     // 1024*64 + 1 default-width (64-lane) groups clears the real wgpu cap (65535) comfortably but
-    // overshoots this fixture's 1024 - the wg-bump to 256 lanes must fire to bring workgroups_x back
+    // overshoots this fixture's 1024 - the 256-lane workgroup must be chosen to bring workgroups_x back
     // under 1024 (1024*64+1 div_ceil 256 = 257 <= 1024).
     let out_numel = 1024 * 64 + 1;
     let bld = Builder::for_tests();
@@ -2101,7 +2101,7 @@ fn sc003_grid_cap_bump_respects_custom_device_caps_not_hardcoded_65535() {
     let wg0 = body.workgroup_size[0] as usize;
     assert_eq!(
         wg0, 256,
-        "the generic wg-bump must fire under the fixture's own max_grid=1024, not the old 65535"
+        "the wide workgroup must be chosen under the fixture's own max_grid=1024, not the old 65535"
     );
     assert!(
         out_numel.div_ceil(wg0) <= 1024,
@@ -2113,17 +2113,17 @@ fn sc003_grid_cap_bump_respects_custom_device_caps_not_hardcoded_65535() {
 /// SC-003 extension (card 546b): `is_elementwise_2d_in`'s
 /// fold-to-2D threshold must also read the caller's own `DeviceCaps.max_grid`, not a baked
 /// `65_535 * 256` wgpu-specific ceiling. Above, `sc003_grid_cap_bump_respects_custom_device_caps_not_hardcoded_65535`
-/// only exercises `finalize`'s generic 1-D wg-bump (its `out_numel` is nowhere near
+/// only exercises the 1-D widening (its `out_numel` is nowhere near
 /// `65535*256`); this fixture's `out_numel` sits ABOVE the fixture's own fold ceiling
 /// (`max_grid[0] * ELEMENTWISE_2D_WIDTH = 262144`) but far BELOW the old hardcoded
 /// `65535*256 = 16,776,960` one, so it is the one case that tells the two ceilings apart: the
-/// generic wg-bump alone (max wg0 = 256) cannot bring a flat 1-D dispatch of this size back under
+/// wide workgroup alone (max wg0 = 256) cannot bring a flat 1-D dispatch of this size back under
 /// `max_grid[0] = 1024`, so a correct plan must fold to 2-D instead.
 ///
 /// MUTATION (recorded here, never left in the tree): restore the `65_535 * 256` literal
 /// `is_elementwise_2d_in`'s `OpKind::Binary` arm compared `out_numel` against. At this fixture's
 /// `out_numel = 262145`, that restored literal is nowhere near `16,776,960`, so the op stays on the
-/// 1-D path; `finalize`'s wg-bump maxes out at `wg0 = 256`, giving `workgroups_x =
+/// 1-D path; the wide workgroup maxes out at `wg0 = 256`, giving `workgroups_x =
 /// 262145.div_ceil(256) = 1025 > 1024` - past the fixture's own cap - and the row goes red (the
 /// `workgroups_x <= 1024` assertion fails, `1025 > 1024`). Restored: green again.
 #[test]
@@ -2169,13 +2169,116 @@ fn sc003_elementwise_2d_fold_respects_custom_device_caps_not_hardcoded_65535x256
     );
     assert!(
         workgroups_x <= small_caps.max_grid[0] as usize,
-        "X dispatch ({workgroups_x} groups) must clear the fixture's max_grid[0]=1024: the generic \
-         wg-bump alone cannot, so the plan must have folded to a 2-D grid"
+        "X dispatch ({workgroups_x} groups) must clear the fixture's max_grid[0]=1024: the wide \
+         workgroup alone cannot, so the plan must have folded to a 2-D grid"
     );
     assert!(
         workgroups_y <= small_caps.max_grid[1] as usize,
         "Y dispatch ({workgroups_y} groups) must clear the fixture's max_grid[1]=1024"
     );
+}
+
+/// POOT-1627: an elementwise request declares the workgroup it is generated at, chosen from the target's own
+/// `caps.max_grid` before generation; the plan's key is the choice's digest, with no suffix naming a bump. The
+/// same equation on a device whose cap the narrow workgroup clears is a different request, and a different key.
+///
+/// MUTATION (recorded here, never left in the tree): make `Workgroup::for_threads` (poot-kernelgen
+/// `request.rs`) return `Self::Narrow` for every launch. The small-cap plan then declares and generates the
+/// narrow 64-lane workgroup, whose `1024*64 + 1` threads need 1025 groups past the fixture's cap of 1024, and the
+/// row goes red: `assertion left == right failed: the over-cap launch is generated at the wide workgroup`
+/// (left: Elementwise { workgroup_x: 64 }, right: Elementwise { workgroup_x: 256 }). Restored: green again.
+#[test]
+fn an_elementwise_request_declares_its_widened_workgroup_before_generation() {
+    let backend = Backend::SpirvVulkan;
+    let roomy = default_caps_for(backend);
+    let tight = DeviceCaps {
+        max_grid: [1024, 1024, 1024],
+        ..roomy
+    };
+    let numel = 1024 * 64 + 1;
+    let bld = Builder::for_tests();
+    let a = bld.constant("a", TensorType::f32(vec![numel])).unwrap();
+    let b = bld.constant("b", TensorType::f32(vec![numel])).unwrap();
+    let y = bld.binary(GBinOp::Add, a, b).unwrap();
+    let g = bld.finish(y).unwrap();
+    let eqn = &g.eqns()[0];
+
+    let planned = |caps: &DeviceCaps| {
+        let (plan, choice) = planned_with_choice_caps(&g, eqn, backend, caps).unwrap();
+        let dispatch = into_plain(plan);
+        let KernelChoice::Generated(request) = &choice else {
+            panic!("a binary op generates its body: {choice:?}");
+        };
+        (
+            request.launch(),
+            dispatch.body().workgroup_size[0],
+            dispatch.key().to_owned(),
+            choice,
+        )
+    };
+    let (tight_launch, tight_wg, tight_key, tight_choice) = planned(&tight);
+    let (roomy_launch, roomy_wg, roomy_key, roomy_choice) = planned(&roomy);
+
+    assert_eq!(
+        tight_launch,
+        LaunchOwnership::Elementwise { workgroup_x: 256 },
+        "the over-cap launch is generated at the wide workgroup"
+    );
+    assert_eq!(tight_wg, 256, "the body is the one the request declared");
+    assert_eq!(
+        roomy_launch,
+        LaunchOwnership::Elementwise { workgroup_x: 64 },
+        "a launch the narrow workgroup clears stays narrow"
+    );
+    assert_eq!(roomy_wg, 64);
+    assert_eq!(
+        tight_key,
+        tight_choice.key(backend.into()),
+        "no suffix names the widening"
+    );
+    assert_eq!(roomy_key, roomy_choice.key(backend.into()));
+    assert_ne!(
+        tight_key, roomy_key,
+        "two bodies must not share a key: the request names the width"
+    );
+}
+
+/// POOT-1627: a request that owns its launch (a tiled contraction) keeps the launch its generator built, on a
+/// device whose grid cap an elementwise launch of the same output would have widened for. The plan's key is the
+/// choice's digest, and `finalize` refuses a dispatch whose key or elementwise workgroup is not the choice's.
+///
+/// MUTATION (recorded here, never left in the tree): in `kernel_mapping::finalize`, before
+/// `check_launch_ownership`, re-add the old post-hoc shaping on a dispatch whose request owns its launch
+/// (`set_workgroup_x(256)` on the single dispatch and `append_key("+wg256x1x1")`). The plan validation goes red:
+/// `called Result::unwrap() on an Err value: InvalidDispatchPlan(KeyNotChoice { dispatch: 0, key: "<digest>+wg256x1x1",
+/// expected: "<digest>" })`. Restored: green again.
+#[test]
+fn a_request_that_owns_its_launch_is_never_reshaped_after_planning() {
+    let backend = Backend::SpirvVulkan;
+    let tight = DeviceCaps {
+        max_grid: [1024, 1024, 1024],
+        ..default_caps_for(backend)
+    };
+    // 90000 outputs: more than the 1024 groups of the narrow workgroup cover, so the old post-hoc bump
+    // would have had a reason to fire on a request that did not own its launch.
+    let g = matmul_graph(300, 16, 300, GDt::F32);
+    let eqn = g
+        .eqns()
+        .iter()
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
+        .expect("a matmul eqn");
+    let (plan, choice) = planned_with_choice_caps(&g, eqn, backend, &tight).unwrap();
+    let KernelChoice::Generated(request) = &choice else {
+        panic!("a matmul generates its body: {choice:?}");
+    };
+    assert_eq!(request.launch(), LaunchOwnership::OwnsLaunch, "{request:?}");
+    for dispatch in plan.dispatches() {
+        assert_eq!(
+            dispatch.key(),
+            choice.key(backend.into()),
+            "the key is the choice's digest, with no suffix"
+        );
+    }
 }
 
 #[test]
@@ -2798,7 +2901,7 @@ fn mixed_dtype_matmul_is_refused_on_every_backend() {
     }
 }
 
-// --- card 235: the decode-time mixed-operand-dtype MatMul widen-cast pass ---
+// --- card 235: the mixed-operand-dtype MatMul has no lowering ---
 
 /// A matmul `[1,m,k] @ [k,n]` with a realistic operand-dtype mismatch: an F32 activation against a BF16
 /// weight (the loader types every native-bf16 checkpoint's projection weights as bf16, independent of
@@ -2817,192 +2920,48 @@ fn mixed_operand_matmul_graph(m: usize, k: usize, n: usize) -> Graph {
     bld.finish(mm).unwrap()
 }
 
+/// POOT-1628, through production `compile`: a matmul whose operand dtype differs from its output dtype is a typed
+/// `DtypeLowering` refusal on every backend, NVPTX included, at decode (M == 1) and prefill (M > 1) shapes and for
+/// both a one-sided (F32 x BF16) and a two-sided (BF16 x BF16 into F32) mismatch. Nothing in `compile` inserts a
+/// `Cast` that would materialize a widened copy of the weight. Mutation: drop the operand-dtype guard in
+/// `planner/matmul.rs`; the pair plans an f32 body over two-byte operands, `compile` succeeds and every row goes
+/// red.
 #[test]
-fn widen_inserts_cast_for_decode_shaped_mixed_matmul() {
-    // Card 235: every matmul body reads one element type, so without the widen pass every backend that is not
-    // the refused decode projection (NVPTX, and any other shape) rejects this graph.
-    let g = mixed_operand_matmul_graph(1, 32, 16);
-    // NVPTX has no refused column Gemv (PTX has its own prepare rule), so it still needs the widening Cast.
-    let backend = Backend::Nvptx;
-    let r = try_matmul_plan(&g, backend);
-    assert!(
-        matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
-        "unwidened decode-shaped mixed matmul should be rejected on {backend:?}: got {r:?}"
-    );
-
-    let gw = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
-    let mm = gw
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .expect("matmul eqn retained");
-    // both matmul operands read F32 (the odt): `a` already was, `w` gained a Cast.
-    for (i, op) in mm.inputs.iter().take(2).enumerate() {
-        if let poot_graph_ir::Operand::Value(v) = op {
-            assert_eq!(
-                gw.aval(*v).dtype,
-                GDt::F32,
-                "widened operand {i} should be F32 on {backend:?}"
+fn compile_refuses_a_mixed_dtype_matmul_on_every_backend_without_widening() {
+    let graphs = [
+        ("decode F32xBF16", mixed_operand_matmul_graph(1, 2048, 2048)),
+        (
+            "prefill F32xBF16",
+            mixed_operand_matmul_graph(128, 2048, 8192),
+        ),
+        ("aligned BF16xBF16", mixed_matmul_graph(GDt::BF16)),
+        ("aligned F16xF16", mixed_matmul_graph(GDt::F16)),
+    ];
+    let options = CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
+    for (name, graph) in &graphs {
+        for backend in [
+            Backend::SpirvVulkan,
+            Backend::Nvptx,
+            Backend::AmdGcn(AmdArch::gfx1151()),
+            Backend::AmdGcn(AmdArch::new("gfx942", 64)),
+        ] {
+            let target = Target::Gpu {
+                backend,
+                caps: default_caps_for(backend),
+            };
+            let result = compile(graph, &target, &options);
+            assert!(
+                matches!(
+                    &result,
+                    Err(CompileError::Plan(e))
+                        if matches!(&**e, PlanError::Refused(r) if r.missing == Capability::DtypeLowering)
+                ),
+                "{name} on {backend:?}: expected a DtypeLowering refusal, got {:?}",
+                result.map(|_| ())
             );
         }
     }
-    let n_casts = gw
-        .eqns()
-        .iter()
-        .filter(|e| matches!(e.op, OpKind::Cast { to: GDt::F32 }))
-        .count();
-    assert_eq!(
-        n_casts, 1,
-        "only the mismatched (BF16) operand should gain a widening cast on {backend:?}: {n_casts}"
-    );
-    let r = try_matmul_plan(&gw, backend);
-    assert!(
-        r.is_ok(),
-        "widened decode-shaped mixed matmul should now plan on {backend:?}: got {r:?}"
-    );
-
-    // SpirvVulkan / AmdGcn: a BF16 `[K, N]` decode projection has no lowering (the column-tile body is
-    // retired), so the widening pass leaves it mixed with no Cast and `plan_eqn` refuses it by name.
-    for backend in [
-        Backend::SpirvVulkan,
-        Backend::AmdGcn(AmdArch::gfx1151()),
-        Backend::AmdGcn(AmdArch::new("gfx942", 64)),
-    ] {
-        let r = try_matmul_plan(&g, backend);
-        assert!(
-            matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
-            "a BF16 [K, N] decode projection must be refused on {backend:?}: got {r:?}"
-        );
-        let gw = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
-        assert!(
-            !gw.eqns()
-                .iter()
-                .any(|e| matches!(e.op, OpKind::Cast { .. })),
-            "the refused decode projection must not gain a widening Cast on {backend:?}"
-        );
-        assert_eq!(
-            gw.aval(const_id(&gw, "w")).dtype,
-            GDt::BF16,
-            "the weight must stay BF16 on {backend:?}"
-        );
-    }
-}
-
-/// A 16-aligned mixed matmul (bf16 operands, f32 output) gains a widening `Cast` on each operand on every backend
-/// and then plans the register-tiled GEMM: no backend reads the narrow pair directly. Mutation: skip the widening
-/// of a 16-aligned matmul in `widen_mismatched_matmul_dtypes`; no cast is added and the row goes red.
-#[test]
-fn widen_casts_an_aligned_mixed_matmul_onto_the_tiled_gemm() {
-    let gm = mixed_matmul_graph(GDt::BF16);
-    for backend in [
-        Backend::SpirvVulkan,
-        Backend::Nvptx,
-        Backend::AmdGcn(AmdArch::gfx1151()),
-    ] {
-        let gw = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(backend)).unwrap();
-        let casts = gw
-            .eqns()
-            .iter()
-            .filter(|e| matches!(e.op, OpKind::Cast { to: GDt::F32 }))
-            .count();
-        assert_eq!(casts, 2, "both bf16 operands are widened on {backend:?}");
-        let choice = matmul_choice(&gw, backend);
-        assert!(
-            kn_tiled(&choice).is_some(),
-            "the widened matmul takes the register-tiled GEMM on {backend:?}: got {choice:?}"
-        );
-    }
-}
-
-/// Round an f32 to bf16 precision (round-to-nearest-even), widened back to f32 (bf16 is the top 16 bits
-/// of an f32). Test-only copy of `poot_eval`'s private `round_bf16` (see `crates/poot-eval/src/lib.rs`),
-/// to simulate the values of a bf16 safetensors checkpoint without depending on poot_eval internals.
-fn round_bf16(f: f32) -> f32 {
-    if f.is_nan() {
-        return f;
-    }
-    let bits = f.to_bits();
-    let bias = 0x7FFF + ((bits >> 16) & 1);
-    f32::from_bits((bits.wrapping_add(bias)) & 0xFFFF_0000)
-}
-
-#[test]
-fn widen_preserves_cpu_oracle_numerics() {
-    // Card 235: the widen-then-matmul round trip must not change results beyond the bf16 precision loss
-    // already incurred when the checkpoint was loaded as bf16 (simulated by rounding `w`'s data through
-    // bf16 before it enters the graph). `poot_eval`'s `Cast{to: F32}` is the identity on f32-resident data
-    // and `MatMul`'s eval rounds only by output dtype, so the CPU oracle is unaffected by widening: the
-    // pass changes what `plan_eqn` accepts, not what the graph computes.
-    let (m, k, n) = (1, 37, 41); // deliberately non-16-aligned: decode-realistic
-    let g = mixed_operand_matmul_graph(m, k, n);
-
-    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.037).sin() * 3.0).collect();
-    // Round through bf16 up front, as a bf16 safetensors checkpoint already is (the loader
-    // reads the raw bf16 bytes, widened to f32 by the loader).
-    let w_data: Vec<f32> = (0..k * n)
-        .map(|i| round_bf16((i as f32 * 0.019).cos() * 7.0))
-        .collect();
-
-    let mut inputs: HashMap<ValueId, poot_eval::Value> = HashMap::new();
-    inputs.insert(
-        g.inputs()[0],
-        poot_eval::Value::from(poot_tensor::HostTensor::f32(vec![1, m, k], a_data.clone())),
-    );
-    inputs.insert(
-        g.inputs()[1],
-        // `w_data` is already bf16-exact, so its words are the high halves of the f32 bit patterns.
-        poot_eval::Value::from(poot_tensor::HostTensor::bf16(
-            vec![k, n],
-            w_data.iter().map(|v| (v.to_bits() >> 16) as u16).collect(),
-        )),
-    );
-    let unwidened = poot_eval::eval(&g, &inputs, poot_eval::EvalOptions::default())
-        .expect("cpu eval (unwidened)")
-        .output
-        .into_host()
-        .expect("dense unwidened output");
-
-    for backend in [
-        Backend::SpirvVulkan,
-        Backend::Nvptx,
-        Backend::AmdGcn(AmdArch::gfx1151()),
-    ] {
-        let gw = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
-        let widened = poot_eval::eval(&gw, &inputs, poot_eval::EvalOptions::default())
-            .expect("cpu eval (widened)")
-            .output
-            .into_host()
-            .expect("dense widened output");
-        assert_eq!(
-            widened.as_f32().unwrap(),
-            unwidened.as_f32().unwrap(),
-            "widening must not change the CPU-oracle result on {backend:?}"
-        );
-    }
-
-    // It also matches a plain all-f32 reference graph fed the same (bf16-rounded) weight data: widening
-    // adds no precision loss beyond the bf16 rounding applied above.
-    let gf = matmul_graph(m, k, n, GDt::F32);
-    let mut inputs_f32: HashMap<ValueId, poot_eval::Value> = HashMap::new();
-    inputs_f32.insert(
-        gf.inputs()[0],
-        poot_eval::Value::from(poot_tensor::HostTensor::f32(vec![1, m, k], a_data)),
-    );
-    inputs_f32.insert(
-        gf.inputs()[1],
-        poot_eval::Value::from(poot_tensor::HostTensor::f32(vec![k, n], w_data)),
-    );
-    let f32_ref = poot_eval::eval(&gf, &inputs_f32, poot_eval::EvalOptions::default())
-        .expect("cpu eval (f32 reference)")
-        .output
-        .into_host()
-        .expect("dense f32 reference output");
-    assert_eq!(
-        unwidened.as_f32().unwrap(),
-        f32_ref.as_f32().unwrap(),
-        "the mismatched-dtype graph's oracle result should already match the all-f32 reference \
-         (poot_eval ignores operand dtype for MatMul, only the Cast/output-dtype rounding matters)"
-    );
 }
 
 fn cast_planned(in_dt: GDt, to: GDt, backend: Backend) -> Result<(Plan, KernelChoice), PlanError> {
@@ -3047,7 +3006,7 @@ fn cast_arm_matches_dtype_pairs_exhaustively() {
             Backend::SpirvVulkan
         };
         match cast_planned(in_dt, to, backend) {
-            Ok((compute_plan, KernelChoice::Generated(KernelRequest::Cast(got))))
+            Ok((compute_plan, KernelChoice::Generated(KernelRequest::Cast(got, _))))
                 if is_plain(&compute_plan) =>
             {
                 assert_eq!(format!("{got:?}"), format!("{want:?}"), "{in_dt:?}->{to:?}")
@@ -3096,7 +3055,7 @@ fn cast_arm_matches_dtype_pairs_exhaustively() {
             .find(|e| matches!(e.op, OpKind::Cast { .. }))
             .unwrap();
         match planned_with_choice(&g, eqn, Backend::Nvptx) {
-            Ok((compute_plan, KernelChoice::Generated(KernelRequest::Cast(got))))
+            Ok((compute_plan, KernelChoice::Generated(KernelRequest::Cast(got, _))))
                 if is_plain(&compute_plan) =>
             {
                 assert_eq!(
@@ -3196,7 +3155,7 @@ fn cast_i32_to_f32_plans_an_i32_in_f32_out_kernel() {
     assert!(
         matches!(
             &choice,
-            KernelChoice::Generated(KernelRequest::Cast(CastSpec::I32ToF32 { numel: 8 }))
+            KernelChoice::Generated(KernelRequest::Cast(CastSpec::I32ToF32 { numel: 8 }, _))
         ),
         "{choice:?}"
     );
@@ -3602,9 +3561,10 @@ fn a_watchdog_split_tiled_gemm_dispatches_whole_waves() {
 }
 
 /// Card 557: the generated tiled GEMM owns its launch (workgroups of its schedule's `lanes^2` lanes), and the op
-/// alone no longer says so: `finalize` reads the recorded choice. A MatMul whose output is past the grid cap at
-/// one workgroup of lanes per tile must keep its schedule-wide workgroups. Mutation: drop the choice from
-/// `finalize`'s custom-grid test; the wg-bump widens the body to 256 lanes and this row goes red.
+/// alone no longer says so: the request's own declared launch does. A MatMul whose output is past the grid cap
+/// at one workgroup of lanes per tile must keep its schedule-wide workgroups. Mutation: make
+/// `KernelRequest::launch` declare `Elementwise { workgroup_x: 1 }` for `Contraction` requests; planning
+/// refuses with `WorkgroupNotDeclared` and this row goes red.
 #[test]
 fn a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn() {
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
@@ -5480,7 +5440,7 @@ fn the_split_kv_plan_records_the_exact_resources_of_both_launches() {
 /// Regression: `is_elementwise_2d` used to gate every arm on `dtype == F32`, including Binary/Unary/
 /// MatMul, whose kernel bodies are dtype-parameterized (`plan_eqn` derives `dt` from the eqn's output
 /// dtype independently of this predicate; see `matmul_batched_dt_grid`'s call site feeding it
-/// `fty(odt)`). A BF16/F16 elementwise/matmul op above the wg-bump's `65535*256` element ceiling would
+/// `fty(odt)`). A BF16/F16 elementwise/matmul op above the `65535*256` element fold ceiling would
 /// keep the 1-D grid and hit the `GridCap` crash this predicate prevents. Only the imported-body-only
 /// arms (ScatterUpdate/DynamicUpdateSlice/Transpose/Slice/Broadcast/Concat) are F32-locked (no
 /// other-dtype imported variant), so those stay gated.
@@ -5579,97 +5539,35 @@ fn const_id(g: &Graph, name: &str) -> ValueId {
 }
 
 /// Card 298, Card 1011: the operand shape a natively-bf16 safetensors checkpoint traces for every projection
-/// matmul: an F32 activation against a BF16 weight const, F32 output. `plan_eqn` refuses it on every
-/// backend unwidened (olmo2-1b's prefill shape, M=128, K=2048, N=8192): every matmul body reads one element
-/// type.
-///
-/// `widen_mismatched_matmul_dtypes`, run by `compile`, makes the eqn plan with an explicit
-/// `Cast{BF16 -> F32}` of the weight: the weight const stays BF16 (the stored words upload as they are) and
-/// the cast reads them from the lane the storage plan gave the const.
+/// matmul: an F32 activation against a BF16 weight const, F32 output (olmo2-1b's prefill shape, M=128, K=2048,
+/// N=8192, and decode's M=1). `plan_eqn` refuses it on every backend: every matmul body reads one element type,
+/// and no pass widens the weight (POOT-1628), so the weight const keeps its stored dtype and no `Cast` exists.
 #[test]
-fn card298_prefill_shaped_mixed_matmul_plans_after_widen() {
-    let g = mixed_operand_matmul_graph(128, 2048, 8192);
-    for backend in [
-        Backend::SpirvVulkan,
-        Backend::AmdGcn(AmdArch::gfx1151()),
-        Backend::AmdGcn(AmdArch::new("gfx942", 64)),
-    ] {
-        let r = try_matmul_plan(&g, backend);
-        assert!(
-            matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
-            "a raw F32xBF16 -> F32 matmul must still be rejected on {backend:?}: got {r:?}"
-        );
-
-        let gp = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
+fn a_mixed_dtype_matmul_is_refused_at_prefill_and_decode_shapes() {
+    for (m, k, n) in [(128, 2048, 8192), (1, 2048, 2048)] {
+        let g = mixed_operand_matmul_graph(m, k, n);
         assert_eq!(
-            gp.aval(const_id(&gp, "w")).dtype,
+            g.aval(const_id(&g, "w")).dtype,
             GDt::BF16,
-            "the BF16 weight const keeps its stored dtype on {backend:?}"
-        );
-        assert_eq!(
-            gp.eqns()
-                .iter()
-                .filter(|e| matches!(e.op, OpKind::Cast { to: GDt::F32 }))
-                .count(),
-            1,
-            "the widening is one planned Cast equation on {backend:?}"
-        );
-        let r = try_matmul_plan(&gp, backend);
-        assert!(
-            r.is_ok(),
-            "the widened F32xBF16 -> F32 matmul must plan on {backend:?}: got {r:?}"
-        );
-    }
-}
-
-/// Card 298: the same shape at decode's M=1, which 16-alignment can never admit. On SpirvVulkan/AmdGcn a BF16
-/// `[K, N]` decode projection is the retired column-tile body's shape: `widen_mismatched_matmul_dtypes` keeps
-/// the weight narrow (no Cast) and `plan_eqn` refuses it with `DtypeLowering`.
-#[test]
-fn card298_decode_shaped_mixed_matmul_is_refused_after_widen() {
-    let g = mixed_operand_matmul_graph(1, 2048, 2048);
-    for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
-        let gp = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
-        let r = try_matmul_plan(&gp, backend);
-        assert!(
-            matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
-            "decode-shaped mixed matmul must be refused on {backend:?}: got {r:?}"
+            "the BF16 weight const keeps its stored dtype"
         );
         assert!(
-            !gp.eqns()
-                .iter()
-                .any(|e| matches!(e.op, OpKind::Cast { .. })),
-            "decode-shaped mixed matmul must not gain a Cast on {backend:?}"
+            !g.eqns().iter().any(|e| matches!(e.op, OpKind::Cast { .. })),
+            "the traced graph holds no widening Cast"
         );
-        assert_eq!(
-            gp.aval(const_id(&gp, "w")).dtype,
-            GDt::BF16,
-            "the refused decode weight must stay BF16 on {backend:?}"
-        );
+        for backend in [
+            Backend::SpirvVulkan,
+            Backend::Nvptx,
+            Backend::AmdGcn(AmdArch::gfx1151()),
+            Backend::AmdGcn(AmdArch::new("gfx942", 64)),
+        ] {
+            let r = try_matmul_plan(&g, backend);
+            assert!(
+                matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
+                "F32xBF16 -> F32 matmul [{m},{k},{n}] must be refused on {backend:?}: got {r:?}"
+            );
+        }
     }
-}
-
-/// Card 298, Card 1011: SPIR-V has no bf16 compute (RADV has no `SPV_KHR_bfloat16`), so a bf16 x bf16 pair is
-/// widened by explicit casts that read the packed lanes. The consts keep
-/// their BF16 dtype; nothing reaches codegen as a BF16 matmul.
-#[test]
-fn card298_spirv_widens_bf16_pairs_with_casts_not_retypes() {
-    let gm = mixed_matmul_graph(GDt::BF16);
-    let gp = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(Backend::SpirvVulkan)).unwrap();
-    for name in ["a", "w"] {
-        assert_eq!(
-            gp.aval(const_id(&gp, name)).dtype,
-            GDt::BF16,
-            "const {name} keeps its stored dtype"
-        );
-    }
-    assert!(
-        gp.eqns()
-            .iter()
-            .any(|e| matches!(e.op, OpKind::Cast { to: GDt::F32 })),
-        "the matmul reads F32 through the widening casts"
-    );
-    assert!(try_matmul_plan(&gp, Backend::SpirvVulkan).is_ok());
 }
 
 /// The Qwen3.8-27B LM head shape after `fold_dense_contractions`: a BF16 `[n, k]` checkpoint const
@@ -5818,20 +5716,18 @@ fn an_m1_dense_bf16_contraction_plans_the_generated_gemv_on_every_backend() {
 #[test]
 fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
     let folded = dense_contraction_graph(1, 32, 16);
-    let prepared =
-        widen_mismatched_matmul_dtypes(&folded, &default_caps_for(Backend::SpirvVulkan)).unwrap();
-    let weight = const_id(&prepared, "w");
+    let weight = const_id(&folded, "w");
     assert_eq!(
-        prepared.aval(weight).dtype,
+        folded.aval(weight).dtype,
         GDt::BF16,
         "a contraction weight must stay BF16 on wgpu: the typed walk uploads it as packed u32 lanes"
     );
     assert!(
-        !prepared
+        !folded
             .eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Cast { .. })),
-        "the fold plus the narrowed retype leave no widening cast"
+        "the fold leaves no widening cast"
     );
     assert!(bf16_const_feeds_only_packed_readers(
         &folded,
@@ -5839,22 +5735,15 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
         weight
     ));
 
-    // An ordinary mixed matmul at M>1 (prefill, not a decode GEMV) has no packed-lane consumer until the
-    // widening pass puts a `Cast` in front of it; the weight is never retyped.
+    // An ordinary mixed matmul at M>1 (prefill, not a decode GEMV) has no packed-lane consumer: the weight is
+    // never retyped, and the matmul is refused at planning.
     let mixed = mixed_operand_matmul_graph(128, 32, 16);
     assert!(!bf16_const_feeds_only_packed_readers(
         &mixed,
         &Default::default(),
         const_id(&mixed, "w")
     ));
-    let widened =
-        widen_mismatched_matmul_dtypes(&mixed, &default_caps_for(Backend::SpirvVulkan)).unwrap();
-    assert_eq!(widened.aval(const_id(&mixed, "w")).dtype, GDt::BF16);
-    assert!(bf16_const_feeds_only_packed_readers(
-        &widened,
-        &Default::default(),
-        const_id(&widened, "w")
-    ));
+    assert_eq!(mixed.aval(const_id(&mixed, "w")).dtype, GDt::BF16);
 
     // The decode-shaped mixed matmul is not a packed reader either: its weight stays BF16 (never retyped) and
     // the matmul is refused at planning.
@@ -5865,10 +5754,7 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
         const_id(&decode_mixed, "w")
     ));
     assert_eq!(
-        widen_mismatched_matmul_dtypes(&decode_mixed, &default_caps_for(Backend::SpirvVulkan))
-            .unwrap()
-            .aval(const_id(&decode_mixed, "w"))
-            .dtype,
+        decode_mixed.aval(const_id(&decode_mixed, "w")).dtype,
         GDt::BF16
     );
 
@@ -6059,19 +5945,17 @@ fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
         &Default::default(),
         table
     ));
-    let prepared =
-        widen_mismatched_matmul_dtypes(&folded, &default_caps_for(Backend::SpirvVulkan)).unwrap();
     assert_eq!(
-        prepared.aval(table).dtype,
+        folded.aval(table).dtype,
         GDt::BF16,
         "an embedding table must stay BF16 on wgpu: the typed walk uploads it as packed u32 lanes"
     );
     assert!(
-        !prepared
+        !folded
             .eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Cast { .. })),
-        "the fold plus the narrowed retype leave no widening cast"
+        "the fold leaves no widening cast"
     );
 
     // The un-folded traced shape (a plain `Gather` of the BF16 table): the table is not a packed-lane
@@ -6097,9 +5981,7 @@ fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
         &Default::default(),
         id
     ));
-    let prepared =
-        widen_mismatched_matmul_dtypes(&unfolded, &default_caps_for(Backend::SpirvVulkan)).unwrap();
-    assert_eq!(prepared.aval(id).dtype, GDt::BF16);
+    assert_eq!(unfolded.aval(id).dtype, GDt::BF16);
 }
 
 /// Card 381. On wgpu the row gather plans to the imported packed kernel as a plain dispatch with no
@@ -6612,13 +6494,13 @@ fn attn_scores_v_graph(hq: usize, cap: usize, d: usize) -> Graph {
 
 /// Card 727 SC-005, plan side: a contraction plan whose body sizes its LDS reduction by its baked
 /// width keeps that width through the planner's launch shaping, by its request type. The fixture is the decode
-/// attention GEMV (`lds_gemv_width` lanes) on a device whose X grid holds a single workgroup, so the generic bump
+/// attention GEMV (`lds_gemv_width` lanes) on a device whose X grid holds a single workgroup, so the widening
 /// (raise a one-thread-per-output body to 256 lanes when `out_numel / width` passes the X cap) would fire; the
 /// plan keeps `lds_gemv_width` and an LDS array of exactly that many lanes. The device half (the result equals the
 /// oracle) is `a_contraction_keeps_its_lds_width_through_the_planner_*` in `poot-wgpu-device` and `poot-rocm-device`.
 ///
-/// Mutation: in `kernel_mapping::shape_launch` drop the request-type exemption (`contraction = false`); the
-/// workgroup becomes 256 and this row goes red.
+/// Mutation: make `KernelRequest::launch` (poot-kernelgen `request.rs`) declare `Elementwise { workgroup_x: 1 }`
+/// for `Contraction` requests; planning refuses with `WorkgroupNotDeclared` and this row goes red.
 #[test]
 fn a_contraction_plan_keeps_its_lds_width_through_the_planner() {
     let g = attn_scores_v_graph(4, 64, 64);
@@ -6697,12 +6579,11 @@ fn bf16_projection_contraction_choice(
 /// POOT-739 SC-006, at planning: through `compile`, a BF16 decode projection (M == 1) whose weight is held in
 /// checkpoint `[N, K]` order plans the generated dense Gemv on every backend. The same projection over a
 /// `[K, N]` weight is a typed `DtypeLowering` refusal on SPIR-V and ROCm (the retired column-tile body was its
-/// only lowering; a per-column Gemv over BF16 would read `[K, N]` at a stride of `N` per lane), and on NVPTX the
-/// weight is widened to f32 and the projection plans the f32 serial contraction, never the BF16 dense Gemv.
-/// Mutation: in `dtype_widen::matmul_bf16_column_gemv` return `false`; the weight is widened by a Cast, the
-/// projection plans the f32 serial contraction and this row goes red.
+/// only lowering; a per-column Gemv over BF16 would read `[K, N]` at a stride of `N` per lane), and the same on
+/// NVPTX: no backend widens the weight (POOT-1628). Mutation: drop the operand-dtype guard in
+/// `planner/matmul.rs`; the projection plans an f32 contraction over the BF16 weight and the `[K, N]` rows go red.
 #[test]
-fn a_k_by_n_bf16_decode_projection_is_refused_on_the_packed_lane_backends() {
+fn a_k_by_n_bf16_decode_projection_is_refused_on_every_backend() {
     let (k, n) = (896, 256);
     for backend in [
         Backend::SpirvVulkan,
@@ -6721,27 +6602,14 @@ fn a_k_by_n_bf16_decode_projection_is_refused_on_the_packed_lane_backends() {
             "{backend:?} [N, K]: {nk:?}"
         );
         let kn = bf16_projection_contraction_choice(backend, false, k, n);
-        if backend == Backend::Nvptx {
-            let kn = kn.unwrap_or_else(|e| panic!("{backend:?} [K, N]: {e}"));
-            assert!(
-                matches!(
-                    kn,
-                    KernelChoice::Generated(KernelRequest::Contraction(
-                        ContractionSpec::Serial { .. }
-                    ))
-                ),
-                "{backend:?} [K, N]: {kn:?}"
-            );
-        } else {
-            assert!(
-                matches!(
-                    &kn,
-                    Err(CompileError::Plan(e))
-                        if matches!(&**e, PlanError::Refused(r) if r.missing == Capability::DtypeLowering)
-                ),
-                "{backend:?} [K, N]: expected a DtypeLowering refusal, got {kn:?}"
-            );
-        }
+        assert!(
+            matches!(
+                &kn,
+                Err(CompileError::Plan(e))
+                    if matches!(&**e, PlanError::Refused(r) if r.missing == Capability::DtypeLowering)
+            ),
+            "{backend:?} [K, N]: expected a DtypeLowering refusal, got {kn:?}"
+        );
     }
 }
 

@@ -753,8 +753,8 @@ pub fn fuse(g: &Graph, rows: RowOutputs) -> Result<Graph, EditError> {
 /// step is claimed by the first chain that reaches it.
 ///
 /// Near misses stay as they were: a head with two consumers, a reducing or reshaping consumer, a step that
-/// changes the shape or the dtype, and a head `head_lowers` refuses (the planner has no epilogue lowering
-/// for it on the target: a tensor-core `MatMul`).
+/// changes the shape or the dtype, and a head `head_lowers` refuses (the planner's schedule for it takes no
+/// epilogue).
 pub(crate) fn fuse_contraction_epilogues(
     g: &Graph,
     head_lowers: impl Fn(&Graph, &Eqn) -> bool,
@@ -782,9 +782,6 @@ pub(crate) fn fuse_contraction_epilogues(
         let Some(contraction) = epilogue_head(g, head) else {
             continue;
         };
-        if !head_lowers(g, head) {
-            continue;
-        }
         let head_ty = g.aval(head.out);
         let mut chain: Vec<usize> = Vec::new();
         let mut current = head.out;
@@ -805,6 +802,10 @@ pub(crate) fn fuse_contraction_epilogues(
         let Some(&root) = chain.last() else {
             continue;
         };
+        // Asked only of a head with a chain to fuse: the answer plans the head.
+        if !head_lowers(g, head) {
+            continue;
+        }
         // The region's inputs: the head result (local 0), then every other value the chain reads, in order. A
         // single-use `Broadcast` of a value is read through: the leaf is its source, which the epilogue reads
         // at the output element's broadcast position, so the expanded copy (or a view of it) is never made.
@@ -924,8 +925,8 @@ fn epilogue_head(g: &Graph, eqn: &Eqn) -> Option<ContractionHead> {
             weight: *weight,
             precision: *precision,
         }),
-        // A plain (`Blocks(1)`) or indexed contraction: the packed Gemv carries an epilogue, the tiled one does not
-        // (`epilogue_head_lowers` decides per shape).
+        // A plain or indexed contraction: both packed schedules carry an epilogue (`epilogue_head_lowers` asks the
+        // planned request).
         OpKind::PackedContraction {
             descriptor,
             rows: rows @ (ContractionRows::Blocks(1) | ContractionRows::Indexed { .. }),

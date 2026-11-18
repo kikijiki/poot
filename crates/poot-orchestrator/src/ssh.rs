@@ -82,6 +82,8 @@ pub(crate) fn kill_process_group(pgid: i32, sig: i32) {
         #[link_name = "killpg"]
         fn libc_killpg(pgrp: i32, sig: i32) -> i32;
     }
+    // SAFETY: `killpg` takes two integers and no pointers; a stale or invalid group id makes it fail with
+    // `ESRCH` or `EPERM`, which is ignored on purpose (the group may already be gone).
     unsafe {
         libc_killpg(pgid, sig);
     }

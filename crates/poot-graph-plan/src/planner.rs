@@ -23,7 +23,7 @@ use poot_kernelgen::BodyLimits;
 use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps};
 
 use crate::dtype_widen::ConstLanes;
-use crate::predicates::check_operand_layouts;
+use crate::predicates::{LayoutDemand, check_operand_layouts};
 use crate::{
     Binding, Capability, CompileError, ImportedKernel, Plan, PlanError, ScratchId, Sink, Source,
     Target, compute_views, numel, value_ids,
@@ -119,6 +119,15 @@ impl Lowering<'_> {
         match self {
             Lowering::Gpu { backend, .. } => backend.into(),
             Lowering::Aie(target) => target.into(),
+        }
+    }
+
+    /// The workgroup a flat launch of `threads` threads runs at: the narrowest that clears the device's grid
+    /// cap. A sequential core has no grid, so it has no wide form.
+    pub(crate) fn workgroup(self, threads: usize) -> poot_kernelgen::Workgroup {
+        match self {
+            Lowering::Gpu { caps, .. } => poot_kernelgen::Workgroup::for_threads(threads, caps),
+            Lowering::Aie(_) => poot_kernelgen::Workgroup::Narrow,
         }
     }
 }
@@ -829,6 +838,36 @@ fn admit_dtypes(op: &OpKind, dtypes: StorageDtypes, caps: &DeviceCaps) -> Result
         // An unfolded `Iota` and an imported op are refused (or routed) by their own arms, before any dtype
         // rule applies.
         OpKind::Iota { .. } | imported_ops!() | side_output_ops!() => Ok(()),
+    }
+}
+
+/// The layout demand of value operand `position` of `eqn` (an index into `eqn.inputs`): the one function behind
+/// view promotion ([`compute_views`]), the bar loop, the planner families and the compile invariant
+/// ([`check_operand_layouts`]). A literal reads nothing. Like [`admit_dtypes`] it only routes, over the same
+/// family partition `plan_gpu_eqn` dispatches on: each family that reads a value through a layout answers in its
+/// own module (`layout_demand`, next to the arm that reads it), and every other family reads its operands flat,
+/// stated here so a new family is a compile error until it says which it is.
+pub(crate) fn operand_demand(g: GraphTables<'_>, eqn: &Eqn, position: usize) -> LayoutDemand {
+    let Some(Operand::Value(value)) = eqn.inputs.get(position) else {
+        return LayoutDemand::Dense;
+    };
+    match &eqn.op {
+        elementwise_ops!() => elementwise::layout_demand(g, eqn, *value),
+        movement_ops!() => movement::layout_demand(g, eqn, *value),
+        moe_ops!() => moe::layout_demand(eqn, position, *value),
+        // These read their operands flat: a contraction, an attention, a scan, a selection, a cast, a sampler,
+        // a packed payload and a side output's region.
+        packed_ops!()
+        | imported_ops!()
+        | matmul_ops!()
+        | attention_ops!()
+        | scan_ops!()
+        | block_top_k_ops!()
+        | stable_rank_ops!()
+        | cast_ops!()
+        | sampling_ops!()
+        | side_output_ops!()
+        | OpKind::Iota { .. } => LayoutDemand::Dense,
     }
 }
 

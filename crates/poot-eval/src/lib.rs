@@ -10,6 +10,11 @@
 //! scalar index is read back via `round`. [`Value`] is the typed storage-aware entry point, which also
 //! carries the E4M3FN and packed-quant executor slices.
 
+#![expect(
+    unsafe_code,
+    reason = "operand storage is filled element by element and then assumed initialised"
+)]
+
 pub mod exact_bf16;
 pub mod exact_value;
 pub mod fp8;

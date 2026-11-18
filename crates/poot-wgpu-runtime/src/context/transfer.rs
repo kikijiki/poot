@@ -23,12 +23,17 @@ pub struct ContextOptions {
     /// How long a wait for the device may take before the context counts it as hung: the wait then
     /// fails with [`RuntimeError::WaitTimeout`] and poisons the context.
     pub wait_timeout: std::time::Duration,
+    /// Print every link of an uncaptured wgpu error (a deferred validation error that has no label to name
+    /// its resource) before the process panics on it. It only adds detail to a fatal error: wgpu's own
+    /// handler panics, and this one re-raises, so it never decides whether an error is fatal.
+    pub uncaptured_error_diagnostics: bool,
 }
 
 impl Default for ContextOptions {
     fn default() -> Self {
         Self {
             wait_timeout: std::time::Duration::from_secs(600),
+            uncaptured_error_diagnostics: false,
         }
     }
 }

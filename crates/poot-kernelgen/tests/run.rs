@@ -233,13 +233,10 @@ fn synthesized_kernels_compile_to_valid_ptx() {
 }
 
 fn ctx() -> Option<Context> {
-    match Context::new() {
-        Ok(c) => Some(c),
-        Err(e) => {
-            poot_test_util::skip_report("poot-kernelgen", &format_args!("no wgpu context: {e}"));
-            None
-        }
-    }
+    poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        Context::new(),
+    )
 }
 
 #[test]
@@ -1328,6 +1325,115 @@ fn dense_tiled_epilogue_is_bit_exact_against_the_unfused_chain() {
             );
         }
     }
+}
+
+/// POOT-1626: the register-tiled body over a weight slab per batch entry (`blocks > 1`, the per-expert and prefill
+/// attention matmuls) carries the epilogue like the shared-weight body: `out = (A @ B + bias) + residual` through
+/// the body's epilogue equals the same body without one followed by the two f32 adds on the host, bit for bit,
+/// for three blocks of a ragged row tile.
+///
+/// Mutation: drop the epilogue from the store chain of `tiled_body` (`contraction/tiled.rs`): the fused output is
+/// the plain product and this row goes red.
+#[test]
+fn batched_dense_tiled_epilogue_is_bit_exact_against_the_unfused_chain() {
+    let Some(ctx) = ctx() else { return };
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
+    let limits = kg::BodyLimits {
+        max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
+    };
+    let (blocks, m, k, n) = (3usize, 5usize, 32usize, 24usize);
+    let tiling = kg::RegisterTiling::choose(
+        kg::TiledShape {
+            blocks,
+            m_per_block: m,
+            out_per_block: n,
+            k,
+            layout: kg::WeightLayout::Kn,
+            rows: poot_kernelgen::TiledRows::Dense,
+            terms: poot_kernelgen::StagedTerms::ONE,
+            weight: kg::StagedWeight::Dense {
+                bits: kg::DenseTiledWeight::KnF32.bits(),
+            },
+            activation_bits: 32,
+        },
+        &caps,
+    );
+    let (tile_rows, tile_cols) = tiling.output_tile();
+    let tiles = blocks * m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
+    let lanes = tiling.workgroup_lanes();
+    let request = |epilogue: Option<kg::Epilogue>| {
+        kg::KernelRequest::Contraction(kg::ContractionSpec::DenseTiled(kg::DenseTiledContraction {
+            weight: kg::DenseTiledWeight::KnF32,
+            schedule: tiling.schedule(),
+            epilogue,
+            grid: [(tiles * lanes) as u32, 1, 1],
+            meta: vec![k as u32, n as u32, m as u32, tiles as u32, 0],
+            precision: poot_graph_ir::OperandPrecision::Exact,
+            activation_stored: None,
+        }))
+    };
+    let run = |epilogue: Option<kg::Epilogue>, inputs: &[&[f32]]| -> Vec<f32> {
+        let generated = kg::generate(&request(epilogue), &caps, &limits)
+            .expect("the batched request generates");
+        let s = spv(&generated.body, "batched_dense_tiled_epilogue");
+        let mut bufs: Vec<KernelBuffer> = inputs
+            .iter()
+            .map(|input| KernelBuffer::read_only_f32(input))
+            .collect();
+        bufs.push(KernelBuffer::read_only_u32(
+            generated.launch.meta.as_deref().expect("tiled metadata"),
+        ));
+        bufs.push(KernelBuffer::write_f32(blocks * m * n));
+        ctx.dispatch(
+            "test",
+            &s,
+            generated.body.workgroup_size,
+            generated.launch.grid,
+            &mut bufs,
+        )
+        .unwrap();
+        bufs.pop().unwrap().as_f32().to_vec()
+    };
+    let a = fill_unit(1, blocks * m * k);
+    let b = fill_unit(2, blocks * k * n);
+    let bias = fill_unit(3, n);
+    let residual = fill_unit(4, blocks * m * n);
+    let epilogue = kg::Epilogue {
+        dt: Ty::F32,
+        out_shape: vec![blocks, m, n],
+        leaves: [vec![n], vec![blocks, m, n]]
+            .into_iter()
+            .map(|shape| kg::EpilogueLeaf {
+                shape,
+                storage: None,
+            })
+            .collect(),
+        steps: vec![
+            kg::EpilogueStep {
+                op: kg::FusedScalarOp::Binary(BinOp::Add),
+                inputs: vec![kg::EpilogueInput::Head, kg::EpilogueInput::Leaf(0)],
+            },
+            kg::EpilogueStep {
+                op: kg::FusedScalarOp::Binary(BinOp::Add),
+                inputs: vec![kg::EpilogueInput::Step(0), kg::EpilogueInput::Leaf(1)],
+            },
+        ],
+        output: kg::EpilogueInput::Step(1),
+    };
+    let fused = run(Some(epilogue), &[&a, &b, &bias, &residual]);
+    let head = run(None, &[&a, &b]);
+    let unfused: Vec<f32> = head
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h + bias[i % n]) + residual[i])
+        .collect();
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<u32>>();
+    assert_eq!(
+        bits(&fused),
+        bits(&unfused),
+        "the batched fused epilogue differs from the unfused chain"
+    );
 }
 
 /// Deterministic values in `[-0.2, 0.2)` from a xorshift stream.

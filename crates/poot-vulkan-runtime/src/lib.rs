@@ -63,7 +63,7 @@
 //! after a timed-out wait); and every `unsafe` block states the invariant it relies on in a `SAFETY:`
 //! comment (denied below).
 
-#![deny(clippy::undocumented_unsafe_blocks)]
+#![expect(unsafe_code, reason = "raw Vulkan FFI through ash and device memory")]
 
 mod buffer;
 mod context;

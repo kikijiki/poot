@@ -4,6 +4,11 @@
 //! The parent is this very test binary re-run as `parent_role` (a no-op unless `ROLE_ENV` names the
 //! lock file), so the row can SIGKILL a real parent process, which `Drop` cannot survive.
 
+#![expect(
+    unsafe_code,
+    reason = "the row locks files and signals the processes it spawned"
+)]
+
 use poot_test_util::contained_child::ContainChild;
 use std::fs::File;
 use std::io::{BufRead, BufReader};

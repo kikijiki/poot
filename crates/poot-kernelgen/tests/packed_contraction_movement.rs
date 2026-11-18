@@ -943,8 +943,10 @@ fn device_bank(device: &mut Device<'_>) {
 #[test]
 fn the_movement_bank_matches_the_reference_on_wgpu() {
     use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
-    let Ok(ctx) = poot_wgpu_runtime::Context::new() else {
-        poot_test_util::skip_report("poot-kernelgen", &"no wgpu context");
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        poot_wgpu_runtime::Context::new(),
+    ) else {
         return;
     };
     let dir = std::env::temp_dir().join("poot-kernelgen-movement-wgpu");
@@ -994,8 +996,11 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
     use poot_target::ElementKind;
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
-        Err(RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent) => {
-            poot_test_util::skip_report("poot-kernelgen", &"no ROCm device");
+        Err(error @ (RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent)) => {
+            poot_runtime_common::device_skip::open_or_skip::<(), _>(
+                poot_runtime_common::DeviceBackend::Rocm,
+                Err(error),
+            );
             return;
         }
         Err(error) => panic!("{error}"),
@@ -1060,8 +1065,10 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
 fn the_movement_bank_matches_the_reference_on_ptx() {
     use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
     use poot_ptx_runtime::PtxContext;
-    let Ok(ctx) = PtxContext::new() else {
-        poot_test_util::skip_report("poot-kernelgen", &"no PTX device");
+    let Some(ctx) = poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Ptx,
+        PtxContext::new(),
+    ) else {
         return;
     };
     let dir = std::env::temp_dir().join("poot-kernelgen-movement-ptx");

@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [features]
 # ADR-0113: `ReplayGraph::segment_count`, which poot-vulkan-device's executor-contract test reads; no production
@@ -30,6 +31,8 @@ poot-runtime-common.workspace = true
 [dev-dependencies]
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
 poot-test-util.workspace = true
+# `device_skip`: a device test that finds no device skips, or fails when the lane requires the backend.
+poot-runtime-common = { workspace = true, features = ["test-support"] }
 
 [[bin]]
 name = "poot-vulkan-check"

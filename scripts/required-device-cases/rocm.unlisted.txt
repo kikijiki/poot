@@ -63,5 +63,4 @@ poot-rocm-runtime	tests::ring_writer_completion_signal_rides_only_the_final_pack
 poot-rocm-runtime	tests::ring_writer_device_store_fence_issues_the_architecture_fence	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	tests::ring_writer_gives_each_timed_packet_its_own_completion_signal	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	tests::ring_writer_write_body_uses_the_shared_body_writer	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
-poot-rocm-runtime	tests::rocm_context_open_is_required_by_its_own_variable_only	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	tests::the_queue_error_callback_records_the_fault_and_poisons	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
