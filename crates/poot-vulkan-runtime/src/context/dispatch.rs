@@ -24,6 +24,7 @@ impl Context {
             .iter()
             .map(|&buffer| Binding {
                 buffer,
+                offset: 0,
                 elems: buffer.native_elems(),
             })
             .collect();

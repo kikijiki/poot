@@ -56,6 +56,16 @@ impl Db {
         Ok(())
     }
 
+    /// Record a pod RunPod no longer lists as `terminated`, keeping `updated_at`: the dashboard ends the pod's
+    /// billing span there, so the time it was found gone must not stretch it. False when it was already terminated.
+    pub(crate) fn mark_pod_gone(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE pods SET status='terminated' WHERE id=?1 AND status != 'terminated'",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub(crate) fn set_pod_endpoint(&self, id: &str, host: &str, port: u16) -> Result<()> {
         self.conn.execute(
             "UPDATE pods SET ssh_host=?2, ssh_port=?3, updated_at=?4 WHERE id=?1",

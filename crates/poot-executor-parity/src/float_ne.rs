@@ -52,15 +52,18 @@ pub fn check<D: Device>(backend: &str, device: &mut D, kernel: &D::Kernel) {
             inputs: &[
                 Arg {
                     buffer: &a,
+                    offset: 0,
                     elems: n,
                 },
                 Arg {
                     buffer: &b,
+                    offset: 0,
                     elems: n,
                 },
             ],
             output: Arg {
                 buffer: &out,
+                offset: 0,
                 elems: n,
             },
             launch: LaunchKind::Grid {

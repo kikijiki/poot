@@ -467,7 +467,13 @@ mod tests {
         backend: Backend,
         caps: &DeviceCaps,
     ) -> Result<StateCommitPlan, PlanError> {
-        let views = compute_views(g, backend);
+        let views = compute_views(
+            g,
+            &crate::Target::Gpu {
+                backend,
+                caps: *caps,
+            },
+        );
         let aliases: Vec<Option<ValueId>> = g
             .eqns()
             .iter()

@@ -7,9 +7,10 @@
 //! generator copies bits either way, so no storage is decoded or re-encoded on the way.
 
 use super::{
-    BodyLimits, Capability, ContractionHead, DType, Eqn, HashMap, KernelRequest, OpKind, Operand,
-    PlanError, Planned, Scalar, ValueId, fty_ty, numel, value_ids,
+    BodyLimits, Capability, ContractionHead, DType, Eqn, KernelRequest, OpKind, Operand, PlanError,
+    Planned, Scalar, ValueId, fty_ty, numel, value_ids,
 };
+use crate::Views;
 use crate::planner::{GraphTables, Layout, Lowering, OutputBuffer, StorageDtypes};
 use crate::predicates::{
     ELEMENTWISE_2D_WIDTH, LayoutDemand, compose_movement, is_elementwise_2d_in,
@@ -129,7 +130,7 @@ pub(super) fn plan(
     out_shape: &[usize],
     out_numel: usize,
     backend: Backend,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
@@ -173,9 +174,10 @@ pub(super) fn plan(
     let copy = || {
         let input = ids[0];
         let in_shape = shape(input);
+        // The input's residual layout: the copy's kernel is bound to the input at the input's own `bound`.
         let in_layout = views
             .get(&input)
-            .cloned()
+            .map(|view| view.layout.clone())
             .unwrap_or_else(|| Layout::contiguous(&in_shape));
         let from = compose_movement(&eqn.op, &in_shape, &in_layout, out_shape)
             .ok_or_else(|| site.refuse(Capability::OperandLayout { value: input }))?;
@@ -214,7 +216,7 @@ pub(super) fn plan(
         // (`compute_views`); a reshape of a dense value is the buffer itself. A reshape that is not promoted
         // but reads a view (its value must be dense) is the one copy of the chain.
         OpKind::Reshape { .. } => match view {
-            Some(layout) => Planned::view(ids[0], layout.clone()),
+            Some(view) => Planned::view(ids[0], view),
             None if views.contains_key(&ids[0]) => copy()?,
             None => Planned::alias(ids[0]),
         },
@@ -255,10 +257,10 @@ pub(super) fn plan(
         }
         OpKind::Transpose { perm } => {
             refuse_zero(out_shape.contains(&0))?;
-            if let Some(layout) = view {
-                // spec 132 phase 1: `compute_views` already proved every consumer of this value reads a layout
-                // (and this backend is SpirvVulkan): no dispatch, no materialize copy.
-                Planned::view(ids[0], layout.clone())
+            if let Some(view) = view {
+                // spec 132 phase 1: `compute_views` already proved every consumer of this value reads it through
+                // the split it carries: no dispatch, no materialize copy.
+                Planned::view(ids[0], view)
             } else if packed && perm.iter().copied().eq(0..perm.len()) {
                 Planned::alias(ids[0])
             } else {
@@ -267,9 +269,9 @@ pub(super) fn plan(
         }
         OpKind::Slice { axis, start, end } => {
             refuse_zero(out_shape.contains(&0))?;
-            if let Some(layout) = view {
+            if let Some(view) = view {
                 // spec 132 phase 1: see the Transpose view arm above.
-                Planned::view(ids[0], layout.clone())
+                Planned::view(ids[0], view)
             } else if packed && *start == 0 && *end == shape(ids[0])[*axis] {
                 Planned::alias(ids[0])
             } else {
@@ -278,9 +280,9 @@ pub(super) fn plan(
         }
         OpKind::Broadcast { .. } => {
             refuse_zero(out_shape.contains(&0))?;
-            if let Some(layout) = view {
+            if let Some(view) = view {
                 // spec 132 phase 1: see the Transpose view arm above.
-                Planned::view(ids[0], layout.clone())
+                Planned::view(ids[0], view)
             } else if packed && shape(ids[0]) == out_shape {
                 Planned::alias(ids[0])
             } else {
@@ -295,7 +297,7 @@ pub(super) fn plan(
                     source: view_source_shape(g, views, id),
                     from: views
                         .get(&id)
-                        .cloned()
+                        .map(|view| view.layout.clone())
                         .unwrap_or_else(|| Layout::contiguous(&shape(id))),
                 })
                 .collect();

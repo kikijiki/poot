@@ -117,6 +117,7 @@ impl<D: Device> Device for ShortActivations<D> {
             .iter()
             .map(|arg| Arg {
                 buffer: arg.buffer,
+                offset: arg.offset,
                 elems: arg.elems,
             })
             .collect();
@@ -125,6 +126,7 @@ impl<D: Device> Device for ShortActivations<D> {
             inputs: &inputs,
             output: Arg {
                 buffer: d.output.buffer,
+                offset: d.output.offset,
                 elems: d.output.elems,
             },
             launch: d.launch,

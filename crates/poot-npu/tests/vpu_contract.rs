@@ -143,7 +143,11 @@ fn a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs() {
     let out = alloc(&mut device, f16, N);
     let wide = alloc(&mut device, BufferStorage::f32(), N);
     let honest = LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest));
-    let arg = |buffer, elems| Arg { buffer, elems };
+    let arg = |buffer, elems| Arg {
+        buffer,
+        offset: 0,
+        elems,
+    };
 
     device.begin().unwrap();
     let mut dispatch = |launch: LaunchKind, inputs: &[Arg<'_, VpuDevice>], output| {
@@ -284,15 +288,18 @@ fn a_replay_that_misses_its_deadline_poisons_the_device() {
             inputs: &[
                 Arg {
                     buffer: &buffers[0],
+                    offset: 0,
                     elems: n,
                 },
                 Arg {
                     buffer: &buffers[1],
+                    offset: 0,
                     elems: n,
                 },
             ],
             output: Arg {
                 buffer: &buffers[2],
+                offset: 0,
                 elems: n,
             },
             launch: LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest)),
@@ -535,10 +542,12 @@ fn an_argument_a_recorded_execution_writes_is_range_checked_as_its_result() {
                 kernel: &kernel,
                 inputs: &[Arg {
                     buffer: input,
+                    offset: 0,
                     elems: N,
                 }],
                 output: Arg {
                     buffer: output,
+                    offset: 0,
                     elems: N,
                 },
                 launch,
@@ -628,10 +637,12 @@ fn a_constant_is_range_checked_at_its_upload_and_not_on_every_replay() {
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &weight,
+                offset: 0,
                 elems: N,
             }],
             output: Arg {
                 buffer: &out,
+                offset: 0,
                 elems: N,
             },
             launch: LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest)),

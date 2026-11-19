@@ -16,6 +16,20 @@ pub enum RuntimeError {
     /// release-build error before any submission.
     #[error("kernel argument schema violation: {0}")]
     KernelArgs(#[from] poot_codegen::KernelArgError),
+    /// A buffer was bound to kernel parameter `param` at a byte offset that is not a multiple of the device's
+    /// `min_storage_buffer_offset_alignment`, which wgpu would refuse in validation: a typed error before
+    /// anything is recorded (POOT-1572).
+    #[error(
+        "parameter {param} is bound at byte offset {offset}, not a multiple of the device's storage binding alignment {alignment}"
+    )]
+    MisalignedBinding {
+        /// The kernel parameter, inputs in order, then the output.
+        param: usize,
+        /// The offending byte offset.
+        offset: u64,
+        /// The device's binding alignment, bytes.
+        alignment: u64,
+    },
     /// wgpu found no adapter it can drive; the payload is the request failure's message.
     #[error("no Vulkan adapter: {0}")]
     NoAdapter(String),

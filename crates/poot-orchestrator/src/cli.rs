@@ -133,7 +133,10 @@ pub(crate) enum Command {
     Run(RunArgs),
     /// Terminate orphaned pods (our name prefix) not tied to an in-progress run. Safe to run anytime.
     Reap(ReapArgs),
-    /// Show recent runs and their phase.
+    /// Record pods RunPod no longer lists as terminated, and finalize expired warm runs whose pod is gone. State
+    /// DB only: nothing is deleted at RunPod. A failed list changes nothing.
+    Reconcile,
+    /// Show recent runs and their phase (first reconciling the DB with RunPod when an API key is set).
     Status,
     /// Serve a read-only web dashboard (runs + phases + per-model progress) over the state DB.
     Serve(ServeArgs),

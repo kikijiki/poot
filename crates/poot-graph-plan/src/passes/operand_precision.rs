@@ -76,7 +76,7 @@ pub fn with_operand_precision(
             // folds expose the dense readers), so the oracle's graph folds them the same way first.
             let graph = exposed_readers(g)?;
             let limits = CompileLimits::STANDARD.body();
-            let views = compute_views(&graph, target.id());
+            let views = compute_views(&graph, target);
             select_operand_precision(&graph, policy, units, |graph, eqn| {
                 crate::planner::runs_on_matrix_unit(graph, eqn, target, &views, &limits, None, None)
             })

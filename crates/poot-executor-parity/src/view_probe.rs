@@ -45,10 +45,12 @@ pub fn an_arena_slot_is_bound_only_through_a_view_it_admits<D: Device>(
                 kernel: len_probe,
                 inputs: &[Arg {
                     buffer: input,
+                    offset: 0,
                     elems: 4,
                 }],
                 output: Arg {
                     buffer: &out,
+                    offset: 0,
                     elems: 1,
                 },
                 launch: LaunchKind::Grid {

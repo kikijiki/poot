@@ -26,8 +26,8 @@ use poot_executor::{
 };
 use poot_graph_plan::Target;
 use poot_rocm_runtime::{
-    BatchedDispatch, BoundKernarg, DispatchSpan, KernelHandle, RocmBuffer, RocmContext,
-    RocmContextOptions, RocmError,
+    BatchedDispatch, BoundKernarg, DispatchSpan, KernargSlot, KernelHandle, RocmBuffer,
+    RocmContext, RocmContextOptions, RocmError,
 };
 use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
 use poot_target::{AmdArch, Backend, BufferStorage, ElementKind, TargetId};
@@ -178,10 +178,10 @@ impl RocmDevice {
     fn bind_kernarg(
         &self,
         kernel: &KernelHandle,
-        in_bufs: &[(&RocmBuffer, u64)],
-        out_buf: (&RocmBuffer, u64),
+        in_bufs: &[KernargSlot<'_>],
+        out_buf: KernargSlot<'_>,
     ) -> Result<BoundKernarg, RocmGpuError> {
-        let slots: Vec<(&RocmBuffer, u64)> = in_bufs.iter().copied().chain([out_buf]).collect();
+        let slots: Vec<KernargSlot<'_>> = in_bufs.iter().copied().chain([out_buf]).collect();
         Ok(self.ctx.bind_kernarg(kernel, &slots)?)
     }
 }
@@ -314,17 +314,15 @@ impl Device for RocmDevice {
         // Card 547b: each argument's own logical element count from the plan, never
         // the bound buffer's `elem_count()` (an arena slot's buffer is sized to its largest
         // occupant, which can exceed this particular dispatch's operand).
-        let in_pairs: Vec<(&RocmBuffer, u64)> = d
-            .inputs
-            .iter()
-            .map(|a: &Arg<'_, Self>| (a.buffer, a.elems as u64))
-            .collect();
-        let out_buf = d.output.buffer;
-        let kernarg = self.bind_kernarg(
-            &d.kernel.kernel,
-            &in_pairs,
-            (out_buf, d.output.elems as u64),
-        )?;
+        fn slot<'a>(a: &Arg<'a, RocmDevice>) -> KernargSlot<'a> {
+            KernargSlot {
+                buffer: a.buffer,
+                offset: a.offset,
+                len: a.elems as u64,
+            }
+        }
+        let in_slots: Vec<KernargSlot<'_>> = d.inputs.iter().map(slot).collect();
+        let kernarg = self.bind_kernarg(&d.kernel.kernel, &in_slots, slot(&d.output))?;
         let mut elements: Vec<ElementKind> = in_bufs.iter().map(|b| b.element()).collect();
         elements.push(d.output.buffer.element());
         let (grid, block) = padded_launch(threads, workgroup);
@@ -357,7 +355,11 @@ impl Device for RocmDevice {
         let words = src_bytes / 4;
         let threads = u32::try_from(words).map_err(|_| RocmGpuError::CopyTooLarge { words })?;
         let words = words as u64;
-        let kernarg = self.bind_kernarg(&copy.kernel.kernel, &[(src, words)], (dst, words))?;
+        let kernarg = self.bind_kernarg(
+            &copy.kernel.kernel,
+            &[KernargSlot::at_base(src, words)],
+            KernargSlot::at_base(dst, words),
+        )?;
         let (grid, block) = padded_launch([threads, 1, 1], copy.workgroup);
         let aql = CapturedAql {
             kernel: copy.kernel.kernel.clone(),

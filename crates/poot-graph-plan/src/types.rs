@@ -745,16 +745,24 @@ pub enum Plan {
     Dispatches(DispatchPlan),
     /// The output aliases the given input value's buffer (reshape).
     Alias(ValueId),
-    /// The output is a strided view of `src`'s buffer (spec 132): no dispatch, like [`Plan::Alias`], but
-    /// with its own (possibly non-row-major) `strides` and element `offset`. Emitted only when every
-    /// consumer can read a layout (`operand_demand`); see `compute_views`. A Reshape of a dense
-    /// value lowers to `Plan::Alias`; this variant is for Transpose/Slice/Broadcast and a Reshape of a view.
+    /// The output is a view of `src`'s buffer (spec 132, POOT-1566): no dispatch, like [`Plan::Alias`], but with
+    /// its own (possibly non-row-major) `strides` and a position in the root. Emitted only where every consumer
+    /// reads it: a consumer of layouts, or a flat reader of a dense view whose root the executor binds at the view's
+    /// own start (`operand_demand`); see `compute_views`. A Reshape of a dense value lowers to `Plan::Alias`; this
+    /// variant is for Transpose/Slice/Broadcast and a Reshape of a view.
+    ///
+    /// The view's position in its root's buffer is split once ([`ViewBinding`](crate::ViewBinding)): the executor
+    /// binds the root `bound` bytes in, and every consumer bakes the residual `offset`.
     View {
         /// The value whose buffer the view reads.
         src: ValueId,
+        /// Byte offset at which the executor binds the root buffer for every reader of this view: a multiple of
+        /// the target's binding alignment, from the root's first byte.
+        bound: u64,
         /// Element strides of the view, per output axis.
         strides: Vec<usize>,
-        /// Element offset of the view's first element in the source buffer.
+        /// Element offset of the view's first element past `bound` (what the root's binding leaves of the view's
+        /// own offset; zero for a view that starts on the alignment).
         offset: usize,
     },
     /// The equation lowers to a node of the target's graph artifact (an Intel NPU's vendor-compiled graph) and

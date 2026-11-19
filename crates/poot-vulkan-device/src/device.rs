@@ -265,6 +265,7 @@ impl Device for VulkanDevice {
             .chain(std::iter::once(&d.output))
             .map(|a: &Arg<'_, Self>| Binding {
                 buffer: a.buffer,
+                offset: a.offset,
                 elems: a.elems,
             })
             .collect();

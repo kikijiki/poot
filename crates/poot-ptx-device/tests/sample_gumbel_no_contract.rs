@@ -114,15 +114,13 @@ fn gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle() {
         &kernel,
         [64, 1, 1],
         [64, 1, 1],
-        &[&logits_buf, &noise_buf, &params_buf, &dims_buf],
         &[
-            logits_buf.elem_count(),
-            noise_buf.elem_count(),
-            params_buf.elem_count(),
-            dims_buf.elem_count(),
+            poot_ptx_runtime::PtxBinding::at_base(&logits_buf, logits_buf.elem_count()),
+            poot_ptx_runtime::PtxBinding::at_base(&noise_buf, noise_buf.elem_count()),
+            poot_ptx_runtime::PtxBinding::at_base(&params_buf, params_buf.elem_count()),
+            poot_ptx_runtime::PtxBinding::at_base(&dims_buf, dims_buf.elem_count()),
         ],
-        &out_buf,
-        out_buf.elem_count(),
+        poot_ptx_runtime::PtxBinding::at_base(&out_buf, out_buf.elem_count()),
     )
     .expect("dispatch sample_gumbel_argmax_batched on PTX");
     let got = ctx.download_i32(&out_buf).expect("download out");

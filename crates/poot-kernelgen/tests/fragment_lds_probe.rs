@@ -520,7 +520,9 @@ fn fragment_probes_match_the_host_reference_on_rocm() {
             let buffers = [&a, &b, &c0, &result];
             let slots: Vec<_> = buffers
                 .iter()
-                .map(|buffer| (*buffer, buffer.elem_count() as u64))
+                .map(|buffer| {
+                    poot_rocm_runtime::KernargSlot::at_base(buffer, buffer.elem_count() as u64)
+                })
                 .collect();
             let elements = [
                 st.element(),
@@ -583,10 +585,12 @@ fn fragment_probes_match_the_host_reference_on_ptx() {
                 &kernel,
                 body.workgroup_size,
                 body.workgroup_size,
-                &[&a, &b, &c0],
-                &[a.elem_count(), b.elem_count(), c0.elem_count()],
-                &result,
-                result.elem_count(),
+                &[
+                    poot_ptx_runtime::PtxBinding::at_base(&a, a.elem_count()),
+                    poot_ptx_runtime::PtxBinding::at_base(&b, b.elem_count()),
+                    poot_ptx_runtime::PtxBinding::at_base(&c0, c0.elem_count()),
+                ],
+                poot_ptx_runtime::PtxBinding::at_base(&result, result.elem_count()),
             )
             .unwrap_or_else(|e| panic!("{}: dispatch: {e}", label(spec)));
             case.check(&label(spec), &ctx.download_f32(&result).unwrap());

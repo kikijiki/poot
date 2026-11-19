@@ -141,6 +141,26 @@ class BuildShaTests(unittest.TestCase):
         self.assertIsNone(embedded)
         self.assertIn("disagrees with the checkout", done.stderr)
 
+    def test_two_checkouts_of_different_commits_never_report_the_same_sha(self):
+        # POOT-1637: both arms of an ABBA built under one exported variable (the devshell's) must not read as one
+        # build. Each checkout names its own HEAD; the variable can match at most one of them, and the other refuses.
+        first, first_head = self.make_checkout()
+        second, second_head = self.make_checkout()
+        git = ["git", "-C", str(second), "-c", "user.name=t", "-c", "user.email=t@t"]
+        (second / "crates" / "lib.rs").write_text("// v2\n")
+        run([*git, "commit", "-q", "-a", "-m", "second"])
+        second_head = run([*git, "rev-parse", "HEAD"]).stdout.strip()
+        self.assertNotEqual(first_head, second_head)
+
+        _, a = self.build(first)
+        _, b = self.build(second)
+        self.assertEqual((a, b), (first_head, second_head))
+
+        done, embedded = self.build(second, exported=first_head)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIsNone(embedded)
+        self.assertIn("disagrees with the checkout", done.stderr)
+
     def test_variable_agreeing_with_the_checkout_is_accepted(self):
         root, head = self.make_checkout()
 

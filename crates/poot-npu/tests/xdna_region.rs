@@ -685,6 +685,7 @@ fn a_reordered_chain_is_its_own_artifact_and_computes_its_own_function() {
             .iter()
             .map(|buffer| Arg {
                 buffer,
+                offset: 0,
                 elems: ELEMENTS as usize,
             })
             .collect();
@@ -695,6 +696,7 @@ fn a_reordered_chain_is_its_own_artifact_and_computes_its_own_function() {
                 inputs: &args[..3],
                 output: Arg {
                     buffer: &buffers[3],
+                    offset: 0,
                     elems: ELEMENTS as usize,
                 },
                 launch: LaunchKind::Aie(AieInvocation::new(AieTargetId::Xdna2, words)),

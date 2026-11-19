@@ -57,10 +57,11 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
         &kernel,
         body.workgroup_size,
         body.workgroup_size, // one warp, one tile: threads == block
-        &[&a_buf, &b_buf],
-        &[a_buf.elem_count(), b_buf.elem_count()],
-        &out_buf,
-        out_buf.elem_count(),
+        &[
+            poot_ptx_runtime::PtxBinding::at_base(&a_buf, a_buf.elem_count()),
+            poot_ptx_runtime::PtxBinding::at_base(&b_buf, b_buf.elem_count()),
+        ],
+        poot_ptx_runtime::PtxBinding::at_base(&out_buf, out_buf.elem_count()),
     )
     .expect("real PTX WMMA dispatch");
     let got = ctx
@@ -152,10 +153,12 @@ fn run_attention_over_keys_on_ptx(
         &kernel,
         body.workgroup_size,
         generated.launch.grid,
-        &buffers,
-        &counts,
-        &out_buf,
-        out_buf.elem_count(),
+        &buffers
+            .iter()
+            .zip(&counts)
+            .map(|(buffer, &len)| poot_ptx_runtime::PtxBinding::at_base(buffer, len))
+            .collect::<Vec<_>>(),
+        poot_ptx_runtime::PtxBinding::at_base(&out_buf, out_buf.elem_count()),
     )
     .unwrap_or_else(|e| panic!("{name}: real PTX attention dispatch: {e:?}"));
     ctx.download_f32(&out_buf).expect("download out")

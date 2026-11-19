@@ -11,11 +11,11 @@
 //! the weight on upload.
 
 use crate::Target;
+use crate::Views;
 use poot_graph_ir::graph::{Storage, ValueMeta};
 use poot_graph_ir::op::{ContractionHead, LocalId, OpKind};
 use poot_graph_ir::types::{DTypeClass, DTypeClassExt, TensorType};
 use poot_graph_ir::{EditError, Eqn, Graph, Operand, ValueId, ValueTable};
-use poot_kernelgen::Layout;
 use poot_tensor::DType;
 
 use std::collections::{HashMap, HashSet};
@@ -38,12 +38,7 @@ pub(crate) struct ConstLanes(Vec<Option<Bf16ConstLane>>);
 
 impl ConstLanes {
     /// The lanes of `eqn`'s operands on `target`.
-    pub(crate) fn of(
-        g: &Graph,
-        views: &HashMap<ValueId, Layout>,
-        eqn: &Eqn,
-        target: &Target,
-    ) -> Self {
+    pub(crate) fn of(g: &Graph, views: &Views, eqn: &Eqn, target: &Target) -> Self {
         Self(
             eqn.inputs
                 .iter()
@@ -83,7 +78,7 @@ impl ConstLanes {
 /// and the lane its source uploads to cannot drift apart.
 pub(crate) fn bf16_const_lane(
     g: &Graph,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     id: ValueId,
     target: &Target,
 ) -> Bf16ConstLane {
@@ -146,11 +141,7 @@ fn packed_bf16_reader(op: &OpKind, position: usize) -> bool {
 /// lane that stores packed BF16, which is the typed value walk on each backend that has one - wgpu's,
 /// and ROCm's since card 450 ROCm. Every other wgpu entry point rejects a BF16 value through
 /// `crate::validate_wgpu_tensor_execution`.
-pub fn bf16_const_feeds_only_packed_readers(
-    g: &Graph,
-    views: &HashMap<ValueId, Layout>,
-    id: ValueId,
-) -> bool {
+pub fn bf16_const_feeds_only_packed_readers(g: &Graph, views: &Views, id: ValueId) -> bool {
     if g.liveness_roots().any(|root| root == id) {
         return false;
     }

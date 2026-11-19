@@ -12,6 +12,7 @@ use poot_target::{
     FragmentConfig, FragmentDtype, FragmentLayout, FragmentShape, MatrixUnits, Queried,
     RegisterFile, RoundingConversions, STRIX_HALO_COMPUTE_UNITS, ShaderFeatures, SubgroupSupport,
 };
+use std::num::NonZeroU64;
 
 /// The [`DeviceCaps`] a test should use for a given [`Backend`] when it has no real measured device to
 /// thread through: the values this box's own wgpu/RADV device measured (card 522), and the documented
@@ -77,6 +78,8 @@ pub fn wgpu_rdna3_igpu() -> DeviceCaps {
         native_two_byte_floats: false,
         rounding_conversions: RoundingConversions::NONE,
         peer_transport: false,
+        // wgpu-core raises RADV's 4 to the WebGPU floor of 32 ([`vulkan_rdna3_igpu`] keeps the raw 4).
+        storage_offset_align: NonZeroU64::new(32).unwrap(),
         perf_calibration: Calibrated::STRIX_HALO_VULKAN,
     }
 }
@@ -107,6 +110,8 @@ pub fn vulkan_rdna3_igpu() -> DeviceCaps {
             FragmentConfig::ANY_WAVES,
             Queried::Known(GFX11_MATRIX_FMA_RATE),
         )),
+        // RADV's own `minStorageBufferOffsetAlignment`: raw Vulkan is not raised to wgpu's floor.
+        storage_offset_align: NonZeroU64::new(4).unwrap(),
         ..wgpu_rdna3_igpu()
     }
 }

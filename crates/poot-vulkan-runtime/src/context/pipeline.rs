@@ -12,7 +12,8 @@ impl Context {
     /// this context, and validate its grid. Every dispatch path goes through here, so a kernel is only ever
     /// bound to exactly the number and native kind of buffers its schema names, all of them children of
     /// this context's device, and none is told more elements than it holds
-    /// ([`RuntimeError::ArgExceedsBuffer`]): the kernel trusts the length it is published, and this safe
+    /// ([`RuntimeError::ArgExceedsBuffer`], counted from the binding's byte offset) and no binding
+    /// starts off the device's storage binding alignment ([`RuntimeError::MisalignedBinding`]): the kernel trusts the length it is published, and this safe
     /// API is the last place that can refuse it. The executor bounds the same count first on the device
     /// path (`poot_executor::DispatchError::ArgExceedsBuffer`).
     pub(crate) fn check_bindings(
@@ -28,8 +29,21 @@ impl Context {
         if args.iter().any(|a| !a.buffer.belongs_to(&self.owner)) {
             return Err(RuntimeError::ForeignObject("buffer"));
         }
+        let alignment = self.device_caps.storage_offset_align.get();
         for (arg, bound) in args.iter().enumerate() {
-            let capacity = bound.buffer.native_elems();
+            if !bound.offset.is_multiple_of(alignment) {
+                return Err(RuntimeError::MisalignedBinding {
+                    arg,
+                    offset: bound.offset,
+                    alignment,
+                });
+            }
+            // The window is the buffer from its offset on: the kernel is told no more than it holds.
+            let width = bound.buffer.element().byte_width() as u64;
+            let capacity = bound
+                .buffer
+                .native_elems()
+                .saturating_sub((bound.offset / width) as usize);
             if bound.elems > capacity {
                 return Err(RuntimeError::ArgExceedsBuffer {
                     arg,

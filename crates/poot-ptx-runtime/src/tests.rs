@@ -810,10 +810,11 @@ fn captured_graph_owns_dispatched_buffers_until_it_drops() {
     let args = KernelArgs::pack(
         &context.capture,
         poot_kernel_ir::IndexWidth::Native,
-        &[&a, &b],
-        &[a.elem_count(), b.elem_count()],
-        &out,
-        out.elem_count(),
+        &[
+            crate::PtxBinding::at_base(&a, a.elem_count()),
+            crate::PtxBinding::at_base(&b, b.elem_count()),
+        ],
+        crate::PtxBinding::at_base(&out, out.elem_count()),
     )
     .expect("lengths fit the i64 kernel ABI");
     let params: Vec<u64> = args
@@ -898,10 +899,11 @@ fn kernel_args_refuse_a_buffer_off_the_binding_alignment() {
     let refused = KernelArgs::pack(
         &context.capture,
         Native,
-        &[&aligned, &misaligned],
-        &[4, 4],
-        &out,
-        4,
+        &[
+            crate::PtxBinding::at_base(&aligned, 4),
+            crate::PtxBinding::at_base(&misaligned, 4),
+        ],
+        crate::PtxBinding::at_base(&out, 4),
     );
     assert!(
         matches!(
@@ -916,7 +918,12 @@ fn kernel_args_refuse_a_buffer_off_the_binding_alignment() {
         "a misaligned input binding must be refused by name, got {:?}",
         refused.as_ref().err()
     );
-    let refused_out = KernelArgs::pack(&context.capture, Native, &[&aligned], &[4], &misaligned, 4);
+    let refused_out = KernelArgs::pack(
+        &context.capture,
+        Native,
+        &[crate::PtxBinding::at_base(&aligned, 4)],
+        crate::PtxBinding::at_base(&misaligned, 4),
+    );
     assert!(
         matches!(
             refused_out,
@@ -925,8 +932,13 @@ fn kernel_args_refuse_a_buffer_off_the_binding_alignment() {
         "a misaligned output binding is refused too, got {:?}",
         refused_out.as_ref().err()
     );
-    KernelArgs::pack(&context.capture, Native, &[&aligned], &[4], &out, 4)
-        .expect("aligned bindings pack");
+    KernelArgs::pack(
+        &context.capture,
+        Native,
+        &[crate::PtxBinding::at_base(&aligned, 4)],
+        crate::PtxBinding::at_base(&out, 4),
+    )
+    .expect("aligned bindings pack");
 }
 
 /// POOT-1405: a kernel narrowed to 32-bit index math is refused a binding whose longest length its index bound
@@ -968,7 +980,12 @@ fn kernel_args_refuse_a_binding_past_a_narrowed_kernels_index_bound() {
     // The longest length whose indices stay within the 32-bit range, and one past it.
     let fits = ((IndexBound::U32_LIMIT - 4096) / 32) as usize;
     let narrowed = IndexWidth::U32(bound);
-    let refused = KernelArgs::pack(&context.capture, narrowed, &[&input], &[fits + 1], &out, 4);
+    let refused = KernelArgs::pack(
+        &context.capture,
+        narrowed,
+        &[crate::PtxBinding::at_base(&input, fits + 1)],
+        crate::PtxBinding::at_base(&out, 4),
+    );
     assert!(
         matches!(
             refused,
@@ -982,15 +999,18 @@ fn kernel_args_refuse_a_binding_past_a_narrowed_kernels_index_bound() {
         "a length past the narrowed kernel's bound must be refused by name, got {:?}",
         refused.as_ref().err()
     );
-    KernelArgs::pack(&context.capture, narrowed, &[&input], &[fits], &out, 4)
-        .expect("the longest length within the bound packs");
+    KernelArgs::pack(
+        &context.capture,
+        narrowed,
+        &[crate::PtxBinding::at_base(&input, fits)],
+        crate::PtxBinding::at_base(&out, 4),
+    )
+    .expect("the longest length within the bound packs");
     KernelArgs::pack(
         &context.capture,
         IndexWidth::Native,
-        &[&input],
-        &[fits + 1],
-        &out,
-        4,
+        &[crate::PtxBinding::at_base(&input, fits + 1)],
+        crate::PtxBinding::at_base(&out, 4),
     )
     .expect("a native-width kernel takes any length its ABI holds");
 }
@@ -1412,10 +1432,8 @@ fn card305_ptx_lifecycle_repeated_contexts_and_surviving_children() {
                 &lifecycle_kernel(),
                 [32, 1, 1],
                 [4, 1, 1],
-                &[&input],
-                &[input.elem_count()],
-                &output,
-                output.elem_count(),
+                &[crate::PtxBinding::at_base(&input, input.elem_count())],
+                crate::PtxBinding::at_base(&output, output.elem_count()),
             )
             .expect("load module and warm tiny kernel");
         worker.synchronize().expect("settle warm dispatch");
@@ -1426,10 +1444,8 @@ fn card305_ptx_lifecycle_repeated_contexts_and_surviving_children() {
                 &lifecycle_kernel(),
                 [32, 1, 1],
                 [4, 1, 1],
-                &[&input],
-                &[input.elem_count()],
-                &output,
-                output.elem_count(),
+                &[crate::PtxBinding::at_base(&input, input.elem_count())],
+                crate::PtxBinding::at_base(&output, output.elem_count()),
             )
             .expect("capture tiny kernel");
         let graph = worker.end_capture().expect("instantiate lifecycle graph");
@@ -1644,15 +1660,13 @@ fn no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows() {
         &kernel,
         [n, 1, 1],
         [n, 1, 1],
-        &[&a_buf, &b_buf, &c_buf, &d_buf],
         &[
-            a_buf.elem_count(),
-            b_buf.elem_count(),
-            c_buf.elem_count(),
-            d_buf.elem_count(),
+            crate::PtxBinding::at_base(&a_buf, a_buf.elem_count()),
+            crate::PtxBinding::at_base(&b_buf, b_buf.elem_count()),
+            crate::PtxBinding::at_base(&c_buf, c_buf.elem_count()),
+            crate::PtxBinding::at_base(&d_buf, d_buf.elem_count()),
         ],
-        &out_buf,
-        out_buf.elem_count(),
+        crate::PtxBinding::at_base(&out_buf, out_buf.elem_count()),
     )
     .expect("dispatch no_contract_probe (marked)");
     let got = ctx.download_f32(&out_buf).expect("download out");
@@ -1835,10 +1849,11 @@ fn an_out_of_bounds_store_is_device_lost_and_poisons_the_context() {
         &kernel,
         block,
         [u32::MAX - (block[0] - 1), 1, 1],
-        &[&a, &b],
-        &[wild, wild],
-        &c,
-        wild,
+        &[
+            crate::PtxBinding::at_base(&a, wild),
+            crate::PtxBinding::at_base(&b, wild),
+        ],
+        crate::PtxBinding::at_base(&c, wild),
     )
     .expect("the launch itself is accepted: the fault is asynchronous");
     let lost = ctx.synchronize();
@@ -1886,10 +1901,8 @@ fn u32x4_vector_load_matches_scalar_loads_on_ptx() {
             &kernel,
             case.body.workgroup_size,
             [poot_kernel_ir::test_support::VECTOR_LOAD_THREADS, 1, 1],
-            &[&input],
-            &[case.input.len()],
-            &output,
-            case.want.len(),
+            &[crate::PtxBinding::at_base(&input, case.input.len())],
+            crate::PtxBinding::at_base(&output, case.want.len()),
         )
         .unwrap_or_else(|e| panic!("{name}: {e}"));
         let mut raw = vec![0u8; case.want.len() * 4];
@@ -1944,9 +1957,7 @@ fn subgroup_shuffle_xor_matches_the_interpreter_on_ptx() {
             body.workgroup_size,
             [THREADS, 1, 1],
             &[],
-            &[],
-            &output,
-            words,
+            crate::PtxBinding::at_base(&output, words),
         )
         .unwrap_or_else(|e| panic!("{name}: {e}"));
         let mut raw = vec![0u8; words * 4];

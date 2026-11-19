@@ -1,9 +1,9 @@
 //! Whole-graph storage representation: every value's physical storage, read from one plan per equation.
 
+use crate::Views;
 use crate::predicates::GraphTables;
 use crate::refusal::refusal_at;
 use crate::types::{GraphStorage, StorageKind, ValueStorage};
-use poot_kernelgen::Layout;
 use poot_tensor::DType;
 use std::collections::{HashMap, HashSet};
 
@@ -47,7 +47,7 @@ pub(crate) fn value_storage_of_plans<'p>(
     check_i32_reads(g, &plans)?;
     let mut weights = dense_contraction_weight_storages(g)?;
     weights.extend(e4m3_row_gather_table_storages(g)?);
-    let views = compute_views(g, target.id());
+    let views = compute_views(g, target);
     let storage = storage_of_kinds(g, target, &views, &weights);
     check_bf16_const_reads(g, target.id(), &storage, &plans)?;
     Ok(storage)
@@ -128,7 +128,7 @@ fn check_bf16_const_reads(
 fn storage_of_kinds(
     g: &Graph,
     target: &Target,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     weights: &HashMap<ValueId, StorageKind>,
 ) -> GraphStorage {
     let values = g
@@ -328,12 +328,7 @@ fn slice_elem(ty: &poot_kernel_ir::Ty) -> Option<&poot_kernel_ir::Ty> {
 /// One value's storage kind. A value keeps its declared dtype, densely stored, except a BF16 const: it is never
 /// widened (Card 1011), it is BF16 on every backend, and [`bf16_const_lane`] decides whether the buffer is packed
 /// two-per-`u32` word or native two-byte bf16, the one answer the planners read too.
-fn value_storage_kind(
-    g: &Graph,
-    views: &HashMap<ValueId, Layout>,
-    id: ValueId,
-    target: &Target,
-) -> StorageKind {
+fn value_storage_kind(g: &Graph, views: &Views, id: ValueId, target: &Target) -> StorageKind {
     let declared = g.aval(id).dtype;
     if !g.meta(id).storage.holds_weight_bytes() || declared != DType::BF16 {
         return StorageKind::Dense(declared);

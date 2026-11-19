@@ -144,6 +144,10 @@ pub trait CopyKernelSink<E> {
 pub struct Arg<'a, D: Device + ?Sized> {
     /// The device buffer the kernel reads or writes.
     pub buffer: &'a D::Buffer,
+    /// Byte offset of this value in `buffer`: a multiple of the device's binding alignment
+    /// ([`poot_target::DeviceCaps::storage_offset_align`]), fixed when the dispatch is recorded. The plan's `bound`
+    /// (`poot_graph_plan::Plan::View`) for a view, zero for a value that owns its buffer.
+    pub offset: u64,
     /// Native device-element count of this value (lane-encoded words for a packed source), not the buffer's capacity.
     pub elems: usize,
 }

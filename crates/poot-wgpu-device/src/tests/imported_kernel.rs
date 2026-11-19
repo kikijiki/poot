@@ -63,10 +63,12 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &x_buf,
+                offset: 0,
                 elems: x.len(),
             }],
             output: Arg {
                 buffer: &out_buf,
+                offset: 0,
                 elems: rows,
             },
             launch: poot_executor::LaunchKind::Grid {
@@ -147,19 +149,23 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
             inputs: &[
                 Arg {
                     buffer: &x_buf,
+                    offset: 0,
                     elems: x.len(),
                 },
                 Arg {
                     buffer: &w_buf,
+                    offset: 0,
                     elems: w.len(),
                 },
                 Arg {
                     buffer: &dims_buf,
+                    offset: 0,
                     elems: dims.len(),
                 },
             ],
             output: Arg {
                 buffer: &out_buf,
+                offset: 0,
                 elems: rows * d,
             },
             launch: poot_executor::LaunchKind::Grid {
@@ -199,4 +205,31 @@ fn float_ne_is_ieee_on_nan_on_wgpu() {
     let body = poot_kernel_ir::test_support::float_ne_kernel();
     let kernel = load(&mut device, "float_ne", &body);
     poot_executor_parity::float_ne::check("wgpu", &mut device, &kernel);
+}
+
+/// POOT-1566 W1 on wgpu: an argument bound 256 bytes into its buffer reads from there (SC-e), and a binding off the
+/// device's `min_storage_buffer_offset_alignment` is refused as `RuntimeError::MisalignedBinding` (SC-f). Mutation:
+/// bind `offset: 0` in `build_dispatch_objects` (the first row reads from the base and goes red); drop the alignment
+/// check (the second row panics in wgpu validation).
+#[test]
+fn an_offset_binding_is_read_from_its_offset_and_a_misaligned_one_is_refused_on_wgpu() {
+    let Some(mut device) = wgpu() else {
+        return;
+    };
+    let body = poot_kernel_ir::test_support::float_ne_kernel();
+    let kernel = load(&mut device, "float_ne", &body);
+    poot_executor_parity::offset_binding::an_offset_binding_reads_from_its_offset(
+        "wgpu",
+        &mut device,
+        &kernel,
+    );
+    let refused =
+        poot_executor_parity::offset_binding::a_misaligned_offset_is_refused(&mut device, &kernel);
+    assert!(
+        matches!(
+            refused,
+            poot_wgpu_runtime::RuntimeError::MisalignedBinding { .. }
+        ),
+        "got {refused:?}"
+    );
 }

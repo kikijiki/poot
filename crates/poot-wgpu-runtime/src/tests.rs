@@ -223,10 +223,11 @@ mod pending_fault_tests {
                 &spv,
                 [64, 1, 1],
                 [4, 1, 1],
-                &[&idx, &data],
-                &[idx.elem_count(), data.elem_count()],
-                &out,
-                out.elem_count(),
+                &[
+                    crate::Binding::at_base(&idx, idx.elem_count()),
+                    crate::Binding::at_base(&data, data.elem_count()),
+                ],
+                crate::Binding::at_base(&out, out.elem_count()),
             )
             .expect("build_cached_dispatch");
 
@@ -337,10 +338,11 @@ mod pending_fault_tests {
                 &spv,
                 [64, 1, 1],
                 [4, 1, 1],
-                &[&idx, &data],
-                &[idx.elem_count(), data.elem_count()],
-                &out,
-                out.elem_count(),
+                &[
+                    crate::Binding::at_base(&idx, idx.elem_count()),
+                    crate::Binding::at_base(&data, data.elem_count()),
+                ],
+                crate::Binding::at_base(&out, out.elem_count()),
             )
             .expect("build_cached_dispatch");
 
@@ -505,10 +507,11 @@ mod profiled_dispatch_tests {
                 &spv,
                 [64, 1, 1],
                 [5, 1, 1],
-                &[&a, &b],
-                &[5, 5],
-                &out,
-                5,
+                &[
+                    crate::Binding::at_base(&a, 5),
+                    crate::Binding::at_base(&b, 5),
+                ],
+                crate::Binding::at_base(&out, 5),
             )
             .expect("build cached dispatch");
         ctx.submit_cached(&[&dispatch]).expect("submit");
@@ -572,10 +575,11 @@ mod profiled_dispatch_tests {
                 &spv,
                 [64, 1, 1],
                 [5, 1, 1],
-                &[&a, &b],
-                &[5, 5],
-                &out,
-                5,
+                &[
+                    crate::Binding::at_base(&a, 5),
+                    crate::Binding::at_base(&b, 5),
+                ],
+                crate::Binding::at_base(&out, 5),
             )
             .expect("build cached dispatch");
         let staging_before: poot_runtime_common::MemoryCounterSnapshot = ctx
@@ -1097,10 +1101,12 @@ mod device_timing_tests {
             kernel,
             [64, 1, 1],
             [threads, 1, 1],
-            inputs,
-            &input_lens,
-            output,
-            output.elem_count(),
+            &inputs
+                .iter()
+                .zip(&input_lens)
+                .map(|(buffer, &len)| crate::Binding::at_base(buffer, len))
+                .collect::<Vec<_>>(),
+            crate::Binding::at_base(output, output.elem_count()),
         )
         .unwrap()
     }

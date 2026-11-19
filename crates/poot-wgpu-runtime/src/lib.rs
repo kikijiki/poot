@@ -57,7 +57,7 @@ mod timestamps;
 
 use crate::context::counters::Counter;
 use crate::pipeline::{CachedPipeline, DeviceTimingAccumulator, PendingDeviceTiming, PendingFault};
-pub use buffer::{DeviceBuffer, KernelBuffer};
+pub use buffer::{Binding, DeviceBuffer, KernelBuffer};
 pub use error::RuntimeError;
 pub use pipeline::{CachedDispatch, DeviceTimingResult};
 use std::cell::{Cell, RefCell};

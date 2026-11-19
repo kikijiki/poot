@@ -6,6 +6,7 @@
 //! a chunked [`Plan`] for ops whose dispatch can exceed a single-launch cap (RADV 2^15-tile miscompile,
 //! iGPU display-watchdog TDR; see each function's doc).
 
+use crate::Target;
 use crate::planner::{Planned, operand_demand};
 use crate::refusal::Site;
 use poot_kernelgen::Layout;
@@ -15,7 +16,7 @@ use std::collections::HashMap;
 use poot_graph_ir::op::{ContractionHead, OpKind};
 use poot_graph_ir::{Eqn, Graph, Operand, TensorType, ValueId, ValueMeta, ValueTable};
 use poot_kernelgen as kg;
-use poot_target::{Backend, DeviceCaps, Queried, SubgroupSupport, TargetId};
+use poot_target::{Backend, DeviceCaps, Queried, SubgroupSupport};
 
 use crate::planner::PlannedDispatch;
 use crate::{Binding, Sink, Source};
@@ -101,8 +102,10 @@ pub(crate) enum LayoutDemand {
     /// Any layout inside the source: the reader indexes every element through its layout (a pointwise leaf, a
     /// movement's data, a concat part).
     Any,
-    /// Row-major from the root's base: the consumer reads the buffer flat (a contraction, a gather, an attention,
-    /// a packed payload). A value read this way is never a view.
+    /// Row-major from the base it is bound at: the consumer reads the buffer flat (a contraction, a gather, an
+    /// attention, a packed payload). A value read this way is a view only when it is dense and the executor binds
+    /// its root at exactly its first element (its [`ViewBinding`] has no residual offset): the consumer's kernel is
+    /// the one it plans for a materialized value, bound at an offset.
     Dense,
     /// The indexed contraction's stacked weight `[E, K, N]`: row-major, or the checkpoint's `[E, N, K]` transpose
     /// of it, which the contraction reads in place.
@@ -110,19 +113,106 @@ pub(crate) enum LayoutDemand {
 }
 
 impl LayoutDemand {
-    /// Whether a value of `shape` read through `layout` meets this demand.
-    pub(crate) fn admits(self, layout: &Layout, shape: &[usize]) -> bool {
+    /// Whether a value of `shape` read through `view` meets this demand.
+    pub(crate) fn admits(self, view: &ViewBinding, shape: &[usize]) -> bool {
+        let layout = &view.layout;
         match self {
             LayoutDemand::Any => true,
-            LayoutDemand::Dense => *layout == Layout::contiguous(shape),
+            LayoutDemand::Dense => layout.offset == 0 && is_dense_view(&layout.strides, shape),
+            // The stacked weight is a const read from its base: no bound, no residual.
             LayoutDemand::IndexedWeight => {
-                *layout == Layout::contiguous(shape)
-                    || matches!(shape, &[_, k, n] if *layout == Layout {
-                        strides: vec![k * n, 1, k],
-                        offset: 0,
-                    })
+                view.bound == 0
+                    && (*layout == Layout::contiguous(shape)
+                        || matches!(shape, &[_, k, n] if *layout == Layout {
+                            strides: vec![k * n, 1, k],
+                            offset: 0,
+                        }))
             }
         }
+    }
+}
+
+/// How the executor binds the root a promoted value reads and what the readers bake (POOT-1566): the value's byte
+/// offset in its root, split once. The executor binds the root `bound` bytes in, a multiple of the target's binding
+/// alignment (`max(BUFFER_PARAM_ALIGN, DeviceCaps::storage_offset_align)`); every reader of the value reads through
+/// `layout`, whose offset is only what is left of the value's offset past `bound`. A reader that cannot read a layout
+/// accepts the value only when `layout` is dense with no offset left ([`LayoutDemand::Dense`]); a reader that can bakes
+/// `layout`, so views at aligned offsets of one root share one kernel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewBinding {
+    /// Byte offset at which the executor binds the view's root. Zero where the root takes no offset binding
+    /// ([`root_binds_at_offset`]) or the view starts inside its first alignment block.
+    pub bound: u64,
+    /// The strides of the view and the element offset left past `bound`.
+    pub layout: Layout,
+}
+
+/// Every promoted view of a graph, by value ([`compute_views`]).
+pub type Views = HashMap<ValueId, ViewBinding>;
+
+/// Whether `strides` read `shape` row-major, from the view's first element: every axis of extent other than one steps by the product of the extents
+/// after it (an axis of extent one is never stepped, whatever its stride), and no axis is empty.
+pub fn is_dense_view(strides: &[usize], shape: &[usize]) -> bool {
+    if shape.contains(&0) {
+        return false;
+    }
+    let mut step = 1usize;
+    for (&extent, &stride) in shape.iter().zip(strides).rev() {
+        if extent != 1 && stride != step {
+            return false;
+        }
+        step *= extent;
+    }
+    true
+}
+
+/// Whether the executor may bind `root` at an offset, so a view of it carries a [`ViewBinding::bound`] and a reader
+/// that cannot read a layout may take it: an activation, state or slot of a dtype whose buffer is its elements laid
+/// out densely. A weight keeps the upload layout its readers decided (a packed lane, a transposed stack: the lane
+/// decisions of `storage_analysis` and `dtype_widen` follow the readers of the weight value, not of a view of it),
+/// and a packed E4M3FN payload pads its rows to a word, so neither is bound at an offset.
+fn root_binds_at_offset(g: GraphTables<'_>, root: ValueId) -> bool {
+    !g.values[root].storage.holds_weight_bytes()
+        && matches!(
+            g.aval(root).dtype,
+            DType::F32 | DType::I32 | DType::BF16 | DType::F16
+        )
+}
+
+/// Split the layout `full` of a value read from `root`, whose offset counts elements of `root`'s dtype from the
+/// root's first element, into the byte offset the executor binds the root at (`full`'s offset rounded down to
+/// `align`) and the layout the readers bake, whose offset is the rest. A root that takes no offset binding keeps its
+/// whole offset in the layout.
+fn split_offset(g: GraphTables<'_>, root: ValueId, full: Layout, align: u64) -> ViewBinding {
+    if !root_binds_at_offset(g, root) {
+        return ViewBinding {
+            bound: 0,
+            layout: full,
+        };
+    }
+    let unit = g.aval(root).dtype.byte_size() as u64;
+    let byte_offset = full.offset as u64 * unit;
+    let bound = byte_offset - byte_offset % align;
+    ViewBinding {
+        bound,
+        layout: Layout {
+            strides: full.strides,
+            offset: ((byte_offset - bound) / unit) as usize,
+        },
+    }
+}
+
+/// The bytes a view of the target's roots binds at a multiple of: the larger of the kernel floor, which every vector
+/// load a kernel proves relies on, and what the device's binding API requires. `None` for a target that binds no
+/// offsets (an NPU has no views).
+fn binding_alignment(target: &Target) -> Option<u64> {
+    match target {
+        Target::Gpu { caps, .. } => Some(
+            caps.storage_offset_align
+                .get()
+                .max(poot_kernel_ir::BUFFER_PARAM_ALIGN),
+        ),
+        Target::Npu(_) => None,
     }
 }
 
@@ -224,11 +314,7 @@ pub(crate) fn compose_movement(
 /// The logical shape of the buffer `value` is read from: the shape of the first value down its chain of promoted
 /// views that is no view. A view's layout is expressed over that shape ([`compose_layouts`]), so it is the bound
 /// every reader of the layout checks.
-pub(crate) fn view_source_shape(
-    g: GraphTables<'_>,
-    views: &HashMap<ValueId, Layout>,
-    value: ValueId,
-) -> Vec<usize> {
+pub(crate) fn view_source_shape(g: GraphTables<'_>, views: &Views, value: ValueId) -> Vec<usize> {
     let mut current = value;
     while views.contains_key(&current) {
         let producer = g
@@ -243,45 +329,50 @@ pub(crate) fn view_source_shape(
 }
 
 /// Which values become a [`Plan::View`] (no dispatch) instead of a materialize copy, composing a whole
-/// chain of movement ops into one Layout each (spec 132). WGPU and AMD GCN only; any other backend gets an
-/// empty map and takes the pre-existing movement lowering.
+/// chain of movement ops into one Layout each (spec 132), each split once into the offset the executor binds the root
+/// at and the layout its readers bake ([`ViewBinding`]). A target with no strided-view bodies (an NPU) gets an empty
+/// map and takes the pre-existing movement lowering.
 ///
 /// Two passes, since deciding promotion needs consumers and composing a Layout needs the input's Layout
 /// (earlier):
 ///
 /// - Pass A decides the promoted set. A `Transpose`/`Slice`/`Broadcast`/`Reshape` output (not pinned, with at
-///   least one reader) is promoted when no reader's [`operand_demand`] is `Dense`. A movement reader counts as a
-///   reader whether or not it is promoted itself: the chain's tail then materializes as one copy that reads the
-///   root through the whole chain's layout, instead of one copy per link. A reshape that is not promoted is the
-///   exception: it is free over a dense value, so it keeps the value under it dense.
+///   least one reader) is promoted. A movement reader counts as a reader whether or not it is promoted itself: the
+///   chain's tail then materializes as one copy that reads the root through the whole chain's layout, instead of
+///   one copy per link. A reshape that is not promoted is the exception: it is free over a dense value, so it keeps
+///   the value under it dense.
 /// - Pass B walks forward and composes each promoted value's Layout onto its input's Layout
 ///   (`Layout::contiguous` if the input was not promoted). A chain tail therefore has a Layout expressed
 ///   in terms of the original contiguous source, matching `poot_eval::apply_movement` over the whole
-///   chain (see the `view_..._chain_matches_oracle_fuzz` test).
+///   chain (see the `view_..._chain_matches_oracle_fuzz` test). The layout is then split at the target's binding
+///   alignment ([`split_offset`]).
 ///
-/// A `Reshape` composes only over a view whose strides it can split or merge ([`reshape_strides`]), and that
-/// depends on the input's composed Layout, which pass B alone knows. The reshape's input is barred when it cannot,
-/// so it materializes and the reshape reads it dense. A promoted value whose composed layout a reader's demand
-/// does not [`admit`](LayoutDemand::admits) is barred too. Barring only shrinks the promoted set, so the loop ends.
+/// A promoted value is kept only where every reader's [`operand_demand`] [admits](LayoutDemand::admits) its split
+/// layout: a reader of layouts takes any; a reader of flat buffers takes a dense view with no residual offset, whose
+/// root the executor binds at the view's own first element ([`root_binds_at_offset`]). A `Reshape` composes only
+/// over a view whose strides it can split or merge ([`reshape_strides`]), and that depends on the input's composed
+/// Layout, which pass B alone knows. The reshape's input is barred when it cannot, so it materializes and the
+/// reshape reads it dense. A promoted value a reader does not admit is barred too. Barring only shrinks the
+/// promoted set, so the loop ends.
 ///
 /// A value with no consumer is not promoted. A pinned value keeps the chain's materialization at its own copy.
 ///
 /// Every pinned value ([`Graph::pinned_values`]: the output, each validation value, and both sides of each
 /// state pair) keeps its own materialized buffer, so a validation packet can copy it row-major from offset 0.
-pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId, Layout> {
+pub fn compute_views(g: &Graph, target: &Target) -> Views {
     // A target that compiles no kernel bodies (a VPU) has no strided-view bodies to read a view through.
-    let strided = poot_codegen::Target::try_from(target.into())
+    let strided = poot_codegen::Target::try_from(target.id())
         .is_ok_and(|target| codegen_capability(target).strided_views);
-    if !strided {
-        return HashMap::new();
-    }
+    let Some(align) = binding_alignment(target).filter(|_| strided) else {
+        return Views::new();
+    };
     let tables = GraphTables::from(g);
     let readers = readers(tables);
     let pinned: std::collections::HashSet<ValueId> = g.pinned_values().collect();
     let mut barred: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
     loop {
         let promoted = promoted_movement(tables, &readers, &pinned, &barred);
-        let (views, unreadable) = compose_layouts(tables, &promoted, &readers);
+        let (views, unreadable) = compose_layouts(tables, &promoted, &readers, align);
         if unreadable.is_empty() {
             return views;
         }
@@ -303,7 +394,8 @@ fn readers(g: GraphTables<'_>) -> HashMap<ValueId, Vec<(usize, usize)>> {
 }
 
 /// Pass A of [`compute_views`] (reverse topological order, so a reader's own promotion is known): the promoted
-/// set, no strides yet. A value in `barred` is never promoted.
+/// set, no strides yet. A value in `barred` is never promoted. Whether every reader can read the view is pass B's
+/// question: it needs the composed layout.
 ///
 /// A reader that is a movement counts whether or not it is promoted, with one exception: a `Reshape` that is not
 /// promoted reads its input dense, where over a dense value it is the zero-cost `Plan::Alias`. Promoting the view
@@ -322,11 +414,11 @@ fn promoted_movement(
             continue;
         }
         let readable = readers.get(&out).is_some_and(|reads| {
-            reads.iter().all(|&(i, position)| {
+            reads.iter().all(|&(i, _)| {
                 let reader = &g.eqns[i];
                 let dense_reshape =
                     matches!(reader.op, OpKind::Reshape { .. }) && !promoted.contains(&reader.out);
-                !dense_reshape && operand_demand(g, reader, position) != LayoutDemand::Dense
+                !dense_reshape
             })
         });
         if readable {
@@ -338,14 +430,18 @@ fn promoted_movement(
 
 /// Pass B of [`compute_views`] (forward topological order): each promoted value's Layout composed from its
 /// input's, and the values to bar: the input of a reshape (promoted or not) whose input Layout has no stride for
-/// the new shape, and a promoted value whose composed Layout a reader's demand does not admit. A reshape over a
-/// value that is no view has no Layout of its own: it stays a `Plan::Alias`.
+/// the new shape, and a promoted value whose split layout a reader's demand does not admit. A reshape over a
+/// value that is no view has no Layout of its own: it stays a `Plan::Alias`. A chain composes over each link's whole
+/// layout from the root's first element; only the value's own layout is split.
 fn compose_layouts(
     g: GraphTables<'_>,
     promoted: &std::collections::HashSet<ValueId>,
     readers: &HashMap<ValueId, Vec<(usize, usize)>>,
-) -> (HashMap<ValueId, Layout>, Vec<ValueId>) {
-    let mut views: HashMap<ValueId, Layout> = HashMap::new();
+    align: u64,
+) -> (Views, Vec<ValueId>) {
+    // Each promoted value's root and its layout over the root's contiguous buffer, before the split.
+    let mut whole: HashMap<ValueId, (ValueId, Layout)> = HashMap::new();
+    let mut views = Views::new();
     let mut unreadable = Vec::new();
     for eqn in g.eqns {
         if !is_movement_view_candidate(&eqn.op) {
@@ -354,10 +450,10 @@ fn compose_layouts(
         let out = eqn.out;
         let input = value_ids(eqn)[0];
         let in_shape = &g.aval(input).shape;
-        let in_layout = match (views.get(&input), &eqn.op) {
-            (Some(layout), _) => layout.clone(),
+        let (root, in_layout) = match (whole.get(&input), &eqn.op) {
+            (Some((root, layout)), _) => (*root, layout.clone()),
             (None, OpKind::Reshape { .. }) => continue,
-            (None, _) => Layout::contiguous(in_shape),
+            (None, _) => (input, Layout::contiguous(in_shape)),
         };
         let Some(layout) = compose_movement(&eqn.op, in_shape, &in_layout, &g.aval(out).shape)
         else {
@@ -368,13 +464,21 @@ fn compose_layouts(
             continue;
         }
         let shape = &g.aval(out).shape;
+        let view = split_offset(g, root, layout.clone(), align);
         let admitted = readers.get(&out).is_some_and(|reads| {
             reads.iter().all(|&(i, position)| {
-                operand_demand(g, &g.eqns[i], position).admits(&layout, shape)
+                reader_admits(
+                    g,
+                    operand_demand(g, &g.eqns[i], position),
+                    &view,
+                    shape,
+                    root,
+                )
             })
         });
         if admitted {
-            views.insert(out, layout);
+            whole.insert(out, (root, layout));
+            views.insert(out, view);
         } else {
             unreadable.push(out);
         }
@@ -382,27 +486,52 @@ fn compose_layouts(
     (views, unreadable)
 }
 
+/// Whether a reader with `demand` reads the view `view` of `root`, whose value has `shape`: its layout meets the
+/// demand, and a reader of flat buffers has a root the executor binds at an offset ([`root_binds_at_offset`]).
+fn reader_admits(
+    g: GraphTables<'_>,
+    demand: LayoutDemand,
+    view: &ViewBinding,
+    shape: &[usize],
+    root: ValueId,
+) -> bool {
+    (demand != LayoutDemand::Dense || root_binds_at_offset(g, root)) && demand.admits(view, shape)
+}
+
 /// The compile invariant of the layout rule: every value operand that is a promoted view meets its reader's
-/// [`operand_demand`]. [`compute_views`] already promotes by that demand, so this holds by construction; it is checked
-/// again here, on every compile, because a view a reader cannot read would be read as if it were dense (wrong
-/// elements, no error). A violation is the typed [`Capability::OperandLayout`] naming the equation.
+/// [`operand_demand`], and every view binds its root at a multiple of the target's binding alignment.
+/// [`compute_views`] already promotes by that demand and splits at that alignment, so this holds by construction; it
+/// is checked again here, on every compile, because a view a reader cannot read would be read as if it were dense
+/// (wrong elements, no error), and a device refuses (or, unchecked, mis-reads) a binding off its alignment. A
+/// violation is the typed [`Capability::OperandLayout`] or [`Capability::ViewBindingAlignment`] naming the
+/// equation.
 pub(crate) fn check_operand_layouts(
     g: GraphTables<'_>,
-    views: &HashMap<ValueId, Layout>,
-    target: impl Into<TargetId> + Copy,
+    views: &Views,
+    target: &Target,
     limits: poot_kernelgen::BodyLimits,
 ) -> Result<(), PlanError> {
+    let align = binding_alignment(target);
     for eqn in g.eqns {
         for (position, operand) in eqn.inputs.iter().enumerate() {
             let Operand::Value(value) = operand else {
                 continue;
             };
-            let Some(layout) = views.get(value) else {
+            let Some(view) = views.get(value) else {
                 continue;
             };
-            if !operand_demand(g, eqn, position).admits(layout, &g.aval(*value).shape) {
-                return Err(Site::new(g, eqn, target, limits)
-                    .refuse(Capability::OperandLayout { value: *value }));
+            let site = || Site::new(g, eqn, target.id(), limits);
+            let root = view_source(g, views, *value);
+            let demand = operand_demand(g, eqn, position);
+            if !reader_admits(g, demand, view, &g.aval(*value).shape, root) {
+                return Err(site().refuse(Capability::OperandLayout { value: *value }));
+            }
+            if let Some(align) = align.filter(|align| !view.bound.is_multiple_of(*align)) {
+                return Err(site().refuse(Capability::ViewBindingAlignment {
+                    value: *value,
+                    bound: view.bound,
+                    align,
+                }));
             }
         }
     }
@@ -1324,11 +1453,7 @@ pub(crate) fn indexed_matmul_lowers(g: GraphTables<'_>, eqn: &Eqn) -> bool {
 /// The value a promoted view `value` reads in place ([`compute_views`]'s table): the input of the movement op
 /// that produced it, followed through every view in the chain; `value` itself when it is no view. The one answer to
 /// "what buffer does this view read", shared by the planner and the storage plan.
-pub(crate) fn view_source(
-    g: GraphTables<'_>,
-    views: &HashMap<ValueId, Layout>,
-    mut value: ValueId,
-) -> ValueId {
+pub(crate) fn view_source(g: GraphTables<'_>, views: &Views, mut value: ValueId) -> ValueId {
     while views.contains_key(&value) {
         let producer = g.eqns.iter().find(|eqn| eqn.out == value);
         match producer.and_then(|eqn| value_ids(eqn).first().copied()) {

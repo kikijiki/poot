@@ -1261,15 +1261,18 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
             inputs: &[
                 Arg {
                     buffer: &idx,
+                    offset: 0,
                     elems: 4,
                 },
                 Arg {
                     buffer: &data,
+                    offset: 0,
                     elems: 4,
                 },
             ],
             output: Arg {
                 buffer: &out_buf,
+                offset: 0,
                 elems: 4,
             },
             launch: poot_executor::LaunchKind::Grid {
@@ -1339,10 +1342,12 @@ fn wgpu_device_refuses_an_aie_launch_as_a_typed_error() {
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &input,
+                offset: 0,
                 elems: 4,
             }],
             output: Arg {
                 buffer: &output,
+                offset: 0,
                 elems: 1,
             },
             launch: LaunchKind::Aie(AieInvocation::new(

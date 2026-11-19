@@ -361,10 +361,12 @@ fn run_inputs(
         &kernel,
         block,
         threads,
-        &in_refs,
-        &in_lens,
-        &out,
-        out.elem_count(),
+        &in_refs
+            .iter()
+            .zip(&in_lens)
+            .map(|(buffer, &len)| poot_ptx_runtime::PtxBinding::at_base(buffer, len))
+            .collect::<Vec<_>>(),
+        poot_ptx_runtime::PtxBinding::at_base(&out, out.elem_count()),
     )
     .expect("dispatch");
     ctx.download_f32(&out).expect("download")
@@ -471,10 +473,11 @@ fn graph_probe(dir: &str) -> i32 {
         &kernel,
         [64, 1, 1],
         [a.len() as u32, 1, 1],
-        &[&da, &db],
-        &[da.elem_count(), db.elem_count()],
-        &dc,
-        dc.elem_count(),
+        &[
+            poot_ptx_runtime::PtxBinding::at_base(&da, da.elem_count()),
+            poot_ptx_runtime::PtxBinding::at_base(&db, db.elem_count()),
+        ],
+        poot_ptx_runtime::PtxBinding::at_base(&dc, dc.elem_count()),
     )
     .expect("warmup dispatch");
     ctx.synchronize().expect("warmup sync");
@@ -485,10 +488,11 @@ fn graph_probe(dir: &str) -> i32 {
         &kernel,
         [64, 1, 1],
         [a.len() as u32, 1, 1],
-        &[&da, &db],
-        &[da.elem_count(), db.elem_count()],
-        &dc,
-        dc.elem_count(),
+        &[
+            poot_ptx_runtime::PtxBinding::at_base(&da, da.elem_count()),
+            poot_ptx_runtime::PtxBinding::at_base(&db, db.elem_count()),
+        ],
+        poot_ptx_runtime::PtxBinding::at_base(&dc, dc.elem_count()),
     )
     .expect("dispatch during capture");
     let exec = ctx.end_capture().expect("end_capture");

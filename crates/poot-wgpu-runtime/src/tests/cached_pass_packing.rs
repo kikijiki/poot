@@ -35,10 +35,12 @@ fn cached(
         kernel,
         [64, 1, 1],
         [threads, 1, 1],
-        inputs,
-        &input_lens,
-        output,
-        output.elem_count(),
+        &inputs
+            .iter()
+            .zip(&input_lens)
+            .map(|(buffer, &len)| crate::Binding::at_base(buffer, len))
+            .collect::<Vec<_>>(),
+        crate::Binding::at_base(output, output.elem_count()),
     )
     .unwrap()
 }
@@ -251,10 +253,11 @@ fn a_dispatch_length_past_u32_is_a_typed_refusal_gpu() {
             &add,
             [64, 1, 1],
             [8, 1, 1],
-            &[&a, &b],
-            &[8, 8],
-            &out,
-            out_len,
+            &[
+                crate::Binding::at_base(&a, 8),
+                crate::Binding::at_base(&b, 8),
+            ],
+            crate::Binding::at_base(&out, out_len),
         )
     };
     let past = u32::MAX as usize + 1;

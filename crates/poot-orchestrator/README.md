@@ -68,7 +68,11 @@ cargo run -p poot-orchestrator --release -- run --dry-run
 cargo run -p poot-orchestrator --release -- reap
 cargo run -p poot-orchestrator --release -- reap --all
 
-# what runs exist + their phase:
+# record pods RunPod no longer lists as terminated, and abort expired warm runs whose pod is gone (state DB only,
+# never deletes at RunPod; a failed list changes nothing). `reap` and `status` do this too:
+cargo run -p poot-orchestrator --release -- reconcile
+
+# what runs exist + their phase (reconciles first when RUNPOD_API_KEY is set):
 cargo run -p poot-orchestrator --release -- status
 
 # web dashboard (auto-refreshing runs + phases + per-model progress + live logs) at http://127.0.0.1:8787:

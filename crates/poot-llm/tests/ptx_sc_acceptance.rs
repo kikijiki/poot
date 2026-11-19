@@ -569,6 +569,7 @@ impl Device for FaultyOnceDevice {
             },
             output: poot_executor::Arg {
                 buffer: d.output.buffer,
+                offset: 0,
                 elems: d.output.elems,
             },
             launch: d.launch,
@@ -744,6 +745,7 @@ impl Device for FaultyOnceSyncDevice {
             },
             output: poot_executor::Arg {
                 buffer: d.output.buffer,
+                offset: 0,
                 elems: d.output.elems,
             },
             launch: d.launch,

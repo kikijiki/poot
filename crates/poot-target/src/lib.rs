@@ -27,6 +27,8 @@ mod register_file;
 mod step_widths;
 pub mod storage;
 pub mod vpu;
+use std::num::NonZeroU64;
+
 pub use access::ArgAccess;
 pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
 pub use kernel_compiler::KernelCompiler;
@@ -412,6 +414,12 @@ pub struct DeviceCaps {
     /// copies and the collectives built on them). Without it a stage cut between two such devices has nothing
     /// to carry its boundary.
     pub peer_transport: bool,
+    /// The multiple, in bytes, a buffer binding's offset must be on this device (POOT-1566): what the runtime
+    /// measured of its API (`minStorageBufferOffsetAlignment`, which wgpu raises to its own floor) or, for a
+    /// runtime that binds raw pointers, the kernel floor `BUFFER_PARAM_ALIGN`. A power of two. The planner binds
+    /// a view at its offset rounded down to the larger of this and the kernel floor, and a device refuses a
+    /// binding at any other offset.
+    pub storage_offset_align: NonZeroU64,
     /// Whether this device's performance figures were measured on it or are the portable prior, resolved from
     /// the device's identity by its runtime. The launch is derived from it by [`DeviceCaps::gemm_launch`].
     pub perf_calibration: calibration::Calibrated,
@@ -479,6 +487,10 @@ pub const AMDGPU_MAX_WORKGROUP_INVOCATIONS: u32 = 1024;
 /// test-preset value (a live PTX context reports its own device's count).
 pub const SM80_A100_COMPUTE_UNITS: u32 = 108;
 
+/// The binding offset multiple of a runtime that binds raw device pointers (ROCm, PTX): no API rule, so the kernel
+/// floor governs (`poot_kernel_ir::BUFFER_PARAM_ALIGN`, 16 bytes; each runtime reports that constant itself).
+pub const RAW_POINTER_BINDING_ALIGN: NonZeroU64 = NonZeroU64::new(16).unwrap();
+
 impl DeviceCaps {
     /// A ROCm/HSA device with no confirmed display watchdog or tiled-GEMM ceiling: HSA queues
     /// dispatches on hardware with no host display-refresh TDR, and the RADV miscompile is a wgpu/RADV
@@ -508,6 +520,7 @@ impl DeviceCaps {
             native_two_byte_floats: true,
             rounding_conversions: RoundingConversions::F16,
             peer_transport: false,
+            storage_offset_align: RAW_POINTER_BINDING_ALIGN,
             // The arch is the live agent's to say ([`calibration::Calibrated::of_hsa_arch`]); a device with no
             // arch plans with the portable prior.
             perf_calibration: calibration::Calibrated::Portable,
@@ -539,6 +552,7 @@ impl DeviceCaps {
             native_two_byte_floats: true,
             rounding_conversions: RoundingConversions::F16,
             peer_transport: true,
+            storage_offset_align: RAW_POINTER_BINDING_ALIGN,
             // sm_80 is not a measured device ([`calibration::Calibrated::of_cuda_compute_capability`]).
             perf_calibration: calibration::Calibrated::Portable,
         }

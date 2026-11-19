@@ -173,6 +173,19 @@ pub enum XdnaError {
         /// Which part of the shape ABI the arguments break.
         reason: String,
     },
+    /// A dispatch bound a buffer at a byte offset. The device binds whole host buffer objects, so no plan for it
+    /// emits one (it reports no `storage_offset_align`): the refusal is the typed backstop (POOT-1572).
+    #[error(
+        "kernel `{key}`: binding {param} is bound at byte offset {offset}, and this device binds whole buffers only"
+    )]
+    OffsetBinding {
+        /// The kernel's key.
+        key: String,
+        /// The binding's position.
+        param: usize,
+        /// The offending byte offset.
+        offset: u64,
+    },
     /// A buffer or binding whose byte size does not fit the address space.
     #[error("{elems} elements of {width} bytes overflow the byte size")]
     Size {
@@ -868,6 +881,13 @@ fn check_bindings(kernel: &LoadedKernel, args: &[&Arg<'_, XdnaDevice>]) -> Resul
         )));
     }
     for (index, (arg, binding)) in args.iter().zip(&kernel.bindings).enumerate() {
+        if arg.offset != 0 {
+            return Err(XdnaError::OffsetBinding {
+                key: kernel.key.clone(),
+                param: index,
+                offset: arg.offset,
+            });
+        }
         if arg.buffer.1 != binding.storage {
             return Err(refuse(format!(
                 "binding {index} is {:?}, the bound buffer is {:?}",

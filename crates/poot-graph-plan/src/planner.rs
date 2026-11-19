@@ -10,6 +10,7 @@
 //! `OpKind` variant fails to compile until it is assigned a family and that family handles it. A
 //! refusal is a typed [`Refusal`], built by `Site::refuse`.
 
+use crate::Views;
 use crate::compile::SlotSchema;
 use crate::kernel_mapping::{finalize, finalize_aie};
 use crate::npu::{NpuLowering, NpuTarget};
@@ -58,7 +59,6 @@ use poot_kernelgen::TopKSpec;
 use poot_kernelgen::ViewOperand;
 use poot_kernelgen::WeightLayout;
 use poot_tensor::DType;
-use std::collections::HashMap;
 
 /// Ops over a packed weight, planned by the descriptor-driven lowering table (`planner::packed_dequant`),
 /// never through the per-family `plan_eqn` bodies.
@@ -288,10 +288,9 @@ pub(crate) fn plan_graph(
     pins: Pins,
     npu: Option<&dyn NpuLowering>,
 ) -> Result<PlannedGraph, CompileError> {
-    let id = target.id();
     check_kv_head_strides(g, target)?;
-    let views = compute_views(g, id);
-    check_operand_layouts(GraphTables::from(g), &views, id, *limits)?;
+    let views = compute_views(g, target);
+    check_operand_layouts(GraphTables::from(g), &views, target, *limits)?;
     // Each equation generates its own bodies; a model repeats every kernel in every layer, so the plan keeps one
     // body per kernel key and the rest are dropped as each equation finishes, not all held until the graph is done.
     let bodies = std::cell::RefCell::new(SharedBodies::default());
@@ -391,7 +390,7 @@ pub fn plan_eqn(
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Plan, PlanError> {
-    plan_eqn_views(g, eqn, backend, &HashMap::new(), caps, limits)
+    plan_eqn_views(g, eqn, backend, &Views::new(), caps, limits)
 }
 
 /// spec 024: map an output storage dtype to the kernel element `Ty`. bf16/f16 bridge to their own
@@ -445,7 +444,7 @@ pub fn plan_eqn_views(
     g: &Graph,
     eqn: &Eqn,
     backend: Backend,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Plan, PlanError> {
@@ -465,7 +464,7 @@ pub fn plan_eqn_choice(
     g: &Graph,
     eqn: &Eqn,
     target: &Target,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     limits: &BodyLimits,
     npu: Option<&dyn NpuLowering>,
 ) -> Result<Planned, PlanError> {
@@ -489,7 +488,7 @@ pub(crate) fn plan_eqn_compiled(
     g: &Graph,
     eqn: &Eqn,
     target: &Target,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     limits: &BodyLimits,
     npu: Option<&dyn NpuLowering>,
     output: OutputBuffer,
@@ -521,7 +520,7 @@ pub(crate) fn runs_on_matrix_unit(
     g: &Graph,
     eqn: &Eqn,
     target: &Target,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     limits: &BodyLimits,
     npu: Option<&dyn NpuLowering>,
     feedback: Option<&crate::RegisterFeedback>,
@@ -589,7 +588,7 @@ fn plan_eqn_policy(
     g: &Graph,
     eqn: &Eqn,
     target: &Target,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     limits: &BodyLimits,
     pins: Pins,
     npu: Option<&dyn NpuLowering>,
@@ -652,7 +651,7 @@ pub(crate) fn plan_eqn_views_impl(
     out_shape: &[usize],
     out_numel: usize,
     target: &Target,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     const_lanes: &ConstLanes,
     limits: BodyLimits,
     pins: Pins,
@@ -738,7 +737,7 @@ fn plan_aie_eqn(
     out_numel: usize,
     target: AieTargetId,
     caps: &AieCaps,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     const_lanes: &ConstLanes,
     limits: BodyLimits,
     npu: &dyn NpuLowering,
@@ -893,7 +892,7 @@ fn plan_gpu_eqn(
     out_shape: &[usize],
     out_numel: usize,
     backend: Backend,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     caps: &DeviceCaps,
     const_lanes: &ConstLanes,
     limits: BodyLimits,

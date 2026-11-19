@@ -157,11 +157,13 @@ impl From<DeviceError> for ExecError {
 pub enum DispatchError {
     /// An argument's asserted element count exceeds the capacity of the buffer bound to it.
     #[error(
-        "dispatch argument {arg} asserts {elems} elements but its buffer holds {capacity} (the output is the last argument)"
+        "dispatch argument {arg} asserts {elems} elements from byte offset {offset} but its buffer holds {capacity} (the output is the last argument)"
     )]
     ArgExceedsBuffer {
         /// The argument's position: the inputs in kernel parameter order, then the output.
         arg: usize,
+        /// The byte offset the argument is bound at ([`crate::Arg::offset`]).
+        offset: u64,
         /// The element count the dispatch asserted for the argument.
         elems: usize,
         /// The element capacity of the bound buffer ([`crate::Device::buffer_elems`]).
@@ -183,6 +185,20 @@ pub enum LoadError {
         program: Box<Target>,
         /// The target of the device.
         device: Box<Target>,
+    },
+    /// A view's plan binds its root at a byte offset that is not inside it: not a whole number of the root's
+    /// elements, or past its end. The planner's split never produces one; the engine checks it where it reads the
+    /// plan, before any device sees an argument at that offset.
+    #[error(
+        "a view binds its root at byte {bound}, which is not inside its root of {root_elems} elements of {element_bytes} bytes"
+    )]
+    ViewOutsideRoot {
+        /// The planned byte offset.
+        bound: u64,
+        /// Bytes of one native element of the root's storage.
+        element_bytes: usize,
+        /// Native elements the root holds.
+        root_elems: usize,
     },
     /// A buffer the engine must allocate is larger than the device's single-buffer limit
     /// ([`poot_target::DeviceCaps::max_buffer_bytes`], this backend's own figure): refused before the

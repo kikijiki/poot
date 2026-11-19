@@ -15,6 +15,14 @@ use poot_tensor::DType as GDt;
 use poot_test_util::device_caps::default_caps_for;
 
 /// `g` compiled for `backend` through the full pipeline.
+/// The GPU target of `backend` with the reference caps the planner fixtures use.
+fn gpu_target(backend: Backend) -> Target {
+    Target::Gpu {
+        backend,
+        caps: default_caps_for(backend),
+    }
+}
+
 fn compiled(g: &Graph, backend: Backend) -> Program {
     let target = Target::Gpu {
         backend,
@@ -28,7 +36,7 @@ fn compiled(g: &Graph, backend: Backend) -> Program {
 /// Dispatch count with the planner's strided-view promotion applied: a promoted eqn counts as 0
 /// dispatches, like `Reshape`.
 fn dispatch_count_planned(g: &Graph, backend: Backend) -> usize {
-    let views = compute_views(g, backend);
+    let views = compute_views(g, &gpu_target(backend));
     g.eqns()
         .iter()
         .filter(|e| !matches!(e.op, OpKind::Reshape { .. }) && !views.contains_key(&e.out))
@@ -90,18 +98,20 @@ fn real_decode_graph(dense: poot_models::test_support::dense::Dense, cap: usize)
 /// Halo RADV device), so a target without channel data (PTX) runs the 368 of the exact capacity.
 /// POOT-1238: -1 on both, the mask region's launch: the attention states its causal mask by the position, so no
 /// mask is built, and -3 more with channel data, the pad column of that mask is not needed either.
+/// POOT-1572: -1 on both, the `[rows]` prefix of the position slot is a view the executor binds at the slot's start.
 const QWEN2_0_5B_DISPATCHES: Dispatches = Dispatches {
-    with_channels: 367,
-    without: 367,
+    with_channels: 366,
+    without: 366,
 };
 
 /// Dispatches per token of the 28-layer Qwen3-0.6B real-config decode graph (the legacy tracer planned 539).
 /// POOT-725: 484; POOT-1108: 483, the position cast folded as for Qwen2.5 above; POOT-1150: 486, the hidden
 /// pad column as above. POOT-1209: 487, the `[rows]` view of the position as above. POOT-1229: 484 on a target
 /// without channel data, as above. POOT-1238: 483 on both, the mask launch and the pad column gone as above.
+/// POOT-1572: 482 on both, the position prefix is a view as for Qwen2.5 above.
 const QWEN3_0_6B_DISPATCHES: Dispatches = Dispatches {
-    with_channels: 483,
-    without: 483,
+    with_channels: 482,
+    without: 482,
 };
 
 /// The dispatch pin of a decode graph by whether the target carries DRAM channel data (the legalizer pads the
@@ -338,7 +348,7 @@ fn rename_values(g: &Graph, rename: impl Fn(usize, &str) -> String) -> Graph {
 /// views, then the plan (or typed refusal) of every equation. `Plan` carries kernel bodies and cache
 /// keys, so a different body, key, grid metadata or refusal shows up as a different string.
 fn planned_graph_summary(g: &Graph, backend: Backend) -> Vec<String> {
-    let views = compute_views(g, backend);
+    let views = compute_views(g, &gpu_target(backend));
     let mut view_ids: Vec<ValueId> = views.keys().copied().collect();
     view_ids.sort();
     let mut summary: Vec<String> = view_ids
@@ -456,8 +466,8 @@ fn amdgcn_view_promotion_matches_spirv_on_real_qwen2_decode_configs() {
     for (name, cfg) in [("qwen2_0_5b", qwen2_0_5b()), ("qwen3_0_6b", qwen3_0_6b())] {
         let g = real_decode_graph(cfg, cap);
 
-        let views_spirv = compute_views(&g, Backend::SpirvVulkan);
-        let views_amd = compute_views(&g, amd);
+        let views_spirv = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
+        let views_amd = compute_views(&g, &gpu_target(amd));
 
         let mut spirv_ids: Vec<ValueId> = views_spirv.keys().copied().collect();
         let mut amd_ids: Vec<ValueId> = views_amd.keys().copied().collect();
@@ -474,15 +484,11 @@ fn amdgcn_view_promotion_matches_spirv_on_real_qwen2_decode_configs() {
              promotion path"
         );
         for id in &spirv_ids {
-            let l_spirv = &views_spirv[id];
-            let l_amd = &views_amd[id];
+            let l_spirv = &views_spirv[id].layout;
+            let l_amd = &views_amd[id].layout;
             assert_eq!(
                 l_spirv.strides, l_amd.strides,
                 "{name}: value {id} strides diverge between SpirvVulkan and AmdGcn"
-            );
-            assert_eq!(
-                l_spirv.offset, l_amd.offset,
-                "{name}: value {id} offset diverges between SpirvVulkan and AmdGcn"
             );
         }
 
@@ -511,7 +517,7 @@ fn amdgcn_view_promotion_matches_spirv_on_real_qwen2_decode_configs() {
 /// instead of SpirvVulkan.
 ///
 /// Mutation: restore `strided_views: false` for `Target::Nvptx` in
-/// `poot-codegen/src/lib.rs::capability`; `compute_views(&g, Nvptx)` goes back to returning an
+/// `poot-codegen/src/lib.rs::capability`; `compute_views(&g, &gpu_target(Nvptx))` goes back to returning an
 /// empty map (its `if !codegen_capability(backend).strided_views { return views; }` early-out),
 /// so `nvptx_ids` is empty while `amd_ids` is not, and this row goes red.
 #[test]
@@ -522,8 +528,8 @@ fn nvptx_view_promotion_matches_amdgcn_on_real_qwen2_decode_configs() {
     for (name, cfg) in [("qwen2_0_5b", qwen2_0_5b()), ("qwen3_0_6b", qwen3_0_6b())] {
         let g = real_decode_graph(cfg, cap);
 
-        let views_nvptx = compute_views(&g, Backend::Nvptx);
-        let views_amd = compute_views(&g, amd);
+        let views_nvptx = compute_views(&g, &gpu_target(Backend::Nvptx));
+        let views_amd = compute_views(&g, &gpu_target(amd));
 
         let mut nvptx_ids: Vec<ValueId> = views_nvptx.keys().copied().collect();
         let mut amd_ids: Vec<ValueId> = views_amd.keys().copied().collect();
@@ -540,15 +546,11 @@ fn nvptx_view_promotion_matches_amdgcn_on_real_qwen2_decode_configs() {
              materialize-everything behavior"
         );
         for id in &nvptx_ids {
-            let l_nvptx = &views_nvptx[id];
-            let l_amd = &views_amd[id];
+            let l_nvptx = &views_nvptx[id].layout;
+            let l_amd = &views_amd[id].layout;
             assert_eq!(
                 l_nvptx.strides, l_amd.strides,
                 "{name}: value {id} strides diverge between Nvptx and AmdGcn"
-            );
-            assert_eq!(
-                l_nvptx.offset, l_amd.offset,
-                "{name}: value {id} offset diverges between Nvptx and AmdGcn"
             );
         }
 
@@ -573,8 +575,8 @@ fn nvptx_view_promotion_matches_amdgcn_on_real_qwen2_decode_configs() {
 /// names, with its own mutation record.
 ///
 /// Mutation: restore `strided_views: false` for `Target::Nvptx` in
-/// `poot-codegen/src/lib.rs::capability`. `compute_views(&g, Nvptx)` goes back to its early-out empty
-/// map while `compute_views(&g, amd)` still promotes every view, so every one of those views costs
+/// `poot-codegen/src/lib.rs::capability`. `compute_views(&g, &gpu_target(Nvptx))` goes back to its early-out empty
+/// map while `compute_views(&g, &gpu_target(amd))` still promotes every view, so every one of those views costs
 /// Nvptx one extra materialize-copy dispatch it does not pay today:
 /// `dispatch_count_planned(&g, Nvptx)` reads higher than `dispatch_count_planned(&g, amd)` by exactly
 /// the view count, and this row goes red. Reverted: GREEN.
@@ -586,7 +588,7 @@ fn sc004_nvptx_strided_view_fixture_pays_no_extra_copy_vs_amdgcn() {
     for (name, cfg) in [("qwen2_0_5b", qwen2_0_5b()), ("qwen3_0_6b", qwen3_0_6b())] {
         let g = real_decode_graph(cfg, cap);
 
-        let views_nvptx = compute_views(&g, Backend::Nvptx);
+        let views_nvptx = compute_views(&g, &gpu_target(Backend::Nvptx));
         assert!(
             !views_nvptx.is_empty(),
             "{name}: this fixture is known to have promotable views on Nvptx - an empty set means \

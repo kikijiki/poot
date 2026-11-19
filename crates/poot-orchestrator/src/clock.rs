@@ -49,6 +49,16 @@ pub(crate) fn iso_in_minutes(minutes: i64) -> String {
     iso_from_secs(secs)
 }
 
+/// How long after its creation a pod may be missing from RunPod's list without being gone: the list is eventually
+/// consistent, so a pod created moments before it was read can be absent.
+pub(crate) const LISTING_GRACE_SECS: i64 = 60;
+
+/// Was a pod created at `created_at` less than [`LISTING_GRACE_SECS`] before `checked_at` (or after it)? An
+/// unparseable timestamp is not within the grace.
+pub(crate) fn created_within_listing_grace(created_at: &str, checked_at: i64) -> bool {
+    secs_from_iso(created_at).is_some_and(|created| created > checked_at - LISTING_GRACE_SECS)
+}
+
 pub(crate) fn new_exec_run_id() -> String {
     let seq = EXEC_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
     exec_run_id_from(SystemTime::now(), std::process::id(), seq)

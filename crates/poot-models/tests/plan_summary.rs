@@ -227,12 +227,17 @@ fn describe_plan(eqn: &Eqn, plan: &Plan, choice: &KernelChoice) -> PlanCells {
         Plan::Alias(src) => PlanCells::no_launch("alias", choice, format!("src={src}")),
         Plan::View {
             src,
+            bound,
             strides,
             offset,
         } => PlanCells::no_launch(
             "view",
             choice,
-            format!("src={src} strides={strides:?} offset={offset}"),
+            // A view the executor binds at the start of its root reads as before; a bound offset is named.
+            match bound {
+                0 => format!("src={src} strides={strides:?} offset={offset}"),
+                bound => format!("src={src} strides={strides:?} offset={offset} bound={bound}"),
+            },
         ),
         Plan::Graph => PlanCells::no_launch("graph", choice, String::new()),
         Plan::SideOutput { region } => {
@@ -844,8 +849,8 @@ fn literal_launch_counts() {
     let registry = registry();
     let corpus = corpus(&registry);
     for (name, launches) in [
-        ("parity.qwen2.decode", 37usize),
-        ("parity.qwen3.decode", 41),
+        ("parity.qwen2.decode", 36usize),
+        ("parity.qwen3.decode", 40),
     ] {
         let graph = corpus
             .iter()

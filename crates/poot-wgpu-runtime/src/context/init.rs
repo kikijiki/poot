@@ -7,6 +7,7 @@ use poot_target::ArgAccess;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 
 impl Context {
     /// A context with device-timing off (the default; no per-dispatch overhead).
@@ -127,6 +128,12 @@ impl Context {
             native_two_byte_floats: false,
             rounding_conversions: poot_target::RoundingConversions::NONE,
             peer_transport: false,
+            // The limit of the device as opened: wgpu-core raises every adapter's value to the WebGPU floor and
+            // refuses a binding offset that is not a multiple of it.
+            storage_offset_align: NonZeroU64::new(u64::from(
+                self.device.limits().min_storage_buffer_offset_alignment,
+            ))
+            .unwrap_or(NonZeroU64::MIN),
             perf_calibration: self.perf_calibration,
         }
     }

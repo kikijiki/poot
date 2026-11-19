@@ -17,7 +17,7 @@ use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
 };
 use poot_graph_plan::Target;
-use poot_ptx_runtime::{PtxBuffer, PtxContext, PtxError, PtxGraphExec, PtxSpan};
+use poot_ptx_runtime::{PtxBinding, PtxBuffer, PtxContext, PtxError, PtxGraphExec, PtxSpan};
 use poot_runtime_common::{BufferRole, DeviceIdentity};
 use poot_target::{Backend, BufferStorage, TargetId};
 
@@ -173,16 +173,20 @@ impl Device for PtxDevice {
         // Card 547b: every argument's own logical element count from the plan, never
         // the bound buffer's capacity (an arena slot's buffer is sized to its largest occupant,
         // which can exceed this particular dispatch's operand).
-        let ins: Vec<&PtxBuffer> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.buffer).collect();
-        let in_lens: Vec<usize> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.elems).collect();
+        fn binding<'a>(a: &Arg<'a, PtxDevice>) -> PtxBinding<'a> {
+            PtxBinding {
+                buffer: a.buffer,
+                offset: a.offset,
+                elems: a.elems,
+            }
+        }
+        let ins: Vec<PtxBinding<'_>> = d.inputs.iter().map(binding).collect();
         Ok(self.ctx.dispatch_dev(
             &d.kernel.compiled,
             workgroup,
             threads,
             &ins,
-            &in_lens,
-            d.output.buffer,
-            d.output.elems,
+            binding(&d.output),
         )?)
     }
 

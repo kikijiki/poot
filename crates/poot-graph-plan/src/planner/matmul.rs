@@ -6,11 +6,11 @@ use super::{
     ValueId, WeightLayout, fty_ty, kg, out_numel_saturating, value_ids,
 };
 use crate::Target;
+use crate::Views;
 use crate::dtype_widen::ConstLanes;
 use crate::kernel_mapping::{
     check_widening_step, float_region_leaf_storage, map_fused_op, narrowing_store_op,
 };
-use crate::planner::kg::Layout;
 use crate::planner::{GraphTables, OutputBuffer, StorageDtypes};
 use crate::predicates::{
     is_batched_tileable_matmul_in, is_decode_attn_gemv_in, is_tileable_matmul_in, lds_gemv_width,
@@ -19,7 +19,6 @@ use crate::predicates::{
 use crate::refusal::{FusedStepGap, Pins, Site};
 use poot_graph_ir::{FragmentDtype, LocalId, OperandPrecision};
 use poot_target::{Backend, DeviceCaps};
-use std::collections::HashMap;
 
 /// The launch of a `Tiled` contraction of `tiles` workgroups of `tile * tile` threads: the tiles laid out on the X
 /// extent, or, above `caps.max_grid[0]`, folded onto a 2-D `(x_groups, y_groups)` grid the body reconstructs as
@@ -111,7 +110,7 @@ pub(crate) fn epilogue_head_lowers(
     g: &Graph,
     eqn: &Eqn,
     target: &Target,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     limits: &BodyLimits,
 ) -> bool {
     super::plan_eqn_compiled(g, eqn, target, views, limits, None, OutputBuffer::Fresh)

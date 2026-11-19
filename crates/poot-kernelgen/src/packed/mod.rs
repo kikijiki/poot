@@ -3121,7 +3121,7 @@ mod rocm_tests {
 
     use poot_codegen::CompiledKernel;
     use poot_rocm_runtime::{
-        BoundKernarg, HsacoModule, KernelHandle, RocmBuffer, RocmContext, RocmError,
+        BoundKernarg, HsacoModule, KernargSlot, KernelHandle, RocmBuffer, RocmContext, RocmError,
     };
     use poot_runtime_common::BufferRole;
     use poot_target::ElementKind;
@@ -3191,9 +3191,9 @@ mod rocm_tests {
         kernel: &KernelHandle,
         buffers: &[&RocmBuffer],
     ) -> BoundKernarg {
-        let slots: Vec<(&RocmBuffer, u64)> = buffers
+        let slots: Vec<KernargSlot<'_>> = buffers
             .iter()
-            .map(|&buffer| (buffer, buffer.elem_count() as u64))
+            .map(|&buffer| KernargSlot::at_base(buffer, buffer.elem_count() as u64))
             .collect();
         ctx.bind_kernarg(kernel, &slots).expect("bind kernarg")
     }
@@ -4011,14 +4011,12 @@ mod ptx_tests {
                 &kernel,
                 body.workgroup_size,
                 [(ids.len() * k) as u32, 1, 1],
-                &[&words_buf, &ids_buf, &metadata_buf],
                 &[
-                    words_buf.elem_count(),
-                    ids_buf.elem_count(),
-                    metadata_buf.elem_count(),
+                    poot_ptx_runtime::PtxBinding::at_base(&words_buf, words_buf.elem_count()),
+                    poot_ptx_runtime::PtxBinding::at_base(&ids_buf, ids_buf.elem_count()),
+                    poot_ptx_runtime::PtxBinding::at_base(&metadata_buf, metadata_buf.elem_count()),
                 ],
-                &out_buf,
-                out_buf.elem_count(),
+                poot_ptx_runtime::PtxBinding::at_base(&out_buf, out_buf.elem_count()),
             )
             .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
             let got = ctx.download_f32(&out_buf).expect("download out");
@@ -4078,14 +4076,12 @@ mod ptx_tests {
             &kernel,
             body.workgroup_size,
             [threads, 1, 1],
-            &[&activation_buf, &words_buf, &metadata_buf],
             &[
-                activation_buf.elem_count(),
-                words_buf.elem_count(),
-                metadata_buf.elem_count(),
+                poot_ptx_runtime::PtxBinding::at_base(&activation_buf, activation_buf.elem_count()),
+                poot_ptx_runtime::PtxBinding::at_base(&words_buf, words_buf.elem_count()),
+                poot_ptx_runtime::PtxBinding::at_base(&metadata_buf, metadata_buf.elem_count()),
             ],
-            &out_buf,
-            out_buf.elem_count(),
+            poot_ptx_runtime::PtxBinding::at_base(&out_buf, out_buf.elem_count()),
         )
         .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
         let got = ctx.download_f32(&out_buf).expect("download out");
@@ -4159,14 +4155,12 @@ mod ptx_tests {
                 &kernel,
                 body.workgroup_size,
                 [(ids.len() * k) as u32, 1, 1],
-                &[&words_buf, &ids_buf, &metadata_buf],
                 &[
-                    words_buf.elem_count(),
-                    ids_buf.elem_count(),
-                    metadata_buf.elem_count(),
+                    poot_ptx_runtime::PtxBinding::at_base(&words_buf, words_buf.elem_count()),
+                    poot_ptx_runtime::PtxBinding::at_base(&ids_buf, ids_buf.elem_count()),
+                    poot_ptx_runtime::PtxBinding::at_base(&metadata_buf, metadata_buf.elem_count()),
                 ],
-                &out_buf,
-                out_buf.elem_count(),
+                poot_ptx_runtime::PtxBinding::at_base(&out_buf, out_buf.elem_count()),
             )
             .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
             let got = ctx.download_f32(&out_buf).expect("download out");
@@ -4356,10 +4350,12 @@ mod planar_ptx_tests {
             &kernel,
             body.workgroup_size,
             [threads, 1, 1],
-            &arg_refs,
-            &arg_lens,
-            &out_buf,
-            out_buf.elem_count(),
+            &arg_refs
+                .iter()
+                .zip(&arg_lens)
+                .map(|(buffer, &len)| poot_ptx_runtime::PtxBinding::at_base(buffer, len))
+                .collect::<Vec<_>>(),
+            poot_ptx_runtime::PtxBinding::at_base(&out_buf, out_buf.elem_count()),
         )
         .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
         let got = ctx.download_f32(&out_buf).expect("download out");

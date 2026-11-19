@@ -790,10 +790,11 @@ fn assert_trap_traps_on_ptx() {
         &ptx_kernel,
         [idx_ok.len() as u32, 1, 1],
         [idx_ok.len() as u32, 1, 1],
-        &[&idx_buf, &data_buf],
-        &[idx_buf.elem_count(), data_buf.elem_count()],
-        &out_buf,
-        out_buf.elem_count(),
+        &[
+            poot_ptx_runtime::PtxBinding::at_base(&idx_buf, idx_buf.elem_count()),
+            poot_ptx_runtime::PtxBinding::at_base(&data_buf, data_buf.elem_count()),
+        ],
+        poot_ptx_runtime::PtxBinding::at_base(&out_buf, out_buf.elem_count()),
     )
     .expect("dispatch is async and should always succeed for valid indices");
     ctx.synchronize()
@@ -818,10 +819,11 @@ fn assert_trap_traps_on_ptx() {
         &ptx_kernel,
         [idx_bad.len() as u32, 1, 1],
         [idx_bad.len() as u32, 1, 1],
-        &[&idx_bad_buf, &data_buf],
-        &[idx_bad_buf.elem_count(), data_buf.elem_count()],
-        &out_bad_buf,
-        out_bad_buf.elem_count(),
+        &[
+            poot_ptx_runtime::PtxBinding::at_base(&idx_bad_buf, idx_bad_buf.elem_count()),
+            poot_ptx_runtime::PtxBinding::at_base(&data_buf, data_buf.elem_count()),
+        ],
+        poot_ptx_runtime::PtxBinding::at_base(&out_bad_buf, out_bad_buf.elem_count()),
     )
     .expect("dispatch is async; the launch call itself should still succeed");
     let err = ctx.synchronize().expect_err(

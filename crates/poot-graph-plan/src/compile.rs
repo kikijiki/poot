@@ -1131,7 +1131,7 @@ pub fn compile(
         };
         let limits = options.limits.body();
         pipeline.require("select_operand_precision", |g| {
-            let views = compute_views(g, target.id());
+            let views = compute_views(g, target);
             #[cfg(any(test, feature = "test-support"))]
             let declared = options.declare_precision;
             #[cfg(not(any(test, feature = "test-support")))]
@@ -1162,7 +1162,7 @@ pub fn compile(
     if let Some((backend, caps)) = lowers(Rewrite::GroupExpertRows) {
         let limits = options.limits.body();
         pipeline.require("group_expert_rows", |g| {
-            let views = compute_views(g, target.id());
+            let views = compute_views(g, target);
             transform::group_expert_rows(
                 g,
                 |graph, eqn| {
@@ -1196,7 +1196,7 @@ pub fn compile(
             // expert stack is read through its view): computed once for the pass, which reads one graph.
             let views = std::cell::OnceCell::new();
             transform::fuse_contraction_epilogues(g, |graph, head| {
-                let views = views.get_or_init(|| compute_views(graph, target.id()));
+                let views = views.get_or_init(|| compute_views(graph, target));
                 planner::epilogue_head_lowers(graph, head, target, views, &options.limits.body())
             })
         })?;
@@ -1224,7 +1224,7 @@ pub fn compile(
         let limits = options.limits.body();
         pipeline.require("store_narrowed_activations", |g| {
             transform::store_narrowed_activations(g, |graph, eqns| {
-                let views = compute_views(graph, target.id());
+                let views = compute_views(graph, target);
                 eqns.iter().all(|eqn| {
                     plan_eqn_compiled(
                         graph,
@@ -1643,7 +1643,7 @@ fn revert_unplannable_rewrites(
     });
     // Probe exactly as `plan_graph` plans: with the graph's own strided views.
     // A probe stricter than the final plan would drop a rewrite the target can run.
-    let views = compute_views(&after, target.id());
+    let views = compute_views(&after, target);
     let mut refused: Vec<(ValueId, Refusal)> = Vec::new();
     for eqn in rewritten {
         match plan_eqn_compiled(

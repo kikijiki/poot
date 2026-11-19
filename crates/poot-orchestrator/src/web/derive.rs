@@ -8,13 +8,12 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::clock::{now_secs, secs_from_iso};
+use crate::clock::{created_within_listing_grace, now_secs, secs_from_iso};
 use crate::db::Pod;
 
 const DAY_SECS: i64 = 24 * 3600;
 /// How long RunPod may take to list a pod it just created: a pod created less than this before the list was read
 /// is not "gone" for being missing from it.
-const LISTING_GRACE_SECS: i64 = 60;
 /// How often the background check lists the pods RunPod knows.
 const VERIFY_EVERY: Duration = Duration::from_secs(30);
 
@@ -129,17 +128,14 @@ pub(super) fn verify(pod: &Pod, view: Option<&RunpodView>, now: i64) -> Verified
                 runpod_status: runpod_status.clone(),
                 checked_secs_ago,
             },
-            None if created_within_grace(pod, view.checked_at) => Verified::Unverified {
-                reason: "created moments before RunPod's list was read".into(),
-            },
+            None if created_within_listing_grace(&pod.created_at, view.checked_at) => {
+                Verified::Unverified {
+                    reason: "created moments before RunPod's list was read".into(),
+                }
+            }
             None => Verified::Gone { checked_secs_ago },
         },
     }
-}
-
-/// Was the pod created less than [`LISTING_GRACE_SECS`] before `checked_at` (or after it)?
-fn created_within_grace(pod: &Pod, checked_at: i64) -> bool {
-    secs_from_iso(&pod.created_at).is_some_and(|created| created > checked_at - LISTING_GRACE_SECS)
 }
 
 /// The span a pod has been billable: from its creation until it was terminated, or RunPod stopped listing it

@@ -3,11 +3,12 @@
 
 use super::matmul::{TiledDispatch, planned_dispatches, register_tiled_launch};
 use super::{
-    BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, HashMap, KernelRequest,
-    OpKind, PlanError, Planned, TopKSpec, ValueId, kg, matmul, value_ids,
+    BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, KernelRequest, OpKind,
+    PlanError, Planned, TopKSpec, ValueId, kg, matmul, value_ids,
 };
+use crate::Views;
 use crate::dtype_widen::ConstLanes;
-use crate::planner::{GraphTables, Layout, StorageDtypes, finalize};
+use crate::planner::{GraphTables, StorageDtypes, finalize};
 use crate::predicates::{
     IndexedRows, LayoutDemand, gemv_wins, indexed_gemv_in, indexed_matmul_lowers, view_source,
 };
@@ -49,7 +50,7 @@ pub(super) fn plan(
     out_shape: &[usize],
     out_numel: usize,
     backend: Backend,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
@@ -145,7 +146,7 @@ pub(super) fn plan(
 /// `[E, N, K]` when it is the view a `Transpose { perm: [0, 2, 1] }` of such a stack became
 /// ([`crate::compute_views`]), which the contraction reads in place. [`LayoutDemand::IndexedWeight`] admits no
 /// other view, so none reaches here ([`crate::predicates::check_operand_layouts`] proves it on every compile).
-fn weight_layout(value: ValueId, views: &HashMap<ValueId, Layout>) -> kg::WeightLayout {
+fn weight_layout(value: ValueId, views: &Views) -> kg::WeightLayout {
     if views.contains_key(&value) {
         kg::WeightLayout::Nk
     } else {
@@ -155,11 +156,7 @@ fn weight_layout(value: ValueId, views: &HashMap<ValueId, Layout>) -> kg::Weight
 
 /// The storage the stacked weight `w` is read in: f32, or BF16 packed lanes, which only a const upload (or a view
 /// of one, read in place) has; `None` for any other.
-fn stack_storage(
-    g: GraphTables<'_>,
-    views: &HashMap<ValueId, Layout>,
-    w: ValueId,
-) -> Option<BufferStorage> {
+fn stack_storage(g: GraphTables<'_>, views: &Views, w: ValueId) -> Option<BufferStorage> {
     match g.aval(w).dtype {
         DType::F32 => Some(BufferStorage::f32()),
         DType::BF16
@@ -205,7 +202,7 @@ fn indexed_tiled_shape(
 pub(crate) fn grouping_candidate(
     g: &poot_graph_ir::Graph,
     eqn: &Eqn,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     caps: &DeviceCaps,
     pin: Option<IndexedRows>,
 ) -> Option<kg::TiledShape> {
@@ -252,7 +249,7 @@ fn plan_indexed(
     g: GraphTables<'_>,
     eqn: &Eqn,
     backend: Backend,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     caps: &DeviceCaps,
     epilogue: Option<kg::Epilogue>,
 ) -> Result<Planned, PlanError> {

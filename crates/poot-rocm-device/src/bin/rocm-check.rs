@@ -37,8 +37,8 @@ use poot_codegen::{
 };
 use poot_kernel_ir::fixtures;
 use poot_rocm_runtime::{
-    DeviceStoreFence, QueuePublicationContract, RocmContext, RocmContextOptions, RocmError,
-    take_issued_device_store_fence_count,
+    DeviceStoreFence, KernargSlot, QueuePublicationContract, RocmContext, RocmContextOptions,
+    RocmError, take_issued_device_store_fence_count,
 };
 use poot_runtime_common::{BufferRole, DeviceBackend, fnv1a};
 use poot_target::{AmdArch, ElementKind};
@@ -196,7 +196,11 @@ fn run_add() -> Result<(), CheckError> {
     // Kernarg layout: ptr a, i64 n_a, ptr b, i64 n_b, ptr c, i64 n_c (48 bytes).
     let kernarg_buf = ctx.bind_kernarg(
         &kernel,
-        &[(&a_buf, n as u64), (&b_buf, n as u64), (&c_buf, n as u64)],
+        &[
+            KernargSlot::at_base(&a_buf, n as u64),
+            KernargSlot::at_base(&b_buf, n as u64),
+            KernargSlot::at_base(&c_buf, n as u64),
+        ],
     )?;
 
     // Dispatch: 64 work-items in one workgroup (see the SC-001 note above).
@@ -343,7 +347,11 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
             // The bound kernarg keeps `a_buf` and `b_buf` alive for the batch lifetime.
             let kernarg_buf = ctx.bind_kernarg(
                 &add_kernel,
-                &[(&a_buf, n as u64), (&b_buf, n as u64), (&c_buf, n as u64)],
+                &[
+                    KernargSlot::at_base(&a_buf, n as u64),
+                    KernargSlot::at_base(&b_buf, n as u64),
+                    KernargSlot::at_base(&c_buf, n as u64),
+                ],
             )?;
             owned_k.push(kernarg_buf);
             c_bufs.push(c_buf);

@@ -517,13 +517,40 @@ struct ValidationLoad {
     sources: Vec<(Loc, usize)>, // (buffer location, lane_count)
 }
 
+/// Where a value's window of its buffer starts, in the two units that need it: the bytes a device binds it at
+/// ([`Arg::offset`]) and the buffer's own native elements, which the extent check counts ([`check_arg_lengths`]).
+/// The planner's `bound` (`Plan::View`), converted once at load by the element width of the root's storage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Offset {
+    bytes: u64,
+    elems: usize,
+}
+
+/// One argument of a recorded dispatch: where its buffer is, where in it the argument starts and its own logical
+/// device-element count (Card 547b): the plan's own length, never the bound buffer's capacity (which an arena slot's
+/// largest occupant may have sized larger than this particular operand).
+#[derive(Clone, Copy, Debug)]
+struct Bound {
+    loc: Loc,
+    offset: Offset,
+    elems: usize,
+}
+
+impl Bound {
+    /// A value that owns its buffer from the first byte.
+    fn whole((loc, elems): (Loc, usize)) -> Self {
+        Self {
+            loc,
+            offset: Offset::default(),
+            elems,
+        }
+    }
+}
+
 struct LoadedStep {
     kernel: usize,
-    /// Each input's location and its own logical device-element count (Card 547b): the
-    /// plan's own length, never the bound buffer's capacity (which an arena slot's largest occupant
-    /// may have sized larger than this particular operand).
-    inputs: Vec<(Loc, usize)>,
-    output: (Loc, usize),
+    inputs: Vec<Bound>,
+    output: Bound,
     launch: LaunchKind,
     work: u64,
     /// The originating equation's semantic report key (Card 552, R-552-2): the aggregation key for
@@ -559,19 +586,51 @@ pub(crate) fn device_error<E: std::error::Error + Send + Sync + 'static>(
     }
 }
 
-/// The one length check every backend shares: no argument of a dispatch may assert more native elements than
-/// the buffer bound to it holds ([`Device::buffer_elems`]), because a kernel trusts the length it is
-/// published. Arguments are numbered as the device sees them, the inputs then the output.
+/// A plan's `bound` (bytes into a view's root, [`poot_graph_plan::Plan::View`]) as an [`Offset`]: the bytes, and the
+/// same position in native elements of the root's `storage`. A bound that is not a whole number of those elements, or
+/// lies past the root's `root_elems`, is refused.
+fn view_offset(storage: BufferStorage, root_elems: usize, bound: u64) -> Result<Offset, LoadError> {
+    let element_bytes = storage.element().byte_width();
+    let outside = || LoadError::ViewOutsideRoot {
+        bound,
+        element_bytes,
+        root_elems,
+    };
+    let width = element_bytes as u64;
+    if !bound.is_multiple_of(width) {
+        return Err(outside());
+    }
+    let elems = usize::try_from(bound / width).map_err(|_| outside())?;
+    if elems > root_elems {
+        return Err(outside());
+    }
+    Ok(Offset {
+        bytes: bound,
+        elems,
+    })
+}
+
+/// The one length check every backend shares: no argument of a dispatch may assert more native elements, from the
+/// offset it is bound at, than the buffer bound to it holds ([`Device::buffer_elems`]), because a kernel trusts the
+/// length it is published. Arguments are numbered as the device sees them, the inputs then the output. `starts` is
+/// each argument's offset in native elements ([`Offset::elems`]), in the same order.
 fn check_arg_lengths<D: Device>(
     device: &D,
     inputs: &[Arg<'_, D>],
     output: &Arg<'_, D>,
+    starts: impl Iterator<Item = usize>,
 ) -> Result<(), DispatchError> {
-    for (arg, bound) in inputs.iter().chain(std::iter::once(output)).enumerate() {
+    for (arg, (bound, start)) in inputs
+        .iter()
+        .chain(std::iter::once(output))
+        .zip(starts)
+        .enumerate()
+    {
         let capacity = device.buffer_elems(bound.buffer);
-        if bound.elems > capacity {
+        if start.saturating_add(bound.elems) > capacity {
             return Err(DispatchError::ArgExceedsBuffer {
                 arg,
+                offset: bound.offset,
                 elems: bound.elems,
                 capacity,
             });
@@ -1827,6 +1886,12 @@ impl<D: Device> Engine<D> {
             sides.sort_unstable();
         }
         let mut steps = Vec::new();
+        // Where a view's window starts in its root's buffer, and the root a view reads: set where a `Plan::View`
+        // binds, carried through an alias, zero for every value that owns its buffer.
+        let mut offsets: ValueTable<Offset> =
+            ValueTable::filled(g.values().len(), Offset::default());
+        let mut view_roots: ValueTable<Option<ValueId>> =
+            ValueTable::filled(g.values().len(), None);
         for (eqn_index, (eqn, plan)) in program.planned().enumerate() {
             let operand = |values: &ValueTable<Option<(Loc, usize)>>,
                            v: ValueId|
@@ -1835,13 +1900,22 @@ impl<D: Device> Engine<D> {
             };
             // Card 547b: each operand's own `(Loc, elems)` pair, exactly as it was recorded when
             // that value was bound or computed above - never re-derived here, so a packed-source
-            // const's own uploaded word count is carried through unchanged.
+            // const's own uploaded word count is carried through unchanged - with the offset a view of
+            // it binds at.
             let operands_with_elems = |values: &ValueTable<Option<(Loc, usize)>>,
+                                       offsets: &ValueTable<Offset>,
                                        eqn: &Eqn|
-             -> Result<Vec<(Loc, usize)>, ExecError> {
+             -> Result<Vec<Bound>, ExecError> {
                 value_ids(eqn)
                     .into_iter()
-                    .map(|v| operand(values, v))
+                    .map(|v| {
+                        let (loc, elems) = operand(values, v)?;
+                        Ok(Bound {
+                            loc,
+                            offset: offsets[v],
+                            elems,
+                        })
+                    })
                     .collect()
             };
             // A region runs as one invocation, at the position of its last equation: its other equations
@@ -1863,7 +1937,7 @@ impl<D: Device> Engine<D> {
                 // after the reads, and the artifact's ABI says which of the arguments the region writes.
                 let mut args = Vec::with_capacity(region.reads().len() + region.writes().len());
                 for &read in region.reads() {
-                    args.push(operand(&values, read)?);
+                    args.push(Bound::whole(operand(&values, read)?));
                 }
                 for &write in region.writes() {
                     let loc = out_loc(
@@ -1879,7 +1953,7 @@ impl<D: Device> Engine<D> {
                     )?;
                     let placed = (loc, elems_of(write)?);
                     values[write] = Some(placed);
-                    args.push(placed);
+                    args.push(Bound::whole(placed));
                 }
                 let output = args
                     .pop()
@@ -1903,9 +1977,31 @@ impl<D: Device> Engine<D> {
             match plan {
                 Plan::Alias(source) => {
                     values[eqn.out] = Some(operand(&values, *source)?);
+                    offsets[eqn.out] = offsets[*source];
+                    view_roots[eqn.out] = view_roots[*source];
                 }
-                Plan::View { src, .. } => {
-                    values[eqn.out] = Some(operand(&values, *src)?);
+                Plan::View {
+                    src,
+                    bound,
+                    strides,
+                    offset,
+                } => {
+                    // The plan's layout is over the root's buffer from its first element, whatever chain of views
+                    // led here: bind the root, not the value the view was cut from.
+                    let root = view_roots[*src].unwrap_or(*src);
+                    let (loc, root_elems) = operand(&values, root)?;
+                    let at = view_offset(storage_of(root), root_elems, *bound)?;
+                    // A reader of layouts indexes the root up to the end of its buffer; a dense view with no
+                    // residual offset is read like a materialized value of its own length.
+                    let shape = &g.aval(eqn.out).shape;
+                    let elems = if *offset == 0 && poot_graph_plan::is_dense_view(strides, shape) {
+                        elems_of(eqn.out)?
+                    } else {
+                        root_elems - at.elems
+                    };
+                    values[eqn.out] = Some((loc, elems));
+                    offsets[eqn.out] = at;
+                    view_roots[eqn.out] = Some(root);
                 }
                 // `package` puts every node of a graph artifact in the program's one region, and the
                 // walk above handled it.
@@ -1934,7 +2030,7 @@ impl<D: Device> Engine<D> {
                         &mut stage_arena,
                     )?;
                     let output = (output_loc, elems_of(eqn.out)?);
-                    let operands = operands_with_elems(&values, eqn)?;
+                    let operands = operands_with_elems(&values, &offsets, eqn)?;
                     // A multi-output region's side outputs: placed here, where its dispatch writes them, and named by
                     // their projections after it (POOT-1456).
                     let mut sides = Vec::new();
@@ -1952,7 +2048,7 @@ impl<D: Device> Engine<D> {
                         )?;
                         let placed = (loc, elems_of(side)?);
                         values[side] = Some(placed);
-                        sides.push(placed);
+                        sides.push(Bound::whole(placed));
                     }
                     // A scratch buffer is an arena slot of this equation's own index, bound through the view
                     // of its slot as its declared storage; its element count is the declared one, never the
@@ -1995,10 +2091,10 @@ impl<D: Device> Engine<D> {
                             }
                         };
                         let binding = dispatch.binding();
-                        let output = match binding.write() {
+                        let output = Bound::whole(match binding.write() {
                             Sink::Out => output,
                             Sink::Scratch(id) => scratch_of(id)?,
-                        };
+                        });
                         let mut inputs = Vec::with_capacity(binding.reads().len() + 1);
                         for source in binding.reads() {
                             inputs.push(match *source {
@@ -2007,12 +2103,12 @@ impl<D: Device> Engine<D> {
                                         "a dispatch binds an operand its equation lacks",
                                     ))?
                                 }
-                                Source::Scratch(id) => scratch_of(id)?,
+                                Source::Scratch(id) => Bound::whole(scratch_of(id)?),
                             });
                         }
                         if !launch.meta.is_empty() {
                             let meta_loc = self.meta_buffer(&launch.meta, locals)?;
-                            inputs.push((meta_loc, launch.meta.len()));
+                            inputs.push(Bound::whole((meta_loc, launch.meta.len())));
                         }
                         // The side writes ride after the reads and the metadata, before the output, as the kernel
                         // declares them.
@@ -2514,20 +2610,19 @@ impl<D: Device> Engine<D> {
         let at = |loc| resolve::<D>(loc, locals, arena, held);
         let on_device = device_error(device.backend_name());
         for step in &stage.steps {
-            let inputs: Vec<Arg<'_, D>> = step
+            let arg = |bound: &Bound| Arg {
+                buffer: at(bound.loc),
+                offset: bound.offset.bytes,
+                elems: bound.elems,
+            };
+            let inputs: Vec<Arg<'_, D>> = step.inputs.iter().map(arg).collect();
+            let output = arg(&step.output);
+            let starts = step
                 .inputs
                 .iter()
-                .map(|&(loc, elems)| Arg {
-                    buffer: at(loc),
-                    elems,
-                })
-                .collect();
-            let (output_loc, output_elems) = step.output;
-            let output = Arg {
-                buffer: at(output_loc),
-                elems: output_elems,
-            };
-            check_arg_lengths(device, &inputs, &output)?;
+                .chain(std::iter::once(&step.output))
+                .map(|bound| bound.offset.elems);
+            check_arg_lengths(device, &inputs, &output, starts)?;
             device
                 .dispatch(Dispatch {
                     kernel: &kernels[step.kernel],

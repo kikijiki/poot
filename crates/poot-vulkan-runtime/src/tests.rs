@@ -363,7 +363,6 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
             timestamp_valid_mask: 0,
             coopmat_subgroup_sizes: None,
             shuffle_subgroup_size: None,
-            min_storage_offset_alignment: 256,
             max_workgroup_count: [65_535, 65_535, 65_535],
             device_caps: poot_target::DeviceCaps {
                 max_buffer_bytes: u64::MAX,
@@ -384,6 +383,7 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 native_two_byte_floats: false,
                 rounding_conversions: poot_target::RoundingConversions::NONE,
                 peer_transport: false,
+                storage_offset_align: std::num::NonZeroU64::new(256).unwrap(),
                 perf_calibration: poot_target::calibration::Calibrated::Portable,
             },
             memory_budget: false,
@@ -1089,6 +1089,7 @@ fn dispatch_and_recording_refuse_objects_of_another_context() {
     let pipeline = mock_pipeline(&context, 1);
     let args = [Binding {
         buffer: &own,
+        offset: 0,
         elems: 4,
     }];
     let result = context.record_dispatch(
@@ -1146,6 +1147,7 @@ fn a_grid_over_the_device_limit_is_refused_not_folded() {
     let pipeline = mock_pipeline(&context, 1);
     let args = [Binding {
         buffer: &buffer,
+        offset: 0,
         elems: 4,
     }];
     let result = context.record_dispatch(
@@ -1183,6 +1185,7 @@ fn a_dispatch_length_beyond_its_buffer_is_refused() {
             [4, 1, 1],
             &[Binding {
                 buffer: &buffer,
+                offset: 0,
                 elems,
             }],
         )
@@ -1232,6 +1235,7 @@ fn a_dispatch_length_is_bounded_in_the_buffers_native_elements() {
                 [4, 1, 1],
                 &[Binding {
                     buffer: &buffer,
+                    offset: 0,
                     elems,
                 }],
             )

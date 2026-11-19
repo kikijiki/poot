@@ -117,8 +117,23 @@ fn record_add(
     device
         .dispatch(Dispatch {
             kernel,
-            inputs: &[Arg { buffer: lhs, elems }, Arg { buffer: rhs, elems }],
-            output: Arg { buffer: dst, elems },
+            inputs: &[
+                Arg {
+                    buffer: lhs,
+                    offset: 0,
+                    elems,
+                },
+                Arg {
+                    buffer: rhs,
+                    offset: 0,
+                    elems,
+                },
+            ],
+            output: Arg {
+                buffer: dst,
+                offset: 0,
+                elems,
+            },
             launch: poot_executor::LaunchKind::Grid {
                 threads: [n as u32, 1, 1],
                 workgroup: [64, 1, 1],
@@ -156,15 +171,18 @@ fn dispatch_reads_the_argument_element_count_not_the_buffer_capacity() {
             inputs: &[
                 Arg {
                     buffer: &a,
+                    offset: 0,
                     elems: 2,
                 },
                 Arg {
                     buffer: &b,
+                    offset: 0,
                     elems: 2,
                 },
             ],
             output: Arg {
                 buffer: &out,
+                offset: 0,
                 elems: 2,
             },
             launch: poot_executor::LaunchKind::Grid {
@@ -202,15 +220,18 @@ fn an_aie_launch_is_a_typed_refusal_on_vulkan() {
             inputs: &[
                 Arg {
                     buffer: &a,
+                    offset: 0,
                     elems: 4,
                 },
                 Arg {
                     buffer: &b,
+                    offset: 0,
                     elems: 4,
                 },
             ],
             output: Arg {
                 buffer: &out,
+                offset: 0,
                 elems: 4,
             },
             launch: poot_executor::LaunchKind::Aie(poot_npu_artifacts::AieInvocation::new(
@@ -339,15 +360,18 @@ fn a_long_recording_is_cut_into_several_submissions_and_replays_exactly() {
                     inputs: &[
                         Arg {
                             buffer: src,
+                            offset: 0,
                             elems: 4,
                         },
                         Arg {
                             buffer: &one,
+                            offset: 0,
                             elems: 4,
                         },
                     ],
                     output: Arg {
                         buffer: dst,
+                        offset: 0,
                         elems: 4,
                     },
                     launch: poot_executor::LaunchKind::Grid {
@@ -427,15 +451,18 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
             inputs: &[
                 Arg {
                     buffer: &idx,
+                    offset: 0,
                     elems: 4,
                 },
                 Arg {
                     buffer: &data,
+                    offset: 0,
                     elems: 4,
                 },
             ],
             output: Arg {
                 buffer: &out,
+                offset: 0,
                 elems: 4,
             },
             launch: poot_executor::LaunchKind::Grid {
@@ -588,10 +615,12 @@ fn a_real_fence_wait_past_its_bound_times_out_and_poisons() {
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &iterations,
+                offset: 0,
                 elems: 1,
             }],
             output: Arg {
                 buffer: &out,
+                offset: 0,
                 elems: 1,
             },
             launch: poot_executor::LaunchKind::Grid {
@@ -671,4 +700,34 @@ fn float_ne_is_ieee_on_nan_on_vulkan() {
         .load_kernel("float_ne", compile_for_vulkan(&body, "float_ne"))
         .expect("load float_ne");
     poot_executor_parity::float_ne::check("vulkan", &mut device, &kernel);
+}
+
+/// POOT-1566 W1 on raw Vulkan: an argument bound 256 bytes into its buffer reads from there (SC-e), and a binding off
+/// `minStorageBufferOffsetAlignment` is refused as `RuntimeError::MisalignedBinding` (SC-f). Mutation: write
+/// `.offset(0)` in the descriptor of `record_dispatch` (the first row reads from the base and goes red); drop the
+/// alignment check (the second row records an invalid descriptor).
+#[test]
+fn an_offset_binding_is_read_from_its_offset_and_a_misaligned_one_is_refused_on_vulkan() {
+    let Some(mut device) = vulkan() else {
+        return;
+    };
+    let body = poot_kernel_ir::test_support::float_ne_kernel();
+    let kernel = device
+        .load_kernel("float_ne", compile_for_vulkan(&body, "float_ne"))
+        .expect("load float_ne");
+    poot_executor_parity::offset_binding::an_offset_binding_reads_from_its_offset(
+        "vulkan",
+        &mut device,
+        &kernel,
+    );
+    let refused =
+        poot_executor_parity::offset_binding::a_misaligned_offset_is_refused(&mut device, &kernel);
+    assert!(
+        matches!(
+            &refused,
+            poot_vulkan_device::VulkanGpuError::Runtime(error)
+                if matches!(**error, poot_vulkan_runtime::RuntimeError::MisalignedBinding { .. })
+        ),
+        "got {refused:?}"
+    );
 }

@@ -1041,7 +1041,9 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
         elements.push(ElementKind::F32);
         let slots: Vec<_> = owned
             .iter()
-            .map(|buffer| (buffer, buffer.elem_count() as u64))
+            .map(|buffer| {
+                poot_rocm_runtime::KernargSlot::at_base(buffer, buffer.elem_count() as u64)
+            })
             .collect();
         let kernarg = ctx.bind_kernarg(&kernel, &slots).unwrap();
         let block_x = body.workgroup_size[0];
@@ -1099,10 +1101,12 @@ fn the_movement_bank_matches_the_reference_on_ptx() {
             &kernel,
             body.workgroup_size,
             [launch.spec.threads() as u32, 1, 1],
-            &refs,
-            &lengths,
-            &out,
-            out.elem_count(),
+            &refs
+                .iter()
+                .zip(&lengths)
+                .map(|(buffer, &len)| poot_ptx_runtime::PtxBinding::at_base(buffer, len))
+                .collect::<Vec<_>>(),
+            poot_ptx_runtime::PtxBinding::at_base(&out, out.elem_count()),
         )
         .unwrap_or_else(|e| panic!("{name}: dispatch: {e}"));
         ctx.download_f32(&out)

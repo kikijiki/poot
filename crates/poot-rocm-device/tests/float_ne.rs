@@ -33,3 +33,46 @@ fn float_ne_is_ieee_on_nan_on_rocm() {
         .expect("load the float_ne kernel");
     poot_executor_parity::float_ne::check("rocm", &mut device, &kernel);
 }
+
+/// POOT-1566 W1 on ROCm: an argument bound 256 bytes into its buffer reads from there (SC-e), and a binding off the
+/// kernel floor is refused as `RocmError::MisalignedBinding` (SC-f). Mutation: bind the buffer's base in
+/// `RocmContext::bind_kernarg` (the first row reads from the base and goes red); drop the alignment check (the
+/// second row launches).
+#[test]
+fn an_offset_binding_is_read_from_its_offset_and_a_misaligned_one_is_refused_on_rocm() {
+    let Some(mut device) =
+        poot_runtime_common::device_skip::open_or_skip(DeviceBackend::Rocm, RocmDevice::new())
+    else {
+        return;
+    };
+    let arch = match gpu_backend(&device.target()) {
+        poot_target::Backend::AmdGcn(arch) => arch,
+        other => panic!("RocmDevice::target must report AmdGcn, got {other:?}"),
+    };
+    let body = poot_kernel_ir::test_support::float_ne_kernel();
+    let artifact = poot_codegen::KernelCache::open(poot_codegen::Target::AmdGcn(arch))
+        .load_or_compile(
+            &body,
+            poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+        )
+        .expect("float_ne must compile to HSACO");
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
+    let kernel = device
+        .load_kernel("float_ne", compiled)
+        .expect("load the float_ne kernel");
+    poot_executor_parity::offset_binding::an_offset_binding_reads_from_its_offset(
+        "rocm",
+        &mut device,
+        &kernel,
+    );
+    let refused =
+        poot_executor_parity::offset_binding::a_misaligned_offset_is_refused(&mut device, &kernel);
+    assert!(
+        matches!(
+            &refused,
+            poot_rocm_device::RocmGpuError::Rocm(error)
+                if matches!(**error, poot_rocm_runtime::RocmError::MisalignedBinding { .. })
+        ),
+        "got {refused:?}"
+    );
+}

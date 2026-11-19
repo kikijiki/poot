@@ -9,12 +9,17 @@
 //!
 //! # Buffer binding contract
 //!
-//! Every buffer a [`Device`] binds to a kernel parameter starts at its allocation base, aligned to at
-//! least [`poot_kernel_ir::BUFFER_PARAM_ALIGN`] (16) bytes: an arena slot shares a whole allocation from
-//! offset 0, and no dispatch binds an offset into a buffer. Generated kernels rely on it (a Gemv reads its
-//! activation in aligned 16-byte groups where the planner proved the group offsets, POOT-1405). A device
-//! refuses a binding that breaks it instead of launching: the PTX runtime's kernel-argument packing
-//! returns `PtxError::MisalignedBinding`.
+//! Every buffer a [`Device`] binds to a kernel parameter is bound [`Arg::offset`] bytes into its allocation. The
+//! offset is a multiple of the device's binding alignment, the larger of [`poot_kernel_ir::BUFFER_PARAM_ALIGN`] (16)
+//! and [`poot_target::DeviceCaps::storage_offset_align`], and `offset + elems * element width` stays inside the
+//! buffer ([`DispatchError::ArgExceedsBuffer`], checked by the engine before any device sees the dispatch). The
+//! address a kernel sees is therefore always `BUFFER_PARAM_ALIGN`-aligned, the floor every proved vector load
+//! relies on (a Gemv reads its activation in aligned 16-byte groups where the planner proved the group offsets,
+//! POOT-1405). A device refuses a binding that breaks the alignment instead of launching, with a typed error
+//! before it records anything: the wgpu and raw Vulkan runtimes' `MisalignedBinding`, the ROCm kernarg binding's,
+//! the PTX runtime's kernel-argument packing, and an NPU, which binds whole buffers, refuses any offset. The offset
+//! is a constant of the entry's plan (`poot_graph_plan::Plan::View`), fixed when the dispatch is recorded: a replay
+//! never changes it, and a recording keeps the whole buffer alive whatever offset it binds.
 
 mod binder;
 mod coordinator;

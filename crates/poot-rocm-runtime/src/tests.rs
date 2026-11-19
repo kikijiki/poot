@@ -15,6 +15,7 @@ use crate::context::{
 };
 use crate::discovery::agent_isa_name;
 use crate::error::{check, describe};
+use crate::hsaco::KernargSlot;
 use crate::hsaco::{ModuleConstruction, kernel_symbol_matches};
 use crate::owner::ResourceOwner;
 use crate::queue::{
@@ -724,7 +725,10 @@ fn bind_kernarg_refuses_more_buffers_than_the_segment_holds() {
     let kernel = KernelHandle::for_test(0, 24, 0, 0, &[]);
     let a = ctx.allocate_f32(4, BufferRole::Input).expect("allocate a");
     let b = ctx.allocate_f32(4, BufferRole::Input).expect("allocate b");
-    let refused = ctx.bind_kernarg(&kernel, &[(&a, 4), (&b, 4)]);
+    let refused = ctx.bind_kernarg(
+        &kernel,
+        &[KernargSlot::at_base(&a, 4), KernargSlot::at_base(&b, 4)],
+    );
     assert!(
         matches!(
             refused,
@@ -736,7 +740,7 @@ fn bind_kernarg_refuses_more_buffers_than_the_segment_holds() {
         ),
         "got {refused:?}"
     );
-    ctx.bind_kernarg(&kernel, &[(&a, 4)])
+    ctx.bind_kernarg(&kernel, &[KernargSlot::at_base(&a, 4)])
         .expect("one pair fits a 24-byte segment");
 }
 
@@ -1255,7 +1259,13 @@ fn dispatch_timeout_keeps_code_object_and_argument_allocations() {
         .allocate_f32(64, BufferRole::Activation)
         .expect("allocate_f32");
     let kernarg = ctx
-        .bind_kernarg(&kernel, &[(&data, 64), (&recorded_data, 1)])
+        .bind_kernarg(
+            &kernel,
+            &[
+                KernargSlot::at_base(&data, 64),
+                KernargSlot::at_base(&recorded_data, 1),
+            ],
+        )
         .expect("bind_kernarg");
     let live_with_arguments = memory.total_live_bytes();
     assert_eq!(
@@ -1350,7 +1360,7 @@ fn dropping_a_bound_buffer_keeps_its_allocation_until_the_kernarg_drops() {
         .expect("allocate_f32");
     let data_bytes = data.byte_capacity() as u64;
     let bound = ctx
-        .bind_kernarg(&kernel, &[(&data, 64)])
+        .bind_kernarg(&kernel, &[KernargSlot::at_base(&data, 64)])
         .expect("bind_kernarg");
 
     drop(data);
@@ -2208,8 +2218,15 @@ fn bind_add_kernarg(
     c: &RocmBuffer,
 ) -> BoundKernarg {
     let len = |buffer: &RocmBuffer| buffer.elem_count() as u64;
-    ctx.bind_kernarg(kernel, &[(a, len(a)), (b, len(b)), (c, len(c))])
-        .expect("bind add kernarg")
+    ctx.bind_kernarg(
+        kernel,
+        &[
+            KernargSlot::at_base(a, len(a)),
+            KernargSlot::at_base(b, len(b)),
+            KernargSlot::at_base(c, len(c)),
+        ],
+    )
+    .expect("bind add kernarg")
 }
 
 /// Card 608, SC-002 (ROCm, on the production dispatch path): a
@@ -2368,7 +2385,10 @@ fn lookup_kernel_rejects_a_mismatched_entry_point_and_dispatches_the_right_kerne
     let square_kernarg = ctx
         .bind_kernarg(
             &square_kernel,
-            &[(&x, x.elem_count() as u64), (&y, y.elem_count() as u64)],
+            &[
+                KernargSlot::at_base(&x, x.elem_count() as u64),
+                KernargSlot::at_base(&y, y.elem_count() as u64),
+            ],
         )
         .expect("bind square kernarg");
     ctx.dispatch(
@@ -2445,7 +2465,7 @@ fn dispatch_no_contract_probe(
         .bind_kernarg(
             &kernel,
             &[&a_buf, &b_buf, &c_buf, &d_buf, &out_buf]
-                .map(|buffer| (buffer, buffer.elem_count() as u64)),
+                .map(|buffer| KernargSlot::at_base(buffer, buffer.elem_count() as u64)),
         )
         .expect("bind no_contract_probe kernarg");
     let n = rows.len() as u32;
@@ -2959,7 +2979,14 @@ fn dispatch_out_of_bounds_store(ctx: &RocmContext) -> Result<(), RocmError> {
     let (owner, _events) = recording_owner(1);
     let wild = mock_buffer(UNMAPPED, owner);
     let kernarg = ctx
-        .bind_kernarg(&kernel, &[(&a, 4), (&b, 4), (&wild, 4)])
+        .bind_kernarg(
+            &kernel,
+            &[
+                KernargSlot::at_base(&a, 4),
+                KernargSlot::at_base(&b, 4),
+                KernargSlot::at_base(&wild, 4),
+            ],
+        )
         .expect("bind kernarg");
     ctx.dispatch(
         &kernel,
@@ -3085,8 +3112,8 @@ fn u32x4_vector_load_matches_scalar_loads_on_rocm() {
             .bind_kernarg(
                 &kernel,
                 &[
-                    (&input, case.input.len() as u64),
-                    (&output, case.want.len() as u64),
+                    KernargSlot::at_base(&input, case.input.len() as u64),
+                    KernargSlot::at_base(&output, case.want.len() as u64),
                 ],
             )
             .expect("bind kernarg");
@@ -3144,7 +3171,7 @@ fn subgroup_shuffle_xor_matches_the_interpreter_on_rocm() {
             .allocate(BufferRole::Output, storage, words)
             .expect("allocate output");
         let kernarg = ctx
-            .bind_kernarg(&kernel, &[(&output, words as u64)])
+            .bind_kernarg(&kernel, &[KernargSlot::at_base(&output, words as u64)])
             .expect("bind kernarg");
         ctx.dispatch(
             &kernel,

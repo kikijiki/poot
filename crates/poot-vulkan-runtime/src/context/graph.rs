@@ -29,8 +29,11 @@ const DESCRIPTORS_PER_SET: u32 = 12;
 pub struct Binding<'a> {
     /// The buffer the kernel reads or writes; it must belong to the same [`Context`] as the dispatch.
     pub buffer: &'a DeviceBuffer,
-    /// Element count the kernel is told the buffer holds, in the argument schema's element kind. It must be at most the
-    /// buffer's capacity, else the dispatch is refused.
+    /// Byte offset of the window in `buffer`, a multiple of the device's `minStorageBufferOffsetAlignment`, else the
+    /// dispatch is refused. Fixed when the dispatch is recorded.
+    pub offset: u64,
+    /// Element count the kernel is told the window holds, in the argument schema's element kind. It must be at most the
+    /// buffer's capacity from `offset` on, else the dispatch is refused.
     pub elems: usize,
 }
 
@@ -185,7 +188,7 @@ impl Context {
             .map(|a| {
                 vk::DescriptorBufferInfo::default()
                     .buffer(a.buffer.vk_buffer())
-                    .offset(0)
+                    .offset(a.offset)
                     .range(vk::WHOLE_SIZE)
             })
             .collect();
@@ -368,7 +371,7 @@ impl GraphCore {
     /// A meta block of `len` bytes, aligned for a descriptor offset, from the arena's last chunk (a
     /// new chunk when it does not fit).
     fn reserve_meta(&mut self, ctx: &Context, len: usize) -> Result<MetaBlock, RuntimeError> {
-        let align = ctx.min_storage_offset_alignment.max(4);
+        let align = (ctx.device_caps.storage_offset_align.get() as usize).max(4);
         let stride = len.next_multiple_of(align);
         debug_assert!(stride <= META_CHUNK_BYTES);
         let fits = !self.meta.chunks.is_empty() && self.meta.used + stride <= META_CHUNK_BYTES;

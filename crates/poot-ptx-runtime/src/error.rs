@@ -53,8 +53,8 @@ pub enum PtxError {
         /// Elements the caller supplied.
         got: usize,
     },
-    /// A buffer bound to a kernel parameter does not start on [`poot_kernel_ir::BUFFER_PARAM_ALIGN`], which the kernel
-    /// bodies' aligned group reads assume.
+    /// A kernel parameter's bound address (its buffer's plus the binding offset) is not on
+    /// [`poot_kernel_ir::BUFFER_PARAM_ALIGN`], which the kernel bodies' aligned group reads assume.
     #[error(
         "{op} binds parameter {param} at device address {address:#x}, not {alignment}-byte aligned"
     )]
@@ -63,7 +63,7 @@ pub enum PtxError {
         op: &'static str,
         /// The kernel parameter (inputs in order, the output last).
         param: usize,
-        /// The buffer's device address.
+        /// The bound device address.
         address: u64,
         /// The alignment the binding contract requires.
         alignment: u64,

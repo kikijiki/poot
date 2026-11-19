@@ -5,8 +5,8 @@ use crate::context::readback::MapSet;
 use crate::pipeline::{DeviceTimingResult, EncodeItem, spirv_words};
 use crate::timestamps::storage_entry;
 use crate::{
-    CachedDispatch, Context, DeviceBuffer, KernelBuffer, PendingDeviceTiming, PendingFault,
-    QueuedWork, RuntimeError,
+    Binding, CachedDispatch, Context, DeviceBuffer, KernelBuffer, PendingDeviceTiming,
+    PendingFault, QueuedWork, RuntimeError,
 };
 use poot_codegen::CompiledKernel;
 use poot_runtime_common::BufferRole;
@@ -125,34 +125,36 @@ impl Context {
     /// count from the plan, index-aligned with `ins` plus `out` last: the length buffer this builds
     /// carries these, never `DeviceBuffer::elem_count()` (an arena slot's buffer is sized to its
     /// largest occupant, which can exceed this particular dispatch's operand).
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the dispatch contract's own tuple: kernel, workgroup and thread shape, each input with its planned length, and the output with its length"
-    )]
     pub(crate) fn build_dispatch_objects(
         &self,
         key: &str,
         kernel: &CompiledKernel,
         wg: [u32; 3],
         threads: [u32; 3],
-        ins: &[&DeviceBuffer],
-        ins_lens: &[usize],
-        out: &DeviceBuffer,
-        out_len: usize,
+        ins: &[Binding<'_>],
+        out: Binding<'_>,
     ) -> Result<DispatchObjects, RuntimeError> {
-        check_device_args(kernel, ins, out)?;
-        debug_assert_eq!(
-            ins.len(),
-            ins_lens.len(),
-            "ins_lens must be index-aligned with ins"
-        );
+        let buffers: Vec<&DeviceBuffer> = ins.iter().map(|b| b.buffer).collect();
+        check_device_args(kernel, &buffers, out.buffer)?;
+        // wgpu validates a binding offset against the limit of the device it opened: refuse it here, typed, before
+        // anything is recorded.
+        let alignment = u64::from(self.device.limits().min_storage_buffer_offset_alignment);
+        for (param, bound) in ins.iter().chain([&out]).enumerate() {
+            if !bound.offset.is_multiple_of(alignment) {
+                return Err(RuntimeError::MisalignedBinding {
+                    param,
+                    offset: bound.offset,
+                    alignment,
+                });
+            }
+        }
         let n = ins.len() + 1;
         let needs_error_word = kernel.has_trap();
         // Fold first so the length buffer can carry the X-thread extent the kernel uses to rebuild
         // the linear index under a 2-D launch (shared codegen, see poot-codegen emit_thread_index).
         let groups = resolve_groups(threads, wg, self.max_workgroups)?;
         let (pipeline, bgl) = self.cached_pipeline(key, kernel)?;
-        let mut lengths = kernel_lens(ins_lens.iter().copied().chain([out_len]))?;
+        let mut lengths = kernel_lens(ins.iter().map(|b| b.elems).chain([out.elems]))?;
         lengths.push(x_extent(groups, wg));
         let len_buf = self
             .device
@@ -189,17 +191,25 @@ impl Context {
         // Card 547a (SC-005): same accounting for the error-word buffer, when this kernel has one.
         let error_storage_guard =
             needs_error_word.then(|| self.tag_alloc(poot_runtime_common::BufferRole::Staging, 4));
+        // A window of the buffer from its offset to its end: the kernel's own length bounds its reads.
+        fn window<'a>(b: &'a Binding<'_>) -> wgpu::BindingResource<'a> {
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &b.buffer.buf,
+                offset: b.offset,
+                size: None,
+            })
+        }
         let mut entries: Vec<wgpu::BindGroupEntry> = ins
             .iter()
             .enumerate()
             .map(|(i, b)| wgpu::BindGroupEntry {
                 binding: i as u32,
-                resource: b.buf.as_entire_binding(),
+                resource: window(b),
             })
             .collect();
         entries.push(wgpu::BindGroupEntry {
             binding: ins.len() as u32,
-            resource: out.buf.as_entire_binding(),
+            resource: window(&out),
         });
         entries.push(wgpu::BindGroupEntry {
             binding: n as u32,
@@ -247,13 +257,11 @@ impl Context {
         kernel: &CompiledKernel,
         wg: [u32; 3],
         threads: [u32; 3],
-        ins: &[&DeviceBuffer],
-        ins_lens: &[usize],
-        out: &DeviceBuffer,
-        out_len: usize,
+        ins: &[Binding<'_>],
+        out: Binding<'_>,
     ) -> Result<CachedDispatch, RuntimeError> {
         let (pipeline, bind_group, groups, error_storage, length_buffer_guard, error_storage_guard) =
-            self.build_dispatch_objects(key, kernel, wg, threads, ins, ins_lens, out, out_len)?;
+            self.build_dispatch_objects(key, kernel, wg, threads, ins, out)?;
         Ok(CachedDispatch {
             pipeline,
             bind_group,
@@ -915,10 +923,12 @@ mod step_encode_allocation_tests {
             kernel,
             [64, 1, 1],
             [threads, 1, 1],
-            inputs,
-            &input_lens,
-            output,
-            output.elem_count(),
+            &inputs
+                .iter()
+                .zip(&input_lens)
+                .map(|(buffer, &len)| crate::Binding::at_base(buffer, len))
+                .collect::<Vec<_>>(),
+            crate::Binding::at_base(output, output.elem_count()),
         )
         .unwrap()
     }

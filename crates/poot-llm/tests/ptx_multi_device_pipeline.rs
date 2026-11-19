@@ -527,6 +527,7 @@ impl Device for FailingFinish {
             .iter()
             .map(|arg| poot_executor::Arg {
                 buffer: arg.buffer,
+                offset: 0,
                 elems: arg.elems,
             })
             .collect();
@@ -535,6 +536,7 @@ impl Device for FailingFinish {
             inputs: &inputs,
             output: poot_executor::Arg {
                 buffer: d.output.buffer,
+                offset: 0,
                 elems: d.output.elems,
             },
             launch: d.launch,

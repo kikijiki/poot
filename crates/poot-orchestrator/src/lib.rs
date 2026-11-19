@@ -41,7 +41,10 @@ use cli::{Cli, Command};
 use db::Db;
 use logging::{log, state_dir};
 use runpod::RunPod;
-use workflow::{cmd_exec, cmd_image, cmd_logs, cmd_run, cmd_status, reap, runpod_api_key};
+use workflow::{
+    cmd_exec, cmd_image, cmd_logs, cmd_run, cmd_status, reap, reconcile, reconcile_for_status,
+    runpod_api_key,
+};
 
 pub use db::PodOwnerPrefix;
 pub use runpod::{CloudType, CreateSpec};
@@ -58,8 +61,19 @@ fn run(cli: Cli) -> Result<()> {
         .unwrap_or_else(|| state_dir().join("state.db").to_string_lossy().into_owned());
     let db = Db::open(&state_db)?;
     match cli.command {
+        Command::Reconcile => {
+            let rp = RunPod::new(runpod_api_key()?)?;
+            let report = reconcile(&db, &rp)?;
+            log(format!(
+                "reconciled: {} pod(s) recorded gone, {} expired warm run(s) aborted",
+                report.pods_gone.len(),
+                report.warm_runs_aborted.len()
+            ));
+            Ok(())
+        }
         Command::Status => {
             workflow::gc_zombies(&db);
+            reconcile_for_status(&db);
             cmd_status(&db, &state_db)
         }
         Command::Reap(a) => {

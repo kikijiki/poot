@@ -271,10 +271,12 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity() {
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &len_src,
+                offset: 0,
                 elems: REAL_LEN,
             }],
             output: Arg {
                 buffer: &out_buf,
+                offset: 0,
                 elems: 1,
             },
             launch: poot_executor::LaunchKind::Grid {

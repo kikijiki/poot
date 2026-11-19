@@ -109,8 +109,6 @@ pub struct Context {
     /// The largest subgroup a shuffling pipeline runs as full subgroups of, when the device reports subgroup
     /// shuffles and can create full-subgroup pipelines (`None`: a kernel that shuffles is refused).
     shuffle_subgroup_size: Option<u32>,
-    /// `minStorageBufferOffsetAlignment`: a descriptor binds a meta block at a multiple of this.
-    min_storage_offset_alignment: usize,
     /// Per-axis `maxComputeWorkGroupCount` from the physical device (queried, not hardcoded).
     /// A dispatch whose grid exceeds these is refused ([`RuntimeError::GridCap`]), never folded.
     max_workgroup_count: [u32; 3],

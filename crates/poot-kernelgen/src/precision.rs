@@ -849,7 +849,13 @@ mod rocm_sweep {
                 .upload_f32(&words(&[base]), BufferRole::Input)
                 .expect("upload");
             let kernarg = ctx
-                .bind_kernarg(&kernel, &[(&meta, 1), (&result, 2)])
+                .bind_kernarg(
+                    &kernel,
+                    &[
+                        poot_rocm_runtime::KernargSlot::at_base(&meta, 1),
+                        poot_rocm_runtime::KernargSlot::at_base(&result, 2),
+                    ],
+                )
                 .expect("bind kernarg");
             ctx.dispatch(
                 &kernel,
@@ -925,10 +931,8 @@ mod ptx_sweep {
                 &kernel,
                 [SWEEP_LANES, 1, 1],
                 [chunk_len as u32, 1, 1],
-                &[&meta],
-                &[1],
-                &result,
-                2,
+                &[poot_ptx_runtime::PtxBinding::at_base(&meta, 1)],
+                poot_ptx_runtime::PtxBinding::at_base(&result, 2),
             )
             .expect("dispatch");
         }

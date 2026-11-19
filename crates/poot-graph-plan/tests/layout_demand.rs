@@ -22,7 +22,7 @@ fn plan_with_views(
     g: &Graph,
     eqn: &poot_graph_ir::Eqn,
     backend: Backend,
-    views: &std::collections::HashMap<ValueId, Layout>,
+    views: &poot_graph_plan::Views,
 ) -> Planned {
     plan_eqn_choice(
         g,
@@ -206,7 +206,7 @@ fn materialized_chain_matches_oracle_fuzz() {
         }
         let g = bld.finish(cur).unwrap();
         let backend = Backend::SpirvVulkan;
-        let views = compute_views(&g, backend);
+        let views = compute_views(&g, &target(backend));
 
         let a_shape = g.aval(a.id()).shape.clone();
         let a_data: Vec<f32> = (0..a_shape.iter().product::<usize>())
@@ -240,7 +240,15 @@ fn materialized_chain_matches_oracle_fuzz() {
                 if root_at + 1 < links.len() {
                     through_a_view += 1;
                 }
-                let buffer = run_dispatch(dispatch, vec![Buffer::from_f32s(&root)], out_len);
+                // The dispatch reads its input through the layout the view left past its `bound`: the executor
+                // binds the root there, so the kernel sees the root from that byte on.
+                let input = poot_graph_plan::value_ids(tail)[0];
+                let bound = views.get(&input).map_or(0, |view| view.bound as usize);
+                let buffer = run_dispatch(
+                    dispatch,
+                    vec![Buffer::from_f32s(&root[bound / size_of::<f32>()..])],
+                    out_len,
+                );
                 buffer.to_f32s().unwrap()
             }
         };
@@ -286,7 +294,7 @@ fn concat_reads_its_parts_through_layouts() {
 
     // The concat's generated body over the second part's root buffer reads the same elements the oracle joins.
     let backend = Backend::SpirvVulkan;
-    let views = compute_views(&g, backend);
+    let views = compute_views(&g, &target(backend));
     let concat = g
         .eqns()
         .iter()
@@ -359,7 +367,7 @@ fn an_exact_i32_reader_takes_an_i32_view() {
         "the transpose of the I32 words is a view"
     );
 
-    let views = compute_views(&g, backend);
+    let views = compute_views(&g, &target(backend));
     let and = g
         .eqns()
         .iter()

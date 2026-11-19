@@ -828,6 +828,28 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Kept-warm exec rows whose window has ended by `now` (UTC ISO), whatever their image.
+    pub(crate) fn expired_warm_execs(&self, now: &str) -> Result<Vec<WarmExec>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, image, pod_id, ssh_host, ssh_port, warm_until FROM runs
+             WHERE kind='exec' AND status='warm' AND warm_until IS NOT NULL AND warm_until <= ?1
+               AND pod_id IS NOT NULL AND ssh_host IS NOT NULL AND ssh_port IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |row| {
+                Ok(WarmExec {
+                    run_id: row.get(0)?,
+                    image: row.get(1)?,
+                    pod_id: row.get(2)?,
+                    host: row.get(3)?,
+                    port: row.get::<_, i64>(4)? as u16,
+                    warm_until: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// The kept-warm exec pods for `image` with a recorded endpoint, newest first (a tie in `updated_at` goes to
     /// the later row). The caller checks expiry and SSH reachability.
     pub(crate) fn find_warm_execs(&self, image: &str) -> Result<Vec<WarmExec>> {
@@ -1033,6 +1055,20 @@ pub(crate) mod test_only {
                 )
                 .optional()
                 .map_err(Into::into)
+        }
+
+        /// Backdate a pod record's timestamps, to age it past the listing grace.
+        pub(crate) fn set_pod_times(
+            &self,
+            id: &str,
+            created_at: &str,
+            updated_at: &str,
+        ) -> Result<()> {
+            self.conn.execute(
+                "UPDATE pods SET created_at=?2, updated_at=?3 WHERE id=?1",
+                params![id, created_at, updated_at],
+            )?;
+            Ok(())
         }
 
         /// Backdate a run, to place it behind the runs the dashboard lists.

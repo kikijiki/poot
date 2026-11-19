@@ -46,6 +46,7 @@ pub mod i32_gather;
 pub mod launch;
 pub mod live_attention;
 pub mod lora;
+pub mod offset_binding;
 pub mod packed;
 pub mod precision;
 pub mod range_check;

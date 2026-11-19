@@ -196,7 +196,9 @@ fn rocm_device() -> Option<Device> {
             let buffers = [&a, &w, &meta, &result];
             let slots: Vec<_> = buffers
                 .iter()
-                .map(|buffer| (*buffer, buffer.elem_count() as u64))
+                .map(|buffer| {
+                    poot_rocm_runtime::KernargSlot::at_base(buffer, buffer.elem_count() as u64)
+                })
                 .collect();
             let elements = [
                 ElementKind::F32,

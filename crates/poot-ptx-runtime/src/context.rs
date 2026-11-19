@@ -156,6 +156,9 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         native_two_byte_floats: true,
         rounding_conversions: poot_target::RoundingConversions::F16,
         peer_transport: true,
+        // `cuMemAlloc` returns 256-byte aligned memory and the address is a raw pointer: no API rule, so the
+        // kernel floor governs.
+        storage_offset_align: poot_target::RAW_POINTER_BINDING_ALIGN,
         perf_calibration: poot_target::calibration::Calibrated::of_cuda_compute_capability(
             attrs.compute_capability_major,
             attrs.compute_capability_minor,
@@ -967,42 +970,23 @@ impl PtxContext {
     /// counts (grid = ceil(threads / block)). Enqueues on the stream and returns without syncing (the
     /// resident fast path).
     ///
-    /// `ins_lens`/`out_len` (Card 547b) are each buffer's own planned element count,
-    /// index-aligned with `ins` plus `out` last: the kernel ABI's `(ptr, len)` pairs carry these,
-    /// never `PtxBuffer::elem_count()` - a caller with no plan of its own (a test, a probe) passes
-    /// each buffer's own `elem_count()` explicitly instead.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the dispatch contract's own tuple: kernel, block and thread shape, each input with its planned length, and the output with its length (Card 547b: lengths are the plan's, never the buffer's capacity)"
-    )]
+    /// Each binding's `elems` (Card 547b) is its own planned element count: the kernel ABI's `(ptr, len)` pairs
+    /// carry these, never `PtxBuffer::elem_count()` - a caller with no plan of its own (a test, a probe) binds
+    /// [`PtxBinding::at_base`] with the buffer's own `elem_count()`.
     pub fn dispatch_dev(
         &self,
         kernel: &CompiledKernel,
         block: [u32; 3],
         threads: [u32; 3],
-        ins: &[&PtxBuffer],
-        ins_lens: &[usize],
-        out: &PtxBuffer,
-        out_len: usize,
+        ins: &[PtxBinding<'_>],
+        out: PtxBinding<'_>,
     ) -> Result<(), PtxError> {
         self.bind()?;
-        check_ptx_args(kernel, ins, out)?;
-        debug_assert_eq!(
-            ins.len(),
-            ins_lens.len(),
-            "ins_lens must be index-aligned with ins"
-        );
+        check_ptx_args(kernel, ins, out.buffer)?;
         let (ptx, entry) = ptx_text_and_entry(kernel)?;
         let func = self.function(ptx, entry)?;
 
-        let args = KernelArgs::pack(
-            &self.capture,
-            kernel.index_width(),
-            ins,
-            ins_lens,
-            out,
-            out_len,
-        )?;
+        let args = KernelArgs::pack(&self.capture, kernel.index_width(), ins, out)?;
         let mut params = args.params();
 
         let grid = (
@@ -1063,12 +1047,12 @@ fn ptx_text_and_entry(kernel: &CompiledKernel) -> Result<(&str, &str), PtxError>
 /// any submission.
 fn check_ptx_args(
     kernel: &CompiledKernel,
-    ins: &[&PtxBuffer],
+    ins: &[PtxBinding<'_>],
     out: &PtxBuffer,
 ) -> Result<(), PtxError> {
     let elements: Vec<ElementKind> = ins
         .iter()
-        .map(|b| b.element())
+        .map(|b| b.buffer.element())
         .chain(std::iter::once(out.element()))
         .collect();
     poot_codegen::check_kernel_args(kernel, &elements)?;
@@ -1083,6 +1067,35 @@ fn device_alloc(bytes: usize) -> Result<sys::CUdeviceptr, PtxError> {
     unsafe { result::malloc_sync(bytes) }.map_err(PtxError::Driver)
 }
 
+/// One kernel parameter of a dispatch: a window of `buffer` that starts `offset` bytes in and holds `elems` elements
+/// of the plan's own count (Card 547b), never the buffer's capacity (an arena slot's buffer can be larger than this
+/// operand). The offset is a plan constant: a captured graph node carries the address it produced.
+#[derive(Clone, Copy)]
+pub struct PtxBinding<'a> {
+    /// The buffer the kernel reads or writes.
+    pub buffer: &'a PtxBuffer,
+    /// Byte offset of the window in `buffer`; the bound address must keep [`poot_kernel_ir::BUFFER_PARAM_ALIGN`].
+    pub offset: u64,
+    /// Element count of the window.
+    pub elems: usize,
+}
+
+impl<'a> PtxBinding<'a> {
+    /// A window from the buffer's base holding `elems` elements.
+    pub fn at_base(buffer: &'a PtxBuffer, elems: usize) -> Self {
+        Self {
+            buffer,
+            offset: 0,
+            elems,
+        }
+    }
+
+    /// The device address the kernel is handed.
+    fn address(&self) -> sys::CUdeviceptr {
+        self.buffer.ptr() + self.offset
+    }
+}
+
 /// The kernel ABI's `(ptr, i64 len)` pair per buffer, inputs then the output. Packing is the only way a
 /// dispatch obtains its launch parameters, and it retains every buffer in the open capture (if any), so a
 /// captured graph can never outlive a buffer whose address it recorded.
@@ -1092,10 +1105,9 @@ pub(crate) struct KernelArgs {
 }
 
 impl KernelArgs {
-    /// `lens`' unit is the caller's own (Card 547b): each buffer's planned element
-    /// count, index-aligned with `ins` plus `out` last - never `PtxBuffer::elem_count()` (an arena
-    /// slot's buffer can be larger than this particular operand's own need). A buffer that does not start on
-    /// [`poot_kernel_ir::BUFFER_PARAM_ALIGN`] is refused (`PtxError::MisalignedBinding`): the kernels read
+    /// Each binding's length is its planned element count (Card 547b), never `PtxBuffer::elem_count()` (an arena
+    /// slot's buffer can be larger than this particular operand's own need). A binding whose address (the buffer's
+    /// plus its offset) does not sit on [`poot_kernel_ir::BUFFER_PARAM_ALIGN`] is refused (`PtxError::MisalignedBinding`): the kernels read
     /// aligned groups of a parameter on that guarantee. A kernel narrowed to 32-bit index math
     /// ([`poot_kernel_ir::IndexWidth::U32`]) is refused (`PtxError::IndexBoundExceeded`) a binding whose longest
     /// length its bound does not keep within [`poot_kernel_ir::IndexBound::U32_LIMIT`]: the planner proved the
@@ -1103,25 +1115,23 @@ impl KernelArgs {
     pub(crate) fn pack(
         capture: &CaptureRetention,
         index_width: poot_kernel_ir::IndexWidth,
-        ins: &[&PtxBuffer],
-        ins_lens: &[usize],
-        out: &PtxBuffer,
-        out_len: usize,
+        ins: &[PtxBinding<'_>],
+        out: PtxBinding<'_>,
     ) -> Result<Self, PtxError> {
-        let buffers = || ins.iter().copied().chain(std::iter::once(out));
-        if let Some((param, buffer)) = buffers().enumerate().find(|(_, buffer)| {
-            !buffer
-                .ptr()
+        let bindings = || ins.iter().copied().chain(std::iter::once(out));
+        if let Some((param, binding)) = bindings().enumerate().find(|(_, binding)| {
+            !binding
+                .address()
                 .is_multiple_of(poot_kernel_ir::BUFFER_PARAM_ALIGN)
         }) {
             return Err(PtxError::MisalignedBinding {
                 op: "dispatch_dev",
                 param,
-                address: buffer.ptr(),
+                address: binding.address(),
                 alignment: poot_kernel_ir::BUFFER_PARAM_ALIGN,
             });
         }
-        let lens = || ins_lens.iter().copied().chain(std::iter::once(out_len));
+        let lens = || bindings().map(|binding| binding.elems);
         if let poot_kernel_ir::IndexWidth::U32(bound) = index_width {
             let longest = lens().max().unwrap_or(0);
             if !bound.fits_u32(longest as u64) {
@@ -1135,9 +1145,10 @@ impl KernelArgs {
         }
         let mut dptrs = Vec::with_capacity(ins.len() + 1);
         let mut packed_lens = Vec::with_capacity(ins.len() + 1);
-        for (buffer, len) in buffers().zip(lens()) {
-            capture.retain(buffer);
-            dptrs.push(buffer.ptr());
+        for (binding, len) in bindings().zip(lens()) {
+            // The recording retains the whole buffer, whatever offset it binds.
+            capture.retain(binding.buffer);
+            dptrs.push(binding.address());
             packed_lens.push(
                 i64::try_from(len).map_err(|_| PtxError::ElementCountTooLarge {
                     op: "dispatch_dev",

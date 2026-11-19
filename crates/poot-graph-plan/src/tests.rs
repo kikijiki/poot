@@ -23,6 +23,7 @@ use poot_kernelgen::{
 use poot_target::{AmdArch, Backend, DeviceCaps, Queried, TargetId};
 use poot_tensor::DType as GDt;
 use poot_test_util::device_caps::default_caps_for;
+
 use std::collections::HashMap;
 
 use super::*;
@@ -63,6 +64,14 @@ fn into_with_meta(plan: Plan) -> Dispatch {
     one_dispatch(plan)
 }
 
+/// The GPU target of `backend` with the reference caps the planner fixtures use.
+fn gpu_target(backend: Backend) -> Target {
+    Target::Gpu {
+        backend,
+        caps: default_caps_for(backend),
+    }
+}
+
 fn one_dispatch(plan: Plan) -> Dispatch {
     match plan {
         Plan::Dispatches(dispatches) if dispatches.len() == 1 => {
@@ -75,7 +84,7 @@ fn one_dispatch(plan: Plan) -> Dispatch {
 /// Dispatch count with the planner's strided-view promotion applied: a promoted eqn counts as 0
 /// dispatches, like `Reshape`.
 fn dispatch_count_planned(g: &Graph, backend: Backend) -> usize {
-    let views = compute_views(g, backend);
+    let views = compute_views(g, &gpu_target(backend));
     g.eqns()
         .iter()
         .filter(|e| !matches!(e.op, OpKind::Reshape { .. }) && !views.contains_key(&e.out))
@@ -3912,14 +3921,14 @@ fn compute_views_never_promotes_validation_values() {
         bld.transpose(a, vec![2, 0, 1]).unwrap()
     });
     assert!(
-        compute_views(&g, Backend::SpirvVulkan).contains_key(&t_id),
+        compute_views(&g, &gpu_target(Backend::SpirvVulkan)).contains_key(&t_id),
         "control: without a witness the transpose is a view"
     );
     let observed = derive(&g, |draft| {
         draft.push_witness(ValidationId(3), "transposed", t_id);
     })
     .unwrap();
-    let views = compute_views(&observed, Backend::SpirvVulkan);
+    let views = compute_views(&observed, &gpu_target(Backend::SpirvVulkan));
     assert!(
         !views.contains_key(&t_id),
         "a validation value keeps its own materialized buffer"
@@ -3934,7 +3943,7 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
     let (g, t_id, move_eqn) = view_test_graph(vec![3, 2, 4], |bld, a| {
         bld.transpose(a, vec![2, 0, 1]).unwrap()
     });
-    let views = compute_views(&g, Backend::SpirvVulkan);
+    let views = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
     assert!(
         views.contains_key(&t_id),
         "a Transpose feeding only a Binary(Add) must be promoted to a view"
@@ -3971,7 +3980,7 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
 
 /// The plan of the eqn that produces `id`, planned against `g`'s own `compute_views` on wgpu.
 fn view_plan_of(g: &Graph, id: ValueId) -> Plan {
-    let views = compute_views(g, Backend::SpirvVulkan);
+    let views = compute_views(g, &gpu_target(Backend::SpirvVulkan));
     let eqn = g.eqns().iter().find(|e| e.out == id).unwrap();
     plan_eqn_views(
         g,
@@ -4006,6 +4015,7 @@ fn slice_then_reshape_into_binary_plans_two_views() {
     match view_plan_of(&g, heads.id()) {
         Plan::View {
             src,
+            bound: 0,
             strides,
             offset,
         } => {
@@ -4052,7 +4062,7 @@ fn transpose_into_matmul_keeps_the_materialize_copy() {
     let g = bld.finish(mm).unwrap();
     let t_id = t.id();
 
-    let views = compute_views(&g, Backend::SpirvVulkan);
+    let views = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
     assert!(
         !views.contains_key(&t_id),
         "a Transpose feeding a MatMul must NOT be promoted to a view (FR-004)"
@@ -4090,7 +4100,7 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
     let out = bld.binary(GBinOp::Add, y_view, y_plain).unwrap();
     let g = bld.finish(out).unwrap();
 
-    let views = compute_views(&g, Backend::SpirvVulkan);
+    let views = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
     assert!(
         views.contains_key(&t.id()),
         "t's only consumer (y_view's Binary) reads a layout"
@@ -4202,10 +4212,10 @@ fn view_transpose_matches_oracle_fuzz() {
         let (g, t_id, move_eqn) = view_test_graph(a_shape.clone(), |bld, a| {
             bld.transpose(a, perm.clone()).unwrap()
         });
-        let views = compute_views(&g, Backend::SpirvVulkan);
+        let views = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
         let layout = views
             .get(&t_id)
-            .cloned()
+            .map(|view| view.layout.clone())
             .expect("a Transpose into Binary(Add) must be a view");
 
         let a_numel = numel(&a_shape);
@@ -4240,10 +4250,10 @@ fn view_slice_matches_oracle_fuzz() {
         let (g, t_id, move_eqn) = view_test_graph(a_shape.clone(), |bld, a| {
             bld.slice(a, axis, start, end).unwrap()
         });
-        let views = compute_views(&g, Backend::SpirvVulkan);
+        let views = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
         let layout = views
             .get(&t_id)
-            .cloned()
+            .map(|view| view.layout.clone())
             .expect("a Slice into Binary(Add) must be a view");
 
         let a_numel = numel(&a_shape);
@@ -4297,10 +4307,10 @@ fn view_broadcast_matches_oracle_fuzz() {
         let (g, t_id, move_eqn) = view_test_graph(a_shape.clone(), |bld, a| {
             bld.broadcast(a, out_shape.clone()).unwrap()
         });
-        let views = compute_views(&g, Backend::SpirvVulkan);
+        let views = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
         let layout = views
             .get(&t_id)
-            .cloned()
+            .map(|view| view.layout.clone())
             .expect("a Broadcast into Binary(Add) must be a view");
 
         let a_numel = numel(&a_shape);
@@ -4344,7 +4354,7 @@ fn transpose_then_slice_into_binary_add_composes_both_into_views() {
     let g = bld.finish(y).unwrap();
     let (t_id, s_id) = (t.id(), s.id());
 
-    let views = compute_views(&g, Backend::SpirvVulkan);
+    let views = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
     assert!(
         views.contains_key(&t_id),
         "the Transpose link must ALSO promote to a view now (chain composition) - phase 1 kept it \
@@ -4358,12 +4368,12 @@ fn transpose_then_slice_into_binary_add_composes_both_into_views() {
     // Hand-computed composition: a's row-major strides (shape [3,2,4]) are [8,4,1].
     // transpose(perm=[2,0,1]): out dim d reads
     // in_strides[perm[d]] -> [in_strides[2], in_strides[0], in_strides[1]] = [1,8,4], offset 0.
-    let t_layout = &views[&t_id];
+    let t_layout = &views[&t_id].layout;
     assert_eq!(t_layout.strides, vec![1, 8, 4]);
     assert_eq!(t_layout.offset, 0);
     // slice(axis=1,start=1) of that view: strides unchanged (a slice never reorders dims), offset
     // advances by start * the view's own stride for axis 1 (8, not a's in_strides[1]=4).
-    let s_layout = &views[&s_id];
+    let s_layout = &views[&s_id].layout;
     assert_eq!(s_layout.strides, vec![1, 8, 4]);
     assert_eq!(s_layout.offset, 8);
 
@@ -4459,7 +4469,7 @@ fn view_chain_matches_oracle_fuzz() {
         let y = bld.binary(GBinOp::Add, cur, cur).unwrap();
         let g = bld.finish(y).unwrap();
 
-        let views = compute_views(&g, Backend::SpirvVulkan);
+        let views = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
         for &id in &link_ids {
             assert!(
                 views.contains_key(&id),
@@ -4480,7 +4490,7 @@ fn view_chain_matches_oracle_fuzz() {
                 .find(|e| e.out == id)
                 .expect("every link id is some eqn's output");
             oracle = poot_eval::apply_movement(&eqn.op, &[oracle]).unwrap();
-            let layout = views.get(&id).expect("checked promoted above");
+            let layout = &views.get(&id).expect("checked promoted above").layout;
             let out_shape = g.aval(id).shape.clone();
             assert_view_matches_oracle(
                 &out_shape,
@@ -4563,7 +4573,7 @@ fn view_chain_with_reshape_matches_oracle_fuzz() {
         }
         let y = bld.binary(GBinOp::Add, cur, cur).unwrap();
         let g = bld.finish(y).unwrap();
-        let views = compute_views(&g, Backend::SpirvVulkan);
+        let views = compute_views(&g, &gpu_target(Backend::SpirvVulkan));
 
         let a_shape = g.aval(a.id()).shape.clone();
         let a_data: Vec<f32> = (0..numel(&a_shape)).map(|i| i as f32 + 0.5).collect();
@@ -4572,7 +4582,7 @@ fn view_chain_with_reshape_matches_oracle_fuzz() {
         for &(id, is_reshape) in &links {
             let eqn = g.eqns().iter().find(|e| e.out == id).unwrap();
             oracle = poot_eval::apply_movement(&eqn.op, &[oracle]).unwrap();
-            if let Some(layout) = views.get(&id).filter(|_| intact) {
+            if let Some(layout) = views.get(&id).filter(|_| intact).map(|view| &view.layout) {
                 assert_view_matches_oracle(
                     &g.aval(id).shape,
                     &layout.strides,

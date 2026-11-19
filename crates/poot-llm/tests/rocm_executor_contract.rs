@@ -756,10 +756,12 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &n_buf,
+                offset: 0,
                 elems: 1,
             }],
             output: Arg {
                 buffer: &out_buf,
+                offset: 0,
                 elems: 1,
             },
             launch: poot_executor::LaunchKind::Grid {

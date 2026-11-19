@@ -169,6 +169,19 @@ pub enum RocmError {
         /// Bytes per element of the buffer.
         element_bytes: usize,
     },
+    /// A kernel parameter's bound address (its buffer's plus the binding offset) is not a multiple of the
+    /// device's binding alignment, which the kernel bodies' aligned group reads assume (POOT-1572).
+    #[error("{op} binds slot {slot} at device address {address:#x}, not {alignment}-byte aligned")]
+    MisalignedBinding {
+        /// The runtime entry point that refused.
+        op: &'static str,
+        /// The kernarg slot (inputs in order, the output last).
+        slot: usize,
+        /// The bound device address.
+        address: u64,
+        /// The device's binding alignment, bytes.
+        alignment: u64,
+    },
     /// More buffers were bound than the kernel's kernarg segment has room for (16 bytes each).
     #[error(
         "{op}: {slots} pointer/length pairs do not fit the kernel's {segment}-byte kernarg segment"

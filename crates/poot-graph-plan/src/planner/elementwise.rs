@@ -1,10 +1,11 @@
 //! Elementwise, reduction, fused-region and fused-RoPE equation planning.
 
 use super::{
-    BinOp, BodyLimits, Capability, ContractionHead, DType, Eqn, GBinOp, GUnOp, HashMap,
-    KernelRequest, Lowering, OpKind, Operand, PlanError, Planned, PointwiseForm, PointwiseSpec,
-    RedOp, RopeSpec, RowSpec, RowStep, Scalar, ValueId, ViewOperand, fty_ty, kg, value_ids,
+    BinOp, BodyLimits, Capability, ContractionHead, DType, Eqn, GBinOp, GUnOp, KernelRequest,
+    Lowering, OpKind, Operand, PlanError, Planned, PointwiseForm, PointwiseSpec, RedOp, RopeSpec,
+    RowSpec, RowStep, Scalar, ValueId, ViewOperand, fty_ty, kg, value_ids,
 };
+use crate::Views;
 use crate::dtype_widen::ConstLanes;
 use crate::kernel_mapping::{
     check_widening_step, float_region_leaf_storage, map_fused_input, map_fused_input_i32,
@@ -73,7 +74,7 @@ pub(super) fn plan(
     out_shape: &[usize],
     out_numel: usize,
     lowering: Lowering<'_>,
-    views: &HashMap<ValueId, Layout>,
+    views: &Views,
     odt: DType,
     limits: BodyLimits,
     const_lanes: &ConstLanes,
@@ -81,9 +82,10 @@ pub(super) fn plan(
     let site = Site::new(g, eqn, lowering.id(), limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let layout_of = |vid: ValueId| -> Layout {
+        // The residual layout: the dispatch binds the operand's root at the view's own `bound`.
         views
             .get(&vid)
-            .cloned()
+            .map(|view| view.layout.clone())
             .unwrap_or_else(|| Layout::contiguous(&shape(vid)))
     };
     // Every input read through its layout (a strided view, or the row-major default).

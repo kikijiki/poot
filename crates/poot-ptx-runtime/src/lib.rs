@@ -69,7 +69,7 @@ mod upload;
 
 pub use buffer::PtxBuffer;
 pub use compiler_probe::{FunctionRegisters, ProbeError, PtxCompilerProbe};
-pub use context::PtxContext;
+pub use context::{PtxBinding, PtxContext};
 pub use error::PtxError;
 pub use graph::{PtxGraphExec, PtxSpan, PtxSyncEvent};
 pub use owner::NativeCounters;

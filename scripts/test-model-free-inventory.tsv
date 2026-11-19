@@ -519,6 +519,8 @@ poot-executor	poot-executor	model-free	timing::tests::default_diagnostic_is_ever
 poot-executor	poot-executor	model-free	timing::tests::default_is_counters_only
 poot-executor	poot-executor	model-free	timing::tests::every_step_has_sample_every_one
 poot-executor	poot-executor::buffer_plan_arena	model-free	a_dispatch_longer_than_its_buffer_is_refused_before_the_device_sees_it
+poot-executor	poot-executor::buffer_plan_arena	model-free	a_view_is_bound_at_its_offset
+poot-executor	poot-executor::buffer_plan_arena	model-free	an_arg_past_its_buffer_is_refused
 poot-executor	poot-executor::buffer_plan_arena	model-free	dispatch_args_carry_the_values_own_length_never_the_slots_capacity
 poot-executor	poot-executor::buffer_plan_arena	model-free	every_arena_binding_is_a_view_of_the_values_own_storage
 poot-executor	poot-executor::buffer_plan_arena	model-free	program_arena_bytes_equals_what_the_engine_allocates
@@ -1427,6 +1429,10 @@ poot-graph-plan	poot-graph-plan::numerical_legality	model-free	reciprocal_roundi
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	rhs_underflow_is_not_factored_out_of_contraction
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	scalar_contraction_corner_corpus_is_bitwise
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	softcap_requires_the_exact_reciprocal_literal
+poot-graph-plan	poot-graph-plan::offset_binding	model-free	aligned_views_share_one_kernel
+poot-graph-plan	poot-graph-plan::offset_binding	model-free	misaligned_offset_keeps_the_copy
+poot-graph-plan	poot-graph-plan::offset_binding	model-free	offset_view_feeds_a_matmul_without_a_copy
+poot-graph-plan	poot-graph-plan::offset_binding	model-free	prefix_slice_is_a_view_on_every_gpu_target
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	a_declared_precision_stands_under_any_policy
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	a_decode_attention_stays_exact_under_the_narrow_policy
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	a_split_policy_splits_contractions_and_leaves_attention_exact
@@ -4367,8 +4373,14 @@ poot-orchestrator	poot-orchestrator	model-free	workflow::tests::one_cloud_refusi
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::one_failed_ssh_probe_does_not_make_a_warm_pod_unreachable
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::python_runner_sync_uploads_helper_modules_beside_run_py
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::reap_never_selects_another_state_databases_pod
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::reap_records_gone_pods_from_its_own_list
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::reap_reports_a_pod_the_api_would_not_delete
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::reap_selects_a_pod_whose_creation_crashed_before_it_was_recorded
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::reconcile_aborts_an_expired_warm_run_with_a_gone_pod_only
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::reconcile_keeps_a_pod_too_young_to_be_listed
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::reconcile_keeps_updated_at
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::reconcile_never_touches_a_pod_runpod_still_lists
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::reconcile_with_a_failed_list_marks_nothing
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::repeats_default_to_one_and_must_be_positive
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::replacing_a_pod_rearms_the_setup_of_every_model
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::resetting_a_models_setup_clears_its_flag
@@ -4470,6 +4482,7 @@ poot-ptx-device	poot-ptx-device::device_timing	device	ptx_dispatch_times_keep_th
 poot-ptx-device	poot-ptx-device::device_timing	device	timed_ptx_device_reads_a_nonzero_device_time_for_a_known_kernel
 poot-ptx-device	poot-ptx-device::device_timing	device	timed_ptx_device_reads_each_dispatch_of_a_captured_step
 poot-ptx-device	poot-ptx-device::feedback_end_to_end	device	the_engine_plans_the_expert_projection_with_the_drivers_verdicts_on_ptx
+poot-ptx-device	poot-ptx-device::float_ne	device	an_offset_binding_is_read_from_its_offset_and_a_misaligned_one_is_refused_on_ptx
 poot-ptx-device	poot-ptx-device::float_ne	device	float_ne_is_ieee_on_nan_on_ptx
 poot-ptx-device	poot-ptx-device::i32_index	device	gather_with_i32_indices_matches_the_oracle_bit_for_bit_on_ptx
 poot-ptx-device	poot-ptx-device::indexed_matmul	device	indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit
@@ -4742,6 +4755,7 @@ poot-rocm-device	poot-rocm-device::device_timing	device	plain_rocm_device_report
 poot-rocm-device	poot-rocm-device::device_timing	device	rocm_dispatch_times_keep_their_plan_labels_across_a_stage_commit
 poot-rocm-device	poot-rocm-device::device_timing	device	timed_rocm_device_reads_a_nonzero_device_time_for_a_known_kernel
 poot-rocm-device	poot-rocm-device::device_timing	device	timing_does_not_change_the_rocm_scan_result
+poot-rocm-device	poot-rocm-device::float_ne	device	an_offset_binding_is_read_from_its_offset_and_a_misaligned_one_is_refused_on_rocm
 poot-rocm-device	poot-rocm-device::float_ne	device	float_ne_is_ieee_on_nan_on_rocm
 poot-rocm-device	poot-rocm-device::i32_index	device	gather_with_i32_indices_matches_the_oracle_bit_for_bit_on_rocm
 poot-rocm-device	poot-rocm-device::indexed_matmul	device	indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit

@@ -56,15 +56,18 @@ fn replay_chain(device: &mut WgpuDevice, dispatches: usize, work: u64) -> Replay
                 inputs: &[
                     Arg {
                         buffer: src,
+                        offset: 0,
                         elems: 4,
                     },
                     Arg {
                         buffer: &one,
+                        offset: 0,
                         elems: 4,
                     },
                 ],
                 output: Arg {
                     buffer: dst,
+                    offset: 0,
                     elems: 4,
                 },
                 launch: poot_executor::LaunchKind::Grid {

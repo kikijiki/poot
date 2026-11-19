@@ -541,7 +541,11 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
 
     let invocation = AieInvocation::new(AieTargetId::Xdna2, linked.words);
     let aie = LaunchKind::Aie(invocation);
-    let arg = |buffer, elems| Arg { buffer, elems };
+    let arg = |buffer, elems| Arg {
+        buffer,
+        offset: 0,
+        elems,
+    };
     let try_dispatch = |device: &mut XdnaDevice,
                         launch: LaunchKind,
                         inputs: &[Arg<'_, XdnaDevice>],
@@ -744,10 +748,12 @@ fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
     let inputs = [
         Arg {
             buffer: &a,
+            offset: 0,
             elems: N,
         },
         Arg {
             buffer: &b,
+            offset: 0,
             elems: N,
         },
     ];
@@ -758,6 +764,7 @@ fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
             inputs: &inputs,
             output: Arg {
                 buffer: &out,
+                offset: 0,
                 elems: N,
             },
             launch: LaunchKind::Aie(AieInvocation::new(AieTargetId::Xdna2, linked.words)),

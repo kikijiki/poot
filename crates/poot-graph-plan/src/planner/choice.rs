@@ -5,6 +5,7 @@
 //! that builds a [`Plan`] and its choice together, so a plan's key, body and launch are always the ones
 //! its choice names. The executor never reads the choice.
 
+use crate::ViewBinding;
 use crate::planner::Lowering;
 use crate::planner::kg::Layout;
 use crate::refusal::Site;
@@ -556,11 +557,12 @@ impl Planned {
         Self::no_dispatch(Plan::Alias(src), NoDispatch::Alias)
     }
 
-    pub(crate) fn view(src: ValueId, layout: Layout) -> Self {
-        let Layout { strides, offset } = layout;
+    pub(crate) fn view(src: ValueId, view: &ViewBinding) -> Self {
+        let Layout { strides, offset } = view.layout.clone();
         Self::no_dispatch(
             Plan::View {
                 src,
+                bound: view.bound,
                 strides,
                 offset,
             },

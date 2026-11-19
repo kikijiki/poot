@@ -194,10 +194,12 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm(
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &len_src,
+                offset: 0,
                 elems: REAL_LEN,
             }],
             output: Arg {
                 buffer: &out_buf,
+                offset: 0,
                 elems: 1,
             },
             launch: poot_executor::LaunchKind::Grid {
@@ -265,10 +267,12 @@ fn an_aie_launch_is_a_typed_refusal_on_rocm() {
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &input,
+                offset: 0,
                 elems: 4,
             }],
             output: Arg {
                 buffer: &output,
+                offset: 0,
                 elems: 1,
             },
             launch: poot_executor::LaunchKind::Aie(poot_npu_artifacts::AieInvocation::new(

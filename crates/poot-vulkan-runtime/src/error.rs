@@ -65,6 +65,20 @@ pub enum RuntimeError {
         /// The element count the buffer holds.
         capacity: usize,
     },
+    /// A dispatch argument was bound at a byte offset that is not a multiple of the device's
+    /// `minStorageBufferOffsetAlignment` (VUID-VkWriteDescriptorSet-descriptorType-00328): refused before anything
+    /// is recorded (POOT-1572).
+    #[error(
+        "dispatch argument {arg} is bound at byte offset {offset}, not a multiple of the storage binding alignment {alignment}"
+    )]
+    MisalignedBinding {
+        /// Position of the argument in the dispatch.
+        arg: usize,
+        /// The offending byte offset.
+        offset: u64,
+        /// The device's binding alignment, bytes.
+        alignment: u64,
+    },
     /// A pipeline key was reused for a different kernel: other SPIR-V, argument schema or trap shape.
     #[error("pipeline key {key:?} is cached for a different kernel")]
     PipelineKeyConflict {

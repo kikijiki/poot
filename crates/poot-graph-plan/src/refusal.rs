@@ -158,6 +158,16 @@ pub enum Capability {
         /// The strided operand.
         value: ValueId,
     },
+    /// A view binds its root at a byte offset that is not a multiple of the target's binding alignment, which the
+    /// device would refuse (or a kernel's aligned loads would mis-read).
+    ViewBindingAlignment {
+        /// The view.
+        value: ValueId,
+        /// The byte offset it binds its root at.
+        bound: u64,
+        /// The alignment the target requires.
+        align: u64,
+    },
     /// A literal in the first operand position, which the planner's operand grammar does not read.
     LiteralFirstOperand,
     /// The index operand is not a form the lowering reads.
@@ -593,6 +603,14 @@ impl fmt::Display for Capability {
             Capability::OperandLayout { value } => {
                 write!(f, "{value} is a strided view the lowering cannot read")
             }
+            Capability::ViewBindingAlignment {
+                value,
+                bound,
+                align,
+            } => write!(
+                f,
+                "{value} binds its root at byte offset {bound}, not a multiple of the target's binding alignment {align}"
+            ),
             Capability::LiteralFirstOperand => {
                 f.write_str("a literal first operand is outside the planner's operand grammar")
             }

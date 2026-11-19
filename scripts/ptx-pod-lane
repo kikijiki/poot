@@ -18,6 +18,11 @@
 # the other modes. PTX_POD_MAX_PRICE then bounds the whole pod's hourly price.
 # --calibrate also ships the `calibrate_launch` example and runs `scripts/calibrate-launch ptx` (tilings, indexed, gemv) on
 # the pod before the device lane (--calibrate-modes "fragment dense" picks other modes), and brings the raw rows and fitted entries back as calibrate/ (POOT-1490).
+# --keep-warm MINUTES (at most 240) passes `exec --keep-warm` to the orchestrator: the pod is NOT torn down when this run's
+# command ends but kept for that many minutes, and the next `exec` with the same image adopts it (no provision, no 30 GB
+# image pull). Use it for any multi-step session (a hold, an ABBA, a red/green on one pod): every step but the last needs it,
+# because a plain `exec` deletes its pod the moment its command exits, which strands a session still in progress. The kept
+# pod bills until its window ends (the last step without --keep-warm tears it down; `reap` takes it after the window).
 # --no-device-lane runs only the checkpoint rows (no `test-device-ptx`, kernelgen emit, ptx-check or gate).
 #
 # The pod has no `just`, cargo or python, so this driver builds everything here and ships it:
@@ -50,6 +55,7 @@ disk_gb=${PTX_POD_DISK_GB:-40}
 passes=3
 calibrate=
 calibrate_modes='tilings indexed gemv'
+keep_warm=
 speed_model=
 two_gpu=
 bank_cases=()
@@ -67,7 +73,8 @@ while [ $# -gt 0 ]; do
     --calibrate-modes) calibrate_modes=$2; shift 2 ;;
     --two-gpu) two_gpu=1; device_lane=; shift ;;
     --no-device-lane) device_lane=; shift ;;
-    *) echo "usage: $0 [--bank-case ID]... [--passes N] [--models MANIFEST --checkpoint-filter FILTERSET] [--speed MODEL] [--no-device-lane]" >&2; exit 2 ;;
+    --keep-warm) keep_warm=$2; shift 2 ;;
+    *) echo "usage: $0 [--bank-case ID]... [--passes N] [--models MANIFEST --checkpoint-filter FILTERSET] [--speed MODEL] [--keep-warm MINUTES] [--no-device-lane]" >&2; exit 2 ;;
   esac
 done
 if { [ -n "$models" ] && [ -z "$checkpoint_filter" ]; } || { [ -z "$models" ] && [ -n "$checkpoint_filter" ]; }; then
@@ -200,7 +207,7 @@ if [ -z "$device_lane" ] && [ -z "$two_gpu" ]; then
 fi
 cargo run -q --release -p poot-orchestrator -- exec --image ghcr.io/kikijiki/poot-bench:latest --cloud secure \
   --gpu-types "$gpu_types" --max-price-per-hour "$max_price" --gpu-count "$([ -n "$two_gpu" ] && echo 2 || echo 1)" --max-cmd "$max_cmd" --container-disk-gb "$disk_gb" \
-  "${uploads[@]}" --cmd 'bash /root/ptx-pod-lane-remote.sh' | tee "$work/exec.log"
+  ${keep_warm:+--keep-warm "$keep_warm"} "${uploads[@]}" --cmd 'bash /root/ptx-pod-lane-remote.sh' | tee "$work/exec.log"
 
 # 6. the results come back between markers
 extract() { sed -n "/===$1-BEGIN===/,/===$1-END===/p" "$work/exec.log" | sed '1d;$d'; }

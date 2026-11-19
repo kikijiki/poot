@@ -17,7 +17,9 @@ use poot_executor::{
 use poot_graph_plan::Target;
 use poot_runtime_common::{BufferRole, DeviceIdentity};
 use poot_target::{Backend, BufferStorage, TargetId};
-use poot_wgpu_runtime::{CachedDispatch, Context, ContextOptions, DeviceBuffer, RuntimeError};
+use poot_wgpu_runtime::{
+    Binding, CachedDispatch, Context, ContextOptions, DeviceBuffer, RuntimeError,
+};
 use std::num::NonZeroUsize;
 
 /// One loaded kernel: its compiled code and the plan key the pipeline cache and labels use.
@@ -260,11 +262,16 @@ impl Device for WgpuDevice {
                 });
             }
         };
-        let inputs: Vec<&DeviceBuffer> =
-            d.inputs.iter().map(|a: &Arg<'_, Self>| a.buffer).collect();
-        // Card 547b: each argument's own logical element count from the plan, never
-        // the bound buffer's capacity.
-        let input_lens: Vec<usize> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.elems).collect();
+        // Card 547b: each argument's own logical element count from the plan, never the bound buffer's
+        // capacity, and the byte offset the plan bound it at.
+        fn binding<'a>(a: &Arg<'a, WgpuDevice>) -> Binding<'a> {
+            Binding {
+                buffer: a.buffer,
+                offset: a.offset,
+                elems: a.elems,
+            }
+        }
+        let inputs: Vec<Binding<'_>> = d.inputs.iter().map(binding).collect();
         let cached = self.ctx.build_cached_dispatch(
             &d.kernel.key,
             &d.kernel.key,
@@ -272,9 +279,7 @@ impl Device for WgpuDevice {
             workgroup,
             threads,
             &inputs,
-            &input_lens,
-            d.output.buffer,
-            d.output.elems,
+            binding(&d.output),
         )?;
         self.push(Recorded::Dispatches(vec![(cached, d.work)]))
     }

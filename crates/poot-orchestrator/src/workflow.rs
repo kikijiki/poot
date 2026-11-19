@@ -10,7 +10,10 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::cli::CloudChoice;
 use crate::cli::{ExecArgs, ImageArgs, LogsArgs, RunArgs};
-use crate::clock::{Clock, SystemClock, iso_from_secs, iso_in_minutes, new_exec_run_id, now_iso};
+use crate::clock::{
+    Clock, SystemClock, created_within_listing_grace, iso_from_secs, iso_in_minutes,
+    new_exec_run_id, now_iso, now_secs,
+};
 use crate::cuda::CudaVersion;
 use crate::db::runs::OwnerLiveness;
 use crate::db::{Db, ExecOwner, ExecReapReport, PodOwnerPrefix, ReapProtection, Run, WarmExec};
@@ -1120,6 +1123,17 @@ pub(crate) fn runpod_api_key() -> Result<String> {
         .ok_or_else(|| anyhow!("RUNPOD_API_KEY is not set"))
 }
 
+/// `status` shows the DB, so first bring it in line with RunPod when that can be asked. Best effort: no API key
+/// or a failed list is logged and the DB is shown as it is (nothing is marked on a failed list).
+pub(crate) fn reconcile_for_status(db: &Db) {
+    let outcome = runpod_api_key()
+        .and_then(RunPod::new)
+        .and_then(|rp| reconcile(db, &rp));
+    if let Err(e) = outcome {
+        log(format!("status shows the DB unreconciled: {e:#}"));
+    }
+}
+
 pub(crate) fn cmd_status(db: &Db, state_db: &str) -> Result<()> {
     use std::io::Write as _;
 
@@ -1185,6 +1199,56 @@ pub(crate) fn finish_status_output(write_result: std::io::Result<()>) -> Result<
     }
 }
 
+/// What one [`reconcile`] changed in the state DB.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReconcileReport {
+    /// Pods the DB called live that RunPod no longer lists, now `terminated`.
+    pub(crate) pods_gone: Vec<String>,
+    /// Expired kept-warm exec runs whose pod is gone, now `aborted`.
+    pub(crate) warm_runs_aborted: Vec<String>,
+}
+
+/// Bring the state DB in line with RunPod: every pod record not `terminated` that a SUCCESSFUL list does not show
+/// (and that is older than the listing grace) is recorded `terminated`, and an expired kept-warm exec run whose
+/// pod is gone is aborted. DB only: it never deletes anything at RunPod. A failed list is an error and changes
+/// nothing, so an outage cannot make every live pod read gone. `now` is read before the list: a pod created after
+/// it is inside the grace.
+pub(crate) fn reconcile<P: PodApi + ?Sized>(db: &Db, rp: &P) -> Result<ReconcileReport> {
+    let now = now_secs();
+    let pods = rp
+        .list_pods()
+        .context("reconcile could not list RunPod pods, so it changed nothing")?;
+    reconcile_listed(db, &pods, now)
+}
+
+/// [`reconcile`] against a list the caller already read successfully at `now` (`reap` shares its own).
+pub(crate) fn reconcile_listed(db: &Db, pods: &[Pod], now: i64) -> Result<ReconcileReport> {
+    let listed: std::collections::HashSet<&str> = pods.iter().map(|p| p.id.as_str()).collect();
+    let mut report = ReconcileReport::default();
+    for pod in db.live_pods()? {
+        if listed.contains(pod.id.as_str()) || created_within_listing_grace(&pod.created_at, now) {
+            continue;
+        }
+        if db.mark_pod_gone(&pod.id)? {
+            log(format!(
+                "pod {} ({}) is no longer listed at RunPod: recorded terminated",
+                pod.id, pod.status
+            ));
+            report.pods_gone.push(pod.id);
+        }
+    }
+    for warm in db.expired_warm_execs(&iso_from_secs(now))? {
+        if !listed.contains(warm.pod_id.as_str()) && db.try_abort_warm_exec(&warm)? {
+            log(format!(
+                "expired warm run {} had pod {}, which RunPod no longer lists: aborted",
+                warm.run_id, warm.pod_id
+            ));
+            report.warm_runs_aborted.push(warm.run_id);
+        }
+    }
+    Ok(report)
+}
+
 /// Terminate this state database's orphan pods. Returns how many the API confirmed deleted; a pod it
 /// would not delete is an error after every target has been tried.
 pub(crate) fn reap<P: PodApi + ?Sized>(db: &Db, rp: &P, force: bool) -> Result<usize> {
@@ -1192,6 +1256,7 @@ pub(crate) fn reap<P: PodApi + ?Sized>(db: &Db, rp: &P, force: bool) -> Result<u
     // exec may be provisioning in the same DB. `--all` overrides. Split into a helper so the DB half is
     // testable without a RunPod client.
     finalize_stale_claims(db, force)?;
+    let listed_at = now_secs();
     // Reap is the leak safety net, so a listing failure means orphans were not reaped either.
     let pods = rp.list_pods().context(
         "reap could not list RunPod pods, so it ALSO could not verify or terminate orphan pods right \
@@ -1202,6 +1267,8 @@ pub(crate) fn reap<P: PodApi + ?Sized>(db: &Db, rp: &P, force: bool) -> Result<u
     // The cloud snapshot must come first: a pod created after it cannot be in `targets`, and a pod
     // already visible is protected by the later DB snapshot (recorded id, run-specific name, or the
     // unrecorded-claim gate). Reading ids before `list_pods` caused the card 149 / 266 incident.
+    // Recording the gone pods first keeps the orphan pass off rows RunPod no longer has.
+    reconcile_listed(db, &pods, listed_at)?;
     let protection = if force {
         ReapProtection::default()
     } else {
@@ -3723,6 +3790,8 @@ mod tests {
         /// (id, name, has an SSH endpoint)
         cloud: RefCell<Vec<(String, String, bool)>>,
         refuse_delete: Cell<bool>,
+        /// Makes `list_pods` fail the way an outage or a revoked key does.
+        refuse_list: Cell<bool>,
         created: Cell<u32>,
         /// The image each create call asked for, in order.
         images: RefCell<Vec<String>>,
@@ -3880,6 +3949,9 @@ mod tests {
         }
 
         fn list_pods(&self) -> Result<Vec<Pod>> {
+            if self.refuse_list.get() {
+                return Err(anyhow!("list_pods failed (503): unavailable"));
+            }
             Ok(self.cloud.borrow().iter().map(Self::to_pod).collect())
         }
 
@@ -3956,6 +4028,112 @@ mod tests {
             status: status.into(),
             pod_id: pod_id.map(String::from),
         }
+    }
+
+    const OLD_CREATED: &str = "2026-01-01T00:00:00Z";
+    const OLD_UPDATED: &str = "2026-01-02T00:00:00Z";
+
+    /// A pod record old enough to be past the listing grace, in `status`, with known timestamps.
+    fn aged_pod(db: &Db, id: &str, status: &str) {
+        db.create_pod_record(id, "RTX 3090", "COMMUNITY", Some(0.22), "img")
+            .unwrap();
+        db.set_pod_status(id, status).unwrap();
+        db.set_pod_times(id, OLD_CREATED, OLD_UPDATED).unwrap();
+    }
+
+    fn pod_status(db: &Db, id: &str) -> String {
+        db.pod_record(id).unwrap().unwrap().status
+    }
+
+    /// POOT-1638 (a): a failed list marks nothing and is an error. Mutation: treat the failure as an empty list
+    /// (`unwrap_or_default()` on the list) and every live pod is recorded terminated.
+    #[test]
+    fn reconcile_with_a_failed_list_marks_nothing() {
+        let db = Db::open(":memory:").unwrap();
+        aged_pod(&db, "p1", "busy");
+        let cloud = FakePods::default();
+        cloud.refuse_list.set(true);
+        let err = reconcile(&db, &cloud).unwrap_err();
+        assert!(format!("{err:#}").contains("503"), "{err:#}");
+        assert_eq!(pod_status(&db, "p1"), "busy");
+    }
+
+    /// POOT-1638 (b): a pod too young to be listed is kept. Mutation: drop the grace check and the young pod is
+    /// recorded terminated.
+    #[test]
+    fn reconcile_keeps_a_pod_too_young_to_be_listed() {
+        let db = Db::open(":memory:").unwrap();
+        db.create_pod_record("young", "RTX 3090", "COMMUNITY", None, "img")
+            .unwrap();
+        aged_pod(&db, "old", "provisioning");
+        let report = reconcile(&db, &FakePods::default()).unwrap();
+        assert_eq!(report.pods_gone, vec!["old".to_string()]);
+        assert_eq!(pod_status(&db, "young"), "provisioning");
+        assert_eq!(pod_status(&db, "old"), "terminated");
+    }
+
+    /// POOT-1638 (c): a pod RunPod still lists is never touched, and reconcile never deletes at RunPod.
+    /// Mutation: invert the `listed.contains` test and the listed pod is recorded terminated.
+    #[test]
+    fn reconcile_never_touches_a_pod_runpod_still_lists() {
+        let db = Db::open(":memory:").unwrap();
+        aged_pod(&db, "listed", "busy");
+        aged_pod(&db, "gone", "busy");
+        let cloud = FakePods::default();
+        cloud.seed("listed", "poot-orch-x", true);
+        let report = reconcile(&db, &cloud).unwrap();
+        assert_eq!(report.pods_gone, vec!["gone".to_string()]);
+        assert_eq!(pod_status(&db, "listed"), "busy");
+        assert_eq!(cloud.ids(), vec!["listed".to_string()]);
+        assert!(cloud.deleted.borrow().is_empty());
+    }
+
+    /// POOT-1638 (d): an expired warm run whose pod is gone is aborted; one still inside its window is kept,
+    /// and so is an expired one whose pod RunPod still lists (the next exec or reap owns that pod). Mutation:
+    /// skip the abort loop, or drop the `warm_until <= now` filter in `expired_warm_execs`.
+    #[test]
+    fn reconcile_aborts_an_expired_warm_run_with_a_gone_pod_only() {
+        let db = Db::open(":memory:").unwrap();
+        let warm = |id: &str, pod: &str, until: String| {
+            let mut run = exec_run(id);
+            run.pod_id = Some(pod.into());
+            db.create_run_with_owner(&run, Some(&ExecOwner::current().unwrap()))
+                .unwrap();
+            db.set_pod(id, pod, Some("1.2.3.4"), Some(40000)).unwrap();
+            db.set_warm(id, &until).unwrap();
+        };
+        warm("expired-gone", "pod-a", iso_in_minutes(-5));
+        warm("expired-listed", "pod-b", iso_in_minutes(-5));
+        warm("inside-window", "pod-c", iso_in_minutes(30));
+        let cloud = FakePods::default();
+        cloud.seed("pod-b", "poot-orch-x", true);
+        let report = reconcile(&db, &cloud).unwrap();
+        assert_eq!(report.warm_runs_aborted, vec!["expired-gone".to_string()]);
+        let status = |id: &str| db.run_status(id).unwrap().unwrap();
+        assert_eq!(status("expired-gone"), "aborted");
+        assert_eq!(status("expired-listed"), "warm");
+        assert_eq!(status("inside-window"), "warm");
+    }
+
+    /// POOT-1638 (e): the pod's `updated_at` is unchanged by being recorded gone (the dashboard ends its billing
+    /// span there). Mutation: record it through `set_pod_status`, which stamps `updated_at`.
+    #[test]
+    fn reconcile_keeps_updated_at() {
+        let db = Db::open(":memory:").unwrap();
+        aged_pod(&db, "p1", "busy");
+        reconcile(&db, &FakePods::default()).unwrap();
+        let pod = db.pod_record("p1").unwrap().unwrap();
+        assert_eq!(pod.status, "terminated");
+        assert_eq!(pod.updated_at, OLD_UPDATED);
+    }
+
+    /// `reap` reconciles from the list it already read (one list, not two) before its orphan pass.
+    #[test]
+    fn reap_records_gone_pods_from_its_own_list() {
+        let db = Db::open(":memory:").unwrap();
+        aged_pod(&db, "p1", "busy");
+        reap(&db, &FakePods::default(), false).unwrap();
+        assert_eq!(pod_status(&db, "p1"), "terminated");
     }
 
     /// SC-001: `provision_pod` creates a pod and the process dies before it is recorded (`on_create`

@@ -99,6 +99,8 @@ fn fake_target() -> Target {
 #[derive(Debug, Clone)]
 struct DispatchRecord {
     input_elems: Vec<usize>,
+    /// The byte offset every input is bound at ([`Arg::offset`]).
+    input_offsets: Vec<u64>,
     output_elems: usize,
     /// The storage of every bound handle, inputs then the output.
     storages: Vec<poot_target::BufferStorage>,
@@ -116,6 +118,8 @@ struct Recorder {
     /// How many bytes short of the asked count each untyped arena buffer (POOT-1450) is really
     /// allocated: a device whose allocation disagrees with the plan's lengths.
     activation_shortfall: usize,
+    /// How many elements short of the asked count each `BufferRole::State` buffer is really allocated.
+    state_shortfall: usize,
 }
 
 /// What the device really allocated, or a typed view of it: what [`Device::buffer_elems`] reports, in
@@ -168,6 +172,9 @@ impl Device for RecordingDevice {
         if storage == poot_target::BufferStorage::untyped() {
             capacity -= self.recorder.activation_shortfall;
         }
+        if role == BufferRole::State {
+            capacity -= self.recorder.state_shortfall;
+        }
         let bytes = (elems * storage.element().byte_width()) as u64;
         // `Buffer = ()` has no `Drop` to tie the guard's live-bytes decrement to (mirrors
         // `cr30_lifecycle.rs`'s `FaultyDevice`): leaked on purpose, read back via `snapshot_all`.
@@ -209,6 +216,7 @@ impl Device for RecordingDevice {
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), std::convert::Infallible> {
         self.recorder.dispatches.borrow_mut().push(DispatchRecord {
             input_elems: d.inputs.iter().map(|a: &Arg<'_, Self>| a.elems).collect(),
+            input_offsets: d.inputs.iter().map(|a: &Arg<'_, Self>| a.offset).collect(),
             output_elems: d.output.elems,
             storages: d
                 .inputs
@@ -590,6 +598,7 @@ fn a_dispatch_longer_than_its_buffer_is_refused_before_the_device_sees_it() {
         *refusal,
         DispatchError::ArgExceedsBuffer {
             arg: 2,
+            offset: 0,
             elems: 64,
             capacity: 63
         },
@@ -631,4 +640,88 @@ fn every_arena_binding_is_a_view_of_the_values_own_storage() {
             record.storages
         );
     }
+}
+
+/// POOT-1566 W1 (SC-g): `sum(slice(k, rows 4..8))` over a carried `[8, 16]` state `k`. The slice starts 256 bytes into
+/// the state's buffer and a reduction reads flat, so the planner binds the slice as a view of that buffer
+/// ([`poot_graph_plan::Plan::View`] with a `bound`) and the reduction's dispatch takes its input 256 bytes in.
+fn offset_fixture() -> (Graph, Arc<WeightStore>, Arc<poot_weights::WeightMap>) {
+    let b = Builder::for_tests();
+    let k_in = b
+        .state_input(
+            "k",
+            TensorType::f32(vec![8, 16]),
+            poot_graph_ir::StateRole::Recurrent,
+        )
+        .unwrap();
+    let rows = b.slice(k_in, 0, 4, 8).unwrap();
+    let out = b.reduce(RedOp::Sum, rows, 1, false).unwrap();
+    let k_out = b.binary(BinOp::Add, k_in, k_in).unwrap();
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(k_in, k_out)]))
+        .unwrap();
+    let store = Arc::new(WeightStore::builder().build());
+    let map = Arc::new(poot_graph_ir::test_support::const_weights::ConstWeights::new(&store).map());
+    (g, store, map)
+}
+
+/// A reader of a view binds its root at the view's offset: the reduction's input arrives 256 bytes in, with the
+/// view's own 64 elements; the same program steps cleanly on a device that allocates exactly.
+#[test]
+fn a_view_is_bound_at_its_offset() {
+    let (g, store, map) = offset_fixture();
+    let recorder = Recorder::default();
+    let mut engine = Engine::new(RecordingDevice {
+        recorder: recorder.clone(),
+    });
+    let exe = engine.load_weights(store, map).unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, fake_target())).unwrap();
+    engine
+        .step(exe, entry, &StepInputs::new(), &mut NoSync)
+        .expect("the exact device steps");
+    let dispatches = recorder.dispatches.borrow();
+    let reduce = dispatches.first().expect("the reduction dispatches first");
+    assert_eq!(reduce.input_offsets, [256]);
+    assert_eq!(reduce.input_elems, [64]);
+}
+
+/// SC-g: an argument whose length fits its buffer but whose window, from its offset, does not is refused with the
+/// shared typed error before `Device::dispatch`. The device allocates the state one element short, so the
+/// 64-element window at byte 256 of the 128-element state asserts 64 against a 127-element buffer: `elems` alone is
+/// within capacity, `offset + elems` is not.
+///
+/// Mutation: count `elems` only in `check_arg_lengths` (`crates/poot-executor/src/engine.rs`, drop `start`): the
+/// dispatch reaches the device and the step succeeds, so this row goes red.
+#[test]
+fn an_arg_past_its_buffer_is_refused() {
+    let (g, store, map) = offset_fixture();
+    let recorder = Recorder {
+        state_shortfall: 1,
+        ..Recorder::default()
+    };
+    let mut engine = Engine::new(RecordingDevice {
+        recorder: recorder.clone(),
+    });
+    let exe = engine.load_weights(store, map).unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, fake_target())).unwrap();
+    let error = engine
+        .step(exe, entry, &StepInputs::new(), &mut NoSync)
+        .err()
+        .expect("a window past its buffer must be refused");
+    let ExecError::Dispatch(refusal) = error else {
+        panic!("expected the shared dispatch error, got {error:?}");
+    };
+    assert_eq!(
+        *refusal,
+        DispatchError::ArgExceedsBuffer {
+            arg: 0,
+            offset: 256,
+            elems: 64,
+            capacity: 127
+        }
+    );
+    assert!(
+        recorder.dispatches.borrow().is_empty(),
+        "the device must never see the refused dispatch"
+    );
 }

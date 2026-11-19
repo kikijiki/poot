@@ -1040,6 +1040,36 @@ impl BoundKernarg {
     }
 }
 
+/// One kernel parameter of a dispatch: a window of `buffer` that starts `offset` bytes in and holds `len` elements in
+/// the kernel body's own unit. The kernarg carries the address of the window's first byte; the recording keeps the
+/// whole buffer alive.
+#[derive(Clone, Copy)]
+pub struct KernargSlot<'a> {
+    /// The buffer the kernel reads or writes.
+    pub buffer: &'a RocmBuffer,
+    /// Byte offset of the window in `buffer`. The bound address must keep the device's binding alignment
+    /// ([`poot_target::RAW_POINTER_BINDING_ALIGN`]), else [`RocmContext::bind_kernarg`] refuses.
+    pub offset: u64,
+    /// The length the kernel is told, in its own unit.
+    pub len: u64,
+}
+
+impl<'a> KernargSlot<'a> {
+    /// A window from the buffer's base.
+    pub fn at_base(buffer: &'a RocmBuffer, len: u64) -> Self {
+        Self {
+            buffer,
+            offset: 0,
+            len,
+        }
+    }
+
+    /// The device address of the window's first byte.
+    fn address(&self) -> u64 {
+        self.buffer.device_ptr() + self.offset
+    }
+}
+
 impl RocmContext {
     /// Allocate a zeroed kernarg buffer of `size` bytes from the fine-grained kernarg-capable pool; it is
     /// freed when its last [`RocmBuffer`] handle drops and initialized through the context's selected
@@ -1063,14 +1093,30 @@ impl RocmContext {
     }
 
     /// Build `kernel`'s kernarg segment from flat `(device pointer, length)` pairs, one per entry of
-    /// `buffers` in the kernel's declared parameter order (the output last), where each length is in the
-    /// kernel body's own unit. The result owns the kernarg allocation and a clone of every bound buffer,
-    /// so a recording of it keeps the data alive until it drops and its last batch completes.
+    /// `buffers` in the kernel's declared parameter order (the output last), where each pointer is the slot's
+    /// window address (its buffer's plus its offset) and each length is in the kernel body's own unit. A window
+    /// off the device's binding alignment is refused ([`RocmError::MisalignedBinding`]): the kernels read aligned
+    /// groups of a parameter on that guarantee. The result owns the kernarg allocation and a clone of every bound
+    /// buffer, so a recording of it keeps the data alive until it drops and its last batch completes.
     pub fn bind_kernarg(
         &self,
         kernel: &KernelHandle,
-        buffers: &[(&RocmBuffer, u64)],
+        buffers: &[KernargSlot<'_>],
     ) -> Result<BoundKernarg, RocmError> {
+        // The alignment this runtime reports as `DeviceCaps::storage_offset_align`.
+        let alignment = poot_target::RAW_POINTER_BINDING_ALIGN.get();
+        if let Some((slot, bound)) = buffers
+            .iter()
+            .enumerate()
+            .find(|(_, bound)| !bound.address().is_multiple_of(alignment))
+        {
+            return Err(RocmError::MisalignedBinding {
+                op: "bind_kernarg",
+                slot,
+                address: bound.address(),
+                alignment,
+            });
+        }
         let segment = kernel.kernarg_size() as usize;
         let required = buffers
             .len()
@@ -1083,15 +1129,15 @@ impl RocmContext {
             })?;
         let kernarg = self.allocate_kernarg(segment)?;
         let mut bytes = vec![0u8; required];
-        for (slot, (buffer, len)) in buffers.iter().enumerate() {
-            let offset = slot * 16;
-            bytes[offset..offset + 8].copy_from_slice(&buffer.device_ptr().to_le_bytes());
-            bytes[offset + 8..offset + 16].copy_from_slice(&len.to_le_bytes());
+        for (slot, bound) in buffers.iter().enumerate() {
+            let at = slot * 16;
+            bytes[at..at + 8].copy_from_slice(&bound.address().to_le_bytes());
+            bytes[at + 8..at + 16].copy_from_slice(&bound.len.to_le_bytes());
         }
         self.write_raw_bytes(&kernarg, 0, &bytes)?;
         Ok(BoundKernarg {
             kernarg,
-            buffers: buffers.iter().map(|&(buffer, _)| buffer.clone()).collect(),
+            buffers: buffers.iter().map(|bound| bound.buffer.clone()).collect(),
         })
     }
 }

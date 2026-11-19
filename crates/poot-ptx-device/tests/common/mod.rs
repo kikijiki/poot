@@ -436,6 +436,7 @@ impl Device for PtxDeviceProxy<'_> {
             },
             output: poot_executor::Arg {
                 buffer: d.output.buffer,
+                offset: d.output.offset,
                 elems: d.output.elems,
             },
             launch: d.launch,

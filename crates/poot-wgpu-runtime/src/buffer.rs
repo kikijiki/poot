@@ -148,6 +148,30 @@ pub(crate) fn x_extent(groups: [u32; 3], wg: [u32; 3]) -> u32 {
     groups[0].saturating_mul(wg[0].max(1))
 }
 
+/// One kernel parameter of a recorded dispatch: a window of `buffer` that starts `offset` bytes in and holds `elems`
+/// native elements of the plan's own count (never the buffer's capacity: an arena slot's buffer is sized to its
+/// largest occupant). The offset is fixed when the dispatch is recorded.
+#[derive(Clone, Copy)]
+pub struct Binding<'a> {
+    /// The buffer the kernel reads or writes.
+    pub buffer: &'a DeviceBuffer,
+    /// Byte offset of the window in `buffer`: a multiple of the device's storage binding alignment.
+    pub offset: u64,
+    /// Native element count of the window.
+    pub elems: usize,
+}
+
+impl<'a> Binding<'a> {
+    /// A window from the buffer's base holding `elems` elements.
+    pub fn at_base(buffer: &'a DeviceBuffer, elems: usize) -> Self {
+        Self {
+            buffer,
+            offset: 0,
+            elems,
+        }
+    }
+}
+
 /// A persistent device buffer (stays on the GPU across dispatches). Cloning shares the GPU buffer
 /// (`wgpu::Buffer` is Arc-backed); reshape uses this to alias its input.
 #[derive(Clone)]

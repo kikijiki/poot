@@ -68,7 +68,7 @@ pub use aql::{DeviceRingReceiptProvenance, DispatchAxis, DispatchGeometryViolati
 pub use buffer::RocmBuffer;
 pub use context::{DispatchSpan, RocmContext, RocmContextOptions, UploadStrategy};
 pub use error::{DeviceFault, HsaStatus, RocmError};
-pub use hsaco::{BatchedDispatch, BoundKernarg, HsacoModule, KernelHandle};
+pub use hsaco::{BatchedDispatch, BoundKernarg, HsacoModule, KernargSlot, KernelHandle};
 pub use publication::{
     DeviceStoreFence, QueueHostLink, QueueHostTarget, QueuePublicationContract,
     QueuePublicationError, QueueRingMemory, take_issued_device_store_fence_count,

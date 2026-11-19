@@ -8,6 +8,7 @@ use ash::vk;
 use poot_runtime_common::vulkan_probe::{amd_vulkan_shader_core, device_local_heap_budget};
 use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -375,6 +376,8 @@ impl Context {
             native_two_byte_floats: false,
             rounding_conversions: poot_target::RoundingConversions::NONE,
             peer_transport: false,
+            storage_offset_align: NonZeroU64::new(props.limits.min_storage_buffer_offset_alignment)
+                .unwrap_or(NonZeroU64::MIN),
             perf_calibration,
         };
 
@@ -387,7 +390,6 @@ impl Context {
             timestamp_valid_mask,
             coopmat_subgroup_sizes,
             shuffle_subgroup_size,
-            min_storage_offset_alignment: props.limits.min_storage_buffer_offset_alignment as usize,
             max_workgroup_count,
             device_caps,
             memory_budget: features.memory_budget(),

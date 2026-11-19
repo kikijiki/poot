@@ -152,9 +152,12 @@ fn a_reshape_that_cannot_compose_over_its_view_is_an_operand_layout_refusal() {
     let g = b.finish(flat).unwrap();
     let views = HashMap::from([(
         transposed.id(),
-        poot_kernelgen::Layout {
-            strides: vec![1, 6],
-            offset: 0,
+        poot_graph_plan::ViewBinding {
+            bound: 0,
+            layout: poot_kernelgen::Layout {
+                strides: vec![1, 6],
+                offset: 0,
+            },
         },
     )]);
     let eqn = g.eqns().last().unwrap();
