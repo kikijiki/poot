@@ -1123,63 +1123,51 @@ mod device_timing_tests {
         (ctx.download_f32(&out).unwrap(), ctx.submits() - before)
     }
 
-    /// Submit one large add on `ctx` and return how long `poll_wait` took to drain it, or the error.
-    fn timed_big_add(ctx: &Context) -> (Result<(), crate::RuntimeError>, std::time::Duration) {
-        let add = kernel(&poot_kernel_ir::fixtures::add_kernel(), "bound-add");
-        let elems = 1usize << 27;
-        let a = ctx.alloc_f32(elems);
-        let b = ctx.alloc_f32(elems);
-        let out = ctx.alloc_f32(elems);
-        let d = cached(
-            ctx,
-            "bound-0",
-            "bound-add",
-            &add,
-            &[&a, &b],
-            &out,
-            elems as u32,
-        );
-        ctx.submit_cached(&[&d]).unwrap();
-        let start = std::time::Instant::now();
-        let waited = ctx.poll_wait();
-        (waited, start.elapsed())
-    }
+    /// Serial iterations of the `spin_busy` probe's dependent chain per lane in the timeout row. It only needs
+    /// to outlast [`WAIT_BOUND`] by a wide margin on any GPU and to stay far below the driver's hang timeout.
+    const SPIN_ITERATIONS: u32 = 800_000_000;
 
-    /// SC-004 (wgpu): a wait that outlasts its configured bound fails with the typed `WaitTimeout`
-    /// within about that bound, long before the dispatch drains, and poisons the context; the next
-    /// call is `Poisoned`. A first context measures how long the dispatch takes; the second waits for a
-    /// quarter of that. Mutation: pass `timeout: None` in `Context::wait_idle`; the wait runs until the
-    /// dispatch finishes and returns `Ok` (red).
+    /// The configured wait bound of the timeout row: fixed, not derived from a measurement.
+    const WAIT_BOUND: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// SC-004 (wgpu): a wait that outlasts its configured bound fails with the typed `WaitTimeout`, after at
+    /// least that bound, and poisons the context; the next call is `Poisoned`. The work is the `spin_busy`
+    /// probe (`poot-rocm-device`'s committed fixture), a single-lane busy loop of [`SPIN_ITERATIONS`]
+    /// serial iterations: its duration is a property of the kernel, not of how fast or contended the GPU is, so
+    /// the fixed [`WAIT_BOUND`] is outlasted on any device (a first measured run made the bound a function of
+    /// the machine's load, which flaked both ways). Mutation: pass `timeout: None` in `Context::wait_idle`;
+    /// the wait runs until the dispatch finishes and returns `Ok` (red). Mutation: do not poison the context
+    /// on the timeout; the next call is not `Poisoned` (red).
     #[test]
     fn a_wait_past_its_bound_times_out_and_poisons_the_context() {
-        let Some(measuring) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
-            return;
-        };
-        let (drained, full) = timed_big_add(&measuring);
-        drained.expect("an unbounded-enough wait drains the dispatch");
-        drop(measuring);
-        let bound = (full / 4).max(std::time::Duration::from_millis(1));
-        assert!(
-            full >= bound * 2,
-            "the dispatch ({full:?}) must outlast the bound ({bound:?}) by a wide margin"
-        );
         let Some(ctx) = open_or_skip(
             DeviceBackend::Wgpu,
             Context::new_with_options(crate::ContextOptions {
-                wait_timeout: bound,
+                wait_timeout: WAIT_BOUND,
                 ..crate::ContextOptions::default()
             }),
         ) else {
             return;
         };
-        let (timed_out, elapsed) = timed_big_add(&ctx);
+        let body: poot_kernel_ir::Body = serde_json::from_str(include_str!(
+            "../../poot-rocm-device/assets/spin_busy.kir.json"
+        ))
+        .expect("deserialize the spin_busy fixture");
+        let spin = kernel(&body, "spin-busy");
+        let iterations = ctx.upload_u32(&[SPIN_ITERATIONS]);
+        let out = ctx.alloc_f32(1);
+        let d = cached(&ctx, "spin-0", "spin-busy", &spin, &[&iterations], &out, 1);
+        ctx.submit_cached(&[&d]).unwrap();
+        let start = std::time::Instant::now();
+        let timed_out = ctx.poll_wait();
+        let elapsed = start.elapsed();
         assert!(
             matches!(timed_out, Err(crate::RuntimeError::WaitTimeout { .. })),
             "got {timed_out:?} after {elapsed:?}"
         );
         assert!(
-            elapsed < full,
-            "the wait ended at {elapsed:?}, not within the bound {bound:?} of a {full:?} dispatch"
+            elapsed >= WAIT_BOUND,
+            "the wait ended at {elapsed:?}, before its {WAIT_BOUND:?} bound"
         );
         let refused = ctx.poll_wait();
         assert!(

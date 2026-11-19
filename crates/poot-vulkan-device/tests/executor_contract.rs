@@ -547,55 +547,64 @@ fn an_over_length_dispatch_is_refused_by_the_engine_on_vulkan() {
     poot_executor_parity::dispatch_length::over_length_dispatch_is_refused(device);
 }
 
-/// Replay one large `add` on `device` and return how long the replay's fence waits took, or the error.
-/// The recording is built before the clock starts.
-fn timed_big_add(device: &mut VulkanDevice) -> (Result<(), VulkanGpuError>, std::time::Duration) {
-    let n = 1usize << 27;
-    let kernel = add_kernel(device);
-    let a = device
-        .allocate(BufferRole::Input, BufferStorage::f32(), n)
-        .unwrap();
-    let b = device
-        .allocate(BufferRole::Input, BufferStorage::f32(), n)
-        .unwrap();
-    let out = device
-        .allocate(BufferRole::Output, BufferStorage::f32(), n)
-        .unwrap();
-    device.begin().unwrap();
-    record_add(device, &kernel, &a, &b, &out, n);
-    let recording = device.finish().unwrap();
-    let start = std::time::Instant::now();
-    let replayed = device.replay(&recording);
-    (replayed, start.elapsed())
-}
+/// Serial iterations of the `spin_busy` probe's dependent chain per lane in the timeout row. About 3 s on
+/// this box's iGPU, which the row never measures: it only needs the dispatch to outlast
+/// [`FENCE_WAIT_BOUND`] by a wide margin on any GPU, and to stay far below the driver's own hang timeout.
+const SPIN_ITERATIONS: u32 = 800_000_000;
+
+/// The configured fence-wait bound of the timeout row: fixed, not derived from a measurement.
+const FENCE_WAIT_BOUND: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// SC-004 (real Vulkan device): a fence wait that outlasts the configured bound fails with the typed
-/// `WaitTimeout` after about that bound, long before the dispatch finishes, and poisons the device; the
-/// next call is `Poisoned`. A first device measures the dispatch; the second waits a quarter of it.
-/// Mutation: pass `Duration::MAX` to `wait_for_fences` in `DeviceOwner::submit_and_wait`; the replay
-/// waits for the whole dispatch and returns `Ok` (red).
+/// `WaitTimeout`, after at least that bound, and poisons the device; the next call is `Poisoned`. The work
+/// is the `spin_busy` probe, a single-lane busy loop of [`SPIN_ITERATIONS`] serial iterations: its duration
+/// is a property of the kernel, not of how fast or how contended the GPU is, so the fixed
+/// [`FENCE_WAIT_BOUND`] is outlasted by a wide margin on any device (a first measurement of the dispatch
+/// would make the bound a function of the machine's load, which flaked in both directions).
+/// Mutation: pass `Duration::from_secs(60)` to `wait_for_fences` in `DeviceOwner::wait_submission`; the replay
+/// waits for the whole dispatch and returns `Ok` (red). Mutation: drop the `poisoned.store(true, ..)` in
+/// `DeviceOwner::wait_submission`; the next call is not `Poisoned` (red).
 #[test]
 fn a_real_fence_wait_past_its_bound_times_out_and_poisons() {
-    let Some(mut measuring) = vulkan() else {
-        return;
-    };
-    let (drained, full) = timed_big_add(&mut measuring);
-    drained.expect("the dispatch drains under the default bound");
-    drop(measuring);
-    let bound = (full / 4).max(std::time::Duration::from_millis(1));
-    assert!(
-        full >= bound * 2,
-        "the dispatch ({full:?}) must outlast the bound ({bound:?}) by a wide margin"
-    );
     let Some(mut device) = open_or_skip(
         DeviceBackend::Vulkan,
         VulkanDevice::new_with_options(poot_vulkan_runtime::ContextOptions {
-            wait_timeout: bound,
+            wait_timeout: FENCE_WAIT_BOUND,
         }),
     ) else {
         return;
     };
-    let (timed_out, elapsed) = timed_big_add(&mut device);
+    let body = ProbeKernel::SpinBusy.body().clone();
+    let kernel = device
+        .load_kernel("spin_busy", compile_for_vulkan(&body, "spin_busy"))
+        .expect("load spin_busy");
+    let iterations = u32_scalar_buffer(&mut device, SPIN_ITERATIONS);
+    let out = device
+        .allocate(BufferRole::Output, BufferStorage::f32(), 1)
+        .unwrap();
+    device.begin().unwrap();
+    device
+        .dispatch(Dispatch {
+            kernel: &kernel,
+            inputs: &[Arg {
+                buffer: &iterations,
+                elems: 1,
+            }],
+            output: Arg {
+                buffer: &out,
+                elems: 1,
+            },
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [1, 1, 1],
+                workgroup: [1, 1, 1],
+            },
+            work: 1,
+        })
+        .unwrap();
+    let recording = device.finish().unwrap();
+    let start = std::time::Instant::now();
+    let timed_out = device.replay(&recording);
+    let elapsed = start.elapsed();
     assert!(
         matches!(
             &timed_out,
@@ -605,8 +614,8 @@ fn a_real_fence_wait_past_its_bound_times_out_and_poisons() {
         "got {timed_out:?} after {elapsed:?}"
     );
     assert!(
-        elapsed < full,
-        "the wait ended at {elapsed:?}, not within the bound {bound:?} of a {full:?} dispatch"
+        elapsed >= FENCE_WAIT_BOUND,
+        "the wait ended at {elapsed:?}, before its {FENCE_WAIT_BOUND:?} bound"
     );
     let refused = device.synchronize().and_then(|()| device.abort());
     assert!(
@@ -617,6 +626,15 @@ fn a_real_fence_wait_past_its_bound_times_out_and_poisons() {
         ),
         "got {refused:?}"
     );
+}
+
+/// A one-element `u32` input buffer holding `value`.
+fn u32_scalar_buffer(device: &mut VulkanDevice, value: u32) -> poot_vulkan_runtime::DeviceBuffer {
+    let buffer = device
+        .allocate(BufferRole::Input, BufferStorage::i32(), 1)
+        .unwrap();
+    poot_executor::write_slice(device, &buffer, 0, &value.to_le_bytes()).unwrap();
+    buffer
 }
 
 /// POOT-1450: an untyped arena slot reaches a kernel only through a typed view its bytes admit, on raw Vulkan

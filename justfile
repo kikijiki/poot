@@ -95,6 +95,7 @@ test-bench-runner:
 test-bench-harness: bench-compare
     python3 -m unittest discover -s benchmarks/harness/tests -p 'test_*.py'
     python3 benchmarks/harness/performance_bank.py
+    python3 benchmarks/harness/headline_claims.py
     python3 benchmarks/harness/planner_invariant.py
     python3 -I scripts/flash-next-correctness/test_compare.py
     python3 -I scripts/flash-next-correctness/test_shards.py

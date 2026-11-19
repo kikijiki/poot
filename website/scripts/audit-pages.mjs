@@ -18,7 +18,7 @@ const chromium = process.env.CHROMIUM ?? "chromium";
 let debugPort; // the DevTools port of the browser withBrowser started
 const viewports = [[1440, 1440], [500, 500]];
 const MAX_PARAGRAPH_LINES = 9;
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const SETTLE_TIMEOUT_MS = 60000;
 
 // Which lane owns a page, for the failure list. First match wins.
 const lanes = [
@@ -113,9 +113,12 @@ async function connect(browserPort) {
   let id = 0;
   const pending = new Map();
   const consoleErrors = [];
+  let loaded;
+  const loadFired = new Promise((resolve) => (loaded = resolve));
   ws.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
-    if (message.id) pending.get(message.id)?.(message.result);
+    if (message.method === "Page.loadEventFired") loaded();
+    else if (message.id) pending.get(message.id)?.(message.result);
     else if (message.method === "Runtime.exceptionThrown") consoleErrors.push(message.params.exceptionDetails.exception?.description ?? message.params.exceptionDetails.text);
     else if (message.method === "Runtime.consoleAPICalled" && message.params.type === "error") consoleErrors.push(message.params.args.map((a) => a.value ?? a.description).join(" "));
     else if (message.method === "Log.entryAdded" && message.params.entry.level === "error") consoleErrors.push(`${message.params.entry.text} ${message.params.entry.url ?? ""}`);
@@ -123,8 +126,37 @@ async function connect(browserPort) {
   const send = (method, params = {}) => new Promise((resolve) => (pending.set(++id, resolve), ws.send(JSON.stringify({ id, method, params }))));
   await send("Runtime.enable");
   await send("Log.enable");
-  return { send, consoleErrors, close: async () => { ws.close(); await fetch(`http://127.0.0.1:${browserPort}/json/close/${target.id}`); } };
+  await send("Page.enable");
+  return { send, consoleErrors, loadFired, close: async () => { ws.close(); await fetch(`http://127.0.0.1:${browserPort}/json/close/${target.id}`); } };
 }
+
+// The page is settled when the load event has fired, React has hydrated (Docusaurus sets data-has-hydrated on <html>), every stylesheet is applied, fonts and images are decoded, and the layout stopped moving:
+// scrollWidth and the document height are equal across five animation frames in a row. A page that never settles fails the audit loudly
+// instead of being measured mid-load (a fixed sleep measured an unstyled page on a loaded box: POOT-1633).
+const settled = String.raw`(async () => {
+  const deadline = performance.now() + ${SETTLE_TIMEOUT_MS};
+  const frame = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  if (document.readyState !== "complete") await new Promise((resolve) => addEventListener("load", resolve, { once: true }));
+  while (document.documentElement.dataset.hasHydrated === "false") {
+    if (performance.now() > deadline) return "timeout: the page never hydrated";
+    await frame();
+  }
+  await document.fonts.ready;
+  const images = [...document.images].filter((img) => !img.complete || img.loading === "lazy");
+  for (const img of document.images) img.loading = "eager";
+  await Promise.all(images.map((img) => img.decode().catch(() => {})));
+  const sheetsReady = () => [...document.styleSheets].every((s) => { try { return s.cssRules.length > 0; } catch { return true; } }) && [...document.querySelectorAll("link[rel=stylesheet]")].every((l) => l.sheet);
+  const size = () => document.documentElement.scrollWidth + "x" + document.documentElement.scrollHeight;
+  let last = "", same = 0;
+  while (same < 5) {
+    if (performance.now() > deadline) return "timeout: layout still moving (" + size() + ")";
+    await frame();
+    const now = sheetsReady() ? size() : "";
+    same = now && now === last ? same + 1 : 0;
+    last = now;
+  }
+  return "settled";
+})()`;
 
 async function auditPage(base, path) {
   const failures = [];
@@ -132,7 +164,14 @@ async function auditPage(base, path) {
     const tab = await connect(debugPort);
     await tab.send("Emulation.setDeviceMetricsOverride", { width, height: 900, deviceScaleFactor: 1, mobile: false });
     await tab.send("Page.navigate", { url: `${base}${path}?docusaurus-theme=dark` });
-    await sleep(3000);
+    // the evaluate below must not run in the about:blank the tab started with
+    await Promise.race([tab.loadFired, new Promise((resolve) => setTimeout(resolve, SETTLE_TIMEOUT_MS))]);
+    const state = await tab.send("Runtime.evaluate", { expression: settled, awaitPromise: true, returnByValue: true });
+    if (state?.result?.value !== "settled") {
+      failures.push({ width: label, rule: "unsettled", selector: path, detail: state?.result?.value ?? "no answer from the page" });
+      await tab.close();
+      continue;
+    }
     const result = await tab.send("Runtime.evaluate", { expression: pageChecks, returnByValue: true });
     for (const f of result?.result?.value ?? []) {
       // Code and tables are checked for sideways scrolling at the desktop width only: at 500 px an 86-column line cannot fit.
@@ -161,7 +200,7 @@ async function withBrowser(run) {
 }
 
 function report(results) {
-  const rules = ["overflow", "code-scrolls", "code-unhighlighted", "table-scrolls", "table-no-cue", "wall-of-text", "heading-skip", "unlabelled", "console-error"];
+  const rules = ["overflow", "code-scrolls", "code-unhighlighted", "table-scrolls", "table-no-cue", "wall-of-text", "heading-skip", "unlabelled", "console-error", "unsettled"];
   console.log(["page".padEnd(46), ...rules.map((r) => r.slice(0, 9).padEnd(9))].join(" "));
   for (const [path, failures] of results) {
     const counts = rules.map((r) => String(failures.filter((f) => f.rule === r).length || "-").padEnd(9));

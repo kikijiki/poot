@@ -95,7 +95,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::db::{ExecOwner, ReapProtection, Run};
-    use crate::runpod::{CloudType, CreateSpec, Pod};
+    use crate::runpod::{CloudType, CreateSpec, Pod, PodSsh, PodStatus, SshEndpoint};
 
     /// SC-001: the `verify-batch` subcommand no longer exists, so the parser refuses it as an unknown
     /// subcommand. Re-adding a `VerifyBatch` arm to `Command` makes the parse succeed and this red.
@@ -138,18 +138,17 @@ frameworks.poot = { support = false, reason = "no Phi3 decode tracer" }
 frameworks.transformers = { support = true, precision = "bf16" }
 "#;
 
-    fn pod(id: &str, name: &str, ip: Option<&str>, port22: Option<u32>) -> Pod {
-        let mut pm = std::collections::HashMap::new();
-        if let Some(p) = port22 {
-            pm.insert("22".to_string(), p);
-        }
+    fn pod(id: &str, name: &str, ip: Option<&str>, port22: Option<u16>) -> Pod {
         Pod {
             id: id.into(),
             name: name.into(),
-            desired_status: "RUNNING".into(),
-            public_ip: ip.map(String::from),
-            port_mappings: if port22.is_some() { Some(pm) } else { None },
-            machine: serde_json::Value::Null,
+            status: PodStatus::Running,
+            ssh: PodSsh {
+                direct: ip.zip(port22).map(|(host, port)| SshEndpoint {
+                    host: host.into(),
+                    port,
+                }),
+            },
             cuda_version: None,
             cost_per_hr: None,
         }
@@ -266,7 +265,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
         assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
     }
 
-    /// `build_exec_create_env` -> `create_pod_body` must put the default driver-caps pair on the REST v1
+    /// `build_exec_create_env` -> `create_pod_body` must put the default driver-caps pair on the REST v2
     /// `env` object (not a GraphQL key/value array).
     #[test]
     fn exec_create_pod_body_includes_default_driver_caps_as_rest_object() {
@@ -376,23 +375,23 @@ frameworks.transformers = { support = true, precision = "bf16" }
 
     #[test]
     fn pod_parses_from_runpod_rest_json() {
-        // Validates the serde field renames (publicIp, portMappings, desiredStatus).
+        // Validates the serde field names of the v2 pod (status, ssh.direct).
         let json = r#"{
             "id": "abc123",
             "name": "poot-bench-run-a1",
-            "desiredStatus": "RUNNING",
-            "publicIp": "194.26.0.7",
-            "portMappings": {"22": 40123},
-            "imageName": "ghcr.io/kikijiki/poot-bench:latest",
+            "status": "RUNNING",
+            "ssh": {"proxy": null, "direct": {"host": "194.26.0.7", "port": 40123,
+                    "username": "root", "command": "ssh -p 40123 root@194.26.0.7"}},
+            "image": "ghcr.io/kikijiki/poot-bench:latest",
             "extraFieldWeIgnore": 42
         }"#;
         let pod: Pod = serde_json::from_str(json).unwrap();
         assert_eq!(pod.id, "abc123");
-        assert_eq!(pod.desired_status, "RUNNING");
+        assert_eq!(pod.status, PodStatus::Running);
         assert_eq!(pod.ssh_endpoint(), Some(("194.26.0.7".into(), 40123)));
-        // A booting pod (no ip/ports) reports no endpoint.
+        // A booting pod (no direct ssh yet) reports no endpoint.
         let booting: Pod =
-            serde_json::from_str(r#"{"id":"x","name":"poot-bench-x","desiredStatus":"PENDING"}"#)
+            serde_json::from_str(r#"{"id":"x","name":"poot-bench-x","status":"STARTING"}"#)
                 .unwrap();
         assert_eq!(booting.ssh_endpoint(), None);
     }

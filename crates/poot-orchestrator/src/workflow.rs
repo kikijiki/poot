@@ -27,7 +27,8 @@ use crate::image_resolve::{
 use crate::logging::{list_logs, log, logs_dir, read_log_tail, run_streaming, set_log_sink};
 use crate::manifest::{Model, parse_manifest_models, select_models};
 use crate::runpod::{
-    CatalogPrice, CloudType, CreateError, CreateSpec, GpuCatalog, Pod, PodNotFound, RunPod,
+    CatalogPrice, CloudType, CreateError, CreateSpec, GpuCatalog, Pod, PodNotFound, PodStatus,
+    RunPod,
 };
 use crate::ssh::{self, Remote, SSH_UNREACHABLE};
 
@@ -155,7 +156,9 @@ pub(crate) fn pod_state<P: PodApi + ?Sized>(
     match api.get_pod(pod_id) {
         Err(e) if e.downcast_ref::<PodNotFound>().is_some() => PodState::Gone,
         Err(_) => PodState::Unknown,
-        Ok(pod) if matches!(pod.desired_status.as_str(), "EXITED" | "TERMINATED") => PodState::Gone,
+        Ok(pod) if matches!(pod.status, PodStatus::Exited | PodStatus::Terminated) => {
+            PodState::Gone
+        }
         Ok(pod) => match pod.ssh_endpoint() {
             Some((host, port)) => PodState::Ready(host, port),
             None if within_provision_window => PodState::Booting,
@@ -2336,10 +2339,13 @@ fn floor_for(
     }
 }
 
-/// Poll until a pod publishes its direct-TCP SSH endpoint (`publicIp` + port 22 map).
-/// Heartbeat every ~60s: a large image takes minutes to pull.
+/// Poll until a pod publishes its direct-TCP SSH endpoint (`ssh.direct`, the `22/tcp` mapping).
+/// Heartbeat every ~60s: a large image takes minutes to pull. Each poll reads the pod by id (the only read that
+/// carries the mapping), at `poll_interval`, well inside Runpod's per-minute request quota.
 ///
-/// Returns `(host, port)` when the endpoint appears, or an error naming `timeout`.
+/// Returns `(host, port)` when the endpoint appears. A pod whose status is `ERROR` never recovers, so the wait
+/// fails at once with that status instead of running out `timeout`; a pod that exited or was terminated fails the
+/// same way. Otherwise the error names `timeout`.
 pub(crate) fn wait_for_ssh_endpoint(
     mut get_pod: impl FnMut(&str) -> anyhow::Result<crate::runpod::Pod>,
     pod_id: &str,
@@ -2360,16 +2366,21 @@ pub(crate) fn wait_for_ssh_endpoint(
                     ));
                     return Ok((h, p));
                 }
+                if matches!(
+                    cur.status,
+                    PodStatus::Error | PodStatus::Exited | PodStatus::Terminated
+                ) {
+                    return Err(anyhow!(
+                        "pod {pod_id} is {} after {}s and will not publish an SSH endpoint",
+                        cur.status,
+                        start.elapsed().as_secs()
+                    ));
+                }
                 if last_beat.elapsed() >= Duration::from_secs(60) {
                     log(format!(
-                        "  ...still waiting ({}s): desiredStatus={}, direct SSH endpoint not published yet (machine metadata {}; image pulling / scheduling)",
+                        "  ...still waiting ({}s): status={}, direct SSH endpoint not published yet (image pulling / scheduling)",
                         start.elapsed().as_secs(),
-                        cur.desired_status,
-                        if cur.machine_ready() {
-                            "assigned"
-                        } else {
-                            "not assigned yet"
-                        }
+                        cur.status,
                     ));
                     last_beat = Instant::now();
                 }
@@ -3457,6 +3468,7 @@ mod tests {
     use super::*;
     use crate::cli::{Cli, Command};
     use crate::image_resolve::ImageResolveError;
+    use crate::runpod::{PodSsh, SshEndpoint};
     use clap::Parser as _;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
@@ -3765,10 +3777,13 @@ mod tests {
             Pod {
                 id: id.clone(),
                 name: name.clone(),
-                desired_status: "RUNNING".into(),
-                public_ip: ssh.then(|| "1.2.3.4".to_string()),
-                port_mappings: ssh.then(|| HashMap::from([("22".to_string(), 40022)])),
-                machine: serde_json::Value::Null,
+                status: PodStatus::Running,
+                ssh: PodSsh {
+                    direct: ssh.then(|| SshEndpoint {
+                        host: "1.2.3.4".to_string(),
+                        port: 40022,
+                    }),
+                },
                 cuda_version: None,
                 cost_per_hr: None,
             }
@@ -4420,25 +4435,29 @@ mod tests {
         provision_all_on(cloud, max_price_per_hour, &FakeClock::default())
     }
 
-    /// The `cloudType` of every create request sent, in order.
+    /// The `cloud` of every create request sent, in order.
     fn sent_clouds(cloud: &FakePods) -> Vec<String> {
         cloud
             .bodies
             .borrow()
             .iter()
-            .map(|b| b["cloudType"].as_str().unwrap().to_string())
+            .map(|b| b["cloud"].as_str().unwrap().to_string())
             .collect()
     }
 
     /// A catalog pricing `NVIDIA L40S` (the GPU `provision_cfg` rents) per GPU and cloud.
     fn l40s_catalog(community: Option<f64>, secure: Option<f64>) -> GpuCatalog {
         GpuCatalog {
-            gpus: vec![crate::runpod::GpuPrice {
-                id: "NVIDIA_L40S".into(),
-                display_name: "NVIDIA L40S".into(),
-                community,
-                secure,
-            }],
+            gpus: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "NVIDIA L40S",
+                    "name": "L40S",
+                    "community": community.is_some(),
+                    "secure": secure.is_some(),
+                    "price": {"community": community, "secure": secure},
+                }))
+                .unwrap(),
+            ],
         }
     }
 
@@ -4463,7 +4482,7 @@ mod tests {
         assert_eq!(landed.to_string(), "COMMUNITY 0.22 per hour");
     }
 
-    /// POOT-1326 SC-002: `--cloud all` is not a RunPod value (it answers 400 to `cloudType: ALL`): provisioning
+    /// POOT-1326 SC-002: `--cloud all` is not a RunPod value (v2 has no `ALL`: `cloud` takes one of the two): provisioning
     /// sends COMMUNITY, and SECURE only after COMMUNITY has no capacity, and records the cloud and the price
     /// the pod really landed at.
     #[test]
@@ -5304,6 +5323,46 @@ mod tests {
             ),
             WarmVerdict::NoEndpoint
         );
+    }
+
+    /// A pod that reports `ERROR` (or exited or was deleted) never publishes an endpoint: the wait fails at once
+    /// with the status instead of polling out its timeout, while a pod still `STARTING` keeps being polled until
+    /// its endpoint appears. Mutation: drop the status arm of `wait_for_ssh_endpoint` and the ERROR row runs to
+    /// its two-second timeout, then fails with "no SSH endpoint within" instead of naming the status.
+    #[test]
+    fn the_ssh_wait_stops_at_once_on_a_pod_that_cannot_come_up() {
+        let read = |status: &'static str| {
+            move |_: &str| -> Result<Pod> {
+                Ok(serde_json::from_str(&format!(r#"{{"id":"p","status":"{status}"}}"#)).unwrap())
+            }
+        };
+        for status in ["ERROR", "EXITED", "TERMINATED"] {
+            let err =
+                wait_for_ssh_endpoint(read(status), "p", Duration::from_secs(2), Duration::ZERO)
+                    .unwrap_err();
+            assert!(
+                format!("{err:#}").contains(&format!("pod p is {status}")),
+                "{status}: {err:#}"
+            );
+        }
+
+        let mut reads = 0;
+        let endpoint = wait_for_ssh_endpoint(
+            |_| {
+                reads += 1;
+                let json = if reads < 3 {
+                    r#"{"id":"p","status":"STARTING"}"#
+                } else {
+                    r#"{"id":"p","status":"RUNNING","ssh":{"proxy":null,"direct":{"host":"9.9.9.9","port":41000}}}"#
+                };
+                Ok(serde_json::from_str(json).unwrap())
+            },
+            "p",
+            Duration::from_secs(3600),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(endpoint, ("9.9.9.9".to_string(), 41000));
     }
 
     /// `--max-price-per-hour` takes a positive finite number and nothing else.
@@ -6240,7 +6299,7 @@ frameworks.llamacpp = { support = true, precision = "f16" }
     fn a_non_capacity_refusal_fails_at_once() {
         let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
         let cloud = FakePods::default();
-        *cloud.refuse_with.borrow_mut() = Some((400, "gpuTypeIds: unknown GPU type".into()));
+        *cloud.refuse_with.borrow_mut() = Some((422, "Unknown GPU type: x".into()));
         let clock = FakeClock::default();
 
         let err = provision_pod(
@@ -6254,7 +6313,7 @@ frameworks.llamacpp = { support = true, precision = "f16" }
         .unwrap_err();
 
         assert!(err.downcast_ref::<Unrecoverable>().is_some(), "{err:#}");
-        assert!(format!("{err:#}").contains("unknown GPU type"), "{err:#}");
+        assert!(format!("{err:#}").contains("Unknown GPU type"), "{err:#}");
         assert_eq!(cloud.creates.get(), 1);
         assert!(clock.sleeps.borrow().is_empty());
     }

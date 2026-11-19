@@ -86,7 +86,7 @@ pub(super) fn eta_secs(elapsed_secs: i64, done: usize, total: usize) -> Option<u
     Some(elapsed_secs as u64 * remaining / done as u64)
 }
 
-/// The pods RunPod listed at one moment (id -> its `desiredStatus`), or why it could not be asked.
+/// The pods RunPod listed at one moment (id -> its `status`), or why it could not be asked.
 #[derive(Debug, Clone)]
 pub(super) struct RunpodView {
     pub checked_at: i64,
@@ -99,7 +99,7 @@ pub(super) struct RunpodView {
 pub(super) enum Verified {
     /// The DB says the pod is terminated: nothing to check.
     Terminated,
-    /// RunPod lists the pod; `runpod_status` is its `desiredStatus` there.
+    /// RunPod lists the pod; `runpod_status` is its `status` there.
     Confirmed {
         runpod_status: String,
         checked_secs_ago: i64,
@@ -254,7 +254,7 @@ pub(super) fn spawn_verifier() -> SharedView {
                 .map(|listed| {
                     listed
                         .into_iter()
-                        .map(|p| (p.id, p.desired_status))
+                        .map(|p| (p.id, p.status.to_string()))
                         .collect()
                 })
                 .map_err(|e| format!("{e:#}"));

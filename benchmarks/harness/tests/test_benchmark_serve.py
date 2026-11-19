@@ -69,8 +69,20 @@ class FakeServer:
                     if body.get("stream"):
                         outer.in_flight += 1
                         outer.max_in_flight = max(outer.max_in_flight, outer.in_flight)
+                released = False
+
+                def release():
+                    # A request is no longer in flight once its last byte is on the wire, and the client may send the
+                    # next one the moment it reads that byte: release BEFORE the closing write, never after it.
+                    nonlocal released
+                    if body.get("stream") and not released:
+                        released = True
+                        with outer.lock:
+                            outer.in_flight -= 1
+
                 try:
                     if outer.fail and outer.fail(index, body):
+                        release()
                         self.send_response(500)
                         self.send_header("Content-Length", "4")
                         self.end_headers()
@@ -97,11 +109,10 @@ class FakeServer:
                     if outer.usage:
                         usage = {"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": count}}
                         self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode())
+                    release()
                     self.wfile.write(b"data: [DONE]\n\n")
                 finally:
-                    if body.get("stream"):
-                        with outer.lock:
-                            outer.in_flight -= 1
+                    release()  # a handler that raised mid-stream
 
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.httpd.server_address[1]

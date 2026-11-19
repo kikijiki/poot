@@ -1,0 +1,10 @@
+# Website claims the committed data do not reproduce (harness/headline_claims.py, POOT-1630).
+# A claim listed here passes the check only while the data still give the number below; a listed claim that
+# reproduces again FAILS, so delete the entry in the commit that fixes the prose. The prose is the owner's to change:
+# nothing here edits website/src/data/status.json or performance.json.
+
+[[gap]]
+claim = "first-token-max"
+stated = "3.5"
+derived = "4.5"
+reason = "The largest first-token ratio is qwen3.8-27b-q4 at 8192 tokens on the RTX PRO 6000 (poot q5_k against llama.cpp q4_k_xl): 4.55x, poot 9782 ms (the median of its two latest sets, 6633 and 12931 ms) against llama.cpp 2150 ms. The stated 3.5x is the largest ratio over the other 36 cells (3.45x, qwen3.8-27b-q4 at 128 tokens)."

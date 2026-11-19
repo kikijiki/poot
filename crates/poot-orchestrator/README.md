@@ -137,10 +137,10 @@ binaries, so image failures are caught before paid pods use the tag.
 has no "any cloud" value, and COMMUNITY is the cheaper cloud for the same GPU, so it goes first). Every create
 logs where the pod landed and what it bills (`pod X created: COMMUNITY 0.22 per hour`), and `status` and the
 dashboard show each live pod's cloud and hourly price. `--max-price-per-hour USD` (optional) caps what a pod may bill per hour, for `run` and `exec` alike. Before a create the
-GPU catalog (GraphQL `gpuTypes`, per-GPU price per cloud times `--gpu-count`) refuses an over-cap cloud without
+GPU catalog (`GET /v2/catalog/gpus`, per-GPU price per cloud times `--gpu-count`) refuses an over-cap cloud without
 creating anything, and skips a cloud that does not offer the GPU type; both are a capacity miss for that cloud, and
-the wait line then reads `no price cap ... for any of ...`. The price of the created pod (`costPerHr`, else `cost`
-from one read of the pod) is the backstop when the catalog is unreachable or omits the type: an over-cap pod is
+the wait line then reads `no price cap ... for any of ...`. The price of the created pod (`cost`, from the create answer, else
+one read of the pod) is the backstop when the catalog is unreachable or omits the type: an over-cap pod is
 deleted (the delete is retried with 2, 4, 8 s backoff, and a refused delete never aborts the run: it is logged
 loudly, retried later and left for `reap`). A pod whose price RunPod never reports is kept. An idle pod or
 kept-warm `exec` pod is reused only when its recorded price is within the cap, and `--reuse-pod` of a dearer one is
@@ -286,8 +286,9 @@ ever gains fields (`scripts/status-board` reads it).
 
 ## Design notes
 
-- RunPod is reached via its REST API (`https://rest.runpod.io/v1`, Bearer auth); the agent-facing MCP is
-  not available to a standalone program.
+- Runpod is reached via its REST v2 API (`https://api.runpod.io/v2`, Bearer auth; v1 was retired on 2026-11-15):
+  pods, the GPU price catalog and list pagination all use it, and the agent-facing MCP is not available to a
+  standalone program.
 - The dashboard uses `tiny_http` (blocking, no tokio) to match the crate's synchronous design. The served
   page is `src/dashboard.html`, baked in with `include_str!`. It is the committed build output of the `ui/`
   React app (Vite + vite-plugin-singlefile); regenerate it after editing `ui/` with

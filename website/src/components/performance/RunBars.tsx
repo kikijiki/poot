@@ -21,7 +21,7 @@ export default function RunBars(props: { title: string; subtitle: string; metric
     <section className={styles.frame}>
       <h2 className={styles.frameTitle}>{props.title}</h2>
       <div className={styles.frameSub}>{props.subtitle}</div>
-      <div role="img" aria-label={`${props.title}: ${bars.map((b) => `${b.label} ${num(b.value, info.unit)} ${info.unit.suffix}${b.note ? `, ${b.note}` : ""}`).join(", ")}`}>
+      <div className={styles.plot} role="img" aria-label={`${props.title}: ${bars.map((b) => `${b.label} ${num(b.value, info.unit)} ${info.unit.suffix}${b.note ? `, ${b.note}` : ""}`).join(", ")}`}>
         <ResponsiveContainer width="100%" height={bars.length * (BAR_H + BAR_GAP)} initialDimension={{ width: 640, height: bars.length * (BAR_H + BAR_GAP) }}>
           <BarChart data={data} layout="vertical" barCategoryGap={BAR_GAP} margin={{ top: 0, right: 200, bottom: 0, left: 8 }}>
             <XAxis type="number" domain={[0, top]} hide />

@@ -74,6 +74,24 @@ A baseline that cannot be found fails with every lookup it tried; nothing falls 
 sets with the baseline: `just bench-compare '' benchmarks/results/<run>-r1 ...`. To publish new sets, add the run
 directories to the archive and regenerate `INDEX.md` and the Performance page (`just perf-page-regen`).
 
+## The website's headline numbers
+
+The limitations on the status page (`website/src/data/status.json`) state numbers against llama.cpp. `harness/headline_claims.py`
+derives each of them from `website/src/data/performance.json` and fails `just test-bench-harness` when a stated number differs
+(`--list` prints every derivation). The pairing rule, which the script's docstring also holds:
+
+- Only `latest`, verified, single-stream points count (no superseded set, no serve-throughput point).
+- A cell is `(hardware, backend pair, model, input length)`. The pairs are poot Vulkan with llama.cpp Vulkan, poot ROCm with
+  llama.cpp ROCm, poot PTX with llama.cpp CUDA; a framework is never paired with another backend.
+- Precision is not part of the cell: each engine runs the precision it supports (bf16 against f16, q4_k against q4_k_m, and on
+  qwen3.8-27b-q4 poot q5_k against llama.cpp q4_k_xl). The list output names both.
+- A side with several `latest` points is the median of their medians.
+- Decode ratio is llama.cpp tok/s over poot tok/s; first-token ratio is poot ms over llama.cpp ms; memory ratio is poot peak VRAM
+  over llama.cpp's, in the `inference` scope. Above 1 is poot behind.
+
+A claim the data do not reproduce is declared in `known-claim-gaps.toml` with the number the data give; it passes only while the
+data give that number, and an entry whose claim reproduces again fails, so the entry is deleted with the prose fix.
+
 ## The measurement contract (why the numbers are fair)
 
 **Page cache.** Before every cell, whichever engine it is, the harness reads the model's whole weights set (every
