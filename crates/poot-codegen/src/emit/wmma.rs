@@ -394,7 +394,10 @@ impl<'a> Emitter<'a> {
     /// array's element type (the pointer addresses elements, not bytes: the LDS arrays are typed). The
     /// cooperative matrix is logical, so a column-major tile loads into the same fragment a row-major one
     /// would.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a WMMA fragment emitter: role, dtype, shape, memory operand, stride, destination and the output writer are independent emission inputs"
+    )]
     pub(super) fn emit_wmma_load_lds_coopmat(
         &mut self,
         role: FragmentRole,
@@ -459,7 +462,10 @@ impl<'a> Emitter<'a> {
 
     // ---- dispatch (target-neutral entry points, card 530) -------------------------------------------
 
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a WMMA fragment emitter: role, dtype, shape, memory operand, stride, destination and the output writer are independent emission inputs"
+    )]
     pub(super) fn emit_wmma_load(
         &mut self,
         which: poot_kernel_ir::WmmaMat,
@@ -510,7 +516,10 @@ impl<'a> Emitter<'a> {
     /// layout `major` (the fragment-IR contract: LDS fragment ops with a base and a major, on every target).
     /// An A/B role fills an operand fragment; the accumulator role reloads an f32 tile, which is how an
     /// `Opaque`-layout target applies a per-row scale to an accumulator.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a WMMA fragment emitter: role, dtype, shape, memory operand, stride, destination and the output writer are independent emission inputs"
+    )]
     pub(super) fn emit_wmma_load_lds(
         &mut self,
         role: FragmentRole,
@@ -600,7 +609,10 @@ impl<'a> Emitter<'a> {
     /// NVPTX WMMA fragment load: call the `load.{a,b}.row.stride.<dtype>.p0` intrinsic on `gptr` and store the
     /// returned aggregate straight into `dst`'s alloca (one store, no per-lane spill - `dst`'s alloca is
     /// exactly this aggregate type, see `fragment_llty`). `gptr` is a generic (addrspace 0) pointer.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a WMMA fragment emitter: role, dtype, shape, memory operand, stride, destination and the output writer are independent emission inputs"
+    )]
     pub(super) fn emit_wmma_load_from_nvptx(
         &mut self,
         which: poot_kernel_ir::WmmaMat,
@@ -869,7 +881,10 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a WMMA fragment emitter: role, dtype, shape, memory operand, stride, destination and the output writer are independent emission inputs"
+    )]
     pub(super) fn emit_wmma_mma(
         &mut self,
         dtype: poot_kernel_ir::WmmaDtype,
@@ -1142,7 +1157,10 @@ impl<'a> Emitter<'a> {
     /// Store the f32 accumulator fragment to a workgroup-local (LDS) f32 `array`: the tile's first element at
     /// index `base`, tile layout `major`. The narrow epilogue and an `Opaque` target's element access stage an
     /// accumulator in LDS this way.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a WMMA fragment emitter: role, dtype, shape, memory operand, stride, destination and the output writer are independent emission inputs"
+    )]
     pub(super) fn emit_wmma_store_lds(
         &mut self,
         dtype: poot_kernel_ir::WmmaDtype,

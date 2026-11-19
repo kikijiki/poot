@@ -16,6 +16,7 @@ pub mod vulkan_probe;
 pub use dl::{DlError, Library, LoadScope};
 pub use identity::DeviceIdentity;
 pub use memory::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
+use poot_target::BufferStorage;
 pub use ring::{RING_SLOTS, RingCursor, UPLOAD_CHUNK_BYTES, chunks, overlaps, slot_bytes};
 pub use telemetry::{
     CallCounts, CallPurpose, Coverage, ExecutionCounters, TransferCounts, TransferDirection,
@@ -117,6 +118,116 @@ pub fn checked_copy_range(
         byte_offset,
         byte_len,
     })
+}
+
+/// The refusals a typed copy or allocation can raise, as constructors a runtime's own error enum
+/// implements. The checks live here once ([`checked_layout`], [`checked_copy`], [`checked_byte_range`]);
+/// a runtime keeps only its error type and the mapping onto it.
+pub trait CopyErrors: Sized {
+    /// Element count times element width overflowed `usize` before an allocation.
+    fn byte_size_overflow(op: &'static str, elements: usize, element_bytes: usize) -> Self;
+    /// A typed transfer met a differently represented allocation.
+    fn representation_mismatch(
+        op: &'static str,
+        expected: BufferStorage,
+        actual: BufferStorage,
+    ) -> Self;
+    /// A whole-buffer transfer had the wrong logical element count.
+    fn size_mismatch(op: &'static str, have: usize, got: usize) -> Self;
+    /// Offset or length arithmetic overflowed.
+    fn range_overflow(op: &'static str, element_offset: usize, elements: usize) -> Self;
+    /// The byte range ends past the allocation's capacity.
+    fn range_out_of_bounds(
+        op: &'static str,
+        byte_offset: usize,
+        byte_end: usize,
+        byte_capacity: usize,
+    ) -> Self;
+}
+
+/// A native buffer handle a copy is validated against: the three facts a check reads, and the
+/// runtime error it raises.
+pub trait CopyTarget {
+    /// The runtime's error type.
+    type Error: CopyErrors;
+    /// The handle's storage (element kind, logical dtype and layout).
+    fn storage(&self) -> BufferStorage;
+    /// Logical element count of the handle.
+    fn elem_count(&self) -> usize;
+    /// Byte capacity of the allocation.
+    fn byte_capacity(&self) -> usize;
+}
+
+/// The allocation size in bytes of `elements` elements of `storage`, or the runtime's
+/// [`CopyErrors::byte_size_overflow`].
+pub fn checked_layout<E: CopyErrors>(
+    op: &'static str,
+    elements: usize,
+    storage: BufferStorage,
+) -> Result<usize, E> {
+    let element_bytes = storage.element().byte_width();
+    checked_byte_capacity(elements, element_bytes)
+        .map_err(|_| E::byte_size_overflow(op, elements, element_bytes))
+}
+
+fn map_copy_range_error<E: CopyErrors>(
+    op: &'static str,
+    element_offset: usize,
+    elements: usize,
+    error: CopyRangeError,
+) -> E {
+    match error {
+        CopyRangeError::SizeMismatch { have, got } => E::size_mismatch(op, have, got),
+        CopyRangeError::RangeOverflow => E::range_overflow(op, element_offset, elements),
+        CopyRangeError::RangeOutOfBounds {
+            byte_offset,
+            byte_end,
+            byte_capacity,
+        } => E::range_out_of_bounds(op, byte_offset, byte_end, byte_capacity),
+    }
+}
+
+/// Validate a copy against `buf`'s full storage contract: a release check on element kind, logical
+/// dtype and layout together, not element kind alone (which a packed or widened value can share with a
+/// buffer of a different logical meaning; see [`BufferStorage`]), then the element range
+/// ([`checked_copy_range`]).
+pub fn checked_copy<B: CopyTarget>(
+    buf: &B,
+    op: &'static str,
+    expected: BufferStorage,
+    element_offset: usize,
+    elements: usize,
+    whole_buffer: bool,
+) -> Result<CopyRange, B::Error> {
+    if buf.storage() != expected {
+        return Err(B::Error::representation_mismatch(
+            op,
+            expected,
+            buf.storage(),
+        ));
+    }
+    checked_copy_range(
+        element_offset,
+        elements,
+        expected.element().byte_width(),
+        whole_buffer,
+        buf.elem_count(),
+        buf.byte_capacity(),
+    )
+    .map_err(|error| map_copy_range_error(op, element_offset, elements, error))
+}
+
+/// Validate a byte range against `buf`'s capacity alone, with no storage or dtype check: the
+/// storage-typed primitives' own range check for raw `write_with`/`read_bytes`, which serve any
+/// role's buffer.
+pub fn checked_byte_range<B: CopyTarget>(
+    op: &'static str,
+    buf: &B,
+    offset: usize,
+    len: usize,
+) -> Result<CopyRange, B::Error> {
+    checked_copy_range(offset, len, 1, false, buf.elem_count(), buf.byte_capacity())
+        .map_err(|error| map_copy_range_error(op, offset, len, error))
 }
 
 /// A device backend whose availability a test run can make mandatory.

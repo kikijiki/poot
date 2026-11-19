@@ -40,7 +40,7 @@ fn f16_decode(bytes: &[u8]) -> Vec<f32> {
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|c| poot_quant::scalar::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .map(|c| poot_tensor::float::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect()
 }
 
@@ -136,7 +136,7 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
     let want_f32 = cpu_matmul(&a_data, &b_data, m, k, n);
     let want: Vec<f32> = want_f32
         .iter()
-        .map(|&x| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(x)))
+        .map(|&x| poot_tensor::float::f16_to_f32(poot_quant::scalar::f32_to_f16(x)))
         .collect();
 
     assert_eq!(got.len(), want.len());

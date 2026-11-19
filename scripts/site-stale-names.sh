@@ -8,7 +8,43 @@
 #
 # A page may deliberately name something that does not exist (a setting the server does not read yet). List it in
 # scripts/site-stale-names.allow, one name per line, with a reason in a comment above it.
+#
+# `--self-test` runs this script inside throwaway repositories that cite a deleted variable (named only in a comment and
+# in a test), and fails unless the check flags it there and passes once the variable is read by library code.
 set -uo pipefail
+
+if [ "${1:-}" = "--self-test" ]; then
+    self=$(realpath "$0")
+    fixture=$(mktemp -d)
+    trap 'rm -rf "$fixture"' EXIT
+    git init -q "$fixture"
+    mkdir -p "$fixture/website/docs" "$fixture/crates/lib/src" "$fixture/crates/lib/tests" "$fixture/scripts"
+    echo "Set \`POOT_FIXTURE_KNOB\` to lower the wait." >"$fixture/website/docs/page.md"
+    echo "// The POOT_FIXTURE_KNOB read this replaces was deleted." >"$fixture/crates/lib/src/lib.rs"
+    echo 'fn knob_has_no_effect() { std::env::set_var("POOT_FIXTURE_KNOB", "0"); }' >"$fixture/crates/lib/tests/knob.rs"
+    : >"$fixture/scripts/site-stale-names.allow"
+    git -C "$fixture" add -A
+    if (cd "$fixture" && "$self") >"$fixture/out" 2>&1; then
+        echo "self-test: a variable named only in a comment and a test was not flagged"
+        cat "$fixture/out"
+        exit 1
+    fi
+    grep -q 'stale variable `POOT_FIXTURE_KNOB`' "$fixture/out" || {
+        echo "self-test: the failure does not name the deleted variable"
+        cat "$fixture/out"
+        exit 1
+    }
+    echo 'pub fn knob() -> Option<String> { std::env::var("POOT_FIXTURE_KNOB").ok() }' >"$fixture/crates/lib/src/lib.rs"
+    git -C "$fixture" add -A
+    (cd "$fixture" && "$self") >"$fixture/out" 2>&1 || {
+        echo "self-test: a variable read by library code was flagged"
+        cat "$fixture/out"
+        exit 1
+    }
+    echo "site-stale-names: self-test passed"
+    exit 0
+fi
+
 cd "$(git rev-parse --show-toplevel)"
 
 allow=scripts/site-stale-names.allow
@@ -81,9 +117,18 @@ while read -r id; do
 done <"$cited"
 echo "site-stale-names: $checked identifiers and file names checked against code"
 
-# Environment variables: the full name must be read somewhere.
+# Environment variables: the full name must be code outside comments and outside tests. A variable that survives only
+# in a doc comment ("the read this replaces was deleted") or in a test that asserts it has no effect is a leftover.
+prod=$(mktemp)
+trap 'rm -f "$corpus" "$stripped" "$cited" "$prod"' EXIT
+{
+    git ls-files -z -- 'crates/*.rs' 'benchmarks/*.rs' ':!*/tests/*' ':!*tests.rs' ':!*_tests.rs' ':!*/test_support/*' |
+        xargs -0 perl -0777 -pe 's{/\*.*?\*/}{}gs; s{(?<!:)//[^\n]*}{}g'
+    git ls-files -z -- crates scripts justfile Cargo.toml flake.nix nix benchmarks ':!*.rs' ':!*.json' ':!*.trace' ':!*.tsv' ':!*.md' ':!*/tests/*' |
+        xargs -0 grep -hIv '^[[:space:]]*#' 2>/dev/null
+} | grep -oE '\bPOOT_[A-Z0-9_]*[A-Z0-9]\b' | sort -u >"$prod"
 while read -r v; do
-    git grep -qIw -- "$v" -- "${src[@]}" || report variable "$v"
+    grep -qxF -- "$v" "$prod" || report variable "$v"
 done < <(git grep -hIoE '\bPOOT_[A-Z0-9_]*[A-Z0-9]\b' -- "${site[@]}" | sort -u)
 
 # Crates and binaries.
@@ -105,5 +150,13 @@ done < <(git grep -hIoE '`just [a-z][a-z0-9-]+' -- "${site[@]}" | sed 's/^`just 
 while read -r f; do
     git grep -qIF -- "$f" -- "${src[@]}" || report flag "$f"
 done < <(git grep -hIoE '(^|[ `])--[a-z][a-z0-9-]+' -- website/docs | tr -d ' `' | sort -u)
+
+# Device lanes: every `test-device-*` recipe is a row of the lane table, so a new lane cannot go unlisted.
+while read -r r; do
+    grep -qF -- "\`just $r\`" website/docs/develop/test.md || {
+        echo "unlisted device lane \`just $r\`: add it to the lane table in website/docs/develop/test.md"
+        rc=1
+    }
+done < <(grep -oE '^test-device-[a-z0-9-]+' justfile | sort -u)
 
 exit $rc

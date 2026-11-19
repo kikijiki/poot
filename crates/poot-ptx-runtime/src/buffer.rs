@@ -6,7 +6,6 @@ use cudarc::driver::sys;
 
 use super::error::PtxError;
 use super::owner::PtxOwner;
-use poot_runtime_common::CopyRange;
 
 /// A device-resident native buffer. Cloning shares the underlying allocation (`Arc`-backed, like the wgpu
 /// `DeviceBuffer`, R471-010); used for reshape (which aliases its input) and for carrying KV state across
@@ -96,21 +95,6 @@ pub(crate) struct PtxAlloc {
     pub(crate) guard: Option<std::mem::ManuallyDrop<AllocGuard>>,
 }
 
-pub(crate) fn checked_layout(
-    op: &'static str,
-    elements: usize,
-    storage: BufferStorage,
-) -> Result<usize, PtxError> {
-    let element_bytes = storage.element().byte_width();
-    poot_runtime_common::checked_byte_capacity(elements, element_bytes).map_err(|_| {
-        PtxError::ByteSizeOverflow {
-            op,
-            elements,
-            element_bytes,
-        }
-    })
-}
-
 pub(crate) fn allocate_owned(
     owner: Arc<PtxOwner>,
     op: &'static str,
@@ -120,7 +104,7 @@ pub(crate) fn allocate_owned(
     allocate: impl FnOnce(usize) -> Result<sys::CUdeviceptr, PtxError>,
     initialize: impl FnOnce(sys::CUdeviceptr, usize) -> Result<(), PtxError>,
 ) -> Result<PtxBuffer, PtxError> {
-    let bytes = checked_layout(op, elements, storage)?;
+    let bytes = poot_runtime_common::checked_layout::<PtxError>(op, elements, storage)?;
     let ptr = allocate(bytes)?;
     let guard = std::mem::ManuallyDrop::new(owner.memory.record_alloc(role, bytes as u64));
     let buffer = PtxBuffer {
@@ -137,85 +121,68 @@ pub(crate) fn allocate_owned(
     Ok(buffer)
 }
 
-fn map_copy_range_error(
-    op: &'static str,
-    element_offset: usize,
-    elements: usize,
-    error: poot_runtime_common::CopyRangeError,
-) -> PtxError {
-    match error {
-        poot_runtime_common::CopyRangeError::SizeMismatch { have, got } => {
-            PtxError::SizeMismatch { op, have, got }
+impl poot_runtime_common::CopyErrors for PtxError {
+    fn byte_size_overflow(op: &'static str, elements: usize, element_bytes: usize) -> Self {
+        Self::ByteSizeOverflow {
+            op,
+            elements,
+            element_bytes,
         }
-        poot_runtime_common::CopyRangeError::RangeOverflow => PtxError::RangeOverflow {
+    }
+
+    fn representation_mismatch(
+        op: &'static str,
+        expected: BufferStorage,
+        actual: BufferStorage,
+    ) -> Self {
+        Self::RepresentationMismatch {
+            op,
+            expected,
+            actual,
+        }
+    }
+
+    fn size_mismatch(op: &'static str, have: usize, got: usize) -> Self {
+        Self::SizeMismatch { op, have, got }
+    }
+
+    fn range_overflow(op: &'static str, element_offset: usize, elements: usize) -> Self {
+        Self::RangeOverflow {
             op,
             element_offset,
             elements,
-        },
-        poot_runtime_common::CopyRangeError::RangeOutOfBounds {
-            byte_offset,
-            byte_end,
-            byte_capacity,
-        } => PtxError::RangeOutOfBounds {
+        }
+    }
+
+    fn range_out_of_bounds(
+        op: &'static str,
+        byte_offset: usize,
+        byte_end: usize,
+        byte_capacity: usize,
+    ) -> Self {
+        Self::RangeOutOfBounds {
             op,
             byte_offset,
             byte_end,
             byte_capacity,
-        },
+        }
     }
 }
 
-/// Validate a copy against `buf`'s full storage contract (card 527, R484-001/R471-009): a release
-/// check on element kind, logical dtype and layout together, not element kind alone (which a packed or
-/// widened value can share with a buffer of a different logical meaning; see
-/// [`poot_target::BufferStorage`]).
-pub(crate) fn checked_copy<T>(
-    buf: &PtxBuffer,
-    op: &'static str,
-    expected: BufferStorage,
-    element_offset: usize,
-    elements: usize,
-    whole_buffer: bool,
-    copy: impl FnOnce(CopyRange) -> Result<T, PtxError>,
-) -> Result<T, PtxError> {
-    if buf.storage() != expected {
-        return Err(PtxError::RepresentationMismatch {
-            op,
-            expected,
-            actual: buf.storage(),
-        });
-    }
-    let range = poot_runtime_common::checked_copy_range(
-        element_offset,
-        elements,
-        expected.element().byte_width(),
-        whole_buffer,
-        buf.elem_count(),
-        buf.byte_capacity(),
-    )
-    .map_err(|error| map_copy_range_error(op, element_offset, elements, error))?;
-    copy(range)
-}
+impl poot_runtime_common::CopyTarget for PtxBuffer {
+    type Error = PtxError;
 
-/// Validate a byte range against `buf`'s capacity alone, with no storage/dtype check (Card 547a: the
-/// storage-typed primitive's own range check, deliberately dtype-agnostic - [`PtxContext::write_with`]/
-/// [`PtxContext::read_bytes`] serve any role's buffer, mirroring `poot_wgpu_runtime::Context::write_with`'s
-/// lack of a storage check).
-pub(crate) fn checked_byte_range(
-    op: &'static str,
-    buf: &PtxBuffer,
-    offset: usize,
-    len: usize,
-) -> Result<CopyRange, PtxError> {
-    poot_runtime_common::checked_copy_range(
-        offset,
-        len,
-        1,
-        false,
-        buf.elem_count(),
-        buf.byte_capacity(),
-    )
-    .map_err(|error| map_copy_range_error(op, offset, len, error))
+    fn storage(&self) -> BufferStorage {
+        self.storage()
+    }
+
+    fn elem_count(&self) -> usize {
+        self.elem_count()
+    }
+
+    fn byte_capacity(&self) -> usize {
+        self.byte_capacity()
+    }
 }
 
 impl Drop for PtxAlloc {
@@ -247,7 +214,7 @@ pub(crate) mod test_only {
         storage: BufferStorage,
         owner: Option<Arc<PtxOwner>>,
     ) -> Result<PtxBuffer, PtxError> {
-        let byte_capacity = checked_layout(op, elements, storage)?;
+        let byte_capacity = poot_runtime_common::checked_layout::<PtxError>(op, elements, storage)?;
         let guard = owner.as_ref().map(|owner| {
             std::mem::ManuallyDrop::new(
                 owner

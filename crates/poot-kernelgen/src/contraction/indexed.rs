@@ -146,7 +146,10 @@ fn emit_in_slab(
 /// metadata as the request carries it: a tiled body's extents ([`TiledExtents::of_meta`]; `K` also decides whether
 /// a packed row's runs start on a word boundary). `epilogue` (f32) runs over each output element's sum before its
 /// store.
-#[expect(clippy::too_many_arguments)] // the schedule, weight and epilogue of one body, and how it rounds
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the schedule, weight and epilogue of one body, and how it rounds"
+)]
 pub(crate) fn indexed_contraction(
     name: &str,
     schedule: Schedule,

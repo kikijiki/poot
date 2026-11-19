@@ -151,7 +151,7 @@ fn row_fits(shape: &[usize], l: &[usize], n: usize) -> bool {
 /// grouping would have planned and the pass revert would then take apart whole.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )
@@ -466,7 +466,7 @@ fn to_i32_region_operand(o: &Operand, operand_of: &HashMap<ValueId, FusedOperand
 /// scalar; under [`RowOutputs::Single`] it takes in single-use values only and ends in a row-width value.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )

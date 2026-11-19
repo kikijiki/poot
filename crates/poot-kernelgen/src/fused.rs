@@ -1382,7 +1382,10 @@ pub fn fused_i32_views_grid_pack(
 /// (entered with the flat element index `i`), `bb2` the work, `bb3` the early exit. `x_groups: None` reads
 /// the flat thread index; `Some(xg)` reads the 2-D folded grid (`i = (GroupY * xg + GroupX) * wg + LocalX`),
 /// which the launch's `x_groups` (`fold_groups`) and workgroup width must match.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel-body emitter: the kernel name plus the shape, layout, epilogue, precision and conversion inputs are the emission's independent parameters"
+)]
 fn pointwise_body(
     name: &str,
     param_count: u32,
@@ -1686,7 +1689,10 @@ enum RowKind {
 /// Compute a leaf's element offset from the linear output index `i_local`, into `off`: `off` starts at the
 /// leaf's layout `base`, then for each output dim with a nonzero effective stride,
 /// `off += (i / out_strides[d] % out_shape[d]) * eff[d]`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel-body emitter: the kernel name plus the shape, layout, epilogue, precision and conversion inputs are the emission's independent parameters"
+)]
 pub(crate) fn emit_leaf_offset(
     leaf_eff: &[usize],
     base: usize,
@@ -1862,7 +1868,10 @@ fn local_for_leaf(j: usize) -> Local {
 /// the written values' shapes: a row value is written at its element of `row_shape`, a per-row scalar at its
 /// row (POOT-1456). Params are the leaves, then one per [`RowKernel::writes`] value. A `Narrow` step rounds as
 /// `conversions` says (the device's, POOT-1458).
-#[expect(clippy::too_many_arguments)] // the shapes, leaves and kernel of one body, its fold, and how it rounds
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shapes, leaves and kernel of one body, its fold, and how it rounds"
+)]
 pub fn fused_row_parallel_views(
     name: &str,
     row_shape: &[usize],

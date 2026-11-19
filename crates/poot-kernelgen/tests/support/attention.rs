@@ -26,7 +26,7 @@ pub(crate) struct KeyExtras<'a> {
     pub(crate) k_shared: Option<&'a [f32]>,
     /// The live length of each batch row.
     pub(crate) len: Option<&'a [i32]>,
-    /// The `[B,Lk]` slot map of a paged key.
+    /// The `[B,Lk/block]` block table of a paged key.
     pub(crate) read: Option<&'a [i32]>,
     /// The sink logit of each query head, `[Hq]`: one more position in every row's softmax that weighs
     /// into the maximum and the normalizer and has no value.
@@ -40,8 +40,8 @@ pub(crate) struct KeyExtras<'a> {
 /// the last `s`, shared by every head) and a live bound (`len [B]`: batch row `b` visits only its first
 /// `clamp(len[b], 0, Lk)` keys, an empty row being `0 / 0`, NaN). `v` is `[B,Hkv,Lk,Dv]` and the output
 /// `[B,Hq,Lq,Dv]`. Keys past a row's bound are never read, so poison there cannot reach the result. A paged
-/// key (`read [B,Lk]`, a slot per position) reads `k [S,Hkv,Dk]` and `v [S,Hkv,Dv]` as pools: key `t` of row `b`
-/// and key head `g` is pool row `read[b * Lk + t] * Hkv + g`. With `sinks`, each row's softmax also holds the
+/// key (`read [B,Lk/block]`, a pool block per `block` positions) reads `k [S,Hkv,Dk]` and `v [S,Hkv,Dv]` as pools:
+/// key `t` of row `b` and key head `g` is pool row `(read[b * Lk/block + t/block] * block + t%block) * Hkv + g`. With `sinks`, each row's softmax also holds the
 /// head's sink logit, which is never a key: a row with no visible key divides by the sink's mass alone.
 pub(crate) fn attention_reference_keys(
     spec: &AttentionSpec,
@@ -62,7 +62,7 @@ pub(crate) fn attention_reference_keys(
     let (hq, lq, lk, dk, dv) = (spec.hq, spec.lq, spec.lk, spec.dk, spec.dv);
     let hkv = hq / spec.n_rep;
     let shared_dim = match spec.key {
-        KeyLayout::Single | KeyLayout::Paged => 0,
+        KeyLayout::Single | KeyLayout::Paged { .. } => 0,
         KeyLayout::Split { shared_dim } => shared_dim,
     };
     let head_dim = dk - shared_dim;
@@ -85,9 +85,12 @@ pub(crate) fn attention_reference_keys(
             let kv_head = h / spec.n_rep;
             let kv_row = (b * hkv + kv_head) * lk;
             // Row `t` of this head's keys and of its values: the dense plane, or the pool row of its slot.
-            let key_at = |t: usize| match read {
-                Some(read) => read[b * lk + t] as usize * hkv + kv_head,
-                None => kv_row + t,
+            let key_at = |t: usize| match (read, spec.key) {
+                (Some(read), KeyLayout::Paged { block }) => {
+                    let first = read[b * (lk / block) + t / block] as usize * block;
+                    (first + t % block) * hkv + kv_head
+                }
+                _ => kv_row + t,
             };
             let mask_plane = (b * mask_heads + if mask_heads == 1 { 0 } else { h }) * lq * lk;
             for i in 0..lq {

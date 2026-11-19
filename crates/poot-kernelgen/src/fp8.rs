@@ -12,7 +12,7 @@ use crate::emit::{c32, copy};
 use crate::helpers::{elem, ld, local, slice_dtype};
 use crate::packed::float_decode::emit_float_decode;
 
-/// The f32 a NaN byte decodes to, as `poot_quant::scalar::e4m3fn_to_f32` states it.
+/// The f32 a NaN byte decodes to, as `poot_tensor::float::e4m3fn_to_f32` states it.
 const CANONICAL_NAN_BITS: u32 = 0x7fc0_0000;
 
 fn nonempty_row(generator: &'static str, logical_row_len: usize) -> Result<(), KernelGenError> {
@@ -111,7 +111,7 @@ pub fn f32_to_e4m3fn_packed(name: &str, logical_row_len: usize) -> Result<Body, 
 mod tests {
     use poot_kernel_ir::interp::{Buffer, run};
     use poot_kernel_ir::test_support::workgroups_covering;
-    use poot_quant::scalar::e4m3fn_to_f32;
+    use poot_tensor::float::e4m3fn_to_f32;
 
     use super::*;
 

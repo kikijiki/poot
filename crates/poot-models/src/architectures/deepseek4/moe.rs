@@ -138,7 +138,10 @@ impl RoutedWeights {
 /// The routes of a hash layer: the table's experts for each token, weighted by their scores
 /// normalized over the selection and scaled. The three run-time witnesses are the score-routed
 /// router's: finite logits, an in-range selection and a usable selected sum.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a model-builder helper: the builder, step and layer coordinates and the module's tensors are distinct graph values; called once per layer from one place"
+)]
 fn hash_routes(
     b: &Builder,
     step: &Step,

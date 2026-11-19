@@ -119,7 +119,10 @@ pub(super) fn layout_demand(g: GraphTables<'_>, eqn: &Eqn, value: ValueId) -> La
 /// Plan one data-movement equation (including the e4m3fn packed forms) and refuse the collectives.
 /// `output` says whether the output buffer already holds an update's base (a donated state), in which
 /// case the update writes only its window.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

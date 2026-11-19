@@ -87,7 +87,7 @@ fn recognize(g: &Graph, producers: &HashMap<ValueId, usize>, eqn: &Eqn) -> Optio
 }
 
 /// A definition built over placeholders, normalized as `compile` normalizes a traced graph.
-struct Definition {
+pub(super) struct Definition {
     graph: Graph,
     root: ValueId,
     /// The placeholder of each operand, in operand order.
@@ -98,7 +98,7 @@ struct Definition {
 impl Definition {
     /// The graph `build` states over placeholders of `operands`' types. `None` when the types do not admit
     /// the definition (the typing rules refuse them).
-    fn new(
+    pub(super) fn new(
         operands: &[TensorType],
         build: impl FnOnce(&poot_graph_ir::Builder, &[Traced]) -> Result<Traced, BuilderError>,
     ) -> Option<Self> {
@@ -126,7 +126,7 @@ impl Definition {
 
     /// The graph values the placeholders stand for when this definition is the computation of `root` in `g`,
     /// in operand order, or `None` when some equation of the definition has no match.
-    fn unify(
+    pub(super) fn unify(
         &self,
         g: &Graph,
         producers: &HashMap<ValueId, usize>,

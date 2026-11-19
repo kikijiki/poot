@@ -18,13 +18,15 @@
 //! window ([`super::conv::causal_conv`]), so a chunk continues the previous one exactly and one token
 //! is a decode step.
 //!
-//! The recurrence is traced token by token: a step of `T` tokens emits `T` copies of the update, in
-//! primitive operations. The size of that expansion is the caller's bound on a step's tokens (the
-//! driver's trace limit) and the common graph budgets; a chunk-parallel schedule is a later
-//! component. The decay differs per key channel, so the closed-form chunked solution of
-//! [`super::gdn`] does not apply as it stands.
+//! The recurrence is one [`ScanFamily::Kda`] scan whatever the token count: decode (one token) and prefill
+//! are the one definition and the one generated kernel, and a step's graph does not grow with its tokens.
+//! The decay differs per key channel, so the closed-form chunked solution of [`super::gdn`] does not apply
+//! as it stands; the scan's reference definition is the token-by-token recurrence
+//! ([`ops::scan_kda_packed`]) and its kernel streams the sequence with the state in workgroup memory.
 
-use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, UnOp, ops};
+use poot_graph_ir::{
+    BinOp, Builder, RedOp, Scalar, ScanAttrs, ScanFamily, ScanResult, Traced, UnOp, ops,
+};
 use poot_tensor::DType;
 use poot_weights::{KdaRole, WeightId, WeightMap, WeightRole};
 
@@ -189,7 +191,7 @@ pub fn kda(
     let v = mixed(&w.v, &w.conv_v, "conv_v")?;
     let q = b.binary_scalar(BinOp::Mul, q, Scalar::F32(1.0 / (d as f32).sqrt()))?;
 
-    // The log forget gate per head and key channel, and the decay it gives.
+    // The forget gate per head and key channel (`sigmoid`, in `(0, 1)`).
     let f = linear(b, linear(b, x, &w.f_a, None)?, &w.f_b, None)?;
     let f = heads_first(b, b.binary(BinOp::Add, f, w.dt_bias.declare_f32(b)?)?, h, d)?;
     let rate = b.reshape(
@@ -197,35 +199,46 @@ pub fn kda(
         vec![1, h, 1, 1],
     )?;
     let gate = ops::sigmoid(b, b.binary(BinOp::Mul, rate, f)?)?;
-    let decay = b.unary(
-        UnOp::Exp,
-        b.binary_scalar(BinOp::Mul, gate, Scalar::F32(p.gate_lower_bound))?,
-    )?; // [rows, heads, tokens, d]
+    // The log decay `lower_bound * gate`, `[rows, heads, tokens, d]`: row `i` of the state decays by `exp(g[i])`.
+    let log_decay = b.binary_scalar(BinOp::Mul, gate, Scalar::F32(p.gate_lower_bound))?;
     let beta = heads_first(b, ops::sigmoid(b, linear(b, x, &w.beta, None)?)?, h, 1)?;
 
     let state = step.recurrent_state(b, &format!("kda.l{layer}.state"), DType::F32, &[h, d, d])?;
-    let (mut s, mut outs) = (state.current(), Vec::with_capacity(tokens));
-    for t in 0..tokens {
-        let at = |y: Traced| Ok::<_, TraceError>(b.slice(y, 2, t, t + 1)?); // [rows, heads, 1, ..]
-        let (q, k, v) = (at(q)?, at(k)?, at(v)?);
-        // Row `i` of the state, the key channel, decays by `exp(g[i])`.
-        let decay = b.transpose(at(decay)?, vec![0, 1, 3, 2])?; // [rows, heads, d, 1]
-        s = b.binary(BinOp::Mul, s, decay)?;
-        let read = b.matmul(k, s)?; // [rows, heads, 1, d]
-        let delta = b.binary(BinOp::Mul, at(beta)?, b.binary(BinOp::Sub, v, read)?)?;
-        s = b.binary(
-            BinOp::Add,
-            s,
-            b.matmul(b.transpose(k, vec![0, 1, 3, 2])?, delta)?,
-        )?;
-        outs.push(b.matmul(q, s)?);
-    }
-    step.carry_recurrent(b, state, s)?;
-    let o = if tokens == 1 {
-        outs[0]
-    } else {
-        b.concat(2, &outs)?
+    // The scan is over one batch row: several step rows fold into the head axis (heads of different rows
+    // share the weights but not the state).
+    let fold = |y: Traced| {
+        if rows == 1 {
+            return Ok::<_, TraceError>(y);
+        }
+        let mut shape = b.aval(y)?.shape;
+        shape.splice(0..2, [1, rows * h]);
+        Ok::<_, TraceError>(b.reshape(y, shape)?)
     };
+    let ScanResult {
+        y: o, s_out: next, ..
+    } = b.scan(
+        ScanAttrs {
+            family: ScanFamily::Kda,
+            chunk: 1,
+        },
+        &[
+            fold(q)?,
+            fold(k)?,
+            fold(v)?,
+            fold(log_decay)?,
+            fold(beta)?,
+            fold(state.current())?,
+        ],
+    )?;
+    let (o, next) = if rows == 1 {
+        (o, next)
+    } else {
+        (
+            b.reshape(o, vec![rows, h, tokens, d])?,
+            b.reshape(next, vec![rows, h, d, d])?,
+        )
+    };
+    step.carry_recurrent(b, state, next)?;
 
     let o = ops::rmsnorm(b, o, w.o_norm.declare_f32(b)?, p.norm.eps())?;
     let g = linear(b, linear(b, x, &w.g_a, None)?, &w.g_b, None)?;

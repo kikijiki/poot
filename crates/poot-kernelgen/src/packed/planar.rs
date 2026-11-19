@@ -147,7 +147,10 @@ impl PlanarPlan {
     /// format has one) and subtracts it from the code as an integer, before the one f32 cast
     /// (`poot_quant::decode::Formula::evaluate`'s `(code.integer() - zero) as f32`, never
     /// `code as f32 - zero as f32`): the codes bit reads to `emit_factors`.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a planar-decode emitter: the emitter and source plus the run coordinates (output row, first element, count, extents) are the emission's independent inputs, threaded through one recursion"
+    )]
     pub(crate) fn emit_value(
         &self,
         e: &mut Emit,
@@ -219,7 +222,10 @@ impl PlanarPlan {
     /// reads the whole run as one `count * bits` field (at most 32 bits) and slices it, so the address chain and
     /// the word loads are emitted once per run instead of once per element. It is [`Self::emit_run_load`] then
     /// [`Self::emit_run_decode`].
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a planar-decode emitter: the emitter and source plus the run coordinates (output row, first element, count, extents) are the emission's independent inputs, threaded through one recursion"
+    )]
     pub(crate) fn emit_run(
         &self,
         e: &mut Emit,
@@ -250,7 +256,10 @@ impl PlanarPlan {
     /// What a run reads from memory ahead of its decode: the scale the run shares (decoded, when its elements cannot
     /// straddle a scale group) then the one field of codes ([`Self::run_field_bits`]). A run that has neither loads
     /// nothing here and reads per element in [`Self::emit_run_decode`], so a software pipeline over it is a no-op.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a planar-decode emitter: the emitter and source plus the run coordinates (output row, first element, count, extents) are the emission's independent inputs, threaded through one recursion"
+    )]
     pub(crate) fn emit_run_load(
         &self,
         e: &mut Emit,
@@ -275,7 +284,10 @@ impl PlanarPlan {
     }
 
     /// The values of the run whose loads are `loaded` ([`Self::emit_run_load`]).
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a planar-decode emitter: the emitter and source plus the run coordinates (output row, first element, count, extents) are the emission's independent inputs, threaded through one recursion"
+    )]
     pub(crate) fn emit_run_decode(
         &self,
         e: &mut Emit,
@@ -335,7 +347,10 @@ impl PlanarPlan {
 
     /// [`Self::emit_run`]'s element-by-element form: each element addresses its own codes, and decodes its own
     /// factors unless `shared` holds the run's.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a planar-decode emitter: the emitter and source plus the run coordinates (output row, first element, count, extents) are the emission's independent inputs, threaded through one recursion"
+    )]
     fn emit_run_elements(
         &self,
         e: &mut Emit,
@@ -402,7 +417,10 @@ impl PlanarPlan {
 
     /// `operand`'s raw stored bits at logical `(o, k)`: `poot_quant::decode::read_planar`'s
     /// `element`/`lane`/`stored_shape`/bit-offset chain, emitted.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a planar-decode emitter: the emitter and source plus the run coordinates (output row, first element, count, extents) are the emission's independent inputs, threaded through one recursion"
+    )]
     fn emit_operand_bits(
         &self,
         e: &mut Emit,
@@ -419,7 +437,10 @@ impl PlanarPlan {
     }
 
     /// The bit offset in `operand`'s source of the stored bits at logical `(o, k)`.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a planar-decode emitter: the emitter and source plus the run coordinates (output row, first element, count, extents) are the emission's independent inputs, threaded through one recursion"
+    )]
     fn emit_operand_bit(
         &self,
         e: &mut Emit,

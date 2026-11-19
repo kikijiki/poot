@@ -16,7 +16,7 @@ use crate::format::{
     BitLayout, BlockField, BlockLayout, Digit, Field, FieldEncoding, FloatFormat, FormatDescriptor,
     OperandRole, Piece, Segment, Storage, ValueMap, WeightFormat,
 };
-use crate::scalar::f16_to_f32;
+use poot_tensor::float::f16_to_f32;
 
 const BROADCAST: &[Digit] = &[Digit {
     extent: 32,

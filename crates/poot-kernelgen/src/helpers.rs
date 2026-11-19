@@ -71,7 +71,10 @@ pub(crate) fn emit_lds_tree_blocks(
 /// always `BinOp::Add`, for a different commutative monoid (e.g. [`crate::fused::fused_row_parallel_views`]'s
 /// `RowReduce::Max`, which needs `BinOp::Max`). `emit_lds_tree_blocks` is the `array == 0, bop == Add` special
 /// case.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel-body emitter: the kernel name plus the shape, layout, epilogue, precision and conversion inputs are the emission's independent parameters"
+)]
 pub(crate) fn emit_lds_tree_blocks_at(
     al: &mut Alloc,
     blocks: &mut Vec<BasicBlock>,

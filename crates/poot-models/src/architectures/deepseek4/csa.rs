@@ -111,7 +111,10 @@ fn select_top_k(
 
 /// A CSA layer's compressed attention inputs: its overlapping-window entries and, per query token,
 /// the mask of the windows the indexer keeps. `None` when the cache holds no whole window.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a model-builder helper: the builder, step and layer coordinates and the module's tensors are distinct graph values; called once per layer from one place"
+)]
 pub(super) fn compressed(
     b: &Builder,
     step: &Step,

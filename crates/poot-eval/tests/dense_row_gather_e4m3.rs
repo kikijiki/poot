@@ -17,7 +17,7 @@ use poot_graph_ir::{
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
 
-use poot_quant::scalar::e4m3fn_to_f32;
+use poot_tensor::float::e4m3fn_to_f32;
 
 /// Row 0's byte. Decodes to `1.0`.
 const ROW0_BYTE: u8 = 0x38;

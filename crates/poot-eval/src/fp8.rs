@@ -4,7 +4,7 @@
 
 use poot_tensor::{DType, HostData, HostTensor};
 
-use poot_quant::scalar::e4m3fn_to_f32;
+use poot_tensor::float::e4m3fn_to_f32;
 
 use crate::EvalError;
 use crate::ops::index_rule::{IndexValue, index_at};

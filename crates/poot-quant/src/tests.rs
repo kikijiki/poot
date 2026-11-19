@@ -540,7 +540,8 @@ fn a_deferred_payload_refuses_a_bad_row_when_it_is_decoded() {
 /// Mutation: build the shift one position short (`10 - mantissa_bits + 1`) and every nonzero code is off.
 #[test]
 fn a_half_embedding_is_the_scalar_decode_up_to_its_rescale() {
-    use crate::scalar::{f16_to_f32, float_to_f32};
+    use crate::scalar::float_to_f32;
+    use poot_tensor::float::f16_to_f32;
     let mut embedded = 0;
     for format in [
         FloatFormat::F32,

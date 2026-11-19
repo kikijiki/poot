@@ -869,7 +869,10 @@ struct ExecPod {
 /// The image tag is resolved to a digest first, before the run row or any pod exists, and the pod is
 /// created from the digest reference: a tag that moves during the run cannot change the image. The run
 /// row records the digest reference, so only a pod kept warm for that same image is adopted.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pod-acquisition step's collaborators (database, pod API, resolver, run identity, warm policy, environment, poll cadence) are injected separately so each is replaceable in tests"
+)]
 fn acquire_exec_pod<P: PodApi + ?Sized>(
     db: &Db,
     pods: &P,

@@ -26,8 +26,8 @@ use poot_executor::{
 };
 use poot_graph_plan::Target;
 use poot_rocm_runtime::{
-    BoundKernarg, DispatchSpan, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions,
-    RocmError,
+    BatchedDispatch, BoundKernarg, DispatchSpan, KernelHandle, RocmBuffer, RocmContext,
+    RocmContextOptions, RocmError,
 };
 use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
 use poot_target::{AmdArch, Backend, BufferStorage, ElementKind, TargetId};
@@ -53,9 +53,6 @@ struct CapturedAql {
     /// dispatch of a plan step: the copy kernel runs on the same queue but is not a step the engine labels.
     is_copy: bool,
 }
-
-/// One flattened entry of [`poot_rocm_runtime::RocmContext::enqueue_graph_batched`]'s dispatch list.
-type BatchedDispatch = (KernelHandle, BoundKernarg, (u32, u32, u32), (u32, u32, u32));
 
 /// A recorded step: the AQL packets captured between `begin` and `finish`, which `replay` re-enqueues
 /// on the context's queue.

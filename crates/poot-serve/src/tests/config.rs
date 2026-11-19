@@ -619,3 +619,69 @@ fn a_single_file_checkpoint_serves_with_the_default_pooling() {
     assert!(crate::startup::served_pooling(&dir).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const README_BEGIN: &str = "<!-- generated:flags:begin -->";
+const README_END: &str = "<!-- generated:flags:end -->";
+const README_REGEN_ENV: &str = "POOT_SERVE_README_REGEN";
+
+/// The flag list of the crate README, one bullet per argument, written from what clap declares: the
+/// name, the value's name, the doc comment and the default. A flag cannot be added, renamed or lose its
+/// default without this text moving.
+fn readme_flags() -> String {
+    use clap::CommandFactory;
+    let command = ServeConfig::command();
+    let mut out = String::new();
+    for arg in command.get_arguments() {
+        let help = arg
+            .get_help()
+            .map(|help| help.to_string())
+            .unwrap_or_default();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let value = arg
+            .get_value_names()
+            .and_then(|names| names.first())
+            .map(|name| name.to_string());
+        let takes_value = arg.get_action().takes_values();
+        let name = match (arg.get_long(), &value) {
+            (Some(long), Some(value)) if takes_value => format!("--{long} {value}"),
+            (Some(long), _) => format!("--{long}"),
+            (None, _) => format!("[{}]", arg.get_id().as_str().to_uppercase()),
+        };
+        let default = arg
+            .get_default_values()
+            .first()
+            .map(|default| format!(" (default `{}`)", default.to_string_lossy()))
+            .unwrap_or_default();
+        out.push_str(&format!("- `{name}` - {help}{default}\n"));
+    }
+    out
+}
+
+fn splice_readme(page: &str, generated: &str) -> String {
+    let begin = page
+        .find(README_BEGIN)
+        .expect("the README has the begin marker")
+        + README_BEGIN.len();
+    let end = page
+        .find(README_END)
+        .expect("the README has the end marker");
+    format!("{}\n\n{generated}\n\n{}", &page[..begin], &page[end..])
+}
+
+/// The README's flag list is what clap declares (R2-C4-015: it listed 16 of 19 flags). `just
+/// serve-readme-regen` rewrites it. Mutation: add a `#[arg(long)]` field to `ServeConfig`; the README
+/// differs and the row fails.
+#[test]
+fn the_readme_flag_list_is_what_clap_declares() {
+    let path = poot_test_util::manifest_dir().join("README.md");
+    let page = std::fs::read_to_string(&path).expect("read the README");
+    let rendered = splice_readme(&page, readme_flags().trim_end());
+    if std::env::var_os(README_REGEN_ENV).is_some() {
+        std::fs::write(&path, &rendered).expect("write the README");
+        return;
+    }
+    assert!(
+        page == rendered,
+        "crates/poot-serve/README.md differs from the flags clap declares; run `just serve-readme-regen`"
+    );
+}

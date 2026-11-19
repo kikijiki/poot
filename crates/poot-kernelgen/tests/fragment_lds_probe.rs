@@ -580,7 +580,6 @@ fn fragment_probes_match_the_host_reference_on_ptx() {
             let c0 = upload(BufferStorage::f32(), &f32_bytes(&case.c0));
             let result = ctx.alloc_f32(256).unwrap();
             ctx.dispatch_dev(
-                &name,
                 &kernel,
                 body.workgroup_size,
                 body.workgroup_size,

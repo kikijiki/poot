@@ -202,6 +202,7 @@ fn a_scan_is_one_launch_over_the_whole_sequence() {
                 spec.kernel,
                 match fixture.family {
                     poot_graph_ir::ScanFamily::DeltaRule => ScanKernel::DeltaRule,
+                    poot_graph_ir::ScanFamily::Kda => ScanKernel::Kda,
                     poot_graph_ir::ScanFamily::Ssd => ScanKernel::Ssd,
                 }
             );
@@ -405,6 +406,76 @@ fn the_model_prefills_plan_bounded_generated_scans() {
     }
 }
 
+/// A recurrent layer's decode step (one token) and its prefill (several) are one recurrence definition: both plan
+/// the same generated scan kernel, the decode as a length-1 scan, one per recurrent layer, with no second
+/// decode-only composition beside it. The delta-rule families (GDN) and the Kimi delta rule (KDA) both. Mutation:
+/// restore the `t == 1` special case in `gdn_scan` (the decode traces `gated_delta_net_decode` again), or trace
+/// `kda`'s recurrence token by token again: the decode graph holds no scan (or, for KDA, the prefill's size grows
+/// with its tokens) and the row goes red.
+#[test]
+fn recurrent_decode_and_prefill_plan_the_one_scan_kernel() {
+    for (family, kernel) in [
+        ("qwen4exp", ScanKernel::DeltaRule),
+        ("qwen3next", ScanKernel::DeltaRule),
+        ("glm53_flash", ScanKernel::Kda),
+    ] {
+        for (target_name, target) in targets() {
+            let label = format!("{family} on {target_name}");
+            let planned = |tokens: usize| {
+                let graph = registered(family, 1, tokens, PROMPT);
+                let program = compile(
+                    &graph,
+                    &target,
+                    &CompileOptions::new(CompileLimits::STANDARD),
+                )
+                .unwrap_or_else(|e| panic!("{label} at {tokens} tokens: {e:?}"));
+                scans(&program)
+            };
+            let (decode, prefill) = (planned(1), planned(PROMPT));
+            assert!(
+                !decode.is_empty(),
+                "{label}: the decode step plans no scan (a decode-only recurrence is traced instead)"
+            );
+            assert_eq!(
+                decode.len(),
+                prefill.len(),
+                "{label}: decode and prefill hold a different number of recurrence kernels"
+            );
+            for ((d, d_launches), (p, p_launches)) in decode.iter().zip(&prefill) {
+                assert_eq!((d.kernel, d.len), (kernel, 1), "{label}");
+                assert_eq!(p.kernel, d.kernel, "{label}");
+                assert_eq!(
+                    (*d_launches, *p_launches),
+                    (1, 1),
+                    "{label}: one launch each"
+                );
+                assert_eq!(
+                    (d.heads, d.rows, d.width),
+                    (p.heads, p.rows, p.width),
+                    "{label}: the two steps run the same recurrence layout"
+                );
+            }
+        }
+    }
+}
+
+/// A KDA prefill's graph does not grow with its tokens: the recurrence is one scan equation however many
+/// tokens a step holds (it was `tokens` copies of the update, 14 equations each). Mutation: trace the
+/// recurrence token by token again in `kda`; the 8-token graph holds more equations than the 4-token one.
+#[test]
+fn a_kda_prefill_graph_does_not_grow_with_its_tokens() {
+    let eqns = |tokens: usize| {
+        registered("glm53_flash", 1, tokens, 2 * PROMPT)
+            .eqns()
+            .len()
+    };
+    assert_eq!(
+        eqns(2 * PROMPT),
+        eqns(PROMPT),
+        "the equation count of a KDA step is independent of its token count"
+    );
+}
+
 /// The schedule is a function of the scan's layout and the device, not of the model it came from: every scan
 /// the registered model prefills plan (at their largest traceable prompt) gets exactly the request a synthetic
 /// fixture of the same layout gets, on every target. Renaming a family or adding one cannot change the choice
@@ -434,6 +505,7 @@ fn a_model_prefill_scan_gets_the_schedule_of_its_layout() {
                     ScanKernel::DeltaRule => {
                         ScanFixture::delta_rule(spec.heads, spec.len, spec.width, 8)
                     }
+                    ScanKernel::Kda => ScanFixture::kda(spec.heads, spec.len, spec.width),
                     ScanKernel::Ssd => {
                         ScanFixture::ssd(spec.heads, spec.len, spec.width, spec.rows, 8)
                     }

@@ -150,13 +150,13 @@ fn uitofp(e: &mut Emit, value: Local) -> Local {
     )
 }
 
-/// bfloat16 to f32: bf16 is the high half of an f32 (`scalar::bf16_to_f32`), no branch.
+/// bfloat16 to f32: bf16 is the high half of an f32 (`poot_tensor::float::bf16_to_f32`), no branch.
 fn emit_bf16(e: &mut Emit, bits: Local) -> Local {
     let widened = bin(e, Ty::U32, BinOp::Shl, copy(bits), c32(16));
     bitcast_f32(e, widened)
 }
 
-/// IEEE-754 binary16 to f32 (`scalar::f16_to_f32`), the zero/subnormal and normal cases (the
+/// IEEE-754 binary16 to f32 (`poot_tensor::float::f16_to_f32`), the zero/subnormal and normal cases (the
 /// admitted domain excludes exponent `0x1f`, infinities and NaN).
 fn emit_f16(e: &mut Emit, bits: Local) -> Local {
     let sign = {
@@ -208,7 +208,7 @@ fn emit_f16(e: &mut Emit, bits: Local) -> Local {
     bitcast_f32(e, result_bits)
 }
 
-/// OCP E4M3FN to f32 (`scalar::e4m3fn_to_f32`), the zero/subnormal and normal cases (the admitted
+/// OCP E4M3FN to f32 (`poot_tensor::float::e4m3fn_to_f32`), the zero/subnormal and normal cases (the admitted
 /// domain excludes `0x7f`/`0xff`, the two NaN bytes).
 fn emit_e4m3fn(e: &mut Emit, bits: Local) -> Local {
     let sign = {

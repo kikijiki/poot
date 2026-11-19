@@ -223,7 +223,6 @@ pub(super) struct StepColumns {
     pub(super) tokens: Vec<i32>,
     pub(super) pos: Vec<i32>,
     pub(super) real: Vec<i32>,
-    pub(super) kv_read: Vec<i32>,
     /// Only a checked map reaches the bind.
     pub(super) kv_write: ForwardSlotMap,
     pub(super) state_read: Vec<i32>,

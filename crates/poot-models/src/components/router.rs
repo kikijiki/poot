@@ -324,7 +324,7 @@ impl RouterWeights {
 }
 
 /// What the router decided for `T` tokens: the selected experts of each token, best first, and the
-/// weight of each. Both `[T, top_k]` F32 (ids are exact small integers).
+/// weight of each. Both `[T, top_k]`: the ids I32 (what `ArgTopK` selects), the weights F32.
 #[derive(Clone, Copy, Debug)]
 pub struct Routes {
     /// The selected expert ids per token, best first, `[T, top_k]`.
@@ -640,6 +640,51 @@ mod tests {
             .0
         };
         (eval(|r| r.ids), eval(|r| r.weights))
+    }
+
+    /// The router's rank reaches a device as one `StableRank` (the linear per-row select), never as the
+    /// `[T, E, E]` pairwise comparison its definition spells: the compiled program holds one rank per router
+    /// and no value of the pairwise shape, for every kind and the group-limited mask. Mutation: stop
+    /// `form_selection` forming `StableRank` (return `None` for its root); no rank forms and the `[T, E, E]`
+    /// value stays, and this row goes red.
+    #[test]
+    fn a_router_ranks_through_one_stable_rank_without_a_pairwise_value() {
+        use poot_graph_ir::OpKind;
+        use poot_graph_plan::{CompileLimits, CompileOptions, Target, compile};
+        use poot_target::{AmdArch, Backend, DeviceCaps};
+
+        let target = Target::Gpu {
+            backend: Backend::AmdGcn(AmdArch::gfx1151()),
+            caps: DeviceCaps::rocm_default(),
+        };
+        let options = CompileOptions::new(CompileLimits::STANDARD);
+        for kind in ARMS {
+            let p = params(kind, false);
+            let fx = fixture(false);
+            let map = fx.map();
+            let w = RouterWeights::new(&map, 0, WIDTH, &p).unwrap();
+            let b = Builder::for_tests();
+            let step = Step::new(&b, step_shape(T, CAP, LogitRows::All)).unwrap();
+            let xs = b.constant("x", TensorType::f32(vec![T, WIDTH])).unwrap();
+            let routes = route(&b, &step, 0, xs, &w, &p).unwrap();
+            let graph = b.finish(routes.weights).unwrap();
+            let program = compile(&graph, &target, &options).unwrap();
+            let g = program.graph();
+            let ranks = g
+                .eqns()
+                .iter()
+                .filter(|eqn| matches!(eqn.op, OpKind::StableRank(_)))
+                .count();
+            assert_eq!(ranks, 1, "{kind:?}: the router forms one StableRank");
+            for eqn in g.eqns() {
+                assert_ne!(
+                    g.aval(eqn.out).shape,
+                    [T, EXPERTS, EXPERTS],
+                    "{kind:?}: {} is a pairwise value",
+                    eqn.op.name()
+                );
+            }
+        }
     }
 
     /// The router in f64, written straight from the definitions: logits `x W^T + b`, the experts

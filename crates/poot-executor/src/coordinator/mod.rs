@@ -929,11 +929,12 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
         Ok(())
     }
 
-    fn write_state_row(
+    fn write_state_range(
         &mut self,
         exe: ExecutableId,
         name: &str,
         row: usize,
+        from: usize,
         values: poot_tensor::HostView<'_>,
     ) -> Result<(), ExecError> {
         self.check_usable()?;
@@ -941,7 +942,7 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
         // A state lives on the devices whose stages carry it; the others do not hold it.
         let mut written = false;
         for (engine, exe) in self.engines.iter_mut().zip(per_rank) {
-            match engine.write_state_row(exe, name, row, values) {
+            match engine.write_state_range(exe, name, row, from, values) {
                 Ok(()) => written = true,
                 Err(ExecError::Bind(bind)) if matches!(*bind, BindError::UnknownState { .. }) => {}
                 Err(error) => return Err(error),

@@ -5,8 +5,9 @@
 //! public to the tests that hold a kernel's staged values against it.
 
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
-use poot_quant::scalar::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
+use poot_quant::scalar::{f32_to_bf16, f32_to_f16};
 use poot_tensor::DType;
+use poot_tensor::float::{bf16_to_f32, f16_to_f32};
 
 /// `x` rounded to `dtype` (round to nearest even) and widened back to f32. An f32 beyond the dtype's range becomes
 /// infinity, never the largest finite value: a non-finite operand then reaches the result and is a fault there

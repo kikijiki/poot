@@ -475,10 +475,13 @@ fn a_paged_pool_plans_by_its_blocks() {
             .filter(|&(role, _)| role != BufferRole::Staging)
             .collect();
         assert_eq!(planned, live, "{blocks} blocks: planned vs live role bytes");
+        // The pool's slots times a position, and the block table: one I32 entry per block of capacity per
+        // sequence (capacity 16 is one block).
         assert_eq!(
             state_bytes(&planned),
-            (blocks * poot_llm::driver::block_table::BLOCK_SIZE) as u64 * POSITION_BYTES,
-            "{blocks} blocks: the pool's slots times a position"
+            (blocks * poot_llm::driver::block_table::BLOCK_SIZE) as u64 * POSITION_BYTES
+                + std::mem::size_of::<i32>() as u64,
+            "{blocks} blocks: the pool's slots times a position, and the block table"
         );
     }
 }

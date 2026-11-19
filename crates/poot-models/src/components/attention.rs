@@ -26,7 +26,7 @@ use super::rope::{RopeParams, apply_rope, apply_rope_sectioned, rope_rows};
 use super::standard::{PagedMaps, ParamError, Step};
 use crate::model::TraceError;
 use crate::model::WiringError;
-use crate::model::{ConfigReason, KvDtype, KvLayout};
+use crate::model::{ConfigReason, KV_BLOCK, KvDtype, KvLayout};
 
 /// Where a Q/K RMSNorm normalizes (applied before RoPE).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -497,7 +497,7 @@ fn write_contiguous(
 /// The paged layout: one `[pool_slots, kv_heads, head_dim]` pool shared by every row. The step's
 /// `rows * tokens` new K/V rows are written in place into the pool by the forward write map (token `t`
 /// goes to slot `write[t]`; a padding token's -1 writes nothing), so the append costs the tokens, not
-/// the pool. Then each row's `capacity` logical positions are viewed by the read map from the
+/// the pool. Then each row's `capacity` logical positions are viewed through its block table from the
 /// post-write pool ([`ops::paged_view`], which attention fuses into reading the pool in place), so the
 /// same mask as the contiguous layout applies.
 fn write_paged(
@@ -527,7 +527,10 @@ fn write_paged(
     )?;
     let flat = b.reshape(b.transpose(new, vec![0, 2, 1, 3])?, vec![rows * t, hkv, d])?;
     let output = b.scatter_update(input, flat, maps.write)?;
-    Ok(((input, output), ops::paged_view(b, output, maps.read)?))
+    Ok((
+        (input, output),
+        ops::paged_view(b, output, maps.table, KV_BLOCK)?,
+    ))
 }
 
 /// Where each row of `step` writes its new positions: the first position of each row under the
@@ -551,7 +554,10 @@ pub(crate) const CONTRACTION_READ_KV: KvDtype = KvDtype::F32;
 /// written into it and carried to the next step; returns the `[rows, hkv, capacity, d]` cache
 /// attention reads, in logical order. A pool and a private cache are different buffers, so they
 /// carry different names: one executable can hold both without a schema clash.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a model-builder helper: the builder, step and layer coordinates and the module's tensors are distinct graph values; called once per layer from one place"
+)]
 pub(crate) fn carried_cache(
     b: &Builder,
     step: &Step,
@@ -902,7 +908,7 @@ mod tests {
 
     use super::*;
     use crate::components::standard::oracle::{self, Fx};
-    use crate::model::{KvLayout, LogitRows, StepShape};
+    use crate::model::{KV_BLOCK, KvLayout, LogitRows, StepShape};
 
     const WIDTH: usize = 8;
     const HEADS: usize = 4;
@@ -1409,8 +1415,23 @@ mod tests {
             let xs = b.constant("x", TensorType::f32(vec![1, 1, WIDTH])).unwrap();
             let y = attention(&b, &step, 2, xs, &w, &p).unwrap();
             let g = step.finish(b, y).unwrap();
-            let shapes: Vec<Vec<usize>> = g
+            // A paged step also carries its block table, written by the host: `[seqs, capacity / block]`.
+            let (tables, caches): (Vec<_>, Vec<_>) = g
                 .state_pairs()
+                .partition(|pair| pair.role == StateRole::BlockTable);
+            assert_eq!(
+                tables
+                    .iter()
+                    .map(|pair| g.meta(pair.input).aval.shape.clone())
+                    .collect::<Vec<_>>(),
+                match kv {
+                    KvLayout::Contiguous => Vec::new(),
+                    KvLayout::Paged { .. } => vec![vec![1, CAP / KV_BLOCK]],
+                },
+                "{kv:?}"
+            );
+            let shapes: Vec<Vec<usize>> = caches
+                .iter()
                 .map(|pair| g.meta(pair.input).aval.shape.clone())
                 .collect();
             let want = match kv {
@@ -1794,8 +1815,9 @@ mod tests {
     }
 
     /// One step over `rows` rows of `t` tokens each, contiguous or paged, on the oracle. `pos` is
-    /// `[rows * t]`. Paged: `state` is the two pools, `maps` the read `[rows * CAP]` and the forward
-    /// write `[rows * t]` maps.
+    /// `[rows * t]`. Paged: `state` is the two pools, row `r` continues sequence `r`, and the maps are the
+    /// block table `[rows * CAP / KV_BLOCK]` the host holds and the forward write `[rows * t]` map. The state
+    /// the oracle returns is the two pools.
     fn run_rows(
         fx: &Fx,
         o: Opts,
@@ -1835,28 +1857,39 @@ mod tests {
             None => StateRole::Positional { axis: 2 },
             Some(_) => StateRole::Positional { axis: 0 },
         };
-        assert!(g.state_pairs().all(|pair| pair.role == role));
+        assert!(
+            g.state_pairs()
+                .all(|pair| pair.role == role || pair.role == StateRole::BlockTable)
+        );
         let tokens = vec![0; rows * t];
+        let sequences: Vec<i32> = (0..rows as i32).collect();
         let named: Vec<(&str, &[i32])> = match paged {
             None => Vec::new(),
-            Some((_, read, write)) => vec![("slotmap.read", read), ("writemap.write", write)],
+            Some((_, _, write)) => vec![
+                ("activation.state_read", &sequences),
+                ("writemap.write", write),
+            ],
         };
-        match paged {
-            None => fx.eval_named(
-                &g,
-                &[("x", x)],
-                &[(Slot::Token, &tokens), (Slot::Pos, pos)],
-                &named,
-                &[&state[0], &state[1]],
-            ),
-            Some(_) => fx.eval_named(
-                &g,
-                &[("x", x)],
-                &[(Slot::Token, &tokens), (Slot::Pos, pos)],
-                &named,
-                &[&state[0], &state[1]],
-            ),
-        }
+        let table: Vec<f32> = paged
+            .map(|(_, table, _)| table.iter().map(|&block| block as f32).collect())
+            .unwrap_or_default();
+        let states: Vec<&[f32]> = match paged {
+            None => vec![&state[0], &state[1]],
+            Some(_) => vec![&table, &state[0], &state[1]],
+        };
+        let (out, carried) = fx.eval_named(
+            &g,
+            &[("x", x)],
+            &[(Slot::Token, &tokens), (Slot::Pos, pos)],
+            &named,
+            &states,
+        );
+        // The host owns the table: the step hands it back unchanged, and the caller reads the pools.
+        let pools = match paged {
+            None => carried,
+            Some(_) => carried.into_iter().skip(1).collect(),
+        };
+        (out, pools)
     }
 
     /// Two contiguous rows at different positions over different caches produce, for each row, what
@@ -1923,27 +1956,39 @@ mod tests {
         });
     }
 
-    const POOL: usize = 2 * CAP + 8;
+    /// The pool's slots: whole blocks, two rows' worth of capacity and room beside them.
+    const POOL: usize = (2 * CAP / BLOCK + 2) * BLOCK;
+    const BLOCK: usize = KV_BLOCK.get();
 
-    /// The pool slot of row `r`'s logical position `j`: the two rows interleave their slots, so
-    /// neither row's blocks are contiguous.
-    fn slot_of(r: usize, j: usize) -> i32 {
-        (2 * j + r + 1) as i32
+    /// The pool block of row `r`'s logical block `i`: the two rows interleave their blocks, so neither row's
+    /// blocks are contiguous.
+    fn block_of(r: usize, i: usize) -> i32 {
+        (2 * i + r + 1) as i32
     }
 
-    /// Paged rows over a shared pool match the same rows run contiguously over the caches the read
-    /// map gathers: identical outputs, and the pool afterwards holds each written token's K/V at
-    /// its slot with every other slot unchanged. Mutation: build the read map for row 1 from row 0's
-    /// slots; row 1's output goes red.
+    /// The block table of two rows, `[2 * CAP / BLOCK]`.
+    fn table() -> Vec<i32> {
+        (0..2)
+            .flat_map(|r| (0..CAP / BLOCK).map(move |i| block_of(r, i)))
+            .collect()
+    }
+
+    /// The pool slot of row `r`'s logical position `j`.
+    fn slot_of(r: usize, j: usize) -> i32 {
+        block_of(r, j / BLOCK) * BLOCK as i32 + (j % BLOCK) as i32
+    }
+
+    /// Paged rows over a shared pool match the same rows run contiguously over the caches the block
+    /// table gathers: identical outputs, and the pool afterwards holds each written token's K/V at
+    /// its slot with every other slot unchanged. Mutation: build the block table for row 1 from row 0's
+    /// blocks; row 1's output goes red.
     #[test]
     fn paged_rows_match_contiguous_rows_over_the_gathered_caches() {
         let fx = fixture(BASE);
         let (t, positions) = (2, [[1usize, 2], [4, 5]]);
         let pool_len = POOL * KV_HEADS * HEAD_DIM;
         let pools = [oracle::random(pool_len, 81), oracle::random(pool_len, 82)];
-        let read: Vec<i32> = (0..2)
-            .flat_map(|r| (0..CAP).map(move |j| slot_of(r, j)))
-            .collect();
+        let read = table();
         // The forward map: flat token `r * t + i` writes the slot of its position.
         let write: Vec<i32> = positions
             .iter()
@@ -2020,9 +2065,7 @@ mod tests {
         let t = 2;
         let pool_len = POOL * KV_HEADS * HEAD_DIM;
         let pools = [oracle::random(pool_len, 91), oracle::random(pool_len, 92)];
-        let read: Vec<i32> = (0..2)
-            .flat_map(|r| (0..CAP).map(move |j| slot_of(r, j)))
-            .collect();
+        let read = table();
         // Row 1's first token is padding: it writes nowhere; its second token (position 3) does.
         let write = [slot_of(0, 1), slot_of(0, 2), -1, slot_of(1, 3)];
         let x = oracle::random(2 * t * WIDTH, 93);

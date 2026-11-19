@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn the_f16_range_bit_test_is_the_conversions_refusal() {
         for bits in 0..=u16::MAX {
-            let half = poot_quant::scalar::f32_to_f16(poot_quant::scalar::bf16_to_f32(bits));
+            let half = poot_quant::scalar::f32_to_f16(poot_tensor::float::bf16_to_f32(bits));
             let refused = half & 0x7c00 == 0x7c00;
             assert_eq!(
                 first_past_f16_range(&bits.to_le_bytes()),

@@ -145,10 +145,6 @@ pub fn passes_without_target(g: &Graph) -> Result<Graph, EditError> {
 }
 
 #[cfg(test)]
-#[expect(
-    unsafe_code,
-    reason = "a counting global allocator is an unsafe impl of GlobalAlloc"
-)]
 mod packed_dequant_eval_soundness;
 #[cfg(test)]
 mod stage_split_eval_soundness;

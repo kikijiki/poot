@@ -1035,8 +1035,14 @@ fn attention_prefill(bank: &Value, case: &Value) -> Result<Prepared, String> {
         Vec::new()
     };
     if kv_f16 {
-        k = k_words.iter().map(|&w| scalar::f16_to_f32(w)).collect();
-        v = v_words.iter().map(|&w| scalar::f16_to_f32(w)).collect();
+        k = k_words
+            .iter()
+            .map(|&w| poot_tensor::float::f16_to_f32(w))
+            .collect();
+        v = v_words
+            .iter()
+            .map(|&w| poot_tensor::float::f16_to_f32(w))
+            .collect();
     }
     let mut want = vec![0.0f64; hq * lq * d];
     std::thread::scope(|scope| {

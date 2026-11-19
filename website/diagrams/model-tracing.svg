@@ -71,7 +71,7 @@
   <text class="d" x="171" y="666">weights, tables</text>
   <rect class="box amber" x="326" y="614" width="262" height="72" rx="10"/>
   <text class="h tx-amber" x="457" y="643">Slot</text>
-  <text class="d" x="457" y="666">token, position, read map</text>
+  <text class="d" x="457" y="666">token, position, write map</text>
   <rect class="box purple" x="612" y="614" width="262" height="72" rx="10"/>
   <text class="h tx-purple" x="743" y="643">State</text>
   <text class="d" x="743" y="666">the KV cache</text>

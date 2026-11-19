@@ -78,14 +78,13 @@ fn run_from_output(out: std::process::Output) -> Run {
 /// Shared by [`output_until`] (kill the whole scp/ssh tree at the deadline) and the
 /// host-local `HostCommand` terminator — one helper, not a second copy of the extern.
 pub(crate) fn kill_process_group(pgid: i32, sig: i32) {
-    unsafe extern "C" {
-        #[link_name = "killpg"]
-        fn libc_killpg(pgrp: i32, sig: i32) -> i32;
-    }
-    // SAFETY: `killpg` takes two integers and no pointers; a stale or invalid group id makes it fail with
-    // `ESRCH` or `EPERM`, which is ignored on purpose (the group may already be gone).
+    // Group 0 is the caller's own group and 1 is init's: signalling either would take the orchestrator (or the
+    // machine) down, so a caller that passes one has a bug worth stopping on.
+    assert!(pgid > 1, "refusing to signal process group {pgid}");
+    // SAFETY: `killpg` takes two integers and no pointers; a stale group id makes it fail with `ESRCH` or
+    // `EPERM`, which is ignored on purpose (the group may already be gone).
     unsafe {
-        libc_killpg(pgid, sig);
+        libc::killpg(pgid, sig);
     }
 }
 
@@ -361,6 +360,23 @@ impl Remote for Endpoint {
 
 #[cfg(test)]
 mod tests {
+    /// Group 0 is the caller's own group and 1 is init's: `kill_process_group` refuses both before any
+    /// signal is sent, and says so.
+    #[test]
+    fn kill_process_group_refuses_the_callers_group_and_init() {
+        for pgid in [0, 1] {
+            let panic = std::panic::catch_unwind(|| super::kill_process_group(pgid, 0))
+                .expect_err("a reserved group id must be refused");
+            let message = panic
+                .downcast_ref::<String>()
+                .expect("assert! formats its message");
+            assert!(
+                message.contains("refusing to signal process group"),
+                "{message}"
+            );
+        }
+    }
+
     /// The by-hand pull commands name the key, port, host and both paths exactly.
     #[test]
     fn the_pull_hint_is_the_exact_ssh_and_scp_command_lines() {

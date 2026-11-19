@@ -37,9 +37,11 @@ fn run(fixture: &ScanFixture, inputs: &ScanInputs) -> Result<(Vec<f32>, Vec<f32>
     ))
 }
 
-fn families(len: usize, chunk: usize) -> [ScanFixture; 2] {
+/// The scan families at `len` tokens; the Kimi delta rule's definition is token by token, so it takes no chunk.
+fn families(len: usize, chunk: usize) -> [ScanFixture; 3] {
     [
         ScanFixture::delta_rule(3, len, 4, chunk),
+        ScanFixture::kda(3, len, 4),
         ScanFixture::ssd(3, len, 4, 5, chunk),
     ]
 }

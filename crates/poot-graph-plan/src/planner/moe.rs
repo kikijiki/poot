@@ -39,7 +39,10 @@ pub(super) fn layout_demand(eqn: &Eqn, position: usize, value: ValueId) -> Layou
 }
 
 /// Plan one MoE-family equation (IndexedMatMul, its `ContractionEpilogue`, or ArgTopK).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

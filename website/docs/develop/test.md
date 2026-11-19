@@ -39,6 +39,12 @@ Each lane needs its device. A lane fails before any test runs when the device is
 | `just test-device-rocm` | ROCm (AMD GPU) |
 | `just test-device-ptx` | PTX (NVIDIA GPU) |
 | `just test-device-kernels` | The kernel suites, on wgpu |
+| `just test-device-npu` | The AMD XDNA2 NPU |
+| `just test-device-vpu` | The Intel NPU, through the driver's own interface |
+| `just test-device-l0` | The Intel NPU, through Level Zero graph compilation |
+| `just test-device-ptx-2gpu` | Two NVIDIA GPUs: pipeline and tensor-parallel decode, and the server over both placements |
+| `just test-device-ptx-4gpu` | Four NVIDIA GPUs: a tensor-parallel decode of world size four |
+| `just test-device-ptx-pod` | The PTX lane on a rented NVIDIA pod, for a machine with no NVIDIA GPU |
 
 Run device lanes one at a time. Two device tests at once can hang the GPU.
 

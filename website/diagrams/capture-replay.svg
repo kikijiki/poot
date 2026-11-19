@@ -45,7 +45,7 @@
   <rect class="box blue" x="40" y="244" width="230" height="56" rx="10"/>
   <text class="m" x="155" y="278">Slot::Pos</text>
   <rect class="box blue" x="40" y="322" width="230" height="56" rx="10"/>
-  <text class="m" x="155" y="356">Slot::SlotMap</text>
+  <text class="m" x="155" y="356">Slot::WriteMap</text>
 
   <rect class="box teal" x="345" y="166" width="300" height="212" rx="12" style="stroke-width:2.4"/>
   <text class="h tx-teal" x="495" y="222">captured decode</text>

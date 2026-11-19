@@ -3321,7 +3321,7 @@ mod tests {
                     .unwrap()
             };
             let write = b.write_map("write", 2, 8).unwrap();
-            let read = b.read_map("read", 1, 3, 8).unwrap();
+            let read = b.block_table_slot("read", 1, 2, 4).unwrap();
             let k_written = b.scatter_update(k_pool, new("new_k"), write).unwrap();
             let v_written = b.scatter_update(v_pool, new("new_v"), write).unwrap();
             let (k_read, v_read) = if stale {
@@ -3333,10 +3333,11 @@ mod tests {
                 .slot_named(Slot::Activation, "q", TensorType::f32(vec![1, 2, 1, 4]))
                 .unwrap();
             let mask = b
-                .slot_named(Slot::Activation, "mask", TensorType::f32(vec![1, 1, 1, 3]))
+                .slot_named(Slot::Activation, "mask", TensorType::f32(vec![1, 1, 1, 4]))
                 .unwrap();
-            let k = poot_graph_ir::ops::paged_view(&b, k_read, read).unwrap();
-            let v = poot_graph_ir::ops::paged_view(&b, v_read, read).unwrap();
+            let block = std::num::NonZeroUsize::new(2).unwrap();
+            let k = poot_graph_ir::ops::paged_view(&b, k_read, read, block).unwrap();
+            let v = poot_graph_ir::ops::paged_view(&b, v_read, read, block).unwrap();
             let out = poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, 0.5, mask).unwrap();
             let graph = b
                 .finish(
@@ -3365,7 +3366,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(keys, [poot_graph_ir::KeyLayout::Paged]);
+        assert_eq!(
+            keys,
+            [poot_graph_ir::KeyLayout::Paged {
+                block: std::num::NonZeroUsize::new(2).unwrap()
+            }]
+        );
     }
 
     /// POOT-1074: an I32 state pool read by a `Gather` and written back by a `ScatterUpdate` (the paged PLE

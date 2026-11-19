@@ -48,6 +48,8 @@ thiserror.workspace = true
 poot-build-identity.workspace = true
 
 [dev-dependencies]
+# The family fixtures the engine-plan rows write as checkpoints; a standalone `-p poot-serve` build needs the feature too.
+poot-models = { workspace = true, features = ["test-support"] }
 poot-graph-plan = { workspace = true, features = ["test-support"] }
 # `Budget::with` and `write_gguf`, the fixtures the engine-plan rows build budgets and checkpoints with.
 poot-llm = { workspace = true, features = ["test-support"] }

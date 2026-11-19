@@ -8,6 +8,8 @@
 //!
 //! - [`ScanKernel::DeltaRule`] (`rows == width == D`): `S[:,j] <- a S[:,j]`, then
 //!   `S[:,j] += k * beta * (v[j] - k . S[:,j])` and `o[j] = q . S[:,j] / sqrt(D)`, `a = exp(g)`.
+//! - [`ScanKernel::Kda`] (`rows == width == D`): the same step with a decay per state row,
+//!   `S[i,j] <- exp(g[i]) S[i,j]`, and `o[j] = q . S[:,j]` (no `1/sqrt(D)`).
 //! - [`ScanKernel::Ssd`] (`rows == N`, `width == P`): `h[:,j] <- exp(delta A) h[:,j] + delta B x[j]` and
 //!   `y[j] = C . h[:,j] + D x[j]`.
 //!
@@ -35,12 +37,14 @@ pub enum ScanKernel {
     DeltaRule,
     /// The SSD (Mamba-2) recurrence, `rows == N`, `width == P`, over seven operands.
     Ssd,
+    /// The Kimi delta rule, `rows == width == D`, over six operands: the delta rule with a decay per key channel.
+    Kda,
 }
 
 impl ScanKernel {
     fn operands(self) -> usize {
         match self {
-            Self::DeltaRule => 6,
+            Self::DeltaRule | Self::Kda => 6,
             Self::Ssd => 7,
         }
     }
@@ -138,7 +142,7 @@ fn validate(spec: &ScanSpec) -> Result<(), KernelGenError> {
             });
         }
     }
-    if spec.kernel == ScanKernel::DeltaRule && spec.rows != spec.width {
+    if matches!(spec.kernel, ScanKernel::DeltaRule | ScanKernel::Kda) && spec.rows != spec.width {
         return Err(KernelGenError::ExceedsBound {
             generator: GENERATOR,
             what: "delta-rule state rows".to_string(),
@@ -313,7 +317,7 @@ fn scan_column(
             ubin(c, BinOp::Add, head, t)
         };
         let o_acc = match kernel {
-            ScanKernel::DeltaRule => delta_rule_step(
+            ScanKernel::DeltaRule | ScanKernel::Kda => delta_rule_step(
                 c,
                 spec,
                 [input(0), input(1), input(2), input(3), input(4)],
@@ -426,6 +430,9 @@ fn reduce_rows(
 /// One delta-rule token for this lane's column; returns `o[col]` (on every lane of the column). `ops` is
 /// `[q, k, v, g, beta]`. The two reductions go through the two planes: a lane that is past the first barrier
 /// has seen every lane's first-plane write, so it may not be overwritten before it reaches the second.
+///
+/// The delta rule decays the whole state by one `exp(g[pos])` and scales `q` by `1/sqrt(D)`; the Kimi variant
+/// ([`ScanKernel::Kda`]) decays row `r` by its own `exp(g[pos, r])` and uses `q` as given.
 fn delta_rule_step(
     c: &mut Cfg,
     spec: &ScanSpec,
@@ -435,19 +442,31 @@ fn delta_rule_step(
     lane: Lane,
 ) -> poot_kernel_ir::Local {
     let [q, k, v, g, beta] = ops;
+    let channel = spec.kernel == ScanKernel::Kda;
     let d = spec.rows;
     let plane = spec.row_split * spec.state_cols();
     let row = uc(c, BinOp::Mul, pos, d);
-    let g_t = c.let_(Ty::F32, Rvalue::Use(copy(elem(g, pos))));
-    let decay = c.let_(Ty::F32, Rvalue::MathUnary(MathOp::Exp, local_op(g_t)));
+    // The head's one decay, hoisted; a per-channel decay is read at each row.
+    let head_decay = (!channel).then(|| {
+        let g_t = c.let_(Ty::F32, Rvalue::Use(copy(elem(g, pos))));
+        c.let_(Ty::F32, Rvalue::MathUnary(MathOp::Exp, local_op(g_t)))
+    });
+    let decay_of = |c: &mut Cfg, ki: poot_kernel_ir::Local| match head_decay {
+        Some(decay) => decay,
+        None => {
+            let g_r = c.let_(Ty::F32, Rvalue::Use(copy(elem(g, ki))));
+            c.let_(Ty::F32, Rvalue::MathUnary(MathOp::Exp, local_op(g_r)))
+        }
+    };
     let beta_t = c.let_(Ty::F32, Rvalue::Use(copy(elem(beta, pos))));
     // kv = k . (decay * S[:,col])
     let kv_part = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
     my_rows(c, spec, lane, |c, r| {
         let slot = state_slot(c, spec, r, lane);
         let s = lds_read(c, STATE, slot);
-        let s = fbin(c, BinOp::Mul, s, decay);
         let ki = ubin(c, BinOp::Add, row, r);
+        let decay = decay_of(c, ki);
+        let s = fbin(c, BinOp::Mul, s, decay);
         let kr = c.let_(Ty::F32, Rvalue::Use(copy(elem(k, ki))));
         let term = fbin(c, BinOp::Mul, kr, s);
         let sum = fbin(c, BinOp::Add, kv_part, term);
@@ -464,14 +483,19 @@ fn delta_rule_step(
     my_rows(c, spec, lane, |c, r| {
         let slot = state_slot(c, spec, r, lane);
         let s = lds_read(c, STATE, slot);
-        let s = fbin(c, BinOp::Mul, s, decay);
         let ki = ubin(c, BinOp::Add, row, r);
+        let decay = decay_of(c, ki);
+        let s = fbin(c, BinOp::Mul, s, decay);
         let kr = c.let_(Ty::F32, Rvalue::Use(copy(elem(k, ki))));
         let bump = fbin(c, BinOp::Mul, kr, delta);
         let s_new = fbin(c, BinOp::Add, s, bump);
         lds_write(c, STATE, slot, local_op(s_new));
         let qr = c.let_(Ty::F32, Rvalue::Use(copy(elem(q, ki))));
-        let qs = c.bin(Ty::F32, BinOp::Mul, local_op(qr), f32c(scale));
+        let qs = if channel {
+            qr
+        } else {
+            c.bin(Ty::F32, BinOp::Mul, local_op(qr), f32c(scale))
+        };
         let term = fbin(c, BinOp::Mul, qs, s_new);
         let sum = fbin(c, BinOp::Add, o_part, term);
         c.assign(Place::local(o_part), Rvalue::Use(local_op(sum)));

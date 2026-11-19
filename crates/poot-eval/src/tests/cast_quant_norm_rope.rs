@@ -91,7 +91,7 @@ fn cast_f32_to_bf16_rounds_and_infers_dtype() {
 /// `cast_f32_to_bf16_rounds_and_infers_dtype`.
 #[test]
 fn cast_f32_to_f16_rounds_and_infers_dtype() {
-    let ref_f16 = |f: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(f));
+    let ref_f16 = |f: f32| poot_tensor::float::f16_to_f32(poot_quant::scalar::f32_to_f16(f));
     let b = Builder::for_tests();
     let x = b.constant("x", TensorType::f32(vec![6])).unwrap();
     let y = b.cast(x, DType::F16).unwrap();
@@ -198,7 +198,7 @@ fn matmul_f16_output_narrows_the_accumulator() {
         .zip(want_f32.iter())
         .enumerate()
     {
-        let want_f16 = poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(w));
+        let want_f16 = poot_tensor::float::f16_to_f32(poot_quant::scalar::f32_to_f16(w));
         assert_eq!(
             got.to_bits(),
             want_f16.to_bits(),

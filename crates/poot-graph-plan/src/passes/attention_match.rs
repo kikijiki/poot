@@ -1,7 +1,11 @@
+use std::num::NonZeroUsize;
+
 use super::guard_witness::{first_unobserved_clamp, producer_map};
+use super::selection::Definition;
 use super::{
     BinOp, DType, EditError, Eqn, Graph, HashMap, HashSet, NumericalRewriteDecline,
-    NumericalRewriteReason, OpKind, Operand, RedOp, Scalar, Storage, UnOp, ValueId, with_eqns,
+    NumericalRewriteReason, OpKind, Operand, RedOp, Scalar, Storage, TensorType, UnOp, ValueId,
+    with_eqns,
 };
 use poot_graph_ir::{
     AttentionAttrs, ComputedConst, IndexRange, KeyLayout, KvBound, MaskOperand, RangeFacts,
@@ -467,12 +471,48 @@ fn peel_widen(g: &Graph, prod: &HashMap<ValueId, usize>, value: ValueId) -> Valu
 /// A key or value view of a paged pool, as [`poot_graph_ir::ops::paged_view`] traces it.
 struct PagedView {
     pool: ValueId,
+    /// The `[B, Lk / block]` block table.
     read: ValueId,
+    block: NonZeroUsize,
 }
 
-/// Peel `view` as `transpose(reshape(gather(pool, 0, reshape(read))))`, the logical `[B, Hkv, Lk, D]` view of a
-/// `[S, Hkv, D]` pool through the I32 `[B, Lk]` slot map `read`. `None` for any other chain: its shapes are
-/// checked, not just its op sequence, so a lookalike movement chain is not a paged view.
+/// The positions per table entry a paged view's slot arithmetic multiplies by: the I32 literal of the
+/// `Mul` beneath the `Add` that [`poot_graph_ir::ops::paged_view`] sums the slots with. `None` when the slot
+/// operand is not that sum.
+fn paged_block(
+    g: &Graph,
+    prod: &HashMap<ValueId, usize>,
+    slots: ValueId,
+    positions: usize,
+) -> Option<NonZeroUsize> {
+    let flat = reshaped_from(g, prod, slots, &[positions])?;
+    let sum = prod.get(&flat).map(|&i| &g.eqns()[i])?;
+    if !matches!(sum.op, OpKind::Binary(BinOp::Add)) {
+        return None;
+    }
+    sum.inputs.iter().find_map(|operand| {
+        let Operand::Value(addend) = operand else {
+            return None;
+        };
+        let broadcast = prod.get(addend).map(|&i| &g.eqns()[i])?;
+        let [Operand::Value(scaled)] = broadcast.inputs.as_slice() else {
+            return None;
+        };
+        let mul = prod.get(scaled).map(|&i| &g.eqns()[i])?;
+        match (&mul.op, mul.inputs.as_slice()) {
+            (OpKind::Binary(BinOp::Mul), [Operand::Value(_), Operand::Lit(Scalar::I32(block))]) => {
+                usize::try_from(*block).ok().and_then(NonZeroUsize::new)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Peel `view` as [`poot_graph_ir::ops::paged_view`], the logical `[B, Hkv, Lk, D]` view of a `[S, Hkv, D]` pool
+/// through the I32 `[B, Lk / block]` block table. The definition itself, built over placeholders of the
+/// operands' types and normalized as `compile` normalizes the traced graph, is unified with the graph from
+/// `view`, so a lookalike movement chain is not a paged view and the recognizer has no second spelling of the
+/// view to drift from it. `None` for any other chain.
 fn peel_paged_view(g: &Graph, prod: &HashMap<ValueId, usize>, view: ValueId) -> Option<PagedView> {
     let eqn = prod.get(&view).map(|&i| &g.eqns()[i])?;
     let (OpKind::Transpose { perm }, [Operand::Value(rows_first)]) =
@@ -493,18 +533,28 @@ fn peel_paged_view(g: &Graph, prod: &HashMap<ValueId, usize>, view: ValueId) -> 
     else {
         return None;
     };
-    let read = reshaped_from(g, prod, *slots, &[rows * cap])?;
-    let read_type = g.aval(read);
-    let pool_type = g.aval(*pool);
-    (read_type.dtype == DType::I32
-        && read_type.shape == [rows, cap]
-        && pool_type.shape.len() == 3
-        && pool_type.shape[1..] == [hkv, d])
-    .then_some(PagedView { pool: *pool, read })
+    let block = paged_block(g, prod, *slots, rows * cap)?;
+    if !cap.is_multiple_of(block.get()) {
+        return None;
+    }
+    let pool_type = g.aval(*pool).clone();
+    if pool_type.shape.len() != 3 || pool_type.shape[1..] != [hkv, d] {
+        return None;
+    }
+    let table_type = TensorType::new(vec![rows, cap / block], DType::I32);
+    let definition = Definition::new(&[table_type, pool_type], |b, operands| {
+        poot_graph_ir::ops::paged_view(b, operands[1], operands[0], block)
+    })?;
+    let bound = definition.unify(g, prod, view)?;
+    Some(PagedView {
+        pool: *pool,
+        read: bound[0],
+        block,
+    })
 }
 
-/// The key and value of a paged cache: both views of pools through one slot map, whose declared range proves
-/// every word a slot of the pools. The proof is what the kernel's unchecked pool read stands on, so a map
+/// The key and value of a paged cache: both views of pools through one block table, whose declared range proves
+/// every word a block of the pools. The proof is what the kernel's unchecked pool read stands on, so a table
 /// that is not proved stays the gather it is.
 fn peel_paged_kv(
     g: &Graph,
@@ -515,10 +565,11 @@ fn peel_paged_kv(
 ) -> Option<(PagedView, PagedView)> {
     let (k, v) = (peel_paged_view(g, prod, k)?, peel_paged_view(g, prod, v)?);
     let slots = g.aval(k.pool).shape[0];
-    let in_pool = IndexRange::below(slots)
+    let in_pool = IndexRange::below(slots / k.block)
         .zip(facts[k.read])
         .is_some_and(|(pool, proved)| proved.within(&pool));
-    (k.read == v.read && g.aval(v.pool).shape[0] == slots && in_pool).then_some((k, v))
+    (k.read == v.read && k.block == v.block && g.aval(v.pool).shape[0] == slots && in_pool)
+        .then_some((k, v))
 }
 
 /// Peel a `repeat_kv(x, n_rep)` chain (`reshape(broadcast(reshape(x)))`) back to `(x, n_rep)`. If `v` is not
@@ -872,7 +923,7 @@ pub(super) fn match_attention(
         Some(_) => None,
     };
     let (k, v, read) = match paged {
-        Some((k, v)) => (k.pool, v.pool, Some(k.read)),
+        Some((k, v)) => (k.pool, v.pool, Some((k.read, k.block))),
         None => (key.head, v, None),
     };
     // A mask built by `causal_mask_from_pos` over this score row is stated by its positions instead of
@@ -885,12 +936,12 @@ pub(super) fn match_attention(
         q,
         k,
         k_shared: key.shared,
-        read,
+        read: read.map(|(table, _)| table),
         key: match (key.shared, read) {
             (Some(shared), _) => KeyLayout::Split {
                 shared_dim: g.aval(shared).shape[3],
             },
-            (None, Some(_)) => KeyLayout::Paged,
+            (None, Some((_, block))) => KeyLayout::Paged { block },
             (None, None) => KeyLayout::Single,
         },
         v,
@@ -1044,7 +1095,7 @@ impl AttnMatch {
 /// not the softmax-normalized matmul shape at all (an ordinary matmul) is no near-miss and is not reported.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )
@@ -1294,7 +1345,7 @@ fn rope_types_as(
 /// `Mul`s around a rotate-half `Concat` is no near-miss and is not reported.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )

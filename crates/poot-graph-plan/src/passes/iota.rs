@@ -18,7 +18,7 @@ use poot_graph_ir::op::OpKind;
 /// written for the pipeline's simple `Graph -> Graph` shape).
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )

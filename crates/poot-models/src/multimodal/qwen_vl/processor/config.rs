@@ -21,7 +21,10 @@ pub(crate) struct Qwen25VlImageProcessorConfig {
 }
 
 impl Default for Qwen25VlImageProcessorConfig {
-    #[expect(clippy::excessive_precision)] // Preserve the upstream decimal constants before f32 rounding.
+    #[expect(
+        clippy::excessive_precision,
+        reason = "the upstream decimal constants are kept as published, before f32 rounding"
+    )]
     fn default() -> Self {
         Self {
             do_resize: true,

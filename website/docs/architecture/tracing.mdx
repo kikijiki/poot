@@ -87,8 +87,8 @@ Eqn inputs have four kinds (see [The Graph IR](./graph-ir#storage-classes)):
 | Kind | Holds |
 | --- | --- |
 | **Const** (`Storage::Const`) | Weights, embeddings, RoPE tables, declared by name; the loader binds buffers that never move. |
-| **Slot** (`Storage::Slot`) | `Slot::Token`, `Slot::Pos`, and for paged decode `Slot::SlotMap` / `Slot::WriteMap` (word ranges checked at bind), rewritten in place each step. |
-| **State** (`Storage::State`) | The KV cache; each `state_in` pairs with a `state_out` the executor overwrites. |
+| **Slot** (`Storage::Slot`) | `Slot::Token`, `Slot::Pos`, and for paged decode the sequence rows and `Slot::WriteMap` (word ranges checked at bind), rewritten in place each step. |
+| **State** (`Storage::State`) | The KV cache, and a paged step's block table (written by the host); each `state_in` pairs with a `state_out` the executor overwrites. |
 | **Device** (`Storage::Device`) | Every activation, at stable addresses fixed at plan time. |
 
 The attention mask is built in-graph from `Slot::Pos`; no slot carries it.

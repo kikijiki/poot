@@ -345,7 +345,7 @@ impl GraphCore {
     /// Submit every segment in order, retiring the oldest submission first whenever the window is full.
     /// `submitted` counts the segments queued so far, also when a later one fails.
     ///
-    /// Submission `i` signals `fences[i % IN_FLIGHT_SUBMITS]`, so the fence a submission reuses belongs to
+    /// The `i`-th submit signals `fences[i % IN_FLIGHT_SUBMITS]`, so the fence a submission reuses belongs to
     /// the one retired just before it.
     fn submit_segments(
         &self,

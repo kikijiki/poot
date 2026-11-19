@@ -3,8 +3,8 @@
 //! the oracle, never inside it - POOT-1130.)
 
 use poot_eval::{EvalOptions, Value};
-use poot_graph_ir::{ForwardSlotMap, Graph, Slot, Storage, ValueId};
-use poot_models::model::{LogitRows, Model, StepSpec};
+use poot_graph_ir::{ForwardSlotMap, Graph, Slot, StateRole, Storage, ValueId};
+use poot_models::model::{KV_BLOCK, LogitRows, Model, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_tensor::HostTensor;
 use poot_test_util::{assert_close_rel, fill, max_abs_error};
@@ -62,32 +62,39 @@ pub(super) fn named_weight(name: &str, shape: &[usize]) -> HostTensor {
     )
 }
 
-/// One row of a paged step: the pool slot of each logical position and the position its first new
-/// token takes.
+/// One row of a paged step: the pool block of each of its logical blocks and the position its first new token
+/// takes.
 pub(super) struct PagedRow<'a> {
-    pub slots: &'a [usize],
+    pub blocks: &'a [usize],
     pub start: usize,
 }
 
-/// The `(read, write)` slot maps of a paged step of `tokens` new tokens per row: `read` is each
-/// row's `capacity` slots; `write` is the forward map of the flat token `r * tokens + i` (row `r`'s
-/// position `start + i`) to its pool slot. `pool` is the pool the map is checked against.
+/// The `(table, write)` maps of a paged step of `tokens` new tokens per row: `table` is each row's block table
+/// (the host's `kv.table` state, one row per step row); `write` is the forward map of the flat token
+/// `r * tokens + i` (row `r`'s position `start + i`) to its pool slot. `pool` is the pool, in slots, the map is
+/// checked against.
 pub(super) fn paged_maps(
     pool: usize,
     rows: &[PagedRow<'_>],
     tokens: usize,
 ) -> (Vec<i32>, Vec<i32>) {
-    let read = rows
+    let table = rows
         .iter()
-        .flat_map(|row| row.slots.iter().map(|&s| s as i32))
+        .flat_map(|row| row.blocks.iter().map(|&block| block as i32))
         .collect();
+    let block = KV_BLOCK.get();
     let write = rows
         .iter()
-        .flat_map(|row| (0..tokens).map(|i| row.slots[row.start + i] as i32))
+        .flat_map(|row| {
+            (0..tokens).map(|i| {
+                let position = row.start + i;
+                (row.blocks[position / block] * block + position % block) as i32
+            })
+        })
         .collect();
     let write =
         ForwardSlotMap::new(write, pool).expect("the test's slots are distinct and in the pool");
-    (read, write.as_slice().to_vec())
+    (table, write.as_slice().to_vec())
 }
 
 /// One evaluated step: its logits and the carried state, in `Graph::state` order.
@@ -97,8 +104,8 @@ pub(super) struct Stepped {
 }
 
 /// Evaluate `g` on the CPU oracle: weights by name ([`named_weight`]), the step's `tokens` and `pos`
-/// (`[rows * tokens]`, row-major), a paged step's `(read, write)` maps, and `state` (zeros when
-/// `None`).
+/// (`[rows * tokens]`, row-major), a paged step's `(table, write)` maps (row `r` continues sequence `r`), and
+/// `state` (zeros when `None`). The block table is the host's, so it is bound from the maps, not carried.
 pub(super) fn eval_step(
     g: &Graph,
     tokens: &[i32],
@@ -112,9 +119,10 @@ pub(super) fn eval_step(
         let t = match m.storage {
             Storage::Slot(Slot::Token) => HostTensor::i32(m.aval.shape.clone(), tokens.to_vec()),
             Storage::Slot(Slot::Pos) => HostTensor::i32(m.aval.shape.clone(), pos.to_vec()),
-            Storage::Slot(Slot::SlotMap) => {
-                let (read, _) = maps.expect("a paged step binds its slot maps");
-                HostTensor::i32(m.aval.shape.clone(), read.to_vec())
+            Storage::Slot(Slot::Activation)
+                if m.name().as_deref() == Some("activation.state_read") =>
+            {
+                HostTensor::i32(m.aval.shape.clone(), (0..m.aval.shape[0] as i32).collect())
             }
             Storage::Slot(Slot::WriteMap) => {
                 let (_, write) = maps.expect("a paged step binds its slot maps");
@@ -129,9 +137,13 @@ pub(super) fn eval_step(
         inputs.insert(id, Value::from(t));
     }
     for (i, (si, _)) in g.state().enumerate() {
-        let carried = match state {
-            None => HostTensor::zeros_of(g.aval(si).dtype, g.aval(si).shape.clone()),
-            Some(prev) => prev[i].clone(),
+        let carried = match (g.state_role(si), state) {
+            (Some(StateRole::BlockTable), _) => {
+                let (table, _) = maps.expect("a paged step binds its block table");
+                HostTensor::i32(g.aval(si).shape.clone(), table.to_vec())
+            }
+            (_, None) => HostTensor::zeros_of(g.aval(si).dtype, g.aval(si).shape.clone()),
+            (_, Some(prev)) => prev[i].clone(),
         };
         inputs.insert(si, Value::from(carried));
     }
@@ -196,12 +208,13 @@ fn fixed_kv_decode_matches_prefill() {
 fn chunked_prefill_matches_one_shot_shared_pool() {
     let model = tiny_qwen2(32, 16, 24, 32);
     let n = 7; // prompt length
-    let pool_slots = 20; // shared physical pool (bigger than the prompt - other sequences' slots exist)
-    let cap = n; // this sequence's logical capacity == the prompt length (no generation headroom needed)
+    let block = KV_BLOCK.get();
+    let pool_slots = 5 * block; // shared physical pool (bigger than the prompt - other sequences' blocks exist)
+    let cap = block; // this sequence's logical capacity: one block (capacity is whole blocks)
     // a non-contiguous physical layout (real block-table allocation is never guaranteed contiguous), used by both the
     // one-shot step and the chunk steps.
-    let global_slots: Vec<usize> = vec![3, 17, 1, 9, 14, 2, 11];
-    assert_eq!(global_slots.len(), n);
+    let global_blocks: Vec<usize> = vec![3];
+    assert_eq!(global_blocks.len(), cap / block);
     let tokens: Vec<i32> = vec![5, 11, 3, 20, 8, 1, 27];
 
     // --- one-shot paged prefill: the whole prompt in one forward. ---
@@ -209,7 +222,7 @@ fn chunked_prefill_matches_one_shot_shared_pool() {
     let (read, write) = paged_maps(
         pool_slots,
         &[PagedRow {
-            slots: &global_slots,
+            blocks: &global_blocks,
             start: 0,
         }],
         n,
@@ -233,7 +246,7 @@ fn chunked_prefill_matches_one_shot_shared_pool() {
         let (read, write) = paged_maps(
             pool_slots,
             &[PagedRow {
-                slots: &global_slots,
+                blocks: &global_blocks,
                 start,
             }],
             l,
@@ -273,6 +286,7 @@ fn chunked_prefill_matches_one_shot_shared_pool() {
         .iter()
         .zip(one_shot.state.iter())
         .enumerate()
+        .filter(|(_, (pool, _))| pool.as_f32().is_some())
     {
         assert_eq!(
             chunk_pool.shape(),
@@ -298,29 +312,31 @@ fn chunked_prefill_matches_one_shot_shared_pool() {
 /// prefix, to see whether the error grows boundedly.
 #[test]
 fn chunked_prefill_redundant_decode_overwrite_error_growth_bounded() {
-    let chunk_size = 8;
-    let num_chunks = 35; // realistic scale (the update's own GPU tests only covered N=4)
+    let chunk_size = 8usize;
+    let num_chunks = 35usize; // realistic scale (the update's own GPU tests only covered N=4)
     let n = chunk_size * num_chunks; // 280-token prompt
-    let pool_slots = n + 20; // headroom, like the N=4 test's pool_slots > prompt convention
+    let block = KV_BLOCK.get();
+    // this sequence's logical capacity: the prompt rounded up to whole blocks (no generation headroom).
+    let cap = n.div_ceil(block) * block;
+    let blocks = cap / block;
+    let pool_slots = (blocks + 5 + 2) * block; // headroom, like the N=4 test's pool > prompt convention
 
     // max_pos covers every real position used below.
-    let model = tiny_qwen2(32, 16, 24, n + 4);
-    // this sequence's logical capacity == the prompt length (no generation headroom; as the N=4 test's `cap = n`).
-    let cap = n;
+    let model = tiny_qwen2(32, 16, 24, cap + 4);
 
     // non-contiguous physical layout (a fixed xorshift permutation of a pool bigger than the prompt); real block-table
     // allocation is never guaranteed contiguous.
-    let mut global_slots: Vec<usize> = (0..n).collect();
+    let mut global_blocks: Vec<usize> = (0..blocks).collect();
     let mut seed: u64 = 88172645463325252;
-    for i in (1..global_slots.len()).rev() {
+    for i in (1..global_blocks.len()).rev() {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
         let j = (seed as usize) % (i + 1);
-        global_slots.swap(i, j);
+        global_blocks.swap(i, j);
     }
-    let global_slots: Vec<usize> = global_slots.iter().map(|&s| s + 5).collect(); // offset into pool_slots
-    assert!(global_slots.iter().all(|&s| s < pool_slots));
+    let global_blocks: Vec<usize> = global_blocks.iter().map(|&b| b + 5).collect(); // offset into the pool
+    assert!(global_blocks.iter().all(|&b| (b + 1) * block <= pool_slots));
     let tokens: Vec<i32> = (0..n).map(|i| (i % 32) as i32).collect();
 
     // independent one-shot reference over the first `m` tokens (what the pool would hold after processing exactly this many
@@ -330,7 +346,7 @@ fn chunked_prefill_redundant_decode_overwrite_error_growth_bounded() {
         let (read, write) = paged_maps(
             pool_slots,
             &[PagedRow {
-                slots: &global_slots,
+                blocks: &global_blocks,
                 start: 0,
             }],
             m,
@@ -352,7 +368,7 @@ fn chunked_prefill_redundant_decode_overwrite_error_growth_bounded() {
         let (read, write) = paged_maps(
             pool_slots,
             &[PagedRow {
-                slots: &global_slots,
+                blocks: &global_blocks,
                 start: pos,
             }],
             l,
@@ -373,7 +389,7 @@ fn chunked_prefill_redundant_decode_overwrite_error_growth_bounded() {
         let (read, write) = paged_maps(
             pool_slots,
             &[PagedRow {
-                slots: &global_slots,
+                blocks: &global_blocks,
                 start: last_pos,
             }],
             1,
@@ -394,6 +410,7 @@ fn chunked_prefill_redundant_decode_overwrite_error_growth_bounded() {
                 .unwrap()
                 .iter()
                 .zip(reference.iter())
+                .filter(|(a, _)| a.as_f32().is_some())
                 .map(|(a, r)| max_abs_error(a.as_f32().unwrap(), r.as_f32().unwrap()))
                 .max_by(f32::total_cmp)
                 .unwrap_or(0.0);
@@ -439,16 +456,18 @@ fn speculative_verify_batched_matches_sequential_decode() {
     let vocab = 32;
     let n = 5; // each row's prompt length
     let l = 4; // draft window width (1 requery + 3 drafts)
-    let cap = n + 4; // each row's own logical capacity (room for the l-token draft window)
+    let block = KV_BLOCK.get();
+    let cap = block; // each row's own logical capacity: one block, room for the prompt and the l-token draft window
+    assert!(n + l <= cap);
     let batch = 2;
-    let pool_slots = 2 * cap + 4; // shared physical pool, bigger than 2 rows' reserved capacity
+    let pool_slots = 4 * block; // shared physical pool, bigger than 2 rows' reserved capacity
 
     // two rows' prompts, disjoint (non-contiguous) physical slot ranges within the same shared pool (two independently
     // admitted sequences sharing one engine pool).
     let tokens_row: [Vec<i32>; 2] = [vec![5, 11, 3, 20, 8], vec![2, 9, 30, 4, 17]];
-    let global_slots_row: [Vec<usize>; 2] = [
-        (0..cap).rev().collect(), // row 0: reverse order within its own disjoint block [0, cap)
-        (0..cap).map(|i| cap + (cap - 1 - i)).collect(), // row 1: reverse order within [cap, 2*cap)
+    let global_blocks_row: [Vec<usize>; 2] = [
+        vec![2], // row 0's one block
+        vec![1], // row 1's one block, disjoint from row 0's
     ];
     // drafts for the l-1 speculative positions (arbitrary token ids: this test checks the verify step's numerics match
     // sequential decode of the same tokens, not any accept/reject outcome).
@@ -462,7 +481,7 @@ fn speculative_verify_batched_matches_sequential_decode() {
         let (read, write) = paged_maps(
             pool_slots,
             &[PagedRow {
-                slots: &global_slots_row[row],
+                blocks: &global_blocks_row[row],
                 start: 0,
             }],
             n,
@@ -486,9 +505,9 @@ fn speculative_verify_batched_matches_sequential_decode() {
             .chain(drafts_row[row].iter().copied())
             .collect()
     });
-    let rows: Vec<PagedRow<'_>> = global_slots_row
+    let rows: Vec<PagedRow<'_>> = global_blocks_row
         .iter()
-        .map(|slots| PagedRow { slots, start: pos })
+        .map(|blocks| PagedRow { blocks, start: pos })
         .collect();
     let g_verify = trace_step(&*model, (batch, l, cap), Some(pool_slots), LogitRows::All);
     let (read, write) = paged_maps(pool_slots, &rows, l);
@@ -511,10 +530,10 @@ fn speculative_verify_batched_matches_sequential_decode() {
     let mut logits_seq = vec![0.0f32; batch * l * vocab];
     for i in 0..l {
         let step_pos = pos + i;
-        let rows: Vec<PagedRow<'_>> = global_slots_row
+        let rows: Vec<PagedRow<'_>> = global_blocks_row
             .iter()
-            .map(|slots| PagedRow {
-                slots,
+            .map(|blocks| PagedRow {
+                blocks,
                 start: step_pos,
             })
             .collect();
@@ -546,7 +565,13 @@ fn speculative_verify_batched_matches_sequential_decode() {
     );
 
     assert_eq!(verify.state.len(), seq_state.len());
-    for (i, (verify_pool, seq_pool)) in verify.state.iter().zip(seq_state.iter()).enumerate() {
+    for (i, (verify_pool, seq_pool)) in verify
+        .state
+        .iter()
+        .zip(seq_state.iter())
+        .enumerate()
+        .filter(|(_, (pool, _))| pool.as_f32().is_some())
+    {
         assert_eq!(
             verify_pool.shape(),
             seq_pool.shape(),
@@ -644,7 +669,10 @@ fn draft_propose_round_schedule_matches_sequential_draft_decode() {
         let mut ref_drafts: Vec<i32> = Vec::new();
         // `pos` is the absolute decode position (fed to the graph's Slot::Pos input), and only incidentally an index into
         // `tokens_row[row]` during catch-up; an iterator rewrite would not simplify this.
-        #[expect(clippy::needless_range_loop)]
+        #[expect(
+            clippy::needless_range_loop,
+            reason = "`pos` is the absolute decode position fed to the graph, only incidentally an index into `tokens_row`"
+        )]
         for pos in 0..(catchup[row] + max_k) {
             let tok = if pos < catchup[row] {
                 tokens_row[row][pos]
@@ -677,24 +705,25 @@ fn draft_propose_round_schedule_matches_sequential_draft_decode() {
 /// Card 550 SC-006: a chunked prefill starting at a NONZERO position (`Slot::Pos = [s, s+1, s+2]`) must
 /// equal the same tokens run one decode step at a time from the same starting KV pool state - both the
 /// per-position logits and the final pool - on the CPU oracle. The chunk and the decode steps share the
-/// contiguous-equivalent shared-pool layout (`global_slots` is a non-contiguous permutation of `[0,cap)`,
-/// so this also proves the chunk's write/read addressing, not just its mask, matches decode's).
+/// shared-pool layout (the sequence's one block sits at a non-contiguous place in the pool, so this also proves
+/// the chunk's write/read addressing, not just its mask, matches decode's).
 #[test]
 fn chunked_prefill_at_nonzero_start_matches_stepped_decode() {
     let model = tiny_qwen2(32, 16, 24, 16);
     let s = 3usize; // nonzero chunk start
     let l = 3usize; // chunk width
-    let cap = s + l; // this sequence's logical capacity (room for s prior + l new positions)
-    let pool_slots = cap + 4; // headroom, non-contiguous layout below
-    let global_slots: Vec<usize> = (0..cap).map(|i| cap + 3 - i).collect(); // non-contiguous permutation
+    let block = KV_BLOCK.get();
+    let cap = block; // this sequence's logical capacity: one block, room for s prior + l new positions
+    let pool_slots = 3 * block; // headroom, non-contiguous layout below
+    let global_blocks: Vec<usize> = vec![2];
     let tokens: Vec<i32> = vec![5, 11, 3, 20, 8, 1];
-    assert_eq!(tokens.len(), cap);
+    assert_eq!(tokens.len(), s + l);
 
     let paged = |start: usize, tokens: usize| {
         paged_maps(
             pool_slots,
             &[PagedRow {
-                slots: &global_slots,
+                blocks: &global_blocks,
                 start,
             }],
             tokens,
@@ -748,7 +777,13 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode() {
         "chunk prefill at nonzero start vs stepped decode: last-position logits differ: max abs err {logit_err}"
     );
     assert_eq!(chunk.state.len(), pool.len());
-    for (i, (chunk_pool, decode_pool)) in chunk.state.iter().zip(pool.iter()).enumerate() {
+    for (i, (chunk_pool, decode_pool)) in chunk
+        .state
+        .iter()
+        .zip(pool.iter())
+        .enumerate()
+        .filter(|(_, (pool, _))| pool.as_f32().is_some())
+    {
         assert_eq!(
             chunk_pool.shape(),
             decode_pool.shape(),
@@ -771,24 +806,21 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode() {
 #[test]
 fn paged_write_lands_mapped_tokens_and_keeps_padding_and_unnamed_slots() {
     let model = tiny_qwen2(32, 16, 24, 32);
-    let (rows, tokens, cap, pool_slots) = (2usize, 2usize, 3usize, 12usize);
+    let block = KV_BLOCK.get();
+    let (rows, tokens, cap, pool_slots) = (2usize, 2usize, block, 6 * block);
     let g = trace_step(
         &*model,
         (rows, tokens, cap),
         Some(pool_slots),
         LogitRows::Last,
     );
-    // Row 0 reads slots [7, 2, 9]; row 1 reads [4, 11, 0]. Row 0 writes positions 0 and 1; row 1's token
-    // 0 is padding and its token 1 writes position 1 (slot 11).
-    let slots = [[7usize, 2, 9], [4, 11, 0]];
-    let read: Vec<i32> = slots.iter().flatten().map(|&s| s as i32).collect();
-    let write = vec![
-        slots[0][0] as i32,
-        slots[0][1] as i32,
-        -1,
-        slots[1][1] as i32,
-    ];
-    let written: [usize; 3] = [slots[0][0], slots[0][1], slots[1][1]];
+    // Row 0's one block is pool block 3, row 1's is block 1. Row 0 writes positions 0 and 1; row 1's token
+    // 0 is padding and its token 1 writes position 1.
+    let blocks = [3usize, 1];
+    let slot = |row: usize, position: usize| blocks[row] * block + position;
+    let read: Vec<i32> = blocks.iter().map(|&b| b as i32).collect();
+    let write = vec![slot(0, 0) as i32, slot(0, 1) as i32, -1, slot(1, 1) as i32];
+    let written: [usize; 3] = [slot(0, 0), slot(0, 1), slot(1, 1)];
     let step_tokens = [5, 11, 3, 20];
     let step_pos = [0, 1, 0, 1];
 
@@ -809,8 +841,8 @@ fn paged_write_lands_mapped_tokens_and_keeps_padding_and_unnamed_slots() {
         Some(&seeded),
     );
 
-    // The first layer's K and V pools: `[pool_slots, kv_heads, head_dim]`.
-    for pair in 0..2 {
+    // The first layer's K and V pools (after the block table): `[pool_slots, kv_heads, head_dim]`.
+    for pair in 1..3 {
         let row_len: usize = fresh.state[pair].shape()[1..].iter().product();
         let fresh_pool = fresh.state[pair].as_f32().unwrap();
         let seeded_in = seeded[pair].as_f32().unwrap();

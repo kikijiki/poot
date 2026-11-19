@@ -183,7 +183,10 @@ fn zero(ty: &Ty) -> Constant {
 /// Row `r`'s partials land in workgroup array `r` at `s * cols + c`, so the per-column fold is a tree of stride
 /// `cols` over the `L` sub-lanes and leaves column `c`'s sum at `LDS[r][c]`; `epilogue`, when given, runs over
 /// that sum (at output element `store_col`) before the store.
-#[expect(clippy::too_many_arguments)] // the name, locals and launch shape of one body plus the operand read and epilogue
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the name, locals and launch shape of one body plus the operand read and epilogue"
+)]
 pub(crate) fn gemv_body<R: RunRead>(
     name: &str,
     mut al: Alloc,

@@ -1,7 +1,7 @@
 use super::select::{DeviceFacts, pick_device};
 use crate::driver::AshResourceDispatch;
 use crate::features::DeviceFeatures;
-use crate::util::bytemuck_cast_i8_to_u8;
+use crate::util::c_char_text;
 use crate::validation::Validation;
 use crate::{Context, DeviceOwner, RuntimeError, validation};
 use ash::vk;
@@ -280,11 +280,7 @@ impl Context {
             .min(max_allocation)
             .min(u64::from(props.limits.max_storage_buffer_range));
         // The device's name, read once: the calibration table and the channel map are keyed by it.
-        let device_name = {
-            let name = bytemuck_cast_i8_to_u8(&props.device_name);
-            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-            String::from_utf8_lossy(&name[..end]).into_owned()
-        };
+        let device_name = c_char_text(&props.device_name);
         // Observed facts about one device (display watchdog, tiled-GEMM ceiling, safe buffer size), not driver
         // answers: only a device the table names gets them, and any other reports none.
         let calibration =
@@ -453,10 +449,7 @@ impl Context {
             self.instance
                 .get_physical_device_properties(self.physical_device)
         };
-        // `device_name` is NUL-terminated; take up to the first NUL.
-        let bytes: &[u8] = bytemuck_cast_i8_to_u8(&props.device_name);
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        String::from_utf8_lossy(&bytes[..end]).into_owned()
+        c_char_text(&props.device_name)
     }
 
     /// The adapter this context opened and the driver the Vulkan loader reports for it
@@ -471,17 +464,12 @@ impl Context {
             self.instance
                 .get_physical_device_properties2(self.physical_device, &mut props2)
         };
-        let text = |s: &[std::ffi::c_char]| {
-            let bytes = bytemuck_cast_i8_to_u8(s);
-            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            String::from_utf8_lossy(&bytes[..end]).into_owned()
-        };
         poot_runtime_common::DeviceIdentity {
             adapter: self.device_name(),
             driver: format!(
                 "{} {}",
-                text(&driver.driver_name),
-                text(&driver.driver_info)
+                c_char_text(&driver.driver_name),
+                c_char_text(&driver.driver_info)
             )
             .trim()
             .to_string(),

@@ -3,7 +3,8 @@
 //!
 //! Weights are data: every const is filled from its name, so the device and the oracle read the same
 //! values. Each graph is the family's own (`poot_models::test_support::dense::Dense`), traced for a
-//! [`StepShape`]; a paged step reads one shared KV pool through the `Slot::SlotMap` input `"read"` and
+//! [`StepShape`]; a paged step reads one shared KV pool through its sequences' block table (the carried
+//! `kv.table` state the host writes) and
 //! writes it through the forward `Slot::WriteMap` input `"write"` (one pool slot per new token).
 
 use poot_graph_ir::test_support::const_weights::ConstWeights;
@@ -13,16 +14,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_eval::{EvalOptions, Value, eval};
-use poot_executor::{Device, Executor, NoSync, StepInputs};
+use poot_executor::{Device, EntryId, ExecutableId, Executor, NoSync, StepInputs};
 use poot_executor_parity::assert_within_class;
 use poot_graph_ir::analysis::Tier2Class;
-use poot_graph_ir::{ForwardSlotMap, Graph, Slot, SlotKey, Storage, ValueId, ValueTable};
+use poot_graph_ir::{
+    ForwardSlotMap, Graph, Slot, SlotKey, StateRole, Storage, ValueId, ValueTable,
+};
 use poot_graph_plan::{
     CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
     staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
     staged::compile_staged,
 };
-use poot_models::model::{LogitRows, StepShape, StepSpec};
+use poot_models::model::{KV_BLOCK, LogitRows, StepShape, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -150,6 +153,38 @@ fn split_consts_and_slots_v(
     (builder.build(), slots)
 }
 
+/// Write the block table of every [`StateRole::BlockTable`] state of `g` into `exe`, as `inputs` binds it: the
+/// host's table is state the executor holds, written one sequence row at a time before the step reads it.
+fn write_block_tables(
+    exec: &mut dyn Executor,
+    exe: ExecutableId,
+    g: &Graph,
+    inputs: &HashMap<ValueId, Value>,
+) {
+    for (input, _) in g.state() {
+        if g.state_role(input) != Some(StateRole::BlockTable) {
+            continue;
+        }
+        let name = g.meta(input).name().expect("a named state").into_owned();
+        let table = inputs
+            .get(&input)
+            .and_then(Value::as_host)
+            .expect("the feed binds the table");
+        let blocks = table.shape()[1];
+        for (row, words) in table
+            .as_i32()
+            .expect("I32 table")
+            .chunks(blocks)
+            .enumerate()
+        {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let view = HostView::new(DType::I32, blocks, &bytes).unwrap();
+            exec.write_state_range(exe, &name, row, 0, view)
+                .expect("the table writes");
+        }
+    }
+}
+
 /// The executor-contract replacement for the deleted `GpuExecutor::run`/`run_resident`/`run_resident_kv` on a
 /// one-shot graph (`Value`-typed bind): `add_entry`/`step` through `Engine<WgpuDevice>`, torn back
 /// down afterward. A graph with state zero-seeds it automatically on first use (Card 546a).
@@ -165,6 +200,7 @@ fn run_once_contract_v(
     let class = program.numerics_class();
     let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
+    write_block_tables(exec, exe, g, inputs);
     let step_in = step_inputs(&slot_binds);
     let bytes = exec
         .step(exe, entry, &step_in, &mut NoSync)
@@ -239,7 +275,7 @@ fn tiny() -> Dense {
         .dims(16, 32, 2)
         .heads(4, 2)
         .head_dim(4)
-        .max_positions(16)
+        .max_positions(64)
 }
 
 /// `dense`'s step graph at `shape`, as an ordinary graph.
@@ -255,12 +291,12 @@ fn trace(dense: &Dense, shape: StepShape) -> Graph {
 }
 
 /// One step's slot values: the new tokens and their absolute positions (`[rows, tokens]`, row major)
-/// and, under a paged layout, the two slot maps.
+/// and, under a paged layout, the block table the host holds and the forward write map.
 #[derive(Clone, Default)]
 struct Feed {
     tokens: Vec<i32>,
     pos: Vec<i32>,
-    read: Vec<i32>,
+    table: Vec<i32>,
     write: Vec<i32>,
 }
 
@@ -273,10 +309,10 @@ impl Feed {
         }
     }
 
-    /// The paged slot maps: `read` is `[rows, capacity]`, `write` is `[rows * tokens]` (one pool slot per
-    /// new token, -1 for padding).
-    fn paged(mut self, read: Vec<i32>, write: Vec<i32>) -> Self {
-        (self.read, self.write) = (read, write);
+    /// The paged inputs: `table` is the `[rows, capacity / KV_BLOCK]` block table (row `r` continues
+    /// sequence `r`), `write` is `[rows * tokens]` (one pool slot per new token, -1 for padding).
+    fn paged(mut self, table: Vec<i32>, write: Vec<i32>) -> Self {
+        (self.table, self.write) = (table, write);
         self
     }
 }
@@ -292,10 +328,10 @@ fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<ValueId, Value> {
         let t = match meta.storage {
             Storage::Slot(Slot::Token) => HostTensor::i32(shape, feed.tokens.clone()),
             Storage::Slot(Slot::Pos) => HostTensor::i32(shape, feed.pos.clone()),
-            Storage::Slot(Slot::SlotMap) => match meta.name().as_deref() {
-                Some("slotmap.read") => HostTensor::i32(shape, feed.read.clone()),
-                other => panic!("unexpected slot map {other:?}"),
-            },
+            // The paged step's sequences: row `r` continues sequence `r`.
+            Storage::Slot(Slot::Activation) if meta.aval.dtype == DType::I32 => {
+                HostTensor::i32(shape.clone(), (0..shape[0] as i32).collect())
+            }
             Storage::Slot(Slot::WriteMap) => match meta.name().as_deref() {
                 Some("writemap.write") => HostTensor::i32(shape, feed.write.clone()),
                 other => panic!("unexpected write map {other:?}"),
@@ -306,6 +342,10 @@ fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<ValueId, Value> {
                 weight(&meta.name().expect("a named const"), &shape)
             }
             Storage::Computed(c) => c.tensor(),
+            // The host's block table is bound whatever the state: the device is written it, the oracle reads it.
+            Storage::State if g.state_role(id) == Some(StateRole::BlockTable) => {
+                HostTensor::i32(shape, feed.table.clone())
+            }
             Storage::State if seed_state => HostTensor::zeros_of(meta.aval.dtype, shape),
             Storage::State => continue,
             Storage::Device => unreachable!(),
@@ -324,6 +364,10 @@ fn cpu_step(
 ) -> (HostTensor, Vec<HostTensor>) {
     let mut cpu_inputs = inputs.clone();
     for (ci, (si, _)) in g.state().enumerate() {
+        // The host's block table is bound by the feed, not carried.
+        if g.state_role(si) == Some(StateRole::BlockTable) {
+            continue;
+        }
         let carried = state
             .get(ci)
             .cloned()
@@ -355,7 +399,7 @@ fn assert_replay_matches_cpu(g: &Graph, feeds: &[Feed], label: &str) {
     let program = staged(&bound, target);
     let class = program.numerics_class();
     let mut cpu_state: Vec<HostTensor> = Vec::new();
-    let mut loaded: Option<(poot_executor::ExecutableId, poot_executor::EntryId)> = None;
+    let mut loaded: Option<(ExecutableId, EntryId)> = None;
     for (i, feed) in feeds.iter().enumerate() {
         let inputs = bind(g, feed, false);
         let (cpu_logits, next) = cpu_step(g, &inputs, &cpu_state);
@@ -367,6 +411,7 @@ fn assert_replay_matches_cpu(g: &Graph, feeds: &[Feed], label: &str) {
                 .unwrap();
             (exe, exec.add_entry(exe, &program).unwrap())
         });
+        write_block_tables(&mut *exec, exe, g, &inputs);
         let gpu_logits = f32_bytes(
             &exec
                 .step(exe, entry, &step_inputs(&slot_binds), &mut NoSync)
@@ -490,27 +535,27 @@ fn prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu() {
     );
 }
 
-/// A prefill of `n` tokens over a paged pool whose logical position `p < n` sits at pool slot
-/// `slot_map[p]` writes the same K/V as the contiguous prefill, and gives the same logits. Compares the
-/// filled caches, not just the logits (which use the fresh k/v directly and match regardless of the
-/// write): on the CPU oracle, then on the device against the oracle's pool and the contiguous run.
-fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool: usize) {
+/// A prefill of `n` tokens over a paged pool whose logical block `i` sits at pool block `blocks[i]` writes the
+/// same K/V as the contiguous prefill, and gives the same logits. Compares the filled caches, not just the
+/// logits (which use the fresh k/v directly and match regardless of the write): on the CPU oracle, then on the
+/// device against the oracle's pool and the contiguous run.
+fn assert_paged_prefill_matches_contiguous(blocks: &[usize], n: usize, pool_blocks: usize) {
     let _gpu_guard = gpu_lock();
+    let block = KV_BLOCK.get();
+    let (cap, pool) = (blocks.len() * block, pool_blocks * block);
+    let slot_of = |p: usize| blocks[p / block] * block + p % block;
     let dense = tiny();
-    let n = slot_map.len();
     let (hkv, d) = (dense.kv_heads, dense.head_dim.unwrap());
     let g_cont = trace(&dense, step(1, n, cap, LogitRows::Last));
     let g_paged = trace(&dense, paged_step(1, n, cap, pool, LogitRows::Last));
     let tokens: Vec<i32> = (0..n).map(|j| (j % dense.vocab) as i32).collect();
     let pos: Vec<i32> = (0..n as i32).collect();
-    // position p -> slot_map[p]; positions past the prompt read slot 0 (they are masked).
-    let read: Vec<i32> = (0..cap)
-        .map(|p| slot_map.get(p).map_or(0, |&s| s as i32))
-        .collect();
+    let table: Vec<i32> = blocks.iter().map(|&b| b as i32).collect();
     // token p of the prompt writes the slot of position p.
-    let write: Vec<i32> = slot_map.iter().map(|&s| s as i32).collect();
+    let write: Vec<i32> = (0..n).map(|p| slot_of(p) as i32).collect();
+    let written: std::collections::HashSet<usize> = (0..n).map(slot_of).collect();
     let feed_c = Feed::new(tokens.clone(), pos.clone());
-    let feed_p = Feed::new(tokens, pos).paged(read, write);
+    let feed_p = Feed::new(tokens, pos).paged(table, write);
 
     let env = |g: &Graph, feed: &Feed| -> ValueTable<Option<HostTensor>> {
         eval(
@@ -526,12 +571,19 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
         .collect()
     };
     let (env_c, env_p) = (env(&g_cont, &feed_c), env(&g_paged, &feed_p));
-    assert_eq!(g_cont.state().count(), g_paged.state().count());
-    // each layer: contiguous [1,Hkv,cap,D] position p vs the pool [pool,Hkv,D] slot slot_map[p].
-    for ((_, so_c), (_, so_p)) in g_cont.state().zip(g_paged.state()) {
+    // The paged graph also carries the host's block table.
+    let pools = |g: &Graph| -> Vec<(ValueId, ValueId)> {
+        g.state()
+            .filter(|&(input, _)| g.state_role(input) != Some(StateRole::BlockTable))
+            .collect()
+    };
+    assert_eq!(g_cont.state().count(), pools(&g_paged).len());
+    // each layer: contiguous [1,Hkv,cap,D] position p vs the pool [pool,Hkv,D] slot of position p.
+    for ((_, so_c), (_, so_p)) in g_cont.state().zip(pools(&g_paged)) {
         let cc = env_c[so_c].as_ref().unwrap().as_f32().unwrap();
         let cp = env_p[so_p].as_ref().unwrap().as_f32().unwrap();
-        for (p, &slot) in slot_map.iter().enumerate() {
+        for p in 0..n {
+            let slot = slot_of(p);
             for hh in 0..hkv {
                 for dd in 0..d {
                     let cont_v = cc[(hh * cap + p) * d + dd];
@@ -545,12 +597,12 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
         }
     }
     // unused pool slots stay zero (passed through from the zero-seeded base).
-    let pool0 = env_p[g_paged.state().next().unwrap().1]
+    let pool0 = env_p[pools(&g_paged)[0].1]
         .as_ref()
         .unwrap()
         .as_f32()
         .unwrap();
-    for slot in (0..pool).filter(|s| !slot_map.contains(s)) {
+    for slot in (0..pool).filter(|s| !written.contains(s)) {
         for x in &pool0[slot * hkv * d..(slot + 1) * hkv * d] {
             assert_eq!(*x, 0.0, "unused slot {slot} must stay zero");
         }
@@ -581,6 +633,7 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
     let program = staged(&bound, target);
     let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
+    write_block_tables(&mut *exec, exe, &g_paged, &inputs);
     let paged = f32_bytes(
         &exec
             .step(exe, entry, &step_inputs(&slot_binds), &mut NoSync)
@@ -593,7 +646,7 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
         d < 1e-3,
         "GPU paged prefill logits diverge from contiguous: {d}"
     );
-    for (i, (si, so)) in g_paged.state().enumerate() {
+    for (i, (si, so)) in pools(&g_paged).into_iter().enumerate() {
         let cpu = env_p[so].as_ref().unwrap();
         let name = g_paged.meta(si).name().expect("named state").into_owned();
         let probe = state_probe_graph(&name, g_paged.aval(si).clone());
@@ -618,17 +671,17 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
 
 #[test]
 fn prefill_kv_paged_matches_contiguous() {
-    // card 059: a paged prefill with an identity map must fill the KV pool exactly as the contiguous
-    // prefill fills its cache.
-    assert_paged_prefill_matches_contiguous(&[0, 1, 2, 3, 4], 8, 8);
+    // card 059: a paged prefill with an identity table must fill the KV pool exactly as the contiguous
+    // prefill fills its cache; 20 tokens cross the first block's boundary.
+    assert_paged_prefill_matches_contiguous(&[0, 1], 20, 2);
 }
 
 #[test]
 fn prefill_kv_shared_pool_matches_contiguous() {
-    // card 059: a paged prefill writes the N positions into the [pool,Hkv,D] cache at global slots
-    // given by a permutation slot map, passing unused slots through. Each position p's KV at
-    // slot_map[p] must equal the contiguous prefill's position-p KV.
-    assert_paged_prefill_matches_contiguous(&[2, 0, 5, 7, 3], 8, 8);
+    // card 059: a paged prefill writes the N positions into the [pool,Hkv,D] cache at the slots of a
+    // permuted block table, passing unused blocks through. Each position p's KV at its slot must equal
+    // the contiguous prefill's position-p KV.
+    assert_paged_prefill_matches_contiguous(&[2, 0, 3], 40, 5);
 }
 
 #[test]
@@ -738,41 +791,43 @@ fn fused_decode_matches_unfused_on_gpu() {
 // `GpuExecutor` is gone.
 
 /// Paged decode graph (spec 045) runs on the wgpu executor and matches the CPU reference with a non-identity
-/// (reverse) slot map. The K/V gather is composed from on-device primitives (transpose + axis-0 gather +
-/// transpose), so there is no host fallback.
+/// block table. The K/V read is the attention kernel's own indirection through the table, so there is no host
+/// fallback.
 #[test]
 fn paged_decode_kv_gpu_matches_cpu() {
-    let (cap, tokens) = (8usize, [5, 9, 2, 14, 7]);
-    // non-identity layout: logical t -> physical slot cap-1-t. The graph writes logical pos `p` at slot_map[p] and
-    // reads by gathering slot_map[t], so it must reconstruct logical order regardless.
-    let read: Vec<i32> = (0..cap).map(|t| (cap - 1 - t) as i32).collect();
-    let g = trace(&tiny(), paged_step(1, 1, cap, cap, LogitRows::Last));
+    let (cap, tokens) = (KV_BLOCK.get(), [5, 9, 2, 14, 7]);
+    // non-identity layout: the sequence's one block is the pool's second. The graph writes logical pos `p` at
+    // slot `cap + p` and reads through the table, so it must reconstruct logical order regardless.
+    let g = trace(&tiny(), paged_step(1, 1, cap, 2 * cap, LogitRows::Last));
     let feeds: Vec<Feed> = tokens
         .iter()
         .enumerate()
         .map(|(pos, &token)| {
-            let write = vec![(cap - 1 - pos) as i32];
-            Feed::new(vec![token], vec![pos as i32]).paged(read.clone(), write)
+            let write = vec![(cap + pos) as i32];
+            Feed::new(vec![token], vec![pos as i32]).paged(vec![1], write)
         })
         .collect();
     assert_replay_matches_cpu(&g, &feeds, "paged kv decode GPU");
 }
 
-/// `batch` rows of a paged decode, each with its own pool region and a per-row non-identity (reverse)
-/// slot map, advancing one token per step over device-resident KV: the per-row scatter/gather lowers
-/// on-device.
+/// `batch` rows of a paged decode, each with its own pool region and a per-row non-identity (reversed) block
+/// table, advancing one token per step over device-resident KV: the per-row scatter and the table read lower
+/// on-device. Twenty steps cross each row's first block boundary.
 #[test]
 fn batched_paged_decode_gpu_matches_cpu() {
-    let (batch, cap, n_steps) = (2usize, 8usize, 4usize);
+    let (batch, n_steps) = (2usize, 20usize);
+    let block = KV_BLOCK.get();
+    let (blocks, cap) = (2usize, 2 * block);
     let vocab = tiny().vocab;
     let g = trace(
         &tiny(),
         paged_step(batch, 1, cap, batch * cap, LogitRows::Last),
     );
-    // row r owns slots [r*cap, r*cap+cap), reversed.
-    let slot = |r: usize, t: usize| (r * cap + (cap - 1 - t)) as i32;
-    let read: Vec<i32> = (0..batch)
-        .flat_map(|r| (0..cap).map(move |t| slot(r, t)))
+    // row r owns blocks [r*blocks, r*blocks+blocks), reversed.
+    let block_of = |r: usize, i: usize| r * blocks + (blocks - 1 - i);
+    let slot = |r: usize, t: usize| (block_of(r, t / block) * block + t % block) as i32;
+    let table: Vec<i32> = (0..batch)
+        .flat_map(|r| (0..blocks).map(move |i| block_of(r, i) as i32))
         .collect();
     let feeds: Vec<Feed> = (0..n_steps)
         .map(|s| {
@@ -780,42 +835,40 @@ fn batched_paged_decode_gpu_matches_cpu() {
                 .map(|r| (((s * batch + r) * 5 + 2) % vocab) as i32)
                 .collect();
             let write: Vec<i32> = (0..batch).map(|r| slot(r, s)).collect();
-            Feed::new(tokens, vec![s as i32; batch]).paged(read.clone(), write)
+            Feed::new(tokens, vec![s as i32; batch]).paged(table.clone(), write)
         })
         .collect();
     assert_replay_matches_cpu(&g, &feeds, "batched paged decode GPU");
 }
 
-/// Shared-pool batched decode (card 046b): all rows share one [P,Hkv,D] pool, the slot map holds global slots.
-/// Runs on the wgpu executor and matches CPU. B=2 rows interleaved in a pool of `B*n_steps` slots (< B*cap).
+/// Shared-pool batched decode (card 046b): all rows share one [P,Hkv,D] pool, the block tables hold global
+/// blocks. Runs on the wgpu executor and matches CPU. B=2 rows interleaved in a pool of `1 + B * 2` blocks
+/// (< B * 3 blocks of capacity); twenty steps fill two of each row's three blocks.
 #[test]
 fn batched_shared_pool_decode_gpu_matches_cpu() {
-    let (batch, cap, n_steps) = (2usize, 8usize, 4usize);
-    let pool_slots = batch * n_steps; // 8 < B*cap = 16
+    let (batch, n_steps, live) = (2usize, 20usize, 2usize);
+    let block = KV_BLOCK.get();
+    let cap = 3 * block;
+    let pool_slots = (1 + batch * live) * block; // 5 blocks < B * 3 = 6
     let vocab = tiny().vocab;
     let g = trace(
         &tiny(),
         paged_step(batch, 1, cap, pool_slots, LogitRows::Last),
     );
-    // global interleaved slot map [B, cap]: (row r, pos t) -> t*B + r for used positions, else slot 0.
-    let read: Vec<i32> = (0..batch)
-        .flat_map(|r| {
-            (0..cap).map(move |t| {
-                if t < n_steps {
-                    (t * batch + r) as i32
-                } else {
-                    0
-                }
-            })
-        })
+    // global interleaved table [B, 3]: (row r, block i) -> 1 + i*B + r for the live blocks, else block 0.
+    let block_of = |r: usize, i: usize| if i < live { 1 + i * batch + r } else { 0 };
+    let table: Vec<i32> = (0..batch)
+        .flat_map(|r| (0..cap / block).map(move |i| block_of(r, i) as i32))
         .collect();
     let feeds: Vec<Feed> = (0..n_steps)
         .map(|s| {
             let tokens = (0..batch)
                 .map(|r| (((s * batch + r) * 5 + 2) % vocab) as i32)
                 .collect();
-            let write: Vec<i32> = (0..batch).map(|r| (s * batch + r) as i32).collect();
-            Feed::new(tokens, vec![s as i32; batch]).paged(read.clone(), write)
+            let write: Vec<i32> = (0..batch)
+                .map(|r| (block_of(r, s / block) * block + s % block) as i32)
+                .collect();
+            Feed::new(tokens, vec![s as i32; batch]).paged(table.clone(), write)
         })
         .collect();
     assert_replay_matches_cpu(&g, &feeds, "batched shared-pool decode GPU");
@@ -986,7 +1039,7 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
 /// executables (so each starts from the same zero state) are both seeded identically by prefilling the
 /// first `s` positions, then diverge: one continues as a second chunk-prefill replay of `[s, s+l)`, the
 /// other steps a paged decode entry `l` times over the same range; both read the pool through the
-/// same non-contiguous `global_slots` map, so this also proves the chunk's write/read addressing
+/// same non-contiguous block table, so this also proves the chunk's write/read addressing
 /// matches decode's, not just its mask.
 #[test]
 fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
@@ -1000,19 +1053,21 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
     let dense = tiny().dims(16, 24, 2);
     let s = 3usize; // nonzero chunk start
     let l = 3usize; // chunk width (== s, so the prefill entry's shape is reused for both halves)
-    let cap = s + l;
-    let pool_slots = cap + 4;
-    let global_slots: Vec<usize> = (0..cap).map(|i| cap + 3 - i).collect(); // non-contiguous
+    let cap = KV_BLOCK.get(); // one block holds the s + l positions
+    let pool_slots = 3 * cap;
+    let global_blocks = [2usize]; // non-contiguous: the pool's third block
     let tokens: Vec<i32> = vec![5, 11, 3, 20, 8, 1];
-    let read: Vec<i32> = global_slots.iter().map(|&p| p as i32).collect();
+    let table: Vec<i32> = global_blocks.iter().map(|&b| b as i32).collect();
     // the chunk of `len` tokens from position `start` writes its token `i` at the slot of `start + i`.
     let feed = |start: usize, len: usize| -> Feed {
-        let write: Vec<i32> = (0..len).map(|i| global_slots[start + i] as i32).collect();
+        let write: Vec<i32> = (0..len)
+            .map(|i| (global_blocks[0] * cap + start + i) as i32)
+            .collect();
         Feed::new(
             tokens[start..start + len].to_vec(),
             (start as i32..(start + len) as i32).collect(),
         )
-        .paged(read.clone(), write)
+        .paged(table.clone(), write)
     };
 
     let g_prefill = trace(&dense, paged_step(1, l, cap, pool_slots, LogitRows::Last));
@@ -1058,6 +1113,12 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
         .load_weights(Arc::new(merged_store()), Arc::clone(&weight_map))
         .unwrap();
     let entry_a = exec.add_entry(exe_a, &staged_prefill).unwrap();
+    write_block_tables(
+        &mut *exec,
+        exe_a,
+        &g_prefill,
+        &bind(&g_prefill, &feed(0, s), false),
+    );
     exec.step(
         exe_a,
         entry_a,
@@ -1088,6 +1149,12 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
         .load_weights(Arc::new(merged_store()), Arc::clone(&weight_map))
         .unwrap();
     let entry_b_prefill = exec.add_entry(exe_b, &staged_prefill).unwrap();
+    write_block_tables(
+        &mut *exec,
+        exe_b,
+        &g_prefill,
+        &bind(&g_prefill, &feed(0, s), false),
+    );
     exec.step(
         exe_b,
         entry_b_prefill,

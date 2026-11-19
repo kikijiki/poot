@@ -8,7 +8,7 @@ use crate::bindings::{
     HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT,
     HSA_AMD_MEMORY_POOL_LOCATION_CPU, HSA_AMD_MEMORY_POOL_LOCATION_GPU, hsa_queue_t,
 };
-use crate::buffer::{Pool, RocmAlloc, checked_copy, checked_layout};
+use crate::buffer::{Pool, RocmAlloc};
 use crate::context::{
     DevicePoison, Held, StagingBuffer, TimeoutLeaks, UploadStrategy, memory_domain_for_pool,
     ticks_to_duration,
@@ -22,6 +22,7 @@ use crate::queue::{
     destroy_queue_reference, queue_request, validate_created_queue, validate_queue_plan_provenance,
 };
 use poot_runtime_common::{BufferRole, MemoryCounters, UPLOAD_CHUNK_BYTES, fnv1a};
+use poot_runtime_common::{checked_copy, checked_layout};
 use poot_target::MemoryDomain;
 use poot_target::{BufferStorage, ElementKind};
 use std::cell::Cell;
@@ -503,7 +504,7 @@ fn ownership_resources_are_send() {
 
 fn test_buffer(elements: usize, storage: BufferStorage) -> RocmBuffer {
     let byte_capacity =
-        checked_layout("test_buffer", elements, storage).expect("valid test buffer");
+        checked_layout::<RocmError>("test_buffer", elements, storage).expect("valid test buffer");
     let (owner, _) = recording_owner(0);
     let memory = MemoryCounters::new();
     RocmBuffer {
@@ -530,18 +531,9 @@ fn count_copy(
     whole: bool,
     calls: &Cell<usize>,
 ) -> Result<(), RocmError> {
-    checked_copy(
-        buffer,
-        "test_copy",
-        expected,
-        offset,
-        elements,
-        whole,
-        |_| {
-            calls.set(calls.get() + 1);
-            Ok(())
-        },
-    )
+    checked_copy(buffer, "test_copy", expected, offset, elements, whole)?;
+    calls.set(calls.get() + 1);
+    Ok(())
 }
 
 #[test]
@@ -666,7 +658,7 @@ fn immutable_metadata_and_valid_copy_share_one_allocation_contract() {
 #[test]
 fn allocation_arithmetic_is_checked_before_native_allocation() {
     assert!(matches!(
-        checked_layout("allocate_f32", usize::MAX, BufferStorage::f32()),
+        checked_layout::<RocmError>("allocate_f32", usize::MAX, BufferStorage::f32()),
         Err(RocmError::ByteSizeOverflow { .. })
     ));
 }
@@ -703,7 +695,8 @@ fn a_buffer_past_u32_elements_allocates_and_its_tail_is_writable() {
 fn allocation_layout_accepts_an_element_count_past_u32() {
     let elements = u32::MAX as usize + 1;
     assert_eq!(
-        checked_layout("allocate_i32", elements, BufferStorage::i32()).expect("a 64-bit layout"),
+        checked_layout::<RocmError>("allocate_i32", elements, BufferStorage::i32())
+            .expect("a 64-bit layout"),
         elements * 4
     );
 }

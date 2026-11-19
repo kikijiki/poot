@@ -5,9 +5,9 @@
       "file": "capture-replay.png",
       "width": 2400,
       "height": 1270,
-      "sha256": "e84cc17743b93e35084278ed79fe3f3218f6e174f66b3a147b6d38ce7c5c85ee",
+      "sha256": "17391a2e4b65fa35bde1c4c1b8952e4611146f508e76fe34432a6d2789013280",
       "source": "website/diagrams/capture-replay.svg",
-      "sourceSha256": "8aa26dc0876c92dfa94e9c6aedce1a04cd255f80a472fed8fded1067341f4fb4",
+      "sourceSha256": "074a698498d4c14db434816b57e0b7084448f401eed48b43f22f409156ca0ae4",
       "alt": "Capture the decode step once and replay it every token, one host call per token"
     },
     {
@@ -25,9 +25,9 @@
       "file": "model-tracing.png",
       "width": 2400,
       "height": 1470,
-      "sha256": "a340e4dd62102639ddb82cd9f85cf9f0e85532ae200da1c74bc38e1004c16b1b",
+      "sha256": "8a8cb5c9d5ba3779ef117a03a3af58774edfade59e7f2fe7da333971bb98735b",
       "source": "website/diagrams/model-tracing.svg",
-      "sourceSha256": "1ea5cbec3f5e7500818b90abf130295ab9c2dc79cdf78fc3d4c48ba842a8ca40",
+      "sourceSha256": "6dc348125212dbf8f6d8fefc9bbc2637853402319abbd4d3c2ecee793c8f0fcb",
       "alt": "A model is a Rust function: the builder records every call into a flat graph IR"
     },
     {

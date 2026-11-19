@@ -184,7 +184,10 @@ pub fn packed_gemv_body_cost(
 /// [`PackedRows::Indexed`] table is a Gemv (decode, per-row ids) or the register-tiled schedule over the rows
 /// grouped by expert (prefill), both with an epilogue. `meta` is the request's metadata; a tiled body reads its extents from it
 /// ([`TiledExtents::of_meta`]).
-#[expect(clippy::too_many_arguments)] // the format, schedule, rows and epilogue of one body, and how it rounds
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the format, schedule, rows and epilogue of one body, and how it rounds"
+)]
 pub(crate) fn packed_contraction(
     name: &str,
     format: WeightFormat,

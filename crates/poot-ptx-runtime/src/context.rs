@@ -10,7 +10,7 @@ use poot_codegen::{CompiledKernel, KernelCode};
 use poot_runtime_common::{BufferRole, fnv1a};
 use poot_target::{ElementKind, MemoryDomain};
 
-use super::buffer::{PtxBuffer, allocate_owned, checked_copy};
+use super::buffer::{PtxBuffer, allocate_owned};
 use super::driver::{CudaDriver, DriverCleanup};
 use super::error::PtxError;
 use super::graph::{
@@ -19,6 +19,7 @@ use super::graph::{
 };
 use super::owner::{NativeCounters, OwnerCounters, PtxOwner, construct_owner};
 use super::upload::UploadRing;
+use poot_runtime_common::{checked_byte_range, checked_copy};
 
 /// A CUDA context + stream, reusable across dispatches. Caches loaded modules/functions by kernel text.
 pub struct PtxContext {
@@ -462,23 +463,22 @@ impl PtxContext {
         whole: bool,
     ) -> Result<(), PtxError> {
         self.bind()?;
-        checked_copy(buf, op, storage, elem_offset, data.len(), whole, |range| {
-            assert_eq!(
-                std::mem::size_of_val(data),
-                range.byte_len,
-                "{op}: element width differs"
-            );
-            let dst = buf.ptr() + range.byte_offset as sys::CUdeviceptr;
-            // SAFETY: `checked_copy` proved `[byte_offset, byte_offset + byte_len)` lies inside `buf`'s live
-            // allocation, and `byte_len` is the size of `data` (checked above). The copy runs on this context's
-            // stream; the driver stages pageable `data` before returning, and the stream is synchronized below
-            // before `data` can be released. No capture is open (every caller refuses first), so the copy is
-            // not recorded into a graph.
-            unsafe { result::memcpy_htod_async(dst, data, self.owner.stream) }
-                .map_err(|error| self.owner.observe(error))?;
-            self.synchronize()?;
-            Ok(())
-        })
+        let range = checked_copy(buf, op, storage, elem_offset, data.len(), whole)?;
+        assert_eq!(
+            std::mem::size_of_val(data),
+            range.byte_len,
+            "{op}: element width differs"
+        );
+        let dst = buf.ptr() + range.byte_offset as sys::CUdeviceptr;
+        // SAFETY: `checked_copy` proved `[byte_offset, byte_offset + byte_len)` lies inside `buf`'s live
+        // allocation, and `byte_len` is the size of `data` (checked above). The copy runs on this context's
+        // stream; the driver stages pageable `data` before returning, and the stream is synchronized below
+        // before `data` can be released. No capture is open (every caller refuses first), so the copy is
+        // not recorded into a graph.
+        unsafe { result::memcpy_htod_async(dst, data, self.owner.stream) }
+            .map_err(|error| self.owner.observe(error))?;
+        self.synchronize()?;
+        Ok(())
     }
 
     /// Synchronize the stream, then copy all of `b` (stored as `element`) to the host.
@@ -489,20 +489,19 @@ impl PtxContext {
         storage: BufferStorage,
     ) -> Result<Vec<T>, PtxError> {
         let elements = b.elem_count();
-        checked_copy(b, op, storage, 0, elements, true, |range| {
-            self.synchronize()?;
-            let mut out = vec![T::default(); elements];
-            assert_eq!(
-                std::mem::size_of_val(&out[..]),
-                range.byte_len,
-                "{op}: element width differs"
-            );
-            // SAFETY: `b` is a live allocation holding `byte_len` bytes (checked by `checked_copy`), `out` has
-            // exactly that many bytes (checked above), and the stream has finished every write to `b`.
-            unsafe { result::memcpy_dtoh_sync(&mut out[..], b.ptr()) }
-                .map_err(|error| self.owner.observe(error))?;
-            Ok(out)
-        })
+        let range = checked_copy(b, op, storage, 0, elements, true)?;
+        self.synchronize()?;
+        let mut out = vec![T::default(); elements];
+        assert_eq!(
+            std::mem::size_of_val(&out[..]),
+            range.byte_len,
+            "{op}: element width differs"
+        );
+        // SAFETY: `b` is a live allocation holding `byte_len` bytes (checked by `checked_copy`), `out` has
+        // exactly that many bytes (checked above), and the stream has finished every write to `b`.
+        unsafe { result::memcpy_dtoh_sync(&mut out[..], b.ptr()) }
+            .map_err(|error| self.owner.observe(error))?;
+        Ok(out)
     }
 
     /// Begin capturing the work enqueued on this context's stream into a CUDA graph (thread-local mode).
@@ -921,7 +920,7 @@ impl PtxContext {
     ) -> Result<(), PtxError> {
         self.refuse_during_capture("write_with")?;
         self.bind()?;
-        let range = crate::buffer::checked_byte_range("write_with", buf, offset, len)?;
+        let range = checked_byte_range("write_with", buf, offset, len)?;
         let dst = buf.ptr() + range.byte_offset as sys::CUdeviceptr;
         // SAFETY: `range` proved `offset..offset + len` lies inside `buf`'s live allocation and `stream`
         // is this context's live stream. No capture is open (refused above).
@@ -938,7 +937,7 @@ impl PtxContext {
     /// `poot_wgpu_runtime::Context::read_bytes`). Syncs the stream first so pending writes have completed.
     pub fn read_bytes(&self, buf: &PtxBuffer, out: &mut [u8]) -> Result<(), PtxError> {
         self.refuse_during_capture("read_bytes")?;
-        let _range = crate::buffer::checked_byte_range("read_bytes", buf, 0, out.len())?;
+        let _range = checked_byte_range("read_bytes", buf, 0, out.len())?;
         self.synchronize()?;
         // SAFETY: `_range` proved `out.len()` lies inside `buf`'s live allocation, and the stream has
         // finished every write to it.
@@ -972,14 +971,12 @@ impl PtxContext {
     /// index-aligned with `ins` plus `out` last: the kernel ABI's `(ptr, len)` pairs carry these,
     /// never `PtxBuffer::elem_count()` - a caller with no plan of its own (a test, a probe) passes
     /// each buffer's own `elem_count()` explicitly instead.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the dispatch contract's own tuple: kernel, block and thread shape, each input with its planned length, and the output with its length (Card 547b: lengths are the plan's, never the buffer's capacity)"
+    )]
     pub fn dispatch_dev(
         &self,
-        // Card 626: unused now that the legacy label-keyed Profiler is gone (its only reader); this
-        // crate's `function` cache keys on the PTX text hash + entry name instead. Kept for call-site
-        // symmetry with `poot_wgpu_runtime::Context::dispatch_dev`, which still uses its own `label` as a
-        // pipeline-cache key.
-        _label: &str,
         kernel: &CompiledKernel,
         block: [u32; 3],
         threads: [u32; 3],

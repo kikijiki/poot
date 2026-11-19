@@ -231,8 +231,9 @@ pub fn read_gguf(index: &GgufIndex, names: &dyn TensorNameMap) -> Result<WeightS
 mod tests {
     use super::*;
     use poot_quant::format::Storage;
-    use poot_quant::scalar::{bf16_to_f32, f16_to_f32, f32_to_f16};
+    use poot_quant::scalar::f32_to_f16;
     use poot_quant::weights::WeightEntry;
+    use poot_tensor::float::{bf16_to_f32, f16_to_f32};
 
     // ggml tensor type ids the fixtures below write.
     const GGML_F32: u32 = 0;
@@ -261,45 +262,6 @@ mod tests {
             .decode_blocks(&raw[..need], &mut out)
             .map_err(|error| gerr(&error.to_string()))?;
         Ok(out)
-    }
-    fn dequant_q4_0(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q4_0, raw, numel)
-    }
-    fn dequant_q4_1(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q4_1, raw, numel)
-    }
-    fn dequant_q5_0(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q5_0, raw, numel)
-    }
-    fn dequant_q5_1(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q5_1, raw, numel)
-    }
-    fn dequant_q8_0(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q8_0, raw, numel)
-    }
-    fn dequant_q2_k(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q2_K, raw, numel)
-    }
-    fn dequant_q3_k(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q3_K, raw, numel)
-    }
-    fn dequant_q4_k(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q4_K, raw, numel)
-    }
-    fn dequant_q5_k(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q5_K, raw, numel)
-    }
-    fn dequant_q6_k(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Q6_K, raw, numel)
-    }
-    fn dequant_iq4_nl(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Iq4_Nl, raw, numel)
-    }
-    fn dequant_iq4_xs(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Iq4_Xs, raw, numel)
-    }
-    fn dequant_mxfp4(raw: &[u8], numel: usize) -> Result<Vec<f32>, LoadError> {
-        dequant(WeightFormat::Mxfp4, raw, numel)
     }
 
     /// Test-only now: production GGUF reads bound-check through `poot_quant`'s block decoder, not this
@@ -389,7 +351,7 @@ mod tests {
     fn q8_0_dequant_matches_block_encoding() {
         let vals: [f32; 32] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.1);
         let buf = q8_0_block(&vals);
-        let got = dequant_q8_0(&buf, 32).unwrap();
+        let got = dequant(WeightFormat::Q8_0, &buf, 32).unwrap();
         // Dequant recovers the values within the Q8_0 step (d ~= amax/127).
         for (g, w) in got.iter().zip(vals.iter()) {
             assert!((g - w).abs() <= 0.02, "{g} vs {w}");
@@ -461,7 +423,7 @@ mod tests {
         for b in blk.iter_mut().skip(16) {
             *b = 0x11; // qs: both nibbles = 1
         }
-        let out = dequant_q4_k(&blk, 256).unwrap();
+        let out = dequant(WeightFormat::Q4_K, &blk, 256).unwrap();
         assert_eq!(out.len(), 256);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 1.0).abs() < 1e-4, "q4_k[{i}] = {v}, want 1.0");
@@ -484,7 +446,7 @@ mod tests {
         for b in blk[48..176].iter_mut() {
             *b = 0x11; // qs: both nibbles = 1
         }
-        let out = dequant_q5_k(&blk, 256).unwrap();
+        let out = dequant(WeightFormat::Q5_K, &blk, 256).unwrap();
         assert_eq!(out.len(), 256);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 17.0).abs() < 1e-3, "q5_k[{i}] = {v}, want 17.0");
@@ -501,7 +463,7 @@ mod tests {
             blk[192 + i] = 0xFE; // scales[16] = -2 (i8)
         }
         blk[208..210].copy_from_slice(&F16_ONE); // d = 1
-        let out = dequant_q6_k(&blk, 256).unwrap();
+        let out = dequant(WeightFormat::Q6_K, &blk, 256).unwrap();
         assert_eq!(out.len(), 256);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 64.0).abs() < 1e-3, "q6_k[{i}] = {v}, want 64.0");
@@ -516,7 +478,7 @@ mod tests {
         for j in 0..16u8 {
             raw.push(j | (j << 4));
         }
-        let got = dequant_mxfp4(&raw, 32).unwrap();
+        let got = dequant(WeightFormat::Mxfp4, &raw, 32).unwrap();
         let e2m1 = [
             0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0,
             -6.0,
@@ -527,13 +489,16 @@ mod tests {
         }
         // The shared scale is a power of two: e = 129 -> X = 2^2 = 4, every value scaled by 4.
         raw[0] = 129;
-        let got4 = dequant_mxfp4(&raw, 32).unwrap();
+        let got4 = dequant(WeightFormat::Mxfp4, &raw, 32).unwrap();
         for j in 0..32 {
             assert_eq!(got4[j], got[j] * 4.0, "e=129 must scale element {j} by 2^2");
         }
         // An all-zero block (e = 0, the encoder's amax == 0 case) must dequantize to exact zeros.
         let zero = vec![0u8; 17];
-        assert_eq!(dequant_mxfp4(&zero, 32).unwrap(), vec![0.0f32; 32]);
+        assert_eq!(
+            dequant(WeightFormat::Mxfp4, &zero, 32).unwrap(),
+            vec![0.0f32; 32]
+        );
     }
 
     /// Cross-check poot's MXFP4 dequant against the OCP MX v1.0 spec in its own terms (shared
@@ -563,7 +528,7 @@ mod tests {
             for j in 0..16u8 {
                 raw.push(j | (j << 4)); // element j = code j, element j+16 = code j
             }
-            let got = dequant_mxfp4(&raw, 32).unwrap();
+            let got = dequant(WeightFormat::Mxfp4, &raw, 32).unwrap();
             for j in 0..16usize {
                 let want = ocp_value(j as u8, e);
                 assert_eq!(got[j], want, "e={e} code={j} (low nibble)");
@@ -580,7 +545,7 @@ mod tests {
         let mut raw = vec![0u8; 17];
         raw[0] = 127; // scale 2^0
         raw[1] = 0x51; // low nibble 1 -> element 0; high nibble 5 -> element 16
-        let got = dequant_mxfp4(&raw, 32).unwrap();
+        let got = dequant(WeightFormat::Mxfp4, &raw, 32).unwrap();
         assert_eq!(got[0], 0.5, "code 1 (E2M1 0.5) belongs at element 0");
         assert_eq!(got[16], 3.0, "code 5 (E2M1 3.0) belongs at element 16");
         for (j, &v) in got.iter().enumerate() {
@@ -603,7 +568,7 @@ mod tests {
             *b = 0xFF;
         }
         a[80..82].copy_from_slice(&F16_ONE); // d = 1; dmin stays 0
-        let out = dequant_q2_k(&a, 256).unwrap();
+        let out = dequant(WeightFormat::Q2_K, &a, 256).unwrap();
         assert_eq!(out.len(), 256);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 45.0).abs() < 1e-3, "q2_k.A[{i}] = {v}, want 45.0");
@@ -616,7 +581,7 @@ mod tests {
         }
         b[80..82].copy_from_slice(&F16_ONE); // d = 1
         b[82..84].copy_from_slice(&F16_ONE); // dmin = 1
-        let out = dequant_q2_k(&b, 256).unwrap();
+        let out = dequant(WeightFormat::Q2_K, &b, 256).unwrap();
         for (i, &v) in out.iter().enumerate() {
             assert!((v + 15.0).abs() < 1e-3, "q2_k.B[{i}] = {v}, want -15.0");
         }
@@ -634,7 +599,7 @@ mod tests {
             *b = 0xFF; // scales -> all 63
         }
         a[108..110].copy_from_slice(&F16_ONE); // d = 1
-        let out = dequant_q3_k(&a, 256).unwrap();
+        let out = dequant(WeightFormat::Q3_K, &a, 256).unwrap();
         assert_eq!(out.len(), 256);
         for (i, &v) in out.iter().enumerate() {
             assert!((v + 124.0).abs() < 1e-3, "q3_k.A[{i}] = {v}, want -124.0");
@@ -652,7 +617,7 @@ mod tests {
             *x = 0xFF; // scales -> all 63
         }
         b[108..110].copy_from_slice(&F16_ONE); // d = 1
-        let out = dequant_q3_k(&b, 256).unwrap();
+        let out = dequant(WeightFormat::Q3_K, &b, 256).unwrap();
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 93.0).abs() < 1e-3, "q3_k.B[{i}] = {v}, want 93.0");
         }
@@ -678,7 +643,7 @@ mod tests {
         for b in blk.iter_mut().skip(2) {
             *b = 0xFF; // both nibbles = 15
         }
-        let out = dequant_q4_0(&blk, 32).unwrap();
+        let out = dequant(WeightFormat::Q4_0, &blk, 32).unwrap();
         assert_eq!(out.len(), 32);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 7.0).abs() < 1e-4, "q4_0[{i}] = {v}, want 7.0");
@@ -692,7 +657,7 @@ mod tests {
         // case A: every nibble = 0 -> kvalues[0] = -127 for all 32.
         let mut a = vec![0u8; 18];
         a[0..2].copy_from_slice(&F16_ONE); // d = 1; qs all zero
-        let out = dequant_iq4_nl(&a, 32).unwrap();
+        let out = dequant(WeightFormat::Iq4_Nl, &a, 32).unwrap();
         assert_eq!(out.len(), 32);
         for (i, &v) in out.iter().enumerate() {
             assert!((v + 127.0).abs() < 1e-4, "iq4_nl.A[{i}] = {v}, want -127.0");
@@ -704,7 +669,7 @@ mod tests {
         for x in b.iter_mut().skip(2) {
             *x = 0x8F;
         }
-        let out = dequant_iq4_nl(&b, 32).unwrap();
+        let out = dequant(WeightFormat::Iq4_Nl, &b, 32).unwrap();
         for (i, &v) in out.iter().enumerate().take(16) {
             assert!(
                 (v - 113.0).abs() < 1e-4,
@@ -731,7 +696,7 @@ mod tests {
             b
         };
         // case A: all scales_l nibbles = 1 -> every sub-block ls = 1 | 32 = 33, dl = 1 -> all 256 = -127.
-        let out = dequant_iq4_xs(&mk([0x11; 4]), 256).unwrap();
+        let out = dequant(WeightFormat::Iq4_Xs, &mk([0x11; 4]), 256).unwrap();
         assert_eq!(out.len(), 256);
         for (i, &v) in out.iter().enumerate() {
             assert!((v + 127.0).abs() < 1e-4, "iq4_xs.A[{i}] = {v}, want -127.0");
@@ -739,7 +704,7 @@ mod tests {
         // case B: scales_l[0] = 0x21 -> sub-block 0 low nibble 1 (ls 33, dl 1), sub-block 1 low nibble 2
         // (ls 34, dl 2); the rest dl 1. So elems [0,32) = -127, [32,64) = -254, [64,256) = -127. This pins the
         // PER-SUB-BLOCK scale indexing (the low/high bit unpacking + which sub-block reads which bits).
-        let out = dequant_iq4_xs(&mk([0x21, 0x11, 0x11, 0x11]), 256).unwrap();
+        let out = dequant(WeightFormat::Iq4_Xs, &mk([0x21, 0x11, 0x11, 0x11]), 256).unwrap();
         for (i, &v) in out.iter().enumerate() {
             let want = if (32..64).contains(&i) {
                 -254.0
@@ -762,7 +727,7 @@ mod tests {
         for b in blk.iter_mut().skip(6) {
             *b = 0xFF; // both nibbles = 15
         }
-        let out = dequant_q5_0(&blk, 32).unwrap();
+        let out = dequant(WeightFormat::Q5_0, &blk, 32).unwrap();
         assert_eq!(out.len(), 32);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 15.0).abs() < 1e-4, "q5_0[{i}] = {v}, want 15.0");
@@ -781,7 +746,7 @@ mod tests {
         for b in blk.iter_mut().skip(4) {
             *b = 0x33; // both nibbles = 3
         }
-        let out = dequant_q4_1(&blk, 32).unwrap();
+        let out = dequant(WeightFormat::Q4_1, &blk, 32).unwrap();
         assert_eq!(out.len(), 32);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 8.0).abs() < 1e-3, "q4_1[{i}] = {v}, want 8.0");
@@ -800,7 +765,7 @@ mod tests {
         for b in blk.iter_mut().skip(8) {
             *b = 0x33; // both nibbles = 3
         }
-        let out = dequant_q5_1(&blk, 32).unwrap();
+        let out = dequant(WeightFormat::Q5_1, &blk, 32).unwrap();
         assert_eq!(out.len(), 32);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 24.0).abs() < 1e-3, "q5_1[{i}] = {v}, want 24.0");

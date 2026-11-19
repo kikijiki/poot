@@ -98,7 +98,10 @@ pub fn assert_batched_lora_matches_merged_weights(
     }
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a parity row's inputs: the executor, the target and LoRA target, tokens, adapter rows, scales and tolerance are the row's independent parameters"
+)]
 fn run_projection(
     exec: &mut dyn Executor,
     target: Target,

@@ -757,6 +757,13 @@ pub enum StateRole {
     /// back (a discarded draw makes the host reseed the row) nor a hand-off, and it leaves a graph's
     /// residency `KvOnly`.
     Sampler,
+    /// A paged layout's block table (POOT-1240): one row per sequence naming the pool block of each of its
+    /// logical blocks, `[seqs, blocks]` I32. The host writes only the entries that changed since it last wrote
+    /// the row and the device never writes it, so an entry past the committed length is stale and every reader
+    /// hides it by position; it is neither rolled back (the host rewrites a truncated tail) nor a hand-off,
+    /// and it leaves a graph's residency `KvOnly`. A host write is checked against the value's declared
+    /// range, which is what the attention kernel's unchecked pool read stands on.
+    BlockTable,
 }
 
 /// Which extent a state value's leading axis has in a step.
@@ -823,6 +830,12 @@ impl StateRole {
                 rollback: false,
                 handoff: false,
                 stale_hidden: false,
+            },
+            StateRole::BlockTable => StatePolicy {
+                rows: StateRows::PoolSeqs,
+                rollback: false,
+                handoff: false,
+                stale_hidden: true,
             },
         }
     }
@@ -2254,7 +2267,12 @@ impl Graph {
                 }
                 (
                     Storage::State,
-                    Some(StateRole::Recurrent | StateRole::Handoff | StateRole::Sampler),
+                    Some(
+                        StateRole::Recurrent
+                        | StateRole::Handoff
+                        | StateRole::Sampler
+                        | StateRole::BlockTable,
+                    ),
                 ) => {}
                 (_, Some(_)) => {
                     return Err(GraphValidationError::UnexpectedStateRole {

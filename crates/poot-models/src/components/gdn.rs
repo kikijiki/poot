@@ -16,10 +16,9 @@
 //! Qwen4Exp) and the output projection. The state is a
 //! `[head_dim, head_dim]` matrix per value head carried across steps, and the conv carries its input
 //! window ([`super::conv::causal_conv`]), so a chunk continues the previous one exactly and one token
-//! is a decode step. A single token runs the recurrence ([`ops::gated_delta_net_decode`]); more run
-//! the scan composite ([`ScanFamily::DeltaRule`], whose reference definition is the chunked form
-//! [`ops::gdn_prefill_chunked`], the UT-transform over `chunk` positions, the same recurrence solved in closed
-//! form).
+//! is a decode step. Every token count runs the one scan composite ([`ScanFamily::DeltaRule`], whose
+//! reference definition is the chunked form [`ops::gdn_prefill_chunked`], the UT-transform over `chunk`
+//! positions, the same recurrence solved in closed form); a single token is its length-1 case.
 //!
 //! A checkpoint spells the layer two ways. GGUF stores one projection per quantity and the decay
 //! `ssm_a` already negative, with the value heads reordered so that query and key heads tile
@@ -426,9 +425,9 @@ struct Recurrence {
 /// `conv_out` is `[rows, tokens, conv_channels]` (post-SiLU), `z` `[rows, tokens, value_dim]`,
 /// `beta` and `g` `[rows, tokens, value_heads]`, `norm_scale` the `[head_dim]` scale and `state`
 /// the carried `[rows, value_heads, head_dim, head_dim]` matrices. Returns the gated output
-/// `[rows, tokens, value_dim]` before the output projection and the next state. A single token runs
-/// the recurrence step; more run the chunked form with the `rows` folded into the head axis (heads
-/// of different rows share the weights but not the state).
+/// `[rows, tokens, value_dim]` before the output projection and the next state. Every token count
+/// runs the one scan, with the `rows` folded into the head axis (heads of different rows share the weights
+/// but not the state).
 fn gdn_scan(
     b: &Builder,
     inputs: ScanInputs,
@@ -472,45 +471,42 @@ fn gdn_scan(
     let g = heads_first(b, g, hv, 1)?;
     let beta = heads_first(b, beta, hv, 1)?;
 
-    let (o, next) = if t == 1 {
-        ops::gated_delta_net_decode(b, q, k, v, g, beta, state)?
-    } else {
-        // The chunk is a power of two (the triangular inverse doubles); a prompt shorter than it
-        // runs one chunk of the next power of two and the op zero-pads the tail.
-        let c = chunk.min(t.next_power_of_two());
-        // One row is already `[1, heads, ..]`: only several rows fold.
-        let fold = |y: Traced| {
-            if rows == 1 {
-                return Ok::<_, TraceError>(y);
-            }
-            let mut shape = b.aval(y)?.shape;
-            shape.splice(0..2, [1, rows * hv]);
-            Ok::<_, TraceError>(b.reshape(y, shape)?)
-        };
-        let ScanResult {
-            y: o, s_out: next, ..
-        } = b.scan(
-            ScanAttrs {
-                family: ScanFamily::DeltaRule,
-                chunk: c,
-            },
-            &[
-                fold(q)?,
-                fold(k)?,
-                fold(v)?,
-                fold(g)?,
-                fold(beta)?,
-                fold(state)?,
-            ],
-        )?;
+    // The chunk is a power of two (the triangular inverse doubles); a prompt shorter than it runs one chunk
+    // of the next power of two and the op zero-pads the tail. A single token is the length-1 scan: decode and
+    // prefill are one recurrence definition, one kernel.
+    let c = chunk.min(t.next_power_of_two());
+    // One row is already `[1, heads, ..]`: only several rows fold.
+    let fold = |y: Traced| {
         if rows == 1 {
-            (o, next)
-        } else {
-            (
-                b.reshape(o, vec![rows, hv, t, hd])?,
-                b.reshape(next, vec![rows, hv, hd, hd])?,
-            )
+            return Ok::<_, TraceError>(y);
         }
+        let mut shape = b.aval(y)?.shape;
+        shape.splice(0..2, [1, rows * hv]);
+        Ok::<_, TraceError>(b.reshape(y, shape)?)
+    };
+    let ScanResult {
+        y: o, s_out: next, ..
+    } = b.scan(
+        ScanAttrs {
+            family: ScanFamily::DeltaRule,
+            chunk: c,
+        },
+        &[
+            fold(q)?,
+            fold(k)?,
+            fold(v)?,
+            fold(g)?,
+            fold(beta)?,
+            fold(state)?,
+        ],
+    )?;
+    let (o, next) = if rows == 1 {
+        (o, next)
+    } else {
+        (
+            b.reshape(o, vec![rows, hv, t, hd])?,
+            b.reshape(next, vec![rows, hv, hd, hd])?,
+        )
     };
 
     let normed = ops::rmsnorm(b, o, norm_scale, eps)?;

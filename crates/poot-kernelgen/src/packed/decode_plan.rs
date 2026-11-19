@@ -380,7 +380,10 @@ impl DecodePlan {
     /// `field`'s raw bits for the `count` in-block indices `first + j` of the block at bit `block_bit`, cut from the
     /// `windows` [`Self::read_field_run`] loaded (none, for a field read element by element as
     /// [`Self::emit_field_bits`] does, which needs `block_bit`; `None` when no field of the run does).
-    #[expect(clippy::too_many_arguments)] // the source and the run's address, with the windows read for it
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the source and the run's address, with the windows read for it"
+    )]
     fn extract_field_run(
         &self,
         e: &mut Emit,

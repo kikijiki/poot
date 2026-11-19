@@ -51,7 +51,10 @@ pub fn matmul_batched_dt_grid(
 /// store: `C = epilogue(A@B)`. The epilogue's leaves are extra input buffers (a bias, a residual) between `b`
 /// and the output; its dtype is `dt`, and the head result rounds through `dt` before the first step reads it
 /// (see [`Epilogue`]).
-#[expect(clippy::too_many_arguments)] // the shapes, the epilogue, the fold and the rounding conversions of one body
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shapes, the epilogue, the fold and the rounding conversions of one body"
+)]
 pub fn matmul_batched_epilogue_dt_grid(
     name: &str,
     dt: Ty,
@@ -77,7 +80,10 @@ pub fn matmul_batched_epilogue_dt_grid(
     ))
 }
 
-#[expect(clippy::too_many_arguments)] // shapes plus the epilogue/weight/fold modes the public entry points fix
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shapes plus the epilogue/weight/fold modes the public entry points fix"
+)]
 fn matmul_batched_impl(
     name: &str,
     dt: Ty,

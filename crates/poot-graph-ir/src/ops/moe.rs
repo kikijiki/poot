@@ -207,7 +207,10 @@ pub fn top_k_gate(b: &Builder, x: Traced, k: usize) -> Result<Traced, BuilderErr
 /// Experts held in the checkpoint's stored orientation `[E, N, K]` are passed as `transpose(w, [0, 2, 1])`:
 /// `compile` plans that transpose as a view the indexed contraction reads in place, so it never runs as a copy
 /// (while the transposed value has no other non-strided reader).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 pub fn moe(
     b: &Builder,
     x: Traced,
@@ -235,7 +238,10 @@ pub fn moe(
 /// of [`moe_sparse`]. Not called by [`moe`] (spec 136 fork b); kept as the CPU-eval correctness
 /// oracle that [`moe_grouped`] is checked against (`moe_grouped_matches_dense`), since the grouped
 /// summation order differs (`~1e-5`, not bit-exact).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn moe_dense(
     b: &Builder,
@@ -280,7 +286,10 @@ pub fn moe_dense(
 /// Routing is the `L=1` case of [`moe_grouped_prep`], so dense, sparse, grouped, router-only, and
 /// pooled paths share the same stable rank, exact mask, and normalized selected weights. Needs the
 /// shared `iota[E]` range for the lower-index tie-break and gate-slot reconstruction.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 pub fn moe_sparse(
     b: &Builder,
     x: Traced,
@@ -397,7 +406,10 @@ pub fn moe_grouped_prep(
 ///    rows at once: `gu = indexed_matmul(x_flat,w_in,idx_flat)` -> swiglu -> `indexed_matmul(_,w_out,idx_flat)`.
 /// 7. Gate-weight, reshape to `[L,k,H]`, and reduce over `k` via TRANSPOSE-TO-LAST-AXIS (S3, since the GPU
 ///    executor only reduces the last axis): `[L,k,H] -> transpose [L,H,k] -> reduce(Sum,axis=2) -> [L,H]`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 pub fn moe_grouped(
     b: &Builder,
     x: Traced,

@@ -201,18 +201,21 @@ Without a cache, K and V would be recomputed every decode step at O(L) cost. poo
 graph. Memory is `cap` whatever the sequence length.
 
 **Paged KV** [^pagedattn]. Fixed-size blocks (16 tokens, `poot_llm::driver::block_table::BLOCK_SIZE`) come from a shared pool;
-each layer has one `[pool_slots, kv_heads, head_dim]` pool. The driver keeps a block table per sequence and binds two inputs per
-step:
+each layer has one `[pool_slots, kv_heads, head_dim]` pool. Every sequence has a block table, a row of a carried
+`[seqs, cap / 16]` i32 state (`kv.table`) that the device only reads. Each step names the sequence each row continues and
+binds the write map:
 
-| Input | Slot | Shape | Meaning |
+| Input | Where | Shape | Meaning |
 | --- | --- | --- | --- |
-| `read` | `Slot::SlotMap` | `[rows, cap]` i32 | Logical position to physical slot. |
+| `kv.table` | state, written by the host | `[seqs, cap / 16]` i32 | Logical block to pool block, per sequence. |
+| `state_read` | `Slot::Activation` | `[rows]` i32 | The sequence each row continues. |
 | `write` | `Slot::WriteMap` | `[rows * tokens]` i32 | New token to pool slot, or -1 for padding. |
 
+- The host writes only the table entries a sequence gained since it last wrote its row. A step that crosses no block boundary writes no table byte, and a step's inputs do not grow with the capacity.
+- The table is declared in `[0, pool_blocks)` and the executor checks every word the host writes against it, so a block outside the pool is a typed refusal before any step reads it.
 - A write map is bound only as a checked `ForwardSlotMap`, which refuses a slot outside the pool or named twice.
-- The read map is declared in `[0, pool_slots)`, so a word outside the pool is a typed range error at bind.
 - New rows go in with `ScatterUpdate` through `write`, in place on the donated pool, at a cost that follows the tokens.
-- Attention reads the pools in place through `read` (a paged key). Blocks are allocated on demand and freed on completion.
+- Attention reads the pools in place through the table (a paged key): position `t` of a row is slot `table[t / 16] * 16 + t % 16`. The capacity is whole blocks. Blocks are reserved at admission and freed on completion.
 
 ### Storage dtype
 

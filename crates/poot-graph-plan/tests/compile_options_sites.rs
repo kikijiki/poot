@@ -6,7 +6,10 @@
 //! Production code is every `.rs` file under `crates/*/src`, `crates/*/examples` and `benchmarks/`, less its inline
 //! `#[cfg(test)] mod … { … }` blocks and the files whose name says test. Test harness crates and test-support
 //! modules build options for fixtures and are not production.
-#![allow(missing_docs)]
+#![allow(
+    missing_docs,
+    reason = "an integration-test binary: the crate-level doc above is its documentation"
+)]
 
 use std::path::{Path, PathBuf};
 

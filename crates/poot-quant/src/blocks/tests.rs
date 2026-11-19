@@ -683,7 +683,7 @@ fn the_eighth_sign_is_the_parity_of_the_stored_seven() {
 /// block at a time. The descriptor decodes the same random blocks bit for bit, so the bit
 /// layouts (which `qs` word and which scale nibble feeds which value) match ggml's loops.
 fn ggml_dequantize(format: WeightFormat, block: &[u8]) -> Vec<f32> {
-    let d = crate::scalar::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let d = poot_tensor::float::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     let ksigns = |index: u32| index | ((index.count_ones() & 1) << 7);
     let mut y = Vec::new();
     match format {
@@ -845,7 +845,7 @@ fn ggml_dequantize_tq1_0(block: &[u8]) -> Vec<f32> {
     assert_eq!(block.len(), 54);
     let (qs, rest) = block.split_at(48);
     let (qh, scale) = rest.split_at(4);
-    let d = crate::scalar::f16_to_f32(u16::from_le_bytes([scale[0], scale[1]]));
+    let d = poot_tensor::float::f16_to_f32(u16::from_le_bytes([scale[0], scale[1]]));
     let pow3: [u8; 5] = [1, 3, 9, 27, 81];
     let trit = |byte: u8, n: usize| {
         let q = byte.wrapping_mul(pow3[n]);

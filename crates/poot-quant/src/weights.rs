@@ -254,15 +254,18 @@ impl DenseWeight {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|word| scalar::bf16_to_f32(u16::from_le_bytes(*word)))
+                .map(|word| poot_tensor::float::bf16_to_f32(u16::from_le_bytes(*word)))
                 .collect()),
             DType::F16 => Ok(raw
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|word| scalar::f16_to_f32(u16::from_le_bytes(*word)))
+                .map(|word| poot_tensor::float::f16_to_f32(u16::from_le_bytes(*word)))
                 .collect()),
-            DType::E4M3FN => Ok(raw.iter().map(|&b| scalar::e4m3fn_to_f32(b)).collect()),
+            DType::E4M3FN => Ok(raw
+                .iter()
+                .map(|&b| poot_tensor::float::e4m3fn_to_f32(b))
+                .collect()),
             DType::E8M0 => Ok(raw.iter().map(|&b| scalar::e8m0_to_f32(b)).collect()),
             dtype => Err(UndecodableDtype { dtype }),
         }

@@ -154,7 +154,13 @@ fn a_paged_pool_keeps_its_logical_extent() {
     let graph = trace(paged_step(1, 1, CAPACITY, POOL_SLOTS, LogitRows::Last));
     let (backend, caps) = gfx1151();
     let program = compiled(&graph, backend, caps);
-    for pair in program.graph().state_pairs() {
+    let pools: Vec<_> = program
+        .graph()
+        .state_pairs()
+        .filter(|pair| pair.role == StateRole::Positional { axis: 0 })
+        .collect();
+    assert_eq!(pools.len(), 4, "two layers, K and V");
+    for pair in pools {
         assert_eq!(
             program.graph().aval(pair.input).shape,
             vec![POOL_SLOTS, KV_HEADS, HEAD_DIM]

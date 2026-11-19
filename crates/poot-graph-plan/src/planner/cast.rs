@@ -20,7 +20,10 @@ pub(super) fn admits_dtypes(dtypes: StorageDtypes, caps: &DeviceCaps) -> Result<
 }
 
 /// Plan one Cast equation, matching the (input, output) dtype pair exhaustively.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

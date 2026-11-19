@@ -633,10 +633,9 @@ impl RocmContext {
     /// When the batch exceeds half the queue size it is dispatched in chunks, spinning on `read_index`
     /// until each fits. Returns the number of physical AQL batch submissions (doorbell rings), which
     /// exceeds one when `dispatches` does not fit in a single chunk.
-    #[expect(clippy::type_complexity)]
     pub fn enqueue_graph_batched(
         &self,
-        dispatches: &[(KernelHandle, BoundKernarg, (u32, u32, u32), (u32, u32, u32))],
+        dispatches: &[BatchedDispatch],
         elements: &[&[poot_target::ElementKind]],
     ) -> Result<usize, RocmError> {
         let n = dispatches.len();
@@ -665,10 +664,9 @@ impl RocmContext {
     /// reserved ring slots, a failure (the queue-space wait timing out) can leave packets in flight and a slot
     /// reserved but never published, so it leaks the completion signal like a timed-out completion
     /// wait and poisons the context.
-    #[expect(clippy::type_complexity)]
     fn enqueue(
         &self,
-        dispatches: &[(KernelHandle, BoundKernarg, (u32, u32, u32), (u32, u32, u32))],
+        dispatches: &[BatchedDispatch],
         tag: &'static str,
     ) -> Result<usize, RocmError> {
         self.ensure_not_poisoned(tag)?;
@@ -974,6 +972,10 @@ impl RocmContext {
 pub struct KernelHandle {
     module: Arc<HsacoModule>,
 }
+
+/// One flattened entry of [`crate::RocmContext::enqueue_graph_batched`]'s dispatch list: the kernel, its
+/// bound kernarg, then the workgroup and the grid sizes.
+pub type BatchedDispatch = (KernelHandle, BoundKernarg, (u32, u32, u32), (u32, u32, u32));
 
 impl KernelHandle {
     /// The AQL packet's `kernel_object` field.

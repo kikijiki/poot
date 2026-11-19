@@ -6,7 +6,7 @@
 
 use poot_quant::PackedWeight;
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::error::{FusedOperandReason, ScanReason, ShapeError};
 use crate::precision::OperandPrecision;
@@ -1008,7 +1008,7 @@ impl ContractionHead {
 ///
 /// `mask`, `key` and `bound` name the operand conventions the kernels read. A variant added to one is a new case
 /// every consumer matches, never a flag on the others. The operand list is `[q, k, v, mask]`, then the shared key
-/// part when `key` is [`KeyLayout::Split`] or the slot map `read` when it is [`KeyLayout::Paged`], then `len`
+/// part when `key` is [`KeyLayout::Split`] or the block table `read` when it is [`KeyLayout::Paged`], then `len`
 /// when `bound` is [`KvBound::Live`], then the per-head `sinks [Hq]` when `sink` is [`SinkOperand::PerHead`].
 #[derive(Clone, Debug)]
 pub struct AttentionAttrs {
@@ -1121,12 +1121,17 @@ pub enum KeyLayout {
         shared_dim: usize,
     },
     /// The key and the value are read in place from the paged KV pools they live in: `k [S,Hkv,Dk]` and
-    /// `v [S,Hkv,Dv]` are the pools of `S` slots, and the I32 `read [B,Lk]` operand, which follows `mask`
-    /// in the operand list, names the pool slot holding logical position `t` of batch row `b`. It is the
-    /// decomposition `transpose(reshape(gather(pool, 0, read)))` of each pool, without the materialized
-    /// `[B,Hkv,Lk,D]` copies. Every `read` word must be a slot of the pool; the matcher fuses only a map
-    /// whose declared range proves it.
-    Paged,
+    /// `v [S,Hkv,Dv]` are the pools of `S` slots grouped in blocks of `block` slots, and the I32 `table
+    /// [B,Lk/block]` operand, which follows `mask` in the operand list, names the pool block holding the
+    /// `block` positions of block `i` of batch row `b`: logical position `t` of row `b` is pool slot
+    /// `table[b, t / block] * block + t % block`. It is the decomposition [`crate::ops::paged_view`] of each
+    /// pool (a gather by the slots the table spells), without the materialized `[B,Hkv,Lk,D]` copies. `Lk`
+    /// is a multiple of `block`, and every `table` word must be a block of the pool; the matcher fuses only
+    /// a table whose declared range proves it.
+    Paged {
+        /// The positions each table entry covers, and the slots of one pool block.
+        block: NonZeroUsize,
+    },
 }
 
 /// Which keys [`AttentionAttrs`]'s kernel visits.
@@ -2879,7 +2884,7 @@ fn reject_i32_region(op: &'static str, output: TensorType) -> Result<TensorType,
 }
 
 /// The typing rule of `Attention`. Operands are `[q, k, v, mask]`, then the shared key part for a
-/// [`KeyLayout::Split`] or the I32 `read [B,Lk]` slot map of the `[S,Hkv,D]` pools `k` and `v` for a
+/// [`KeyLayout::Split`] or the I32 `read [B,Lk/block]` block table of the `[S,Hkv,D]` pools `k` and `v` for a
 /// [`KeyLayout::Paged`], then the I32 `len [B]` for a [`KvBound::Live`]. Every consumer (the oracle, the
 /// generated kernels) indexes the operands densely, with no broadcast strides: `q[B,Hq,Lq,Dk]` with `n_rep | Hq`,
 /// `k[B,Hq/n_rep,Lk,Dk]` (or `Dk - shared_dim` wide next to `k_shared[B,1,Lk,shared_dim]`), `v[B,Hq/n_rep,Lk,Dv]`
@@ -2898,7 +2903,7 @@ pub(crate) fn stored_kv_reads_as(stored: DType, query: DType) -> bool {
 
 fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorType, ShapeError> {
     let split = matches!(attrs.key, KeyLayout::Split { .. });
-    let paged = matches!(attrs.key, KeyLayout::Paged);
+    let paged = matches!(attrs.key, KeyLayout::Paged { .. });
     let live = matches!(attrs.bound, KvBound::Live);
     let sink = matches!(attrs.sink, SinkOperand::PerHead);
     arity(
@@ -2968,9 +2973,9 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
     let hkv = hq / n_rep;
     // The key and value extents `Lk` and `Dv`, with the key and value operands checked against them: a dense
     // `[B,Hkv,Lk,..]` pair, or one `[S,Hkv,..]` pool each read through the `[B,Lk]` slot map.
-    let (lk, dv) = match read {
-        Some(read) => {
-            let &[rows, lk] = read.shape.as_slice() else {
+    let (lk, dv) = match (read, attrs.key) {
+        (Some(read), KeyLayout::Paged { block }) => {
+            let &[rows, blocks] = read.shape.as_slice() else {
                 return Err(ShapeError::AttentionOperand {
                     operand: "read",
                     expected: vec![bsz, 1],
@@ -2980,10 +2985,11 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
             if rows != bsz {
                 return Err(ShapeError::AttentionOperand {
                     operand: "read",
-                    expected: vec![bsz, lk],
+                    expected: vec![bsz, blocks],
                     actual: read.shape.clone(),
                 });
             }
+            let lk = blocks * block.get();
             let Some(&slots) = k.shape.first() else {
                 return Err(ShapeError::AttentionOperand {
                     operand: "k",
@@ -3016,7 +3022,7 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
             }
             (lk, dv)
         }
-        None => {
+        _ => {
             let Some(&lk) = k.shape.get(2) else {
                 return Err(ShapeError::AttentionOperand {
                     operand: "k",
@@ -3025,7 +3031,7 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
                 });
             };
             let key_width = match attrs.key {
-                KeyLayout::Single | KeyLayout::Paged => dk,
+                KeyLayout::Single | KeyLayout::Paged { .. } => dk,
                 KeyLayout::Split { shared_dim } => {
                     if shared_dim == 0 || shared_dim >= dk {
                         return Err(ShapeError::AttentionOperand {
@@ -3138,13 +3144,19 @@ pub enum ScanFamily {
     /// (already at the head count), `delta` `[1,H,L,1]`, `a` and `d` `[1,H,1,1]`, `h_in` `[1,H,N,P]`.
     /// Result `[1,H,L+N,P]`.
     Ssd,
+    /// The Kimi delta rule: the delta rule with a decay per key channel. Operands `[q, k, v, g, beta, s_in]`:
+    /// `q`, `k`, `v` `[1,H,L,D]` (`q` used as given, with no `1/sqrt(D)`), `g` `[1,H,L,D]` (log-domain: row `i`
+    /// of the state decays by `exp(g[t, i])` before token `t`'s update), `beta` `[1,H,L,1]`, `s_in` `[1,H,D,D]`.
+    /// Result `[1,H,L+D,D]`. Its reference definition is the token-by-token recurrence
+    /// ([`crate::ops::scan_kda_packed`]).
+    Kda,
 }
 
 impl ScanFamily {
     /// How many operands the family takes.
     pub const fn operands(self) -> usize {
         match self {
-            Self::DeltaRule => 6,
+            Self::DeltaRule | Self::Kda => 6,
             Self::Ssd => 7,
         }
     }
@@ -3155,7 +3167,7 @@ impl ScanFamily {
     #[cfg(any(test, feature = "test-support"))]
     pub const fn sequence_operands(self) -> std::ops::Range<usize> {
         match self {
-            Self::DeltaRule => 0..5,
+            Self::DeltaRule | Self::Kda => 0..5,
             Self::Ssd => 0..4,
         }
     }
@@ -3164,6 +3176,7 @@ impl ScanFamily {
     pub const fn name(self) -> &'static str {
         match self {
             Self::DeltaRule => "delta_rule",
+            Self::Kda => "kda",
             Self::Ssd => "ssd",
         }
     }
@@ -3221,6 +3234,16 @@ impl ScanAttrs {
                     ("k", vec![1, h, l, w]),
                     ("v", vec![1, h, l, w]),
                     ("g", vec![1, h, l, 1]),
+                    ("beta", vec![1, h, l, 1]),
+                    ("s_in", vec![1, h, w, w]),
+                ],
+            ),
+            ScanFamily::Kda => (
+                w,
+                vec![
+                    ("k", vec![1, h, l, w]),
+                    ("v", vec![1, h, l, w]),
+                    ("g", vec![1, h, l, w]),
                     ("beta", vec![1, h, l, 1]),
                     ("s_in", vec![1, h, w, w]),
                 ],
@@ -4961,12 +4984,14 @@ mod tests {
         ));
     }
 
-    /// A paged key types over `[S,Hkv,D]` pools and the `[B,Lk]` I32 slot map: the output is the dense one's,
+    /// A paged key types over `[S,Hkv,D]` pools and the `[B,Lk/block]` I32 block table: the output is the dense one's,
     /// and every operand that disagrees with the pool or the map is a typed refusal naming it.
     #[test]
-    fn a_paged_attention_types_over_pools_and_a_slot_map_and_refuses_each_disagreement() {
+    fn a_paged_attention_types_over_pools_and_a_block_table_and_refuses_each_disagreement() {
         let op = OpKind::Attention(AttentionAttrs {
-            key: KeyLayout::Paged,
+            key: KeyLayout::Paged {
+                block: NonZeroUsize::new(2).unwrap(),
+            },
             ..AttentionAttrs::new(2, 1.0, None)
         });
         let i32_map = |shape: &[usize]| TensorType::new(shape.to_vec(), DType::I32);
@@ -4977,7 +5002,7 @@ mod tests {
             f(&[9, 2, 8]),
             f(&[9, 2, 5]),
             mask.clone(),
-            i32_map(&[2, 6]),
+            i32_map(&[2, 3]),
         ];
         assert_eq!(op.infer(&ok).unwrap(), f(&[2, 4, 1, 5]));
 
@@ -5000,9 +5025,9 @@ mod tests {
             refused(2, f(&[8, 2, 5])),
             Err(ShapeError::AttentionOperand { operand: "v", .. })
         ));
-        // The slot map is I32 `[B, Lk]`, `Lk` the mask's key width.
+        // The block table is I32 `[B, Lk / block]`, `Lk` the mask's key width.
         assert!(matches!(
-            refused(4, f(&[2, 6])),
+            refused(4, f(&[2, 3])),
             Err(ShapeError::AttentionDtype {
                 operand: "read",
                 expected: DType::I32,
@@ -5010,7 +5035,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            refused(4, i32_map(&[3, 6])),
+            refused(4, i32_map(&[3, 3])),
             Err(ShapeError::AttentionOperand {
                 operand: "read",
                 ..
@@ -5023,7 +5048,7 @@ mod tests {
                 ..
             })
         ));
-        // A paged key without its slot map is an arity error, not a dense read of the pool.
+        // A paged key without its block table is an arity error, not a dense read of the pool.
         assert!(matches!(op.infer(&ok[..4]), Err(ShapeError::Arity { .. })));
     }
 

@@ -747,7 +747,7 @@ fn fp8_raw_bit_cases() -> Vec<RawBitCase> {
 /// reference). Padding lanes of the inputs are all ones and those of the output start all ones, so neither
 /// is required to be zero or read.
 fn fp8_raw_bits_on(device: &mut Device<'_>) {
-    use poot_quant::scalar::e4m3fn_to_f32;
+    use poot_tensor::float::e4m3fn_to_f32;
     let decoded = |t: &Tensor| Tensor {
         shape: t.shape.clone(),
         lanes: t
@@ -1096,7 +1096,6 @@ fn the_movement_bank_matches_the_reference_on_ptx() {
         let seed: Vec<f32> = launch.out.iter().map(|&w| f32::from_bits(w)).collect();
         let out = ctx.upload_f32(&seed).unwrap();
         ctx.dispatch_dev(
-            &name,
             &kernel,
             body.workgroup_size,
             [launch.spec.threads() as u32, 1, 1],

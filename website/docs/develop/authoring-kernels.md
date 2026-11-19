@@ -15,7 +15,7 @@ The `#[kernel]` attribute (from `poot-kernel-attr`) marks a function for import 
 - **Device pass:** extern-link a `poot-kernel-attr` built with `--features device-pass`. The attribute renames each marked function into poot's reserved namespace. pootc reads the functions from Stable MIR, lowers each kernel to SPIR-V and PTX, and writes a module cache (`poot_cache.rs`) next to them.
 - **Host pass:** extern-link the crate's default build. The macro emits a typed host launcher that looks the compiled module up by name.
 
-There is no cargo integration yet: you invoke `pootc` on the kernel source yourself, `--extern`-linking the `poot-kernel-attr` build the pass needs.
+There is no cargo integration: you invoke `pootc` on the kernel source yourself, `--extern`-linking the `poot-kernel-attr` build the pass needs.
 
 Under `#[cfg(test)]` the same function is ordinary Rust. Call it on CPU arrays before any GPU is involved.
 

@@ -557,16 +557,19 @@ pub trait Executor {
     ) -> Result<StepOutputs<'_>, ExecError>;
     /// Zero the carried state of `exe` selected by `scope`.
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError>;
-    /// Overwrite row `row` of the leading axis of the carried state named `name` with `values`, one row
-    /// of the state's own dtype. The host seeds a state it then leaves to the device (the sampler's
-    /// per-sequence history); no step is in flight, because `step` returns only after its wait. A
-    /// name the executable does not hold, a row outside the leading axis or a row of another dtype or
-    /// length is a [`BindError`] and writes nothing.
-    fn write_state_row(
+    /// Overwrite elements `from..from + values.elems()` of row `row` of the leading axis of the carried state
+    /// named `name` with `values`, of the state's own dtype. The host seeds a state it then leaves to the
+    /// device (the sampler's per-sequence history, a whole row) or keeps current (a paged layout's block
+    /// table, only the entries that changed); no step is in flight, because `step` returns only after its
+    /// wait. A name the executable does not hold, a row outside the leading axis, a range past the row's end
+    /// or values of another dtype, or outside the range the state declares ([`StateRole::BlockTable`]), is a
+    /// [`BindError`] and writes nothing.
+    fn write_state_range(
         &mut self,
         exe: ExecutableId,
         name: &str,
         row: usize,
+        from: usize,
         values: HostView<'_>,
     ) -> Result<(), ExecError>;
     /// Drops `entry`'s recording and arena; the executable's shared state is untouched (R-546-3).

@@ -902,14 +902,15 @@ impl Executor for Probed {
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.inner.reset_state(exe, scope)
     }
-    fn write_state_row(
+    fn write_state_range(
         &mut self,
         exe: ExecutableId,
         name: &str,
         row: usize,
+        from: usize,
         values: poot_tensor::HostView<'_>,
     ) -> Result<(), ExecError> {
-        self.inner.write_state_row(exe, name, row, values)
+        self.inner.write_state_range(exe, name, row, from, values)
     }
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         self.inner.remove_entry(exe, entry)

@@ -312,7 +312,10 @@ fn check_guided_len(field: &str, len: usize, max: usize) -> Result<()> {
 /// OpenAI `response_format` (`{type: json_schema, json_schema: {schema}}`) to the same JSON-Schema
 /// constraint, and `{type: json_object}` to a free-JSON constraint. Precedence: choice, regex,
 /// grammar, guided_json, then response_format.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request's guided-decoding fields (choice, regex, grammar, json, response format, tools, tool choice) are separate optional, mutually exclusive constraints the request carries as separate fields"
+)]
 pub(crate) fn apply_guided(
     sampler: Sampler,
     text: &poot_text::TextCodec,

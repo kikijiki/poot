@@ -72,7 +72,7 @@ pub(super) fn plan(
     };
     // A dense key carries the extents itself; a paged one is `[S,Hkv,D]` pools and the `[B,Lk]` slot map.
     let (lk, dv) = match key {
-        KeyLayout::Paged => (shape(4)[1], v[2]),
+        KeyLayout::Paged { block } => (shape(4)[1] * block.get(), v[2]),
         KeyLayout::Single | KeyLayout::Split { .. } => (k[2], v[3]),
     };
     let mask_kind = match mask_operand {
@@ -97,7 +97,7 @@ pub(super) fn plan(
     let kv = kv_lane(&site, &stored, caps)?;
     let shared_dim = match key {
         KeyLayout::Split { shared_dim } => *shared_dim,
-        KeyLayout::Single | KeyLayout::Paged => 0,
+        KeyLayout::Single | KeyLayout::Paged { .. } => 0,
     };
     let (lanes, walk) = attention_key_walk((dk, dv, shared_dim), *n_rep, kv.bytes(), backend, caps)
         .map_err(|missing| site.refuse(missing))?;
@@ -115,7 +115,7 @@ pub(super) fn plan(
             KeyLayout::Split { shared_dim } => KernelKeyLayout::Split {
                 shared_dim: *shared_dim,
             },
-            KeyLayout::Paged => KernelKeyLayout::Paged,
+            KeyLayout::Paged { block } => KernelKeyLayout::Paged { block: block.get() },
         },
         score,
         mask: mask_kind,

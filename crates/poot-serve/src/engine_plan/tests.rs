@@ -402,14 +402,15 @@ impl Executor for Probe {
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.inner.reset_state(exe, scope)
     }
-    fn write_state_row(
+    fn write_state_range(
         &mut self,
         exe: ExecutableId,
         name: &str,
         row: usize,
+        from: usize,
         values: poot_tensor::HostView<'_>,
     ) -> Result<(), ExecError> {
-        self.inner.write_state_row(exe, name, row, values)
+        self.inner.write_state_range(exe, name, row, from, values)
     }
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         self.inner.remove_entry(exe, entry)
@@ -842,6 +843,12 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// and 243288 -> 234988 at four, two and one rows.
 /// POOT-1576 reads a movement chain's root through the chain's composed layout, so a link under a materialized tail
 /// stops materializing: at one row `Activation` 234988 -> 234960 (the four- and two-row peaks are set elsewhere).
+/// POOT-1240 moves three rows of this fixture. The paged KV is read through the sequences' block table, a carried
+/// `[seqs, capacity / 16]` I32 state instead of a per-step `[rows, capacity]` slot map input: `State` +64, +32 and
+/// +16 bytes at four, two and one rows, and `Input` 189100 -> 156060, 117748 -> 102348 and 82072 -> 75492 (the
+/// per-entry read maps leave). The gated delta-net decode is the length-1 scan, whose operands are dense: its q/k/v
+/// slices are planned in the arena where the decode composition read them as views, so `Activation` 937428 ->
+/// 972180, 468868 -> 486244 and 234960 -> 243648.
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
 /// is no longer 5216 and this row goes red.
@@ -860,17 +867,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=937428 Input=189100 Meta=16884 State=12416 Weight=5216",
+            "Activation=972180 Input=156060 Meta=16884 State=12480 Weight=5216",
         ),
         (
             2,
             64,
-            "Activation=468868 Input=117748 Meta=16884 State=6208 Weight=5216",
+            "Activation=486244 Input=102348 Meta=16884 State=6240 Weight=5216",
         ),
         (
             1,
             64,
-            "Activation=234960 Input=82072 Meta=15564 State=3104 Weight=5216",
+            "Activation=243648 Input=75492 Meta=15564 State=3120 Weight=5216",
         ),
     ];
     let domain = candidates(&handle, &args);
@@ -2348,4 +2355,148 @@ fn a_rank_whose_budget_dropped_after_the_fit_is_refused_before_serving() {
     };
     assert_eq!(device, DeviceId(1));
     assert!(matches!(health.state(), EngineState::Starting));
+}
+
+// ---- the served-family list of website/docs/serve/api.md ------------------------------------------
+
+const SERVED_BEGIN: &str = "<!-- generated:served-families:begin -->";
+const SERVED_END: &str = "<!-- generated:served-families:end -->";
+const SERVED_REGEN_ENV: &str = "POOT_SERVE_SERVED_REGEN";
+
+/// What the engine plan said about one registered family's fixture checkpoint.
+enum Verdict {
+    Serves,
+    Refuses(String),
+}
+
+/// `fixture` as an HF checkpoint directory: its config, safetensors, optional generation and
+/// preprocessor configs, and a word-level tokenizer over its 48-token vocabulary.
+fn write_family_checkpoint(
+    label: &str,
+    fixture: &poot_models::registry::Fixture,
+) -> poot_test_util::UniqueTempPath {
+    let dir = poot_test_util::unique_temp_path(format!("poot_serve_served_{label}"));
+    std::fs::create_dir_all(&dir).expect("create the checkpoint directory");
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(0);
+    std::fs::write(dir.join("config.json"), config.to_string()).expect("write config");
+    if let Some(generation) = &fixture.generation {
+        std::fs::write(dir.join("generation_config.json"), generation.to_string())
+            .expect("write generation config");
+    }
+    if let Some(preprocessor) = &fixture.preprocessor {
+        std::fs::write(
+            dir.join("preprocessor_config.json"),
+            preprocessor.to_string(),
+        )
+        .expect("write preprocessor config");
+    }
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    let words: serde_json::Map<String, serde_json::Value> = (0..48)
+        .map(|i| (format!("w{i}"), serde_json::json!(i)))
+        .collect();
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "WhitespaceSplit" },
+        "post_processor": null,
+        "decoder": null,
+        "model": { "type": "WordLevel", "vocab": words, "unk_token": "w0" },
+    });
+    std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).expect("write tokenizer");
+    dir
+}
+
+/// Plan every registered family's fixture checkpoint through `EnginePlan::build` on the reference
+/// SPIR-V target with room to spare, and record whether the server would start it.
+fn served_verdicts() -> Vec<(String, Verdict)> {
+    let registry = poot_models::registry::Registry::builtin().expect("builtin registry");
+    let mut verdicts = Vec::new();
+    for entry in registry.entries() {
+        let fixture = poot_models::test_support::family_fixtures::base(entry.family);
+        let label = entry.family.as_str().to_string();
+        let dir = write_family_checkpoint(&label, &fixture);
+        let handle = Arc::new(
+            ModelHandle::load(&dir, &registry, &poot_llm::driver::LoadOptions::default())
+                .unwrap_or_else(|error| panic!("{label}: the fixture does not load: {error}")),
+        );
+        drop(dir);
+        let mut args = args(BackendChoice::Wgpu);
+        args.embeds = handle.front_end().is_some();
+        let (executor, _) = probe(spirv_target(), 0);
+        let (started, _) = build_with(&args, &handle, executor, roomy, &EngineHealth::starting());
+        verdicts.push((
+            label,
+            match started {
+                Ok(_) => Verdict::Serves,
+                // The family's typed refusal of a step shape reads as its reason; any other failure as its message.
+                Err(StartupError::Driver(poot_llm::driver::error::DriverError::Unsupported(
+                    poot_llm::driver::error::Unsupported::Trace(
+                        poot_models::model::TraceError::ShapeUnsupported { reason, .. },
+                    ),
+                ))) => Verdict::Refuses(format!("refuses the paged serving shape: `{reason:?}`")),
+                Err(error) => Verdict::Refuses(error.to_string()),
+            },
+        ));
+    }
+    verdicts.sort_by(|a, b| a.0.cmp(&b.0));
+    verdicts
+}
+
+fn served_region(verdicts: &[(String, Verdict)]) -> String {
+    let served: Vec<_> = verdicts
+        .iter()
+        .filter(|(_, verdict)| matches!(verdict, Verdict::Serves))
+        .map(|(family, _)| format!("`{family}`"))
+        .collect();
+    let mut out = format!(
+        "Families the server starts, from the engine plan over each registered family's fixture checkpoint on the reference SPIR-V target:\n\n{}\n",
+        served.join(", ")
+    );
+    let refused: Vec<_> = verdicts
+        .iter()
+        .filter_map(|(family, verdict)| match verdict {
+            Verdict::Refuses(reason) => {
+                Some(format!("- `{family}`: {}", reason.replace('|', "\\|")))
+            }
+            Verdict::Serves => None,
+        })
+        .collect();
+    if !refused.is_empty() {
+        out.push_str("\nFamilies the engine plan refuses:\n\n");
+        out.push_str(&refused.join("\n"));
+        out.push('\n');
+    }
+    out
+}
+
+/// The served-family list of `website/docs/serve/api.md` is the engine plan's verdict (R2-C4-007): each
+/// registered family's fixture checkpoint goes through the production `EnginePlan::build`, and the page
+/// lists what started. `just serve-served-regen` rewrites the region.
+///
+/// Mutation: make `Workload::of` refuse every model with a `step` program (`return Workload::Encode ...`
+/// for all); the planned list changes and the page differs.
+#[test]
+fn the_served_family_list_of_the_api_page_is_the_engine_plans_verdict() {
+    let path = poot_test_util::repo_root().join("website/docs/serve/api.md");
+    let page = std::fs::read_to_string(&path).expect("read the API page");
+    let begin = page.find(SERVED_BEGIN).expect("the begin marker") + SERVED_BEGIN.len();
+    let end = page.find(SERVED_END).expect("the end marker");
+    let rendered = format!(
+        "{}\n\n{}\n{}",
+        &page[..begin],
+        served_region(&served_verdicts()),
+        &page[end..]
+    );
+    if std::env::var_os(SERVED_REGEN_ENV).is_some() {
+        std::fs::write(&path, &rendered).expect("write the API page");
+        return;
+    }
+    assert!(
+        page == rendered,
+        "website/docs/serve/api.md differs from the engine plan's verdict; run `just serve-served-regen`"
+    );
 }

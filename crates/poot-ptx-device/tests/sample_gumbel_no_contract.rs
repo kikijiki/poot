@@ -111,7 +111,6 @@ fn gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle() {
         .alloc_storage(BufferRole::Activation, BufferStorage::i32(), 2)
         .expect("alloc out");
     ctx.dispatch_dev(
-        "sample_gumbel_argmax_batched",
         &kernel,
         [64, 1, 1],
         [64, 1, 1],

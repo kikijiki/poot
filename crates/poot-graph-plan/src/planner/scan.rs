@@ -124,6 +124,7 @@ pub(super) fn plan(
     let spec = ScanSpec {
         kernel: match attrs.family {
             ScanFamily::DeltaRule => ScanKernel::DeltaRule,
+            ScanFamily::Kda => ScanKernel::Kda,
             ScanFamily::Ssd => ScanKernel::Ssd,
         },
         heads: layout.heads,

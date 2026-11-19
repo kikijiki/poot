@@ -3306,10 +3306,14 @@ enum ReadMap {
 }
 
 /// A decode over a paged cache as the production tracer emits it ([`poot_graph_ir::ops::paged_view`] of each
-/// pool through the read map, then the one attention composite): batch 2, two key heads shared by four
-/// query heads, 12 pool slots, 6 positions. Returns the graph with its `[k_pool, v_pool, read]` values.
+/// pool through the block table, then the one attention composite): batch 2, two key heads shared by four
+/// query heads, 4 pool blocks of 4 slots, 8 positions. Returns the graph with its `[k_pool, v_pool, read]`
+/// values.
 fn paged_attention_graph(map: ReadMap, live: bool) -> (poot_graph_ir::Graph, [ValueId; 3]) {
-    let (batch, hq, hkv, cap, d, slots) = (2usize, 4usize, 2usize, 6usize, 8usize, 12usize);
+    let (batch, hq, hkv, cap, d) = (2usize, 4usize, 2usize, 8usize, 8usize);
+    let block = std::num::NonZeroUsize::new(4).unwrap();
+    let (blocks, pool_blocks) = (cap / block, 4usize);
+    let slots = pool_blocks * block.get();
     let b = Builder::for_tests();
     let q = b
         .constant("q", TensorType::f32(vec![batch, hq, 1, d]))
@@ -3323,9 +3327,11 @@ fn paged_attention_graph(map: ReadMap, live: bool) -> (poot_graph_ir::Graph, [Va
     let mask = b
         .constant("mask", TensorType::f32(vec![batch, 1, 1, cap]))
         .unwrap();
-    let map_type = TensorType::new(vec![batch, cap], poot_tensor::DType::I32);
+    let map_type = TensorType::new(vec![batch, blocks], poot_tensor::DType::I32);
     let read = match map {
-        ReadMap::InPool | ReadMap::TwoMaps => b.read_map("read", batch, cap, slots).unwrap(),
+        ReadMap::InPool | ReadMap::TwoMaps => b
+            .block_table_slot("read", batch, blocks, pool_blocks)
+            .unwrap(),
         ReadMap::Unranged => b
             .slot_named(poot_graph_ir::Slot::SlotMap, "read", map_type.clone())
             .unwrap(),
@@ -3334,16 +3340,18 @@ fn paged_attention_graph(map: ReadMap, live: bool) -> (poot_graph_ir::Graph, [Va
                 poot_graph_ir::Slot::SlotMap,
                 "read",
                 map_type.clone(),
-                poot_graph_ir::IndexRange::below(slots + 1).unwrap(),
+                poot_graph_ir::IndexRange::below(pool_blocks + 1).unwrap(),
             )
             .unwrap(),
     };
     let v_read = match map {
-        ReadMap::TwoMaps => b.read_map("read_v", batch, cap, slots).unwrap(),
+        ReadMap::TwoMaps => b
+            .block_table_slot("read_v", batch, blocks, pool_blocks)
+            .unwrap(),
         _ => read,
     };
-    let k = poot_graph_ir::ops::paged_view(&b, k_pool, read).unwrap();
-    let v = poot_graph_ir::ops::paged_view(&b, v_pool, v_read).unwrap();
+    let k = poot_graph_ir::ops::paged_view(&b, k_pool, read, block).unwrap();
+    let v = poot_graph_ir::ops::paged_view(&b, v_pool, v_read, block).unwrap();
     let outputs = if live {
         let len = b
             .constant("len", TensorType::new(vec![batch], poot_tensor::DType::I32))
@@ -3376,8 +3384,11 @@ fn paged_attention_graph(map: ReadMap, live: bool) -> (poot_graph_ir::Graph, [Va
     )
 }
 
-/// The attention match of `graph`'s output equation.
+/// The attention match of `graph`'s output equation, over the graph as `compile` hands it to the matcher
+/// (canonicalized, cse'd, iotas folded).
 fn matched_attention(graph: &poot_graph_ir::Graph) -> attention_match::AttnMatch {
+    let (graph, _) = canonicalize_with_declines(graph).unwrap();
+    let graph = &fold_iota(&cse(&graph).unwrap()).unwrap();
     match_attention(
         graph,
         &producer_map(graph),
@@ -3396,7 +3407,13 @@ fn the_paged_views_of_two_pools_fuse_to_an_attention_over_the_pools() {
     for live in [false, true] {
         let (graph, [k_pool, v_pool, read]) = paged_attention_graph(ReadMap::InPool, live);
         let matched = matched_attention(&graph);
-        assert_eq!(matched.key, KeyLayout::Paged, "live={live}");
+        assert_eq!(
+            matched.key,
+            KeyLayout::Paged {
+                block: std::num::NonZeroUsize::new(4).unwrap()
+            },
+            "live={live}"
+        );
         assert_eq!(
             (matched.k, matched.v, matched.read),
             (k_pool, v_pool, Some(read)),
@@ -3413,7 +3430,12 @@ fn the_paged_views_of_two_pools_fuse_to_an_attention_over_the_pools() {
         let OpKind::Attention(attrs) = matched.op() else {
             panic!("the match collapses to an attention op")
         };
-        assert_eq!(attrs.key, KeyLayout::Paged);
+        assert_eq!(
+            attrs.key,
+            KeyLayout::Paged {
+                block: std::num::NonZeroUsize::new(4).unwrap()
+            }
+        );
         assert_eq!(
             attrs.bound,
             if live {

@@ -2503,11 +2503,11 @@ mod tests {
             let bits = finite_f16_bits(n * k, (m * 1000 + k * 10 + n) as u64);
             let decoded: Vec<f32> = bits
                 .iter()
-                .map(|&b| poot_quant::scalar::f16_to_f32(b))
+                .map(|&b| poot_tensor::float::f16_to_f32(b))
                 .collect();
             let activation: Vec<f32> = finite_f16_bits(m * k, 7 + m as u64)
                 .iter()
-                .map(|&b| poot_quant::scalar::f16_to_f32(b))
+                .map(|&b| poot_tensor::float::f16_to_f32(b))
                 .collect();
             let request = |weight: BufferStorage| {
                 KernelRequest::Contraction(match (m, k) {
@@ -2633,7 +2633,7 @@ mod tests {
                 let f16_bits = finite_f16_bits(n * k, (k * 31 + n) as u64);
                 let values: Vec<f32> = f16_bits
                     .iter()
-                    .map(|&b| poot_quant::scalar::f16_to_f32(b))
+                    .map(|&b| poot_tensor::float::f16_to_f32(b))
                     .collect();
                 let activation = weight_values(k, 17 + k as u64);
                 for weight in [

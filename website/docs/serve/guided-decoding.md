@@ -43,7 +43,7 @@ The error names the regex and the limit it hit. A large automaton, such as a cou
 | `integer`           | `minimum`/`maximum`, inclusive or exclusive, one- or two-sided             |
 | `number`, `boolean` | Plain types                                                                |
 | `enum`, `const`     | Scalar or composite                                                        |
-| `oneOf`, `anyOf`    | Alternation                                                                |
+| `oneOf`, `anyOf`    | Alternation; `oneOf` accepts a value matching more than one branch, as `anyOf` does |
 | local `$ref`        | `"#/$defs/Name"` into the same document, inlined                           |
 
 Object keys are emitted in sorted order. Unsupported constructs (recursive or external `$ref`, `number` bounds) return an error rather than silently under-constraining.

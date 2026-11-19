@@ -30,24 +30,35 @@ pub(crate) fn token_pos(
     ]
 }
 
-/// The two slot maps of a paged step: `read` `[rows, capacity]` and the forward `write` map, one pool slot
-/// per new token (`-1` for padding).
-pub(crate) fn slot_maps(
-    rows: usize,
-    capacity: usize,
-    read: Vec<i32>,
-    write: Vec<i32>,
-) -> Vec<(SlotKey, HostTensor)> {
+/// The slot inputs of a paged step beyond the tokens and positions: row `r` continues sequence `r`
+/// (`state_read`), and the forward `write` map names one pool slot per new token (`-1` for padding). The
+/// block table is the host's carried state: bind it with [`with_table`].
+pub(crate) fn paged_slots(rows: usize, write: Vec<i32>) -> Vec<(SlotKey, HostTensor)> {
     vec![
         (
-            SlotKey::new(Slot::SlotMap, Some("read")),
-            HostTensor::i32(vec![rows, capacity], read),
+            SlotKey::new(Slot::Activation, Some("state_read")),
+            HostTensor::i32(vec![rows], (0..rows as i32).collect()),
         ),
         (
             SlotKey::new(Slot::WriteMap, Some("write")),
             HostTensor::i32(vec![write.len()], write),
         ),
     ]
+}
+
+/// `state` (in `g.state` order) with the paged step's block table bound to `table`, `[seqs * blocks]` words
+/// the host holds: the step carries it unchanged, so the caller binds it again every step.
+pub(crate) fn with_table(g: &Graph, state: &[HostTensor], table: &[i32]) -> Vec<HostTensor> {
+    g.state()
+        .zip(state)
+        .map(|((input, _), carried)| {
+            if g.state_role(input) == Some(poot_graph_ir::StateRole::BlockTable) {
+                HostTensor::i32(g.aval(input).shape.clone(), table.to_vec())
+            } else {
+                carried.clone()
+            }
+        })
+        .collect()
 }
 
 /// Zero carried state, in `g.state` order.

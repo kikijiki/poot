@@ -19,7 +19,10 @@
 //! refills) have no check after them, so a modification racing one is not detected (a truncation ends the
 //! process with `SIGBUS`). Replacing a checkpoint by rename is always safe.
 
-#[expect(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "the one mmap of a checkpoint; its residual contract is the invariant documented above"
+)]
 mod mapping;
 
 use std::fmt;

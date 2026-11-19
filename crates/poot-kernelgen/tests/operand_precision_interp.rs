@@ -350,7 +350,7 @@ fn a_weight_stored_in_the_fragment_dtype_enters_once() {
             .iter()
             .map(|&b| match dtype {
                 FragmentDtype::Bf16 => f32::from_bits(u32::from(b) << 16),
-                FragmentDtype::F16 => poot_quant::scalar::f16_to_f32(b),
+                FragmentDtype::F16 => poot_tensor::float::f16_to_f32(b),
             })
             .collect();
         let words: Vec<u32> = bits

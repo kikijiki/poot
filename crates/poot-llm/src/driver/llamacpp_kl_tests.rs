@@ -856,8 +856,9 @@ mod checkpoint_rows {
     use poot_load::gguf::GgufIndex;
     use poot_models::registry::Registry;
     use poot_quant::StoredBytes;
-    use poot_quant::scalar::{f16_to_f32, f32_to_f16};
+    use poot_quant::scalar::f32_to_f16;
     use poot_runtime_common::DeviceBackend;
+    use poot_tensor::float::f16_to_f32;
 
     /// What poot measured against llama.cpp `d812350` on the wgpu device (RADV, Strix Halo), over [`CORPUS`]
     /// (315 scored positions), compared over the tokens the reference file represents (see

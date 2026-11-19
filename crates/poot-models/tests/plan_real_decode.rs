@@ -121,9 +121,10 @@ impl Dispatches {
 }
 
 /// Dispatches per token of the same Qwen2.5-0.5B config traced over a paged KV pool: the contiguous decode's
-/// minus the one the in-place write does not need. Before attention read the pools in place this was 96 more
-/// (one gather and one transpose per layer and per K and V).
-const QWEN2_0_5B_PAGED_DISPATCHES: usize = 366;
+/// minus the one the in-place write does not need, plus the one gather of the step's rows of the block table
+/// (shared by every layer's attention). Before attention read the pools in place this was 96 more (one gather and
+/// one transpose per layer and per K and V).
+const QWEN2_0_5B_PAGED_DISPATCHES: usize = 367;
 
 /// Dispatches `program` runs per step: every planned equation but the free ones (an alias or a strided view).
 fn dispatches(program: &Program) -> usize {
@@ -175,7 +176,7 @@ fn dispatch_count_planned_regression_on_real_qwen2_decode_configs() {
 }
 
 /// POOT-1149: a paged decode of the real Qwen2.5-0.5B config reads each layer's K and V pools in place. Every
-/// layer's attention is one `Paged` attention over the scatter-updated pools and the read map, so the plan holds
+/// layer's attention is one `Paged` attention over the scatter-updated pools and the block table, so the plan holds
 /// no gather and no transpose of a materialized `[rows, hkv, capacity, d]` view: the 96 per-step gather and
 /// transpose dispatches of the gathered view are gone and the step dispatches no more than the contiguous one.
 ///
@@ -184,7 +185,7 @@ fn dispatch_count_planned_regression_on_real_qwen2_decode_configs() {
 #[test]
 fn a_paged_decode_of_the_real_qwen2_config_dispatches_no_gather_or_transpose_of_the_pools() {
     use poot_graph_ir::KeyLayout;
-    use poot_models::model::{LogitRows, StepSpec};
+    use poot_models::model::{KV_BLOCK, LogitRows, StepSpec};
     use poot_models::test_support::dense::paged_step;
 
     let (cap, layers) = (64usize, 24usize);
@@ -209,7 +210,7 @@ fn a_paged_decode_of_the_real_qwen2_config_dispatches_no_gather_or_transpose_of_
             .collect();
         assert_eq!(
             attentions,
-            vec![KeyLayout::Paged; layers],
+            vec![KeyLayout::Paged { block: KV_BLOCK }; layers],
             "{backend:?}: every layer's attention reads its pools in place"
         );
         let written: std::collections::HashSet<ValueId> = graph

@@ -195,7 +195,10 @@ impl PooledDsaParams {
     /// `index_heads` heads of `index_dim` channels, pools `pool` consecutive keys into one and keeps
     /// the best `index_topk / pool` complete pools (so `index_topk` raw tokens) plus the tokens
     /// after the last complete pool.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the constructor takes each dimension and sub-module of its checkpoint config separately; a config record would only move the same fields into a struct built at the one call site"
+    )]
     pub fn new(
         heads: usize,
         q_rank: usize,
@@ -313,7 +316,10 @@ impl PooledDsaWeights {
 /// their positions, plus every position after its last complete pool up to itself. The keys the
 /// step caches carry the position axis like attention's own (`kv.l{layer}.index`); a pool not yet
 /// written is never complete.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a model-builder helper: the builder, step and layer coordinates and the module's tensors are distinct graph values; called once per layer from one place"
+)]
 fn pooled_keep(
     b: &Builder,
     step: &Step,

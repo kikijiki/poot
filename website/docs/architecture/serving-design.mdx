@@ -51,7 +51,7 @@ The driver reserves a request's paged KV blocks for its whole `max_tokens` when 
 | GPTQ [^gptq], AWQ [^awq] | Packed 4-bit projections by default |
 | FP8 (`compressed-tensors`) | Packed E4M3 per-channel projections |
 
-Mixed K-quant files such as `Q4_K_M` widen some layers. KV-cache quantization is not implemented. See [Using quantized checkpoints](../serve/quantized-checkpoints.md).
+Mixed K-quant files such as `Q4_K_M` widen some layers. See [Using quantized checkpoints](../serve/quantized-checkpoints.md).
 
 **LoRA adapters** [^lora] use the PEFT [^peft] layout and are loaded, selected and unloaded while the server runs. They apply to the seven attention and MLP projections of dense decoder families. See [Using LoRA adapters](../serve/lora-adapters.md).
 

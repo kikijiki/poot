@@ -138,7 +138,7 @@ per-graph skip), and callers choose typed options, not pass sequences. The order
 2. RoPE and attention recognition, DCE.
 3. Packed contraction and row-gather recognition, packed escape check.
 4. Legalization, dense BF16 recognition, reduction and dtype preparation.
-5. Fusion, tiling and flash-region synthesis.
+5. Fusion: contraction epilogues, elementwise and row regions, widening and index casts, then slice-of-concat folding and DCE.
 
 Planning then produces equation plans, storage decisions and the slot schema. `Program::passes()` lists the passes that changed
 the graph.

@@ -764,6 +764,9 @@ struct Runtime {
     /// `[rows, positions]` extent, and state is keyed by (name, aval) inside an executable, so two encode
     /// shapes cannot share one. The weights are the base weights, shared with the serving executable.
     encode_exes: HashMap<(NonZeroUsize, NonZeroUsize), ExecutableId>,
+    /// What each executable's device block table holds ([`block_table::DeviceTable`]): the host writes only
+    /// the entries a sequence's blocks gained since.
+    tables: HashMap<ExecutableId, block_table::DeviceTable>,
     /// The expert pool, when routed experts are paged ([`Driver::with_expert_pool`]).
     pool: Option<ExpertPool>,
 }
@@ -974,6 +977,7 @@ impl Driver<Unprepared> {
                 formats,
                 adapter_exes: HashMap::new(),
                 encode_exes: HashMap::new(),
+                tables: HashMap::new(),
                 pool: None,
             },
             settings: Settings {
@@ -1191,6 +1195,8 @@ impl<S: State> Driver<S> {
         self.runtime
             .executor
             .reset_state(exe, poot_executor::StateScope::All)?;
+        // The reset zeroed the executable's block table: the host's account of it is empty again.
+        self.runtime.tables.remove(&exe);
         if let Some(manager) = self
             .runtime
             .pool
@@ -1607,9 +1613,6 @@ impl<S: State> Driver<S> {
                     }
                     Binder::Step(StepInput::RealTokens) => {
                         HostTensor::i32(shape, columns.real.clone())
-                    }
-                    Binder::Step(StepInput::KvReadMap) => {
-                        HostTensor::i32(shape, columns.kv_read.clone())
                     }
                     Binder::Step(StepInput::StateReadRows) => {
                         HostTensor::i32(shape, columns.state_read.clone())

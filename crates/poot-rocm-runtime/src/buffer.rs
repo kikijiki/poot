@@ -6,8 +6,6 @@ use poot_target::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use poot_runtime_common::CopyRange;
-
 /// Which native pool a ROCm allocation lives in (Card 547a): `Weight`/`Activation`/`State` allocate
 /// from the coarse-grained device pool, `Input`/`Output`/`Meta`/`Staging` from the fine-grained system
 /// pool. Fixed for an allocation's whole life (unlike [`RocmBuffer::storage`], which a caller may
@@ -140,100 +138,68 @@ impl RocmAlloc {
     }
 }
 
-pub(crate) fn checked_layout(
-    op: &'static str,
-    elements: usize,
-    storage: BufferStorage,
-) -> Result<usize, RocmError> {
-    let element_bytes = storage.element().byte_width();
-    poot_runtime_common::checked_byte_capacity(elements, element_bytes).map_err(|_| {
-        RocmError::ByteSizeOverflow {
+impl poot_runtime_common::CopyErrors for RocmError {
+    fn byte_size_overflow(op: &'static str, elements: usize, element_bytes: usize) -> Self {
+        Self::ByteSizeOverflow {
             op,
             elements,
             element_bytes,
         }
-    })
-}
+    }
 
-fn map_copy_range_error(
-    op: &'static str,
-    element_offset: usize,
-    elements: usize,
-    error: poot_runtime_common::CopyRangeError,
-) -> RocmError {
-    match error {
-        poot_runtime_common::CopyRangeError::SizeMismatch { have, got } => {
-            RocmError::SizeMismatch { op, have, got }
+    fn representation_mismatch(
+        op: &'static str,
+        expected: BufferStorage,
+        actual: BufferStorage,
+    ) -> Self {
+        Self::RepresentationMismatch {
+            op,
+            expected,
+            actual,
         }
-        poot_runtime_common::CopyRangeError::RangeOverflow => RocmError::RangeOverflow {
+    }
+
+    fn size_mismatch(op: &'static str, have: usize, got: usize) -> Self {
+        Self::SizeMismatch { op, have, got }
+    }
+
+    fn range_overflow(op: &'static str, element_offset: usize, elements: usize) -> Self {
+        Self::RangeOverflow {
             op,
             element_offset,
             elements,
-        },
-        poot_runtime_common::CopyRangeError::RangeOutOfBounds {
-            byte_offset,
-            byte_end,
-            byte_capacity,
-        } => RocmError::RangeOutOfBounds {
+        }
+    }
+
+    fn range_out_of_bounds(
+        op: &'static str,
+        byte_offset: usize,
+        byte_end: usize,
+        byte_capacity: usize,
+    ) -> Self {
+        Self::RangeOutOfBounds {
             op,
             byte_offset,
             byte_end,
             byte_capacity,
-        },
+        }
     }
 }
 
-/// Validate a copy against `buf`'s full storage contract (card 527, R484-001/R471-009): a release
-/// check on element kind, logical dtype and layout together, not element kind alone (which a packed or
-/// widened value can share with a buffer of a different logical meaning; see
-/// [`poot_target::BufferStorage`]).
-pub(crate) fn checked_copy<T>(
-    buf: &RocmBuffer,
-    op: &'static str,
-    expected: BufferStorage,
-    element_offset: usize,
-    elements: usize,
-    whole_buffer: bool,
-    copy: impl FnOnce(CopyRange) -> Result<T, RocmError>,
-) -> Result<T, RocmError> {
-    if buf.storage() != expected {
-        return Err(RocmError::RepresentationMismatch {
-            op,
-            expected,
-            actual: buf.storage(),
-        });
-    }
-    let range = poot_runtime_common::checked_copy_range(
-        element_offset,
-        elements,
-        expected.element().byte_width(),
-        whole_buffer,
-        buf.elem_count(),
-        buf.byte_capacity(),
-    )
-    .map_err(|error| map_copy_range_error(op, element_offset, elements, error))?;
-    copy(range)
-}
+impl poot_runtime_common::CopyTarget for RocmBuffer {
+    type Error = RocmError;
 
-/// Validate a byte range against `buf`'s capacity alone, with no storage/dtype check (Card 547a: the
-/// storage-typed primitive's own range check, deliberately dtype-agnostic - [`RocmContext::write_with`]/
-/// [`RocmContext::read_bytes`] serve any role's buffer, mirroring `poot_wgpu_runtime::Context::write_with`'s
-/// lack of a storage check).
-pub(crate) fn checked_byte_range(
-    op: &'static str,
-    buf: &RocmBuffer,
-    offset: usize,
-    len: usize,
-) -> Result<CopyRange, RocmError> {
-    poot_runtime_common::checked_copy_range(
-        offset,
-        len,
-        1,
-        false,
-        buf.elem_count(),
-        buf.byte_capacity(),
-    )
-    .map_err(|error| map_copy_range_error(op, offset, len, error))
+    fn storage(&self) -> BufferStorage {
+        self.storage()
+    }
+
+    fn elem_count(&self) -> usize {
+        self.elem_count()
+    }
+
+    fn byte_capacity(&self) -> usize {
+        self.byte_capacity()
+    }
 }
 
 impl Drop for RocmAlloc {

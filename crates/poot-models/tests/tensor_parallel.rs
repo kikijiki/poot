@@ -15,14 +15,14 @@ use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::{BinOp, MatmulPrecision, RedOp};
-use poot_graph_ir::{ComputedConst, Graph, Slot, SlotKey, Storage, TensorType, ValueId};
+use poot_graph_ir::{ComputedConst, Graph, Slot, SlotKey, StateRole, Storage, TensorType, ValueId};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, LoraPlan, ShardError, ShardRule, Target,
     multi_device::topology::DeviceId, shard, staged::DevicePlacement, staged::ExpertPlacement,
     staged::Partition, staged::StagedCompileError, staged::StagedProgram, staged::TargetSet,
     staged::compile_staged,
 };
-use poot_models::model::{LogitRows, StepSpec};
+use poot_models::model::{KV_BLOCK, LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_models::test_support::weight_map::MappedModel;
 use poot_quant::format::WeightFormat;
@@ -132,13 +132,21 @@ fn paged_decode_graph(mapped: &MappedModel, rows: usize, pool_slots: usize) -> G
         .expect("the fixture traces a paged decode step")
 }
 
-/// The capacity of the paged steps below: positions each row reads.
-const CAPACITY: usize = 6;
+/// Positions per KV block.
+const BLOCK: usize = KV_BLOCK.get();
 
-/// Where position `t` of row `r` lives in a pool of `pool` slots: scattered, so a read that ignored
-/// the map would read the wrong slot.
+/// The capacity of the paged steps below: positions each row reads, one KV block.
+const CAPACITY: usize = BLOCK;
+
+/// The pool block of row `r`'s logical block `i` in a pool of `pool` slots: scattered, so a read that ignored
+/// the table would read the wrong block.
+fn pool_block(row: usize, i: usize, pool: usize) -> usize {
+    (5 * i + 3 * row + 2) % (pool / BLOCK)
+}
+
+/// Where position `t` of row `r` lives in a pool of `pool` slots.
 fn pool_slot(row: usize, t: usize, pool: usize) -> usize {
-    (5 * t + 3 * row + 2) % pool
+    pool_block(row, t / BLOCK, pool) * BLOCK + t % BLOCK
 }
 
 /// What names an input binder: stage graphs renumber their values.
@@ -252,6 +260,13 @@ fn decode_step(graph: &Graph) -> Step {
                     HostTensor::i32(shape, ids),
                 );
             }
+            // The paged step's sequence rows: row `r` continues sequence `r`.
+            Storage::Slot(Slot::Activation) if meta.aval.dtype == DType::I32 => {
+                slots.insert(
+                    meta.slot_key().cloned().unwrap(),
+                    HostTensor::i32(shape, (0..numel as i32).collect()),
+                );
+            }
             Storage::Slot(Slot::Activation) => {
                 slots.insert(
                     meta.slot_key().cloned().unwrap(),
@@ -264,19 +279,8 @@ fn decode_step(graph: &Graph) -> Step {
                     HostTensor::i32(shape, vec![3; numel]),
                 );
             }
-            // The paged slot maps: a row's logical position `t` reads pool slot `pool_slot(row, t)`;
-            // the step's one token per row (position 3) writes the slot its position maps to.
-            Storage::Slot(Slot::SlotMap) => {
-                let cap = shape[1];
-                let pool = pool_slots;
-                let map = (0..rows)
-                    .flat_map(|r| (0..cap).map(move |t| pool_slot(r, t, pool) as i32))
-                    .collect();
-                slots.insert(
-                    meta.slot_key().cloned().unwrap(),
-                    HostTensor::i32(shape, map),
-                );
-            }
+            // The paged write map: the step's one token per row (position 3) writes the slot its position
+            // maps to; the block table is carried state, bound below.
             Storage::Slot(Slot::WriteMap) => {
                 let map = (0..rows)
                     .map(|row| pool_slot(row, 3, pool_slots) as i32)
@@ -292,6 +296,17 @@ fn decode_step(graph: &Graph) -> Step {
                 slots.insert(
                     meta.slot_key().cloned().unwrap(),
                     HostTensor::i32(shape, idx),
+                );
+            }
+            // The paged block table: row `r`'s logical block `i` is pool block `pool_block(r, i)`.
+            Storage::State if graph.state_role(input) == Some(StateRole::BlockTable) => {
+                let blocks = shape[1];
+                let table = (0..rows)
+                    .flat_map(|r| (0..blocks).map(move |i| pool_block(r, i, pool_slots) as i32))
+                    .collect();
+                state.insert(
+                    meta.name().unwrap().into_owned(),
+                    HostTensor::i32(shape, table),
                 );
             }
             Storage::State => {
@@ -537,6 +552,10 @@ fn assert_walk_matches(
         &format!("{label}: output"),
     );
     for (name, want) in &state {
+        // The host's block table is carried unchanged: only the float pools are written.
+        if want.as_f32().is_none() {
+            continue;
+        }
         for rank in 0..program.tensor().unwrap().devices.len() {
             let got = walked
                 .state
@@ -1203,7 +1222,7 @@ fn the_other_dense_families_shard_and_walk_to_the_whole_graph() {
 
 // ---- paged KV (POOT-1104) -----------------------------------------------------------------
 
-const POOL_SLOTS: usize = 16;
+const POOL_SLOTS: usize = 6 * BLOCK;
 
 /// SC-001 (POOT-1104): a paged decode step of two rows, sharded over two ranks and walked by rank,
 /// equals the whole graph on the logits and on every rank's slice of every carried KV pool, and each

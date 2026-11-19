@@ -40,9 +40,14 @@ use crate::io::{
 };
 use crate::model::WiringError;
 use crate::model::{
-    ConfigReason, FamilyKey, KvLayout, LogitRows, ModelError, ModelOutput, StepShape, TraceError,
+    ConfigReason, FamilyKey, KV_BLOCK, KvLayout, LogitRows, ModelError, ModelOutput, StepShape,
+    TraceError,
 };
 use poot_graph_ir::Requirement;
+
+/// The state name of a paged step's block table ([`PagedMaps::table`]): one I32 `[seqs, capacity / KV_BLOCK]`
+/// value, the same aval in every program of an executable. The driver writes it ([`StateRole::BlockTable`]).
+pub const KV_TABLE_STATE: &str = "kv.table";
 
 /// The state name of the hidden-state carry ([`Step::carry_hidden`]): one f32
 /// `[seqs, positions, width]` value, the same aval in every program of an executable.
@@ -86,8 +91,9 @@ pub struct Step {
     embeds: Option<EmbedInputs>,
     head: HeadKind,
     paged: Option<PagedMaps>,
-    /// The recurrent state pool's index inputs, declared by the first recurrent component.
-    state_rows: RefCell<Option<StateRows>>,
+    /// `Slot::WriteMap` `[rows]`: the pool row each step row's recurrent result is written to (a masked row is
+    /// -1, so its result is dropped), declared by the first recurrent component.
+    state_write: RefCell<Option<Traced>>,
     state: RefCell<Vec<(Traced, Traced)>>,
     validations: RefCell<Vec<(ValidationId, String, Traced)>>,
 }
@@ -127,25 +133,19 @@ fn hidden_dims(b: &Builder, hidden: Traced) -> Result<(usize, usize), TraceError
     Ok((tokens, width))
 }
 
-/// The two slot maps of a [`KvLayout::Paged`] step, both I32 inputs.
+/// What a [`KvLayout::Paged`] step reads and writes its KV pools through.
 #[derive(Clone, Copy, Debug)]
 pub struct PagedMaps {
-    /// `Slot::SlotMap` `[rows, capacity]`: row `r`'s logical position to the pool slot holding its K/V.
-    pub read: Traced,
+    /// The `[rows, capacity / KV_BLOCK]` I32 block table of the step's rows: entry `i` of row `r` is the pool
+    /// block holding positions `i * KV_BLOCK..` of the sequence `r` continues (the gather of the carried
+    /// `kv.table` state by [`Self::seq_rows`]). Every word is a block of the pool by the state's declared range.
+    pub table: Traced,
+    /// `Slot::Activation` `state_read` `[rows]`: the sequence (pool row) each step row continues. A masked row
+    /// reads row 0.
+    pub seq_rows: Traced,
     /// `Slot::WriteMap` `[rows * tokens]`: the pool slot the K/V of flat token `r * tokens + i` is
     /// written to, or -1 for a padding token. Each slot is named at most once (a `ForwardSlotMap`).
     pub write: Traced,
-}
-
-/// The two index inputs of a paged step's recurrent state pool, both I32: `read` a `Slot::Activation`,
-/// `write` a `Slot::WriteMap`.
-#[derive(Clone, Copy, Debug)]
-struct StateRows {
-    /// `[rows]`: the pool row each step row continues. A masked row (beyond the live ones) reads row 0.
-    read: Traced,
-    /// `Slot::WriteMap` `[rows]`: the pool row each step row's result is written to. A masked row is
-    /// -1, so its result is dropped.
-    write: Traced,
 }
 
 /// One recurrent state a component continues: the carried value and the rows this step reads.
@@ -167,21 +167,48 @@ impl Step {
     /// `[rows, tokens]` I32, and under a paged layout the two slot maps.
     pub fn new(b: &Builder, shape: StepShape) -> Result<Self, TraceError> {
         let ids = TensorType::new(vec![shape.rows.get(), shape.tokens.get()], DType::I32);
+        let mut state = Vec::new();
         let paged = match shape.kv {
             KvLayout::Contiguous => None,
-            KvLayout::Paged { pool_slots, .. } => Some(PagedMaps {
-                read: b.read_map(
-                    "read",
-                    shape.rows.get(),
-                    shape.capacity.get(),
-                    pool_slots.get(),
-                )?,
-                write: b.write_map(
-                    "write",
-                    shape.rows.get() * shape.tokens.get(),
-                    pool_slots.get(),
-                )?,
-            }),
+            KvLayout::Paged { pool_slots, seqs } => {
+                let block = KV_BLOCK.get();
+                let capacity = shape.capacity.get();
+                if !capacity.is_multiple_of(block) {
+                    return Err(WiringError::PagedCapacityNotWholeBlocks { capacity, block }.into());
+                }
+                let pool_blocks = IndexRange::below(pool_slots.get() / block).ok_or(
+                    WiringError::PagedPoolHoldsNoBlock {
+                        pool_slots: pool_slots.get(),
+                        block,
+                    },
+                )?;
+                let seq_rows = b.slot_named_ranged(
+                    Slot::Activation,
+                    STATE_READ_TAG,
+                    TensorType::new(vec![shape.rows.get()], DType::I32),
+                    IndexRange::below(seqs.get()).ok_or(WiringError::PagedPoolHoldsNoBlock {
+                        pool_slots: 0,
+                        block,
+                    })?,
+                )?;
+                let carried = b.block_table_state(
+                    KV_TABLE_STATE,
+                    TensorType::new(vec![seqs.get(), capacity / block], DType::I32),
+                    pool_blocks,
+                )?;
+                // The device never writes the table: it is carried unchanged, and the host updates it.
+                state.push((carried, carried));
+                let table = b.gather(carried, 0, seq_rows)?;
+                Some(PagedMaps {
+                    table,
+                    seq_rows,
+                    write: b.write_map(
+                        "write",
+                        shape.rows.get() * shape.tokens.get(),
+                        pool_slots.get(),
+                    )?,
+                })
+            }
         };
         Ok(Self {
             shape,
@@ -198,8 +225,8 @@ impl Step {
             embeds: None,
             head: HeadKind::Logits,
             paged,
-            state_rows: RefCell::new(None),
-            state: RefCell::new(Vec::new()),
+            state_write: RefCell::new(None),
+            state: RefCell::new(state),
             validations: RefCell::new(Vec::new()),
         })
     }
@@ -312,7 +339,7 @@ impl Step {
             }
             KvLayout::Paged { seqs, .. } => {
                 let pool = pooled(seqs.get())?;
-                let current = b.gather(pool, 0, self.state_rows(b, seqs.get())?.read)?;
+                let current = b.gather(pool, 0, self.state_read()?)?;
                 Ok(RecurrentState { pool, current })
             }
         }
@@ -330,8 +357,7 @@ impl Step {
         let carried = match self.shape.kv {
             KvLayout::Contiguous => next,
             KvLayout::Paged { seqs, .. } => {
-                let rows = self.state_rows(b, seqs.get())?;
-                b.scatter_update(state.pool, next, rows.write)?
+                b.scatter_update(state.pool, next, self.state_write(b, seqs.get())?)?
             }
         };
         self.carry(state.pool, carried);
@@ -437,22 +463,22 @@ impl Step {
         Ok(())
     }
 
-    /// The pool's index inputs, declared once per step.
-    fn state_rows(&self, b: &Builder, seqs: usize) -> Result<StateRows, TraceError> {
-        let mut declared = self.state_rows.borrow_mut();
-        if let Some(rows) = *declared {
-            return Ok(rows);
+    /// The `[rows]` pool row each step row continues, declared with the paged layout's maps.
+    fn state_read(&self) -> Result<Traced, TraceError> {
+        self.paged
+            .map(|maps| maps.seq_rows)
+            .ok_or_else(|| WiringError::SlotMapsOnContiguousStep.into())
+    }
+
+    /// The `[rows]` pool row each step row's result is written to, declared once per step.
+    fn state_write(&self, b: &Builder, seqs: usize) -> Result<Traced, TraceError> {
+        let mut declared = self.state_write.borrow_mut();
+        if let Some(write) = *declared {
+            return Ok(write);
         }
-        let rows = StateRows {
-            read: b.slot_named(
-                Slot::Activation,
-                STATE_READ_TAG,
-                TensorType::new(vec![self.shape.rows.get()], DType::I32),
-            )?,
-            write: b.write_map(STATE_WRITE_TAG, self.shape.rows.get(), seqs)?,
-        };
-        *declared = Some(rows);
-        Ok(rows)
+        let write = b.write_map(STATE_WRITE_TAG, self.shape.rows.get(), seqs)?;
+        *declared = Some(write);
+        Ok(write)
     }
 
     /// Declare `value`, a bounded F32 witness, as validation root `id` named `name`: the executor
@@ -1042,7 +1068,7 @@ pub(crate) mod oracle {
                     .collect(),
                 Stored::E4m3(codes) => codes
                     .iter()
-                    .map(|&code| poot_quant::scalar::e4m3fn_to_f32(code))
+                    .map(|&code| poot_tensor::float::e4m3fn_to_f32(code))
                     .collect(),
                 Stored::Packed(payload) => decoded(payload),
                 Stored::PackedStack(experts) => experts.iter().flat_map(|e| decoded(e)).collect(),

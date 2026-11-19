@@ -200,7 +200,7 @@ fn encode_mxfp4_block(block: &[f32], out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scalar::f16_to_f32;
+    use poot_tensor::float::f16_to_f32;
 
     /// Decode every row of `payload` through the one scalar decoder.
     fn decode(payload: &PackedPayload) -> Vec<f32> {

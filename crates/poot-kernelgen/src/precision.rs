@@ -922,7 +922,6 @@ mod ptx_sweep {
             let base = (chunk * chunk_len) as u32;
             let meta = ctx.upload_i32(&[base as i32]).expect("upload");
             ctx.dispatch_dev(
-                "f16_sweep",
                 &kernel,
                 [SWEEP_LANES, 1, 1],
                 [chunk_len as u32, 1, 1],

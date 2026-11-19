@@ -15,7 +15,10 @@ use super::helpers::*;
 
 /// Build and evaluate a tiny prefill attention graph with a given additive mask tensor.
 /// Q/K/V are `[1, hq, l, d]`; mask is `[1, 1, l, l]`. Returns the `[1,hq,l,d]` output.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a test reference taking the operand data and the head/width scalars the op under test takes, in the op's own argument order"
+)]
 fn eval_prefill_attn(
     q_data: Vec<f32>,
     k_data: Vec<f32>,

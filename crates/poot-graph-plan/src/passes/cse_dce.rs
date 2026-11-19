@@ -18,7 +18,7 @@ use poot_graph_ir::ValueTable;
 /// output is remapped to its canonical value.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )
@@ -77,7 +77,7 @@ pub fn cse(g: &Graph) -> Result<Graph, EditError> {
 /// Eqns are topologically ordered, so a single reverse liveness sweep suffices.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )

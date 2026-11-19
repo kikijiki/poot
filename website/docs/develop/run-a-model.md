@@ -77,7 +77,7 @@ A model that ships a chat template answers the prompt as a user turn of it and p
 `poot-serve` and the `poot` commands take `--backend wgpu|rocm|ptx|vulkan|auto`; the benchmark runner takes `--backend ptx|rocm|wgpu` (raw Vulkan is not benchmarked). Every backend is in every build, and a backend whose device is absent is refused when it opens. Library code selects a backend by wiring its executor crate (`poot-wgpu-device`, `poot-rocm-device`, `poot-ptx-device` or `poot-vulkan-device`). See [Develop: Backends](./index.md#backends) and [Picking a backend](../serve/choosing-a-backend.md).
 
 :::note
-The AMD XDNA2 and Intel NPUs are library devices, not serving backends yet; they are under active development, with prefill as the goal.
+The AMD XDNA2 and Intel NPUs are library devices, not serving backends.
 :::
 
 ## What runs where

@@ -324,6 +324,22 @@ export const CATEGORIES: Category[] = [
           "meaning": "the padded order (each expert's rows in row order, padded to whole tiles of block rows), then each tile's expert"
         },
         "notes": "Compiler-only: groups the rows of a tiled indexed contraction by expert so every tile is one expert's rows; an id outside the table lands in a last bucket whose rows the contraction makes NaN"
+      },
+      {
+        "name": "Iota(len, dtype)",
+        "inputs": [
+          {
+            "name": "len",
+            "shape": "scalar",
+            "meaning": "the number of elements, an attribute: the op has no tensor operand"
+          }
+        ],
+        "output": {
+          "name": "out",
+          "shape": "[len]",
+          "meaning": "the range 0, 1, .., len - 1 in dtype (F32 or I32)"
+        },
+        "notes": "The compiler folds every Iota into a computed constant before planning, so no kernel runs it. An F32 range is exact only below 2^24"
       }
     ]
   },
@@ -569,6 +585,148 @@ export const CATEGORIES: Category[] = [
           "meaning": "AllReduce: partials combined across ranks; AllGather: slices concatenated, axis grows by the world size"
         },
         "notes": "Tensor-parallel collectives. AllGather takes the number of ranks and multiplies the gather axis by it. A collective is a cut between stages: compiling one inside a stage graph is refused, and the reference evaluator refuses an AllGather over more than one rank"
+      },
+      {
+        "name": "SideOutput",
+        "inputs": [
+          {
+            "name": "region",
+            "shape": "[...]",
+            "meaning": "the multi-output FusedRow result that defines this value"
+          }
+        ],
+        "output": {
+          "name": "out",
+          "shape": "[...]",
+          "meaning": "a value the region's kernel writes besides its result"
+        },
+        "notes": "Names a value; it computes nothing and plans no dispatch. Each side output of a FusedRow has exactly one projection"
+      },
+      {
+        "name": "Scan",
+        "inputs": [
+          {
+            "name": "operands",
+            "shape": "[...]",
+            "meaning": "the recurrence's inputs, in the order its family documents (the gated delta rule or the Mamba2 SSD)"
+          }
+        ],
+        "output": {
+          "name": "out",
+          "shape": "[1, H, L + S, W]",
+          "meaning": "one packed result: rows up to L are the sequence output, the last S rows the carried state"
+        },
+        "notes": "A bounded recurrence over the sequence axis. Its definition is the family's chunked primitive chain; the CPU oracle evaluates one chunk window at a time and a planner schedule runs a loop of bounded dispatches"
+      },
+      {
+        "name": "BlockTopK",
+        "inputs": [
+          {
+            "name": "scores",
+            "shape": "[R, 1, T, NB]",
+            "meaning": "F32 score of each block of consecutive positions"
+          },
+          {
+            "name": "positions",
+            "shape": "[R, T]",
+            "meaning": "I32 absolute position of each query"
+          }
+        ],
+        "output": {
+          "name": "out",
+          "shape": "[R, 1, T, K + NB]",
+          "meaning": "I32: the K selected block ids in ascending order (-1 after the last), then a 0 or 1 keep indicator per block"
+        },
+        "notes": "A sparse-attention indexer's block selection. Only blocks the query's position has completed are eligible, ranked by score with ties to the lower block. A tracer never emits it: the selection pass of compile forms it"
+      },
+      {
+        "name": "StableRank",
+        "inputs": [
+          {
+            "name": "scores",
+            "shape": "[..., E]",
+            "meaning": "F32 scores, ranked along the last axis"
+          },
+          {
+            "name": "eligible",
+            "shape": "[..., E]",
+            "meaning": "F32 eligibility, present only when the op is masked"
+          }
+        ],
+        "output": {
+          "name": "rank",
+          "shape": "[..., E]",
+          "meaning": "F32 integer-valued position of each element: score descending, lower index first on ties"
+        },
+        "notes": "The router's ranking contract. Every row is a permutation of 0 to E - 1, bit-identical on every executor. A tracer never emits it"
+      },
+      {
+        "name": "SelectedAttention",
+        "inputs": [
+          {
+            "name": "q",
+            "shape": "[B, Hq, Lq, Dk]",
+            "meaning": "queries"
+          },
+          {
+            "name": "k",
+            "shape": "[B, Hkv, Lk, Dk]",
+            "meaning": "the key cache"
+          },
+          {
+            "name": "v",
+            "shape": "[B, Hkv, Lk, Dv]",
+            "meaning": "the value cache"
+          },
+          {
+            "name": "ids",
+            "shape": "[B, 1, Lq, K]",
+            "meaning": "I32 selected block ids: the ids half of a BlockTopK result"
+          },
+          {
+            "name": "positions",
+            "shape": "[B, Lq]",
+            "meaning": "I32 absolute position of each query"
+          }
+        ],
+        "output": {
+          "name": "out",
+          "shape": "[B, Hq, Lq, Dv]",
+          "meaning": "attention over the selected blocks and the query's own unfinished block"
+        },
+        "notes": "A query reads only its K selected blocks plus its own unfinished block, not all Lk positions. Its definition is dense Attention under the additive mask those blocks make. A tracer never emits it"
+      },
+      {
+        "name": "RandomUniform(cols)",
+        "inputs": [
+          {
+            "name": "seed",
+            "shape": "[...]",
+            "meaning": "I32 seed, the bits of a u32; one row of noise per seed element"
+          }
+        ],
+        "output": {
+          "name": "out",
+          "shape": "[..., cols]",
+          "meaning": "F32 uniform noise in [2^-24, 1 - 2^-24]"
+        },
+        "notes": "One integer hash and a power-of-two multiply, bit-exact on every backend. A seed draws the same noise whichever row of a batch it rides in"
+      },
+      {
+        "name": "SampleToken(rule)",
+        "inputs": [
+          {
+            "name": "logits",
+            "shape": "[..., V]",
+            "meaning": "F32 logits, plus the operands the sampling rule lists"
+          }
+        ],
+        "output": {
+          "name": "out",
+          "shape": "[..., 2]",
+          "meaning": "I32 pair: the chosen token and the index of the first non-finite logit, or -1"
+        },
+        "notes": "Picks one token per row on the device. The rule is a closed set; ties go to the lower index. The token is 0 when a logit in the row is not finite"
       }
     ]
   }

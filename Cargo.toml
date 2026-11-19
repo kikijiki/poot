@@ -112,6 +112,8 @@ wildcard_imports = "deny"
 # An outer `#[allow]` hides a lint that stops firing; `#[expect]` fails once the lint is gone (R2-L13-014). Inner
 # `#![allow]` attributes, which clippy leaves alone, remain the way to share a test support module across binaries.
 allow_attributes = "deny"
+# An `#[expect]` or inner `#![allow]` says why the lint stays off: a bare one hides whether it is still wanted.
+allow_attributes_without_reason = "deny"
 # Every `unsafe` block needs a `// SAFETY:` comment naming the contract it relies on. Paired with `unsafe_code` below:
 # a crate that holds unsafe declares it once at its root and every block in it is then reviewed.
 undocumented_unsafe_blocks = "deny"

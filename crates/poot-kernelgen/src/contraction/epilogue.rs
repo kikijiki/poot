@@ -291,7 +291,10 @@ pub(crate) fn emit_epilogue(
 
 /// Leaf `j` of `epilogue` (in `buffer`, read through `lane`, a half decoded as `conversions` says) at the
 /// broadcast position of output element `out_index`, widened to f32.
-#[expect(clippy::too_many_arguments)] // the leaf, its lane and buffer, and the output position it broadcasts to
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the leaf, its lane and buffer, and the output position it broadcasts to"
+)]
 fn read_leaf(
     e: &mut Emit,
     epilogue: &Epilogue,

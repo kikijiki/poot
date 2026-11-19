@@ -199,10 +199,10 @@ fn a_live_attention_bound_types_at_every_float_dtype() {
     }
 }
 
-/// `paged_view` over a read map or a pool of the wrong rank is a typed builder refusal naming the expected
+/// `paged_view` over a block table or a pool of the wrong rank is a typed builder refusal naming the expected
 /// rank, not an index panic; the well-formed pair builds the `[B, Hkv, Lk, D]` view.
 ///
-/// Mutation: require a rank-3 read map in the `let &[rows, cap]` guard; the well-formed row is refused with
+/// Mutation: require a rank-3 block table in the `let &[rows, blocks]` guard; the well-formed row is refused with
 /// `Rank { expected: 2, found: [2, 3] }`.
 #[test]
 fn a_paged_view_over_a_mis_ranked_map_or_pool_is_a_typed_refusal() {
@@ -219,18 +219,20 @@ fn a_paged_view_over_a_mis_ranked_map_or_pool_is_a_typed_refusal() {
     let read = i32_map("read", vec![2, 3]);
     let flat_read = i32_map("flat_read", vec![6]);
 
-    let view = paged_view(&b, pool, read).expect("a rank-3 pool and a rank-2 map build a view");
-    assert_eq!(b.aval(view).unwrap().shape, [2, 2, 3, 4]);
+    let block = std::num::NonZeroUsize::new(4).unwrap();
+    let view =
+        paged_view(&b, pool, read, block).expect("a rank-3 pool and a rank-2 table build a view");
+    assert_eq!(b.aval(view).unwrap().shape, [2, 2, 12, 4]);
     for (what, result, expected, found) in [
         (
-            "a rank-1 read map",
-            paged_view(&b, pool, flat_read),
+            "a rank-1 block table",
+            paged_view(&b, pool, flat_read, block),
             2,
             vec![6],
         ),
         (
             "a rank-2 pool",
-            paged_view(&b, flat_pool, read),
+            paged_view(&b, flat_pool, read, block),
             3,
             vec![8, 8],
         ),

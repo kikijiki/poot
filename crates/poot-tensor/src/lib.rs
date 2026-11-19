@@ -14,6 +14,7 @@
 
 use std::fmt;
 
+pub mod float;
 mod host;
 
 #[cfg(feature = "read-counter")]

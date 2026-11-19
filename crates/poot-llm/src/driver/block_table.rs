@@ -2,9 +2,12 @@
 //! fixed-size KV blocks and a per-sequence block table mapping logical token positions to physical block
 //! slots. The driver owns them; nothing here touches the GPU.
 //! Paged KV stays static-capacity (a fixed pool), so capture/replay is unchanged: the block table is a
-//! device input and the K/V fetch is indirected through it (see the spec).
+//! carried device state ([`DeviceTable`] keeps the host's account of what the device holds, and only the
+//! entries that changed are written) and the K/V fetch is indirected through it (see the spec).
 //!
 //! The block-table approach follows vLLM's PagedAttention (not copied).
+
+use poot_models::model::KV_BLOCK;
 
 use super::prefix_cache::{PrefixCache, PrefixIdentity};
 
@@ -13,9 +16,9 @@ use super::prefix_cache::{PrefixCache, PrefixIdentity};
 #[error("paged KV block pool exhausted")]
 pub struct PoolExhausted;
 
-/// Tokens of K (and V) per physical block. vLLM uses 16; small enough to limit waste, large enough to keep
-/// the gather cheap.
-pub const BLOCK_SIZE: usize = 16;
+/// Tokens of K (and V) per physical block, the model's [`KV_BLOCK`]: the attention kernel indexes the pool by
+/// it. vLLM uses 16; small enough to limit waste, large enough to keep the gather cheap.
+pub const BLOCK_SIZE: usize = KV_BLOCK.get();
 
 /// A free-list allocator over a fixed number of physical KV blocks (sized once, like the contiguous KV
 /// buffer, so paged KV stays static-capacity). `alloc` hands out a physical block id; `free` returns it
@@ -109,8 +112,8 @@ impl BlockTable {
         self.len == 0
     }
 
-    /// The physical block ids for this sequence (logical order). This is what the decode graph supplies as
-    /// the per-sequence block-table device input.
+    /// The physical block ids for this sequence (logical order): the entries of its row of the device block
+    /// table ([`DeviceTable`]).
     pub fn blocks(&self) -> &[u32] {
         &self.blocks
     }
@@ -164,17 +167,6 @@ impl BlockTable {
         }
         let phys_block = self.blocks[logical_pos / BLOCK_SIZE] as usize;
         Some(phys_block * BLOCK_SIZE + logical_pos % BLOCK_SIZE)
-    }
-
-    /// The `[cap]`-length gather index vector the paged decode graph binds to its slot-map input: logical
-    /// key position `t` maps to the flat physical slot holding its K/V (`physical_slot(t)`) for `t < len`.
-    /// Positions `t >= len` are not written yet and are masked out of attention, so they get slot 0 (any
-    /// valid index works - they are never read). The decode graph gathers the physical-order K/V
-    /// cache by this vector to reconstruct logical order, then runs the usual masked attention.
-    pub(crate) fn slot_mapping(&self, cap: usize) -> Vec<u32> {
-        (0..cap)
-            .map(|t| self.physical_slot(t).unwrap_or(0) as u32)
-            .collect()
     }
 
     /// Return all of this sequence's blocks to the pool and reset to empty.
@@ -294,14 +286,51 @@ impl PagedKvCache {
         self.tables[s].extend(n, &mut self.pool)
     }
 
-    /// The `[cap]` gather index vector for slot `s` (what the paged decode graph binds as its slot map).
-    pub(crate) fn slot_mapping(&self, s: usize, cap: usize) -> Vec<u32> {
-        self.tables[s].slot_mapping(cap)
+    /// The flat pool slot of slot `s`'s logical token position `pos` (`None` past its reserved length): where
+    /// the step's write map puts that token's K/V.
+    pub(crate) fn physical_slot(&self, s: usize, pos: usize) -> Option<usize> {
+        self.tables[s].physical_slot(pos)
+    }
+
+    /// Slot `s`'s physical block ids in logical order: the entries of its row of the device block table.
+    pub(crate) fn blocks(&self, s: usize) -> &[u32] {
+        self.tables[s].blocks()
     }
 
     /// Free slot `s`'s blocks back to the shared pool and clear it (on request completion / eviction).
     pub fn reset(&mut self, s: usize) {
         self.tables[s].free(&mut self.pool);
+    }
+}
+
+/// The host's account of what one executable's device block table holds, one row per sequence slot: the
+/// entries written so far. A step writes only the entries of a sequence's blocks that differ from the
+/// account, from the first difference on, so the upload per step is the blocks the sequence gained (a
+/// block boundary crossed, an admission's reservation, a prefix hit) and nothing when it gained none.
+/// Entries past a shortened table stay on the device: every reader hides a position past the sequence by
+/// position, and each is still a block of the pool.
+#[derive(Debug, Default)]
+pub(super) struct DeviceTable {
+    rows: Vec<Vec<u32>>,
+}
+
+impl DeviceTable {
+    /// The first entry of `blocks` the device row of `slot` does not hold, or `None` when the device row
+    /// already starts with all of `blocks`.
+    pub(super) fn first_stale(&self, slot: usize, blocks: &[u32]) -> Option<usize> {
+        let held: &[u32] = self.rows.get(slot).map_or(&[], Vec::as_slice);
+        let agreed = held.iter().zip(blocks).take_while(|(a, b)| a == b).count();
+        (agreed < blocks.len() || held.len() > blocks.len()).then_some(agreed)
+    }
+
+    /// Record that the device row of `slot` now holds `blocks`, written from entry `from`.
+    pub(super) fn record(&mut self, slot: usize, from: usize, blocks: &[u32]) {
+        if self.rows.len() <= slot {
+            self.rows.resize_with(slot + 1, Vec::new);
+        }
+        let row = &mut self.rows[slot];
+        row.truncate(from);
+        row.extend_from_slice(&blocks[from..]);
     }
 }
 
@@ -386,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_mapping_reconstructs_logical_order_through_blocks() {
+    fn physical_slots_reconstruct_logical_order_through_blocks() {
         // seqA gets non-contiguous physical blocks [0, 2] (b holds block 1 between them).
         let mut pool = BlockPool::new(3);
         let mut a = BlockTable::new();
@@ -395,18 +424,14 @@ mod tests {
         b.extend(BLOCK_SIZE, &mut pool).unwrap(); // b: block 1
         a.append(&mut pool).unwrap(); // a: + block 2, now len BLOCK_SIZE+1
         assert_eq!(a.blocks(), &[0, 2]);
-
-        let cap = 3 * BLOCK_SIZE;
-        let map = a.slot_mapping(cap);
-        assert_eq!(map.len(), cap);
         // logical 0..BLOCK_SIZE -> physical block 0 (slots 0..BLOCK_SIZE).
-        for (t, &slot) in map.iter().enumerate().take(BLOCK_SIZE) {
-            assert_eq!(slot, t as u32);
+        for t in 0..BLOCK_SIZE {
+            assert_eq!(a.physical_slot(t), Some(t));
         }
         // logical BLOCK_SIZE -> physical block 2, offset 0 = slot 2*BLOCK_SIZE.
-        assert_eq!(map[BLOCK_SIZE], (2 * BLOCK_SIZE) as u32);
-        // unwritten positions (t >= len) are padded with slot 0 (masked out of attention).
-        assert!(map[BLOCK_SIZE + 1..].iter().all(|&s| s == 0));
+        assert_eq!(a.physical_slot(BLOCK_SIZE), Some(2 * BLOCK_SIZE));
+        // unwritten positions (t >= len) have no slot.
+        assert_eq!(a.physical_slot(BLOCK_SIZE + 1), None);
     }
 
     #[test]
@@ -456,17 +481,17 @@ mod tests {
     }
 
     #[test]
-    fn slot_mapping_per_slot_is_independent() {
+    fn physical_slots_per_slot_are_independent() {
         let mut cache = PagedKvCache::new(2, 4);
         cache.append(0, 3).unwrap();
         cache.append(1, 3).unwrap();
-        // distinct slots get distinct physical blocks, so their slot maps point at different slots.
-        let m0 = cache.slot_mapping(0, BLOCK_SIZE);
-        let m1 = cache.slot_mapping(1, BLOCK_SIZE);
+        // distinct slots get distinct physical blocks, so their positions land in different pool slots.
         assert_ne!(
-            m0[0], m1[0],
+            cache.physical_slot(0, 0),
+            cache.physical_slot(1, 0),
             "the two slots occupy different physical blocks"
         );
+        assert_ne!(cache.blocks(0), cache.blocks(1));
     }
 
     #[test]
@@ -482,6 +507,48 @@ mod tests {
         let mut t2 = BlockTable::new();
         t2.extend(BLOCK_SIZE, &mut pool).unwrap();
         assert_eq!(t2.blocks().len(), 1);
+    }
+
+    /// The device's block table is written by what changed: an account that holds a sequence's blocks asks
+    /// for nothing, a grown table asks for the new entries only, a rewritten block for the tail from it, and a
+    /// shortened table for no entries (the stale tail is hidden by position). Mutation: have `first_stale`
+    /// return `Some(0)` always (rewrite the row each step); the "nothing changed" and "one new block"
+    /// assertions go red.
+    #[test]
+    fn the_device_table_account_asks_only_for_what_changed() {
+        let mut table = DeviceTable::default();
+        assert_eq!(
+            table.first_stale(2, &[]),
+            None,
+            "an empty row holds nothing to write"
+        );
+        assert_eq!(
+            table.first_stale(2, &[7, 3]),
+            Some(0),
+            "a fresh row writes all of it"
+        );
+        table.record(2, 0, &[7, 3]);
+        assert_eq!(table.first_stale(2, &[7, 3]), None, "nothing changed");
+        assert_eq!(table.first_stale(2, &[7, 3, 9]), Some(2), "one new block");
+        table.record(2, 2, &[7, 3, 9]);
+        assert_eq!(
+            table.first_stale(2, &[7, 4, 9]),
+            Some(1),
+            "a rewritten block rewrites the tail"
+        );
+        table.record(2, 1, &[7, 4, 9]);
+        assert_eq!(
+            table.first_stale(2, &[7, 4]),
+            Some(2),
+            "a shortened table records its length"
+        );
+        table.record(2, 2, &[7, 4]);
+        assert_eq!(table.first_stale(2, &[7, 4]), None);
+        assert_eq!(
+            table.first_stale(1, &[5]),
+            Some(0),
+            "another slot is its own row"
+        );
     }
 
     #[test]

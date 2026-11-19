@@ -63,6 +63,7 @@ BindError	UncheckedWriteMap	covered	crates/poot-executor/src/engine.rs	a_write_m
 BindError	NotAWriteMap	covered	crates/poot-executor/src/engine.rs	a_write_map_binds_only_as_a_checked_forward_slot_map
 BindError	UnknownState	covered	crates/poot-executor/src/engine.rs	the_host_seeds_one_row_of_a_carried_state
 BindError	StateRowValues	covered	crates/poot-executor/src/engine.rs	the_host_seeds_one_row_of_a_carried_state
+BindError	StateWordOutOfRange	covered	crates/poot-executor/src/engine.rs	the_host_writes_a_range_of_a_block_table_row_inside_its_declared_range
 BindError	LateValues	covered	crates/poot-executor/src/engine.rs	late_inputs_that_build_the_wrong_number_of_values_are_refused
 BindError	StateRow	covered	crates/poot-executor/src/engine.rs	a_state_row_past_the_pool_is_a_state_row_refusal_that_zeroes_nothing
 BindError	HostedRowOutOfRange	covered	crates/poot-executor/src/engine.rs	an_id_outside_the_hosted_table_is_refused_before_any_write

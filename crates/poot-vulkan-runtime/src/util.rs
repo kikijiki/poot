@@ -50,10 +50,13 @@ pub(crate) fn find_memory_type(
     })
 }
 
-/// `vk::PhysicalDeviceProperties::device_name` is `[c_char; 256]` with `c_char == i8` on Linux; reinterpret as `u8` for UTF-8 decoding.
-pub(crate) fn bytemuck_cast_i8_to_u8(s: &[std::ffi::c_char]) -> &[u8] {
-    // SAFETY: `c_char` and `u8` have identical size/alignment on every platform this crate targets
-    // (Linux: `c_char == i8`); this is a same-size, same-alignment reinterpret of a plain data array with
-    // no padding.
-    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len()) }
+/// A NUL-terminated Vulkan property string (`device_name`, `driver_name`: `[c_char; N]`) as text: up to the
+/// first NUL, invalid UTF-8 replaced.
+pub(crate) fn c_char_text(s: &[std::ffi::c_char]) -> String {
+    let bytes: Vec<u8> = s
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }

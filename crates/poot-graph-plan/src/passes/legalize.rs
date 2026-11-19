@@ -99,7 +99,7 @@ impl From<poot_graph_ir::EditError> for LegalizeError {
 /// the rewrites is a typed refusal, before any device allocation (SC-002).
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )

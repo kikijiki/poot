@@ -248,7 +248,7 @@ impl TiledLayout {
         // Every lane stages the same share of each tile ([`stage_strided`]).
         let shared_dim = match spec.key {
             KeyLayout::Split { shared_dim } => shared_dim,
-            KeyLayout::Single | KeyLayout::Paged => 0,
+            KeyLayout::Single | KeyLayout::Paged { .. } => 0,
         };
         for (what, total) in [
             ("staged query", rows * spec.dk),
@@ -735,7 +735,7 @@ pub(super) fn tiled_body(
     let hkv = hq / n_rep;
     let blocks_per_head = lq.div_ceil(br);
     let shared_dim = match key {
-        KeyLayout::Single | KeyLayout::Paged => 0,
+        KeyLayout::Single | KeyLayout::Paged { .. } => 0,
         KeyLayout::Split { shared_dim } => shared_dim,
     };
     let head_dim = dk - shared_dim;
@@ -761,10 +761,12 @@ pub(super) fn tiled_body(
     };
     let k_shared = match key {
         KeyLayout::Split { .. } => Some(next_param(kv.param())),
-        KeyLayout::Single | KeyLayout::Paged => None,
+        KeyLayout::Single | KeyLayout::Paged { .. } => None,
     };
     let read = match key {
-        KeyLayout::Paged => Some(next_param(ld(slice_dtype(Ty::I32, false), false))),
+        KeyLayout::Paged { block } => {
+            Some((next_param(ld(slice_dtype(Ty::I32, false), false)), block))
+        }
         KeyLayout::Single | KeyLayout::Split { .. } => None,
     };
     let len = match bound {
@@ -949,17 +951,21 @@ pub(super) fn tiled_body(
                     let by_batch = un(e, BinOp::Mul, tile.b, lk);
                     (row, uu(e, BinOp::Add, by_batch, t))
                 }
-                Some(read) => {
-                    let base = un(e, BinOp::Mul, tile.b, lk);
-                    let at = uu(e, BinOp::Add, base, t);
+                Some((read, block)) => {
+                    let base = un(e, BinOp::Mul, tile.b, lk / block);
+                    let entry = un(e, BinOp::Div, t, block);
+                    let at = uu(e, BinOp::Add, base, entry);
                     let word = e.let_(Ty::I32, Rvalue::Use(crate::helpers::copy(elem(read, at))));
-                    let slot = e.let_(
+                    let block_id = e.let_(
                         Ty::Usize,
                         Rvalue::Cast {
                             to: Ty::Usize,
                             operand: op(word),
                         },
                     );
+                    let first = un(e, BinOp::Mul, block_id, block);
+                    let within = un(e, BinOp::Rem, t, block);
+                    let slot = uu(e, BinOp::Add, first, within);
                     let by_slot = un(e, BinOp::Mul, slot, hkv);
                     let pool_row = uu(e, BinOp::Add, by_slot, kv_head);
                     (pool_row, pool_row)

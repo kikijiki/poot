@@ -69,7 +69,7 @@ A control token spelled in a message (contents, system prompts, tool definitions
 
 - A chat template that fails to render the conversation (it raises, spends its instruction budget, or prints more than its output budget) is a `400` naming the template error.
 - Not covered: a template that builds a control token's text out of a message by string surgery.
-- Not covered yet: image chats, whose prompt is tokenized with control tokens parsed.
+- Not covered: image chats, whose prompt is tokenized with control tokens parsed.
 
 ### Engine errors
 
@@ -90,3 +90,15 @@ The model is a safetensors directory or a single **GGUF** file.
 - A checkpoint whose family has a vision front end also takes images; see [Multimodal](./multimodal.md).
 
 [Supported models and formats](../develop/supported-models.md) lists the registered families.
+
+<!-- generated:served-families:begin -->
+
+Families the server starts, from the engine plan over each registered family's fixture checkpoint on the reference SPIR-V target:
+
+`bert`, `bloom`, `deepseek2`, `deepseek3`, `deepseek32`, `deepseek4`, `gemma2`, `gemma3`, `gemma4`, `glm53_flash`, `gpt_oss`, `granite`, `idefics3`, `llama`, `minimax_m2`, `mpt`, `nemotron_h`, `olmo2`, `olmoe`, `phi3`, `qwen2`, `qwen2_5_vl`, `qwen3`, `qwen35`, `qwen3moe`, `qwen3next`, `smollm3`
+
+Families the engine plan refuses:
+
+- `qwen4exp`: refuses the paged serving shape: `PagedBlockedState`
+
+<!-- generated:served-families:end -->

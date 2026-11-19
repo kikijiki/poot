@@ -962,7 +962,7 @@ fn evaluate_cast(
             )?))
         }
         // BF16/F16 <-> E4M3FN: via F32 (deval 4), composed from the float-precision widen/narrow above
-        // and the E4M3 codec (`fp8::encode_e4m3fn`/`poot_quant::scalar::e4m3fn_to_f32`) `cast_value`
+        // and the E4M3 codec (`fp8::encode_e4m3fn`/`poot_tensor::float::e4m3fn_to_f32`) `cast_value`
         // already uses for the direct F32 <-> E4M3FN pair.
         (DType::BF16, DType::E4M3FN) => {
             let bytes: Vec<u8> = if let Value::Host(tensor) = env_value(env, input_id)? {

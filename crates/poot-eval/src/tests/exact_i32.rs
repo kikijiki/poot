@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use poot_graph_ir::{BinOp, Builder, Scalar, StateRole, TensorType, UnOp};
 
-use super::allocation::allocated_bytes;
 use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
+use poot_test_util::alloc_count::allocated_bytes;
 
 fn i32_tensor(shape: Vec<usize>, values: &[i32]) -> HostTensor {
     HostTensor::i32(shape, values.to_vec())

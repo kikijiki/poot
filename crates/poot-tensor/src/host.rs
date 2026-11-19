@@ -10,6 +10,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use crate::float::{bf16_to_f32, e4m3fn_to_f32, f16_to_f32};
 use crate::{DType, HostView};
 
 #[cfg(not(target_endian = "little"))]
@@ -384,42 +385,6 @@ impl HostTensor {
             (HostData::Bytes(_), dtype) => Err(CarrierError::NotWidenable { dtype }),
         }
     }
-}
-
-/// IEEE-754 binary16 to f32 (exact; subnormals, infinities and NaN payloads carry through).
-const fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exponent = ((bits >> 10) & 0x1f) as u32;
-    let mantissa = (bits & 0x03ff) as u32;
-    match exponent {
-        0 => {
-            let magnitude = mantissa as f32 * (1.0 / 16_777_216.0);
-            f32::from_bits(magnitude.to_bits() | sign)
-        }
-        0x1f => f32::from_bits(sign | 0x7f80_0000 | (mantissa << 13)),
-        _ => f32::from_bits(sign | ((exponent + 112) << 23) | (mantissa << 13)),
-    }
-}
-
-/// bfloat16 to f32: bf16 is the high half of an f32.
-const fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
-
-/// OCP E4M3FN to f32: bias 7, no infinities; `0x7f` and `0xff` both decode to the one canonical
-/// positive quiet NaN (`0x7fc0_0000`).
-const fn e4m3fn_to_f32(byte: u8) -> f32 {
-    let sign = ((byte & 0x80) as u32) << 24;
-    let exponent = ((byte >> 3) & 0x0f) as u32;
-    let mantissa = (byte & 0x07) as u32;
-    if exponent == 0x0f && mantissa == 0x07 {
-        return f32::from_bits(0x7fc0_0000);
-    }
-    if exponent == 0 {
-        let magnitude = mantissa as f32 * (1.0 / 512.0);
-        return f32::from_bits(magnitude.to_bits() | sign);
-    }
-    f32::from_bits(sign | ((exponent + 120) << 23) | (mantissa << 20))
 }
 
 /// A count of [`HostTensor::to_f32`] calls, for the test that proves a bind path never widens.

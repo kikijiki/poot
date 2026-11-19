@@ -581,14 +581,14 @@ fn execute(body: &Body, args: &[(Buf, usize)], workgroups: [u32; 3]) -> Result<(
                 Ty::F16,
                 &halves
                     .iter()
-                    .map(|h| poot_quant::scalar::f16_to_f32(u16::from_le_bytes(*h)))
+                    .map(|h| poot_tensor::float::f16_to_f32(u16::from_le_bytes(*h)))
                     .collect::<Vec<_>>(),
             ),
             Ty::BF16 => Buffer::from_halves(
                 Ty::BF16,
                 &halves
                     .iter()
-                    .map(|h| poot_quant::scalar::bf16_to_f32(u16::from_le_bytes(*h)))
+                    .map(|h| poot_tensor::float::bf16_to_f32(u16::from_le_bytes(*h)))
                     .collect::<Vec<_>>(),
             ),
             Ty::F32 => Buffer::from_f32s(
@@ -1482,12 +1482,14 @@ fn paged_tokens(driver: Driver, max_new: usize) -> Vec<u32> {
     tokens
 }
 
-/// Bytes of the paged KV pools one rank holds: K and V of one layer, `pool_slots` rows of `kv_heads`
-/// heads of `HEAD_DIM` values in the default driver's KV dtype, the heads divided over `world` ranks.
+/// Bytes of the paged KV state one rank holds: K and V of one layer, `pool_slots` rows of `kv_heads` heads of
+/// `HEAD_DIM` values in the default driver's KV dtype, the heads divided over `world` ranks, and the block table
+/// every rank holds whole (one I32 entry: one sequence, one block of capacity).
 fn pool_bytes(world: usize) -> u64 {
     let slots = POOL_BLOCKS * super::block_table::BLOCK_SIZE;
     let element = poot_models::model::KvDtype::DEFAULT.dtype().byte_size();
-    (2 * slots * (HEADS / world) * HEAD_DIM * element) as u64
+    let table = std::mem::size_of::<i32>();
+    (2 * slots * (HEADS / world) * HEAD_DIM * element + table) as u64
 }
 
 /// A paged tensor-parallel decode over two executing devices equals the single-device driver's tokens:
@@ -1581,10 +1583,12 @@ fn each_ranks_paged_kv_footprint_is_its_heads_of_the_pool_and_equals_the_prepare
         [pool_bytes(2), pool_bytes(2)],
         "each rank plans its own heads of the pool"
     );
+    // The pool is divided over the ranks; the block table (one I32 entry) is whole on each.
+    let table = std::mem::size_of::<i32>() as u64;
     assert_eq!(
         state.iter().sum::<u64>(),
-        whole,
-        "the ranks hold the pool once"
+        whole + table,
+        "the ranks hold the pool once and the table on each"
     );
 
     let (driver, _) = placed(&handle, tensor()).unwrap();

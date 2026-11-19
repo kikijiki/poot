@@ -63,7 +63,10 @@ fn leaf_ty_of(site: Site<'_>, dtype: DType) -> Result<kg::LeafTy, PlanError> {
 }
 
 /// Plan one elementwise-family equation (Binary/Select/Unary/Rope/Reduce/Fused/FusedRow).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

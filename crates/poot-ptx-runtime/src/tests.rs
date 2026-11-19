@@ -1,6 +1,6 @@
 use super::*;
+use crate::buffer::allocate_owned;
 use crate::buffer::test_only::checked_buffer;
-use crate::buffer::{allocate_owned, checked_copy, checked_layout};
 use crate::context::KernelArgs;
 use crate::driver::CudaDriver;
 use crate::graph::{CaptureRetention, ModuleConstruction, create_event_pair, instantiate_graph};
@@ -8,6 +8,7 @@ use crate::owner::{PtxOwner, construct_owner};
 use crate::upload::UploadRing;
 use cudarc::driver::{DriverError, result, sys};
 use poot_runtime_common::BufferRole;
+use poot_runtime_common::{checked_copy, checked_layout};
 use poot_target::BufferStorage;
 use poot_target::ElementKind;
 use std::collections::HashMap;
@@ -1170,18 +1171,9 @@ fn count_copy(
     whole: bool,
     calls: &Cell<usize>,
 ) -> Result<(), PtxError> {
-    checked_copy(
-        buffer,
-        "test_copy",
-        expected,
-        offset,
-        elements,
-        whole,
-        |_| {
-            calls.set(calls.get() + 1);
-            Ok(())
-        },
-    )
+    checked_copy(buffer, "test_copy", expected, offset, elements, whole)?;
+    calls.set(calls.get() + 1);
+    Ok(())
 }
 
 #[test]
@@ -1290,7 +1282,7 @@ fn immutable_metadata_and_valid_copy_share_one_allocation_contract() {
 #[test]
 fn allocation_arithmetic_is_checked_before_native_allocation() {
     assert!(matches!(
-        checked_layout("alloc_f32", usize::MAX, BufferStorage::f32()),
+        checked_layout::<PtxError>("alloc_f32", usize::MAX, BufferStorage::f32()),
         Err(PtxError::ByteSizeOverflow { .. })
     ));
 }
@@ -1328,7 +1320,8 @@ fn a_buffer_past_u32_elements_allocates_and_its_tail_is_writable() {
 fn allocation_layout_accepts_an_element_count_past_u32() {
     let elements = u32::MAX as usize + 1;
     assert_eq!(
-        checked_layout("alloc_i32", elements, BufferStorage::i32()).expect("a 64-bit layout"),
+        checked_layout::<PtxError>("alloc_i32", elements, BufferStorage::i32())
+            .expect("a 64-bit layout"),
         elements * 4
     );
 }
@@ -1416,7 +1409,6 @@ fn card305_ptx_lifecycle_repeated_contexts_and_surviving_children() {
 
         worker
             .dispatch_dev(
-                "card305_lifecycle_warm",
                 &lifecycle_kernel(),
                 [32, 1, 1],
                 [4, 1, 1],
@@ -1431,7 +1423,6 @@ fn card305_ptx_lifecycle_repeated_contexts_and_surviving_children() {
         worker.begin_capture().expect("begin lifecycle capture");
         worker
             .dispatch_dev(
-                "card305_lifecycle_capture",
                 &lifecycle_kernel(),
                 [32, 1, 1],
                 [4, 1, 1],
@@ -1650,7 +1641,6 @@ fn no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows() {
     let out_buf = ctx.alloc_f32(rows.len()).expect("alloc out");
     let n = rows.len() as u32;
     ctx.dispatch_dev(
-        "no_contract_probe",
         &kernel,
         [n, 1, 1],
         [n, 1, 1],
@@ -1842,7 +1832,6 @@ fn an_out_of_bounds_store_is_device_lost_and_poisons_the_context() {
     // refused by the driver at the launch, before any store.
     let block = body.workgroup_size;
     ctx.dispatch_dev(
-        "add",
         &kernel,
         block,
         [u32::MAX - (block[0] - 1), 1, 1],
@@ -1894,7 +1883,6 @@ fn u32x4_vector_load_matches_scalar_loads_on_ptx() {
             .alloc_storage(BufferRole::Output, BufferStorage::i32(), case.want.len())
             .expect("alloc output");
         ctx.dispatch_dev(
-            &name,
             &kernel,
             case.body.workgroup_size,
             [poot_kernel_ir::test_support::VECTOR_LOAD_THREADS, 1, 1],
@@ -1952,7 +1940,6 @@ fn subgroup_shuffle_xor_matches_the_interpreter_on_ptx() {
             .alloc_storage(BufferRole::Output, storage, words)
             .expect("alloc output");
         ctx.dispatch_dev(
-            &name,
             &kernel,
             body.workgroup_size,
             [THREADS, 1, 1],

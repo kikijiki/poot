@@ -49,12 +49,14 @@ pub fn grid_scores(blocks: usize, levels: u32, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// One row of [`selection_cases`]: `(label, scores, positions, ratio, k)`.
+type SelectionCase = (String, Vec<Vec<f32>>, Vec<i32>, usize, usize);
+
 /// The score rows the selection stage is exercised on (design section 5, tier 1), as `(label, scores,
 /// positions, ratio, k)`: distinct, coarse (many ties, some straddling the threshold) and all-equal
 /// scores at block counts that are not powers of two; eligibility edges (`E` of 0, 1, `k - 1`, `k`, `k + 1`
 /// and every block); and NaN, infinities and signed zeros.
-#[expect(clippy::type_complexity)]
-pub fn selection_cases() -> Vec<(String, Vec<Vec<f32>>, Vec<i32>, usize, usize)> {
+pub fn selection_cases() -> Vec<SelectionCase> {
     let mut cases = Vec::new();
     let (ratio, k) = (4, 5);
     for blocks in [7usize, 12, 64, 100] {

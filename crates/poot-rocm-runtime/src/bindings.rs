@@ -8,9 +8,10 @@
 //! References: ROCm 7.2.3 `include/hsa/hsa.h` and `include/hsa/hsa_ext_amd.h` (ROCR-Runtime
 //! `runtime/hsa-runtime/inc/`).
 
-// These type aliases mirror the HSA C API's snake_case names 1:1 so the bindings stay diffable
-// against the C headers.
-#![allow(non_camel_case_types)]
+#![allow(
+    non_camel_case_types,
+    reason = "these type aliases mirror the HSA C API's snake_case names 1:1 so the bindings stay diffable against the C headers"
+)]
 
 use std::ffi::{c_char, c_void};
 

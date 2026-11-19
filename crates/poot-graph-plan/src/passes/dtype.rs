@@ -31,7 +31,7 @@ pub(crate) fn transpose_is_noop(in_shape: &[usize], perm: &[usize]) -> bool {
 /// cuts node count, and so the per-token host capture/plan work, on the launch-bound decode path.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )
@@ -85,7 +85,7 @@ pub fn collapse_reshape_chains(g: &Graph) -> Result<Graph, EditError> {
 /// value-preserving, so it composes anywhere.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
-    allow(
+    expect(
         unreachable_pub,
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )

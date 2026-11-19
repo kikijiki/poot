@@ -33,6 +33,7 @@ echo "-- navbar (every top-level docs section has a navbar entry and its sidebar
 echo "-- build (broken-link check) --"
 (cd website && bun run build) || rc=1
 echo "-- stale names (identifiers, variables, crates, paths, recipes, flags the code no longer has) --"
+scripts/site-stale-names.sh --self-test || rc=1
 scripts/site-stale-names.sh || rc=1
 if [ "$toolchain" = 1 ]; then
   echo "-- rust snippets (the develop/ pages' code compiles) --"

@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use super::{BinOp, Builder, BuilderError, DType, RedOp, Scalar, Traced, UnOp, softcap};
 use crate::error::Requirement;
 use crate::precision::OperandPrecision;
@@ -38,7 +40,10 @@ pub fn repeat_kv_tiled(b: &Builder, k: Traced, n_rep: usize) -> Result<Traced, B
 /// sum. `sinks` is `[Hq]`. Implemented without a concat op: folding the sink into the max and the sum over
 /// the real columns equals concatenating a sink column. `OpKind::Attention` with [`crate::SinkOperand::PerHead`]
 /// is the fusion of this chain.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 pub fn attention_masked_sinks(
     b: &Builder,
     q: Traced,
@@ -133,7 +138,10 @@ pub fn attention_masked(
 /// `c * tanh(scores / c)` ([`softcap`]) to the scaled `Q K^T` scores BEFORE the additive mask and softmax
 /// (the Gemma2 order); `None` is byte-identical to [`attention_masked`] (no extra eqns). One definition
 /// across tracing, the oracle and every lowering.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 pub fn attention_masked_softcap(
     b: &Builder,
     q: Traced,
@@ -159,11 +167,17 @@ pub fn attention_masked_softcap(
     )
 }
 
-/// The `[B,Hkv,Lk,D]` view of the `[S,Hkv,D]` KV `pool` through the `[B,Lk]` I32 slot map `read`: position `t`
-/// of batch row `b` is pool slot `read[b,t]`. It is the one definition of a paged cache's logical view: the
-/// models trace it, and [`crate::KeyLayout::Paged`] attention is its fusion into the attention kernel, which
-/// reads the pool through `read` instead of materializing the view.
-pub fn paged_view(b: &Builder, pool: Traced, read: Traced) -> Result<Traced, BuilderError> {
+/// The `[B,Hkv,Lk,D]` view of the `[S,Hkv,D]` KV `pool` through the I32 block table `table [B,Lk/block]`:
+/// position `t` of batch row `b` is pool slot `table[b, t / block] * block + t % block`. It is the one
+/// definition of a paged cache's logical view: the models trace it, and [`crate::KeyLayout::Paged`] attention
+/// is its fusion into the attention kernel, which reads the pool through the table instead of materializing
+/// the view.
+pub fn paged_view(
+    b: &Builder,
+    pool: Traced,
+    table: Traced,
+    block: NonZeroUsize,
+) -> Result<Traced, BuilderError> {
     let rank = |expected: usize, shape: Vec<usize>| BuilderError::Requirement {
         operation: "paged view",
         requirement: Requirement::Rank {
@@ -171,15 +185,32 @@ pub fn paged_view(b: &Builder, pool: Traced, read: Traced) -> Result<Traced, Bui
             found: shape,
         },
     };
-    let read_shape = b.aval(read)?.shape.clone();
-    let &[rows, cap] = read_shape.as_slice() else {
-        return Err(rank(2, read_shape));
+    let table_shape = b.aval(table)?.shape.clone();
+    let &[rows, blocks] = table_shape.as_slice() else {
+        return Err(rank(2, table_shape));
     };
     let pool_shape = b.aval(pool)?.shape.clone();
     let &[_, hkv, d] = pool_shape.as_slice() else {
         return Err(rank(3, pool_shape));
     };
-    let slots = b.reshape(read, vec![rows * cap])?;
+    let block = block.get();
+    let cap = blocks * block;
+    // `[B, blocks, 1] * block + [1, 1, block]`: the slot of each position, in exact I32.
+    let first = b.binary_scalar(
+        BinOp::Mul,
+        b.reshape(table, vec![rows, blocks, 1])?,
+        Scalar::I32(i32::try_from(block).map_err(|_| BuilderError::Requirement {
+            operation: "paged view",
+            requirement: Requirement::AtLeastOne { what: "block" },
+        })?),
+    )?;
+    let within = b.reshape(b.iota_i32(block)?, vec![1, 1, block])?;
+    let slots = b.binary(
+        BinOp::Add,
+        b.broadcast(first, vec![rows, blocks, block])?,
+        b.broadcast(within, vec![rows, blocks, block])?,
+    )?;
+    let slots = b.reshape(slots, vec![rows * cap])?;
     let rows_first = b.reshape(b.gather(pool, 0, slots)?, vec![rows, cap, hkv, d])?;
     b.transpose(rows_first, vec![0, 2, 1, 3])
 }
@@ -213,7 +244,10 @@ pub struct LiveAttention {
 /// row `b`, with `len` a raw I32 `[B]` that must lie in `1..=Lk`. The range is checked by the canonical
 /// index-bounds guard ([`Builder::guard_index_bounds`] on `len - 1`), so an out-of-range length publishes
 /// nothing through the validation channel and the graph reads a valid in-range fallback.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 pub fn attention_live(
     b: &Builder,
     q: Traced,
@@ -256,7 +290,10 @@ pub fn attention_live(
 /// inactive K and V rows are *selected* to zero before either matmul (a float `Select`, never a multiplication
 /// by zero, so a NaN there cannot survive) and inactive scores are selected to `-inf` after the mask is
 /// added, so inactive positions weigh exactly zero. Both parts of a split key are guarded.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 pub(crate) fn attention_over_keys(
     b: &Builder,
     q: Traced,

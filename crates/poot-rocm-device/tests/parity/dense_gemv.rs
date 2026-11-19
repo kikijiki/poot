@@ -38,7 +38,7 @@ fn weight(dtype: DType, count: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
             DType::F16 => {
                 let bits = ((r & 0x8000) | ((8 + (r >> 10) % 7) << 10) | (r & 0x03ff)) as u16;
                 bytes.extend(bits.to_le_bytes());
-                held.push(poot_quant::scalar::f16_to_f32(bits));
+                held.push(poot_tensor::float::f16_to_f32(bits));
             }
             DType::BF16 | DType::F32 => {
                 let bits = ((r & 0x8000) | ((120 + (r >> 7) % 7) << 7) | (r & 0x7f)) as u16;

@@ -30,7 +30,7 @@ Grids and buffer addresses stay constant, so one capture serves every position u
 
 ## Slot buffers
 
-Per-step inputs (`Slot::Token`, `Slot::Pos`, and `Slot::SlotMap` / `Slot::WriteMap` for paged KV) live in device buffers at
+Per-step inputs (`Slot::Token`, `Slot::Pos`, and the sequence rows and `Slot::WriteMap` for paged KV) live in device buffers at
 stable addresses. Recorded kernels point at them, and the host rewrites their contents before each replay. A scalar that depends
 on a slot is bound to the slot buffer, never baked into the capture.
 

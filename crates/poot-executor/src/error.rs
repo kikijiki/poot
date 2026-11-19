@@ -524,15 +524,16 @@ pub enum BindError {
         /// Values they built.
         values: usize,
     },
-    /// `write_state_row` named a carried state the executable does not hold.
+    /// `write_state_range` named a carried state the executable does not hold.
     #[error("no carried state is named {name}")]
     UnknownState {
         /// The name the write gave.
         name: String,
     },
-    /// `write_state_row` was given a row whose dtype or element count is not the state's own.
+    /// `write_state_range` was given values of another dtype than the state's, or a range that does not fit
+    /// inside one row of it.
     #[error(
-        "state {name}: a row holds {expected_len} {expected:?} elements, got {got_len} {got:?}"
+        "state {name}: a row holds {row_len} {expected:?} elements, got {got_len} {got:?} from element {from}"
     )]
     StateRowValues {
         /// The carried state's name.
@@ -540,11 +541,28 @@ pub enum BindError {
         /// The state's dtype.
         expected: poot_tensor::DType,
         /// Elements in one row of the state.
-        expected_len: usize,
+        row_len: usize,
+        /// The first element the write named.
+        from: usize,
         /// The dtype the write carried.
         got: poot_tensor::DType,
         /// Elements the write carried.
         got_len: usize,
+    },
+    /// `write_state_range` carried a word outside the range the state declares: a block table names only
+    /// blocks of its pool, and the attention kernel reads the pool by it unchecked.
+    #[error(
+        "state {name}: word {word} at element {at} of the write is outside the declared range {range}"
+    )]
+    StateWordOutOfRange {
+        /// The carried state's name.
+        name: String,
+        /// The index of the word in the write.
+        at: usize,
+        /// The word.
+        word: i32,
+        /// The range the state declares.
+        range: poot_graph_ir::IndexRange,
     },
     /// A hosted gather's id is not a row of its table: the step names a row the checkpoint does not hold.
     #[error("hosted table {name}: id {id} is not one of its {rows} rows")]

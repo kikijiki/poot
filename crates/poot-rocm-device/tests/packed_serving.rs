@@ -986,7 +986,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
 
 /// POOT-1060: the sharded-PLE lookup's table shape - a dense E4M3FN `[rows, width]` checkpoint const
 /// gathered by an exact I32 index and widened in one `DenseRowGather` - through the executor contract,
-/// bit-exact against `poot_quant::scalar::e4m3fn_to_f32`. The table holds all 256 codes (NaN
+/// bit-exact against `poot_tensor::float::e4m3fn_to_f32`. The table holds all 256 codes (NaN
 /// included) and is read at its first and last row, a repeated row and an interior row, at widths 1, 3,
 /// 4, 6 and 8: a width that is not a multiple of four pads each row to a whole `u32` word
 /// (`words_per_row = ceil(width / 4)`), so a flat `element / 4` lane read goes red on the odd widths.
@@ -1060,7 +1060,7 @@ fn dense_e4m3_row_gather_is_bit_exact() {
         for (r, &id) in ids.iter().enumerate() {
             for c in 0..width {
                 let byte = table[id as usize * width + c];
-                let want = poot_quant::scalar::e4m3fn_to_f32(byte);
+                let want = poot_tensor::float::e4m3fn_to_f32(byte);
                 let got = out[r * width + c];
                 assert_eq!(
                     got.to_bits(),

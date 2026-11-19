@@ -92,16 +92,22 @@ pub struct ModelConfig {
     pub tool_codec: Option<Arc<dyn ToolCallCodec>>,
 }
 
+/// The positions one paged KV block holds, and so the positions each entry of a sequence's block table covers:
+/// logical position `t` of a sequence lives at pool slot `table[t / KV_BLOCK] * KV_BLOCK + t % KV_BLOCK`. The
+/// driver's block pool allocates in these units and the attention kernel reads through them.
+pub const KV_BLOCK: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+
 /// How the traced step's KV cache is laid out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KvLayout {
     /// One private `[rows, kv_heads, capacity, head_dim]` cache per layer; row `r` writes at its own
     /// first position. Every row of a step carries the same token count.
     Contiguous,
-    /// One `[pool_slots, kv_heads, head_dim]` pool per layer shared by every row. Each row reads and
-    /// writes through per-step slot maps (`Slot::SlotMap` `"read"`: logical position to pool slot,
-    /// `[rows, capacity]`; `Slot::WriteMap` `"write"`: the step's flat token index to its pool slot or
-    /// -1, `[rows * tokens]`), so a row's blocks may sit anywhere in the pool and a token whose write
+    /// One `[pool_slots, kv_heads, head_dim]` pool per layer shared by every row. Each row reads through its
+    /// sequence's block table (`kv.table`, a carried `[seqs, capacity / KV_BLOCK]` state the host updates only
+    /// where a sequence's blocks changed; the step names each row's sequence by its `state_read` index) and
+    /// writes through a per-step map (`Slot::WriteMap` `"write"`: the step's flat token index to its pool slot
+    /// or -1, `[rows * tokens]`), so a row's blocks may sit anywhere in the pool and a token whose write
     /// map entry is -1 (a padding token) leaves the pool untouched. Recurrent state is pooled the same way:
     /// one row per sequence the pool serves (`seqs`), which a step's rows address through the
     /// `state_read` and `state_write` index inputs (`Step::recurrent`).
@@ -714,6 +720,22 @@ pub enum WiringError {
     /// A step with slot maps was traced against a contiguous KV layout.
     #[error("a step with slot maps must be paged")]
     SlotMapsOnContiguousStep,
+    /// A paged step's capacity is not whole blocks: its block table covers `capacity / KV_BLOCK` entries.
+    #[error("a paged step's capacity {capacity} is not a multiple of the {block}-slot KV block")]
+    PagedCapacityNotWholeBlocks {
+        /// The step's capacity.
+        capacity: usize,
+        /// The block size.
+        block: usize,
+    },
+    /// A paged KV pool holds no whole block.
+    #[error("a paged pool of {pool_slots} slots holds no whole {block}-slot KV block")]
+    PagedPoolHoldsNoBlock {
+        /// The pool's slots.
+        pool_slots: usize,
+        /// The block size.
+        block: usize,
+    },
     /// A sectioned rope was traced over a step that carries no mRoPE position input.
     #[error("a sectioned rope needs the step's mRoPE positions")]
     SectionedRopeWithoutMrope,

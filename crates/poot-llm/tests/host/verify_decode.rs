@@ -4,10 +4,10 @@
 //! `pos..pos+L` (carrying the cache). Tiny synthetic config with deterministic random weights, CPU
 //! eval: no model, no GPU.
 
-use crate::common::{slot_maps, step, token_pos, zero_state};
+use crate::common::{paged_slots, step, token_pos, with_table, zero_state};
 use poot_graph_ir::Graph;
 use poot_graph_plan::passes_without_target;
-use poot_models::model::{LogitRows, StepSpec};
+use poot_models::model::{KV_BLOCK, LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step as step_shape};
 use poot_models::test_support::weight_map::MappedModel;
 use poot_tensor::HostTensor;
@@ -77,22 +77,23 @@ fn verify(
 }
 
 /// Spec 045 (paged KV, card 046a): the paged decode graph must produce token-identical logits to
-/// the contiguous fixed-KV decode for any consistent slot map (FR-001). The slot map is a
-/// non-identity (reverse) layout, so the reorder is exercised.
+/// the contiguous fixed-KV decode for any consistent block table (FR-001). The sequence's one block is a
+/// non-identity pool block, so the indirection is exercised.
 #[test]
 fn paged_decode_matches_contiguous_decode_cpu() {
     let m = tiny();
-    let cap = 20;
+    let cap = KV_BLOCK.get(); // one block
     let n_steps = 12; // < cap
     let cont = decode_graph(&m, cap);
     let paged = m
         .model
         .trace(
-            &StepSpec::step(paged_step(1, 1, cap, cap, LogitRows::Last)),
+            &StepSpec::step(paged_step(1, 1, cap, 2 * cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
-    let read: Vec<i32> = (0..cap as i32).map(|t| cap as i32 - 1 - t).collect();
+    // The sequence's block is the pool's second: position `t` is pool slot `cap + t`.
+    let table = [1i32];
 
     let mut c_caches = zero_state(&cont);
     let mut p_caches = zero_state(&paged);
@@ -104,10 +105,10 @@ fn paged_decode_matches_contiguous_decode_cpu() {
         let (clog, cnew) = decode(&m, &cont, &c_caches, tok, pos);
         c_caches = cnew;
 
-        let write = vec![read[pos]];
+        let write = vec![(cap + pos) as i32];
         let mut slots = token_pos(1, 1, &[tok], &[pos as i32]);
-        slots.extend(slot_maps(1, cap, read.clone(), write));
-        let (plog, pnew) = step(&m, &paged, &slots, &p_caches);
+        slots.extend(paged_slots(1, write));
+        let (plog, pnew) = step(&m, &paged, &slots, &with_table(&paged, &p_caches, &table));
         p_caches = pnew;
 
         assert_eq!(clog.as_f32().unwrap().len(), plog.as_f32().unwrap().len());

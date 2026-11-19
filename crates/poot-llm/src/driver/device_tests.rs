@@ -2220,7 +2220,7 @@ fn llama_fp8_and_decoded_twin() -> (Vec<ArchiveTensor>, Vec<ArchiveTensor>) {
             .iter()
             .enumerate()
             .flat_map(|(i, &code)| {
-                (poot_quant::scalar::e4m3fn_to_f32(code) * scales[i / cols]).to_le_bytes()
+                (poot_tensor::float::e4m3fn_to_f32(code) * scales[i / cols]).to_le_bytes()
             })
             .collect();
         packed.push(ArchiveTensor {

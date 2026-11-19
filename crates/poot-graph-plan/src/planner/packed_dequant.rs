@@ -34,7 +34,10 @@ use poot_target::{Backend, DeviceCaps};
 /// Plan one imported packed equation. A descriptor card 542a's table does not admit for this op is
 /// refused with `Capability::PackedLowering`; a standalone `PackedDequant`, which no kernel lowers, with
 /// `Capability::ImportedKernelPlanning`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -117,7 +120,10 @@ pub(super) fn plan(
 /// `out[.., :] = decode(ids[..], :)`: the `PackedRowGather` equation (quantized token
 /// embeddings). Params `(words, ids, metadata, out)` - `eqn.inputs` is the one `Blocks` carrier then
 /// the row ids, bound to kernel params 1..=n in that order; one thread per output element.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 fn try_plan_row_gather(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -205,7 +211,10 @@ fn try_plan_row_gather(
 /// `DispatchSizeOverflow` naming the equation, before any dispatch - no widening ever touches this arm
 /// (a packed contraction request owns its launch, `LaunchOwnership::OwnsLaunch`), since widening the baked
 /// 64-lane workgroup would corrupt the fixed-size LDS tile regardless of the grid.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 fn try_plan_contraction(
     g: GraphTables<'_>,
     eqn: &Eqn,

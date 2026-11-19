@@ -288,6 +288,17 @@ calibrate-launch backend mode out='':
 supported-models-regen:
     POOT_SUPPORTED_MODELS_REGEN=1 cargo nextest run -p poot-models --test supported_models the_page_is_what_the_generator_renders
 
+# rewrite the generated flag list of crates/poot-serve/README.md from the flags `poot-serve` declares (clap). The
+# poot-serve test the_readme_flag_list_is_what_clap_declares fails when the README differs.
+serve-readme-regen:
+    POOT_SERVE_README_REGEN=1 cargo nextest run -p poot-serve --bin poot-serve the_readme_flag_list_is_what_clap_declares
+
+# rewrite the generated served-family list of website/docs/serve/api.md from the engine plan's verdict on each registered
+# family's fixture checkpoint. The poot-serve test the_served_family_list_of_the_api_page_is_the_engine_plans_verdict fails
+# when the page differs.
+serve-served-regen:
+    POOT_SERVE_SERVED_REGEN=1 cargo nextest run -p poot-serve --bin poot-serve the_served_family_list_of_the_api_page_is_the_engine_plans_verdict
+
 # tests that build real model dimensions, in the release profile (too slow for the debug default lane)
 test-real-dims:
     scripts/test-model-free.sh run-real-dims --release

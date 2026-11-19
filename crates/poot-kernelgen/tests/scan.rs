@@ -26,6 +26,7 @@ fn spec(fixture: &ScanFixture, state_cols: usize, row_split: usize) -> ScanSpec 
     ScanSpec {
         kernel: match fixture.family {
             ScanFamily::DeltaRule => ScanKernel::DeltaRule,
+            ScanFamily::Kda => ScanKernel::Kda,
             ScanFamily::Ssd => ScanKernel::Ssd,
         },
         heads: fixture.heads,
@@ -77,10 +78,12 @@ fn interpret(fixture: &ScanFixture, state_cols: usize, row_split: usize) -> (Vec
     (y, s)
 }
 
-fn fixtures() -> [ScanFixture; 6] {
+fn fixtures() -> [ScanFixture; 8] {
     [
         ScanFixture::delta_rule(3, 9, 6, 4),
         ScanFixture::delta_rule(2, 5, 8, 4),
+        ScanFixture::kda(3, 9, 6),
+        ScanFixture::kda(2, 7, 8),
         ScanFixture::ssd(3, 9, 6, 5, 4),
         ScanFixture::ssd(2, 5, 8, 3, 4),
         // Eight state rows: every split of 1, 2, 4 and 8 divides them. `width` 6 leaves a partial column
@@ -184,7 +187,7 @@ fn a_split_adds_its_barriers_and_an_unsplit_launch_has_none() {
                 .count();
             let (want_barriers, want_arrays) = match (split, fixture.family) {
                 (1, _) => (0, 1),
-                (_, ScanFamily::DeltaRule) => (2, 2),
+                (_, ScanFamily::DeltaRule | ScanFamily::Kda) => (2, 2),
                 (_, ScanFamily::Ssd) => (1, 2),
             };
             assert_eq!(

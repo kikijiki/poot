@@ -212,8 +212,8 @@ fn a_narrowed_dense_contraction_rounds_its_bf16_weight_to_the_fragment_dtype() {
     let rounded: Vec<f32> = words
         .iter()
         .map(|&w| {
-            poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(
-                poot_quant::scalar::bf16_to_f32(w),
+            poot_tensor::float::f16_to_f32(poot_quant::scalar::f32_to_f16(
+                poot_tensor::float::bf16_to_f32(w),
             ))
         })
         .collect();

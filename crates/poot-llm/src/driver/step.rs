@@ -24,9 +24,10 @@
 
 use std::num::{NonZeroU64, NonZeroUsize};
 
-use poot_graph_ir::ForwardSlotMap;
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::ops::sampling::{Adjust, HISTORY_STATE, SampleSpec};
+use poot_graph_ir::{ForwardSlotMap, StateRole};
+use poot_models::components::standard::KV_TABLE_STATE;
 use poot_models::io::{InputError, InputSet, InputValue, ProgramId, RequestInputs, StepInput};
 use poot_models::model::{KvLayout, LogitRows, StepShape, TraceError};
 
@@ -1004,6 +1005,56 @@ impl Driver<Serving> {
         Ok(Readback::Tokens(picked))
     }
 
+    /// Bring the device block table of `entry`'s executable up to date for the sequences `lanes` continue: each
+    /// sequence's blocks from the first one the device does not hold, written as one range of its row (nothing
+    /// when it gained none). A step that crosses no block boundary writes no byte.
+    fn sync_block_tables(
+        &mut self,
+        entry: &super::Prepared,
+        lanes: &[Lane<'_>],
+    ) -> Result<(), DriverError> {
+        let KvStore::Paged { cache, .. } = &self.state.kv else {
+            return Ok(());
+        };
+        if !entry
+            .carried
+            .iter()
+            .any(|state| state.role() == StateRole::BlockTable)
+        {
+            return Ok(());
+        }
+        let device = self.runtime.tables.entry(entry.exe).or_default();
+        let stale: Vec<(usize, usize, &[u32])> = lanes
+            .iter()
+            .filter_map(|lane| {
+                let slot = self.state.seqs[&lane.seq].slot;
+                let blocks = cache.blocks(slot);
+                device
+                    .first_stale(slot, blocks)
+                    .map(|from| (slot, from, blocks))
+            })
+            .collect();
+        for (slot, from, blocks) in stale {
+            let words: Vec<u8> = blocks[from..]
+                .iter()
+                .flat_map(|&block| (block as i32).to_le_bytes())
+                .collect();
+            if !words.is_empty() {
+                let view = HostView::new(DType::I32, blocks.len() - from, &words)
+                    .expect("whole i32 words");
+                self.runtime.executor.write_state_range(
+                    entry.exe,
+                    KV_TABLE_STATE,
+                    slot,
+                    from,
+                    view,
+                )?;
+            }
+            device.record(slot, from, blocks);
+        }
+        Ok(())
+    }
+
     /// The columns `entry` binds for `plans`: each live row's feed, positions and cache mapping, the
     /// sampling suffix's inputs, and the request values the lanes' sequences carry. `offset` is the step's
     /// index within a chain: every row's token sits that many positions further on, and the sampler
@@ -1019,11 +1070,10 @@ impl Driver<Serving> {
         let StepShape {
             rows: entry_rows,
             tokens: width,
-            capacity,
             kv,
             ..
         } = key.shape;
-        let (entry_rows, width, capacity) = (entry_rows.get(), width.get(), capacity.get());
+        let (entry_rows, width) = (entry_rows.get(), width.get());
         let mut columns = StepColumns {
             tokens: vec![0; entry_rows * width],
             pos: vec![0; entry_rows * width],
@@ -1031,40 +1081,43 @@ impl Driver<Serving> {
             lora: vec![0; entry_rows],
             ..StepColumns::default()
         };
-        // The forward write maps, one entry per flat token (KV) and per step row (recurrent state): -1
-        // writes nothing, so padding and masked rows leave the pool alone.
+        // The device block table of every sequence the step reads, brought up to date before the step reads
+        // it: only the entries a sequence's blocks gained are written.
+        self.sync_block_tables(entry, lanes)?;
+        // The forward write map, one entry per flat token: -1 writes nothing, so padding leaves the pool alone.
         let mut kv_write = Vec::new();
         if let KvLayout::Paged { .. } = kv {
-            columns.kv_read = vec![0; entry_rows * capacity];
             kv_write = vec![ForwardSlotMap::PADDING; entry_rows * width];
         }
-        // A recurrent state pool: masked rows read pool row 0 and write nothing.
-        let pools_state = entry
+        // The pool rows a step's rows continue (a recurrent state, a paged KV table) and write: masked rows
+        // read pool row 0 and write nothing.
+        let reads_rows = entry
+            .slots
+            .iter()
+            .any(|spec| matches!(spec.binder, Binder::Step(StepInput::StateReadRows)));
+        let writes_rows = entry
             .slots
             .iter()
             .any(|spec| matches!(spec.binder, Binder::Step(StepInput::StateWriteRows)));
         let mut state_write = Vec::new();
-        if pools_state {
+        if reads_rows {
             columns.state_read = vec![0; entry_rows];
+        }
+        if writes_rows {
             state_write = vec![ForwardSlotMap::PADDING; entry_rows];
         }
         let serving = &self.state;
         for (i, (lane, plan)) in lanes.iter().zip(plans).enumerate() {
             let seq = &serving.seqs[&lane.seq];
             let n = plan.feed.len();
-            let map = match &serving.kv {
-                KvStore::Paged { cache, .. } => {
-                    let map = cache.slot_mapping(seq.slot, capacity);
-                    columns.kv_read[i * capacity..(i + 1) * capacity]
-                        .iter_mut()
-                        .zip(&map)
-                        .for_each(|(dst, &slot)| *dst = slot as i32);
-                    Some(map)
-                }
+            let cache = match &serving.kv {
+                KvStore::Paged { cache, .. } => Some(cache),
                 KvStore::Contiguous => None,
             };
-            if pools_state {
+            if reads_rows {
                 columns.state_read[i] = seq.slot as i32;
+            }
+            if writes_rows {
                 state_write[i] = seq.slot as i32;
             }
             columns.lora[i] = seq.adapter.row_value();
@@ -1078,10 +1131,11 @@ impl Driver<Serving> {
                         columns.tokens[at] = plan.feed[j] as i32;
                         columns.pos[at] = position as i32;
                         columns.real[at] = 1;
-                        if let Some(map) = &map
+                        if let Some(cache) = cache
                             && position < seq.reserved
+                            && let Some(slot) = cache.physical_slot(seq.slot, position)
                         {
-                            kv_write[at] = map[position] as i32;
+                            kv_write[at] = slot as i32;
                         }
                     }
                     None => columns.pos[at] = (plan.start + offset) as i32,
@@ -1097,7 +1151,7 @@ impl Driver<Serving> {
         // Each pool slot has one owner: a block table that handed two tokens one slot is refused here.
         if let KvLayout::Paged { pool_slots, seqs } = kv {
             columns.kv_write = ForwardSlotMap::new(kv_write, pool_slots.get())?;
-            if pools_state {
+            if writes_rows {
                 columns.state_write = ForwardSlotMap::new(state_write, seqs.get())?;
             }
         }
@@ -1276,7 +1330,7 @@ impl Driver<Serving> {
                 .expect("an f32 row is whole words");
             self.runtime
                 .executor
-                .write_state_row(entry.exe, HISTORY_STATE, seq.slot, view)?;
+                .write_state_range(entry.exe, HISTORY_STATE, seq.slot, 0, view)?;
             seq.history_synced = true;
         }
         Ok(())

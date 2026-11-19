@@ -84,6 +84,11 @@ pub(super) struct CarriedState {
 }
 
 impl CarriedState {
+    /// The role the program declared the state with.
+    pub(super) fn role(&self) -> StateRole {
+        self.role
+    }
+
     /// The state pairs of one compiled stage graph, at the avals the planner chose.
     pub(super) fn of_graph(graph: &Graph) -> impl Iterator<Item = Self> + '_ {
         graph.state_pairs().map(|pair| {

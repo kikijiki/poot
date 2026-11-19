@@ -6,13 +6,13 @@ sidebar_position: 10
 
 # Recurrence Scan
 
-Gated delta rule (GDN) and Mamba2 layers replace attention with a recurrence: each token updates a per-head state matrix, carried from step to step. Unrolled as primitives, the graph would grow with the prompt, so one `Scan` equation stands for it.
+Gated delta rule (GDN), Kimi delta attention (KDA) and Mamba2 layers replace attention with a recurrence: each token updates a per-head state matrix, carried from step to step. Unrolled as primitives, the graph would grow with the prompt, so one `Scan` equation stands for it. A decode step is the same equation at length one: decode and prefill share one definition and one generated kernel.
 
 ## One equation, one packed result
 
-The tracer emits a single `Scan` equation of the `DeltaRule` or `Ssd` family. Its one result is a packed tensor `[1, H, L + S, W]`: the first `L` rows are the output `y`, the next `S` rows the carried state `s_out`. A typed layout names the ranges, and the state is published by pairing `s_out` with its input state like any other.
+The tracer emits a single `Scan` equation of the `DeltaRule`, `Ssd` or `Kda` family (KDA is the delta rule with a decay per key channel instead of one per head). Its one result is a packed tensor `[1, H, L + S, W]`: the first `L` rows are the output `y`, the next `S` rows the carried state `s_out`. A typed layout names the ranges, and the state is published by pairing `s_out` with its input state like any other.
 
-The scan is defined by its decomposition into primitives, run chunk by chunk with each chunk continuing from the previous state. The CPU oracle evaluates exactly that, so it has no sequence-length ceiling. A device kernel is compared with it within the reassociating tolerance, on every element of `y` and `s_out`.
+The scan is defined by its decomposition into primitives (the delta rule's chunked closed form, the token-by-token recurrence for KDA), run chunk by chunk with each chunk continuing from the previous state. The CPU oracle evaluates exactly that, so it has no sequence-length ceiling. A device kernel is compared with it within the reassociating tolerance, on every element of `y` and `s_out`.
 
 ## The output gate
 

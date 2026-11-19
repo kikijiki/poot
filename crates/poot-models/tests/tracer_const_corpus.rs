@@ -31,6 +31,11 @@ struct Row {
     build: fn(prompt: usize, cap: usize) -> Graph,
 }
 
+/// `cap` rounded up to the whole blocks a paged step's capacity is.
+fn blocks(cap: usize) -> usize {
+    cap.next_multiple_of(poot_models::model::KV_BLOCK.get())
+}
+
 /// A dense family at the corpus dimensions, traced through `Model::trace` at `shape`.
 fn dense_trace(family: Family, spec: StepSpec) -> Graph {
     let mut dense = Dense::new(family)
@@ -104,7 +109,13 @@ fn corpus() -> Vec<Row> {
             build: |_, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    StepSpec::step(paged_step(2, 1, cap, 2 * cap, LogitRows::Last)),
+                    StepSpec::step(paged_step(
+                        2,
+                        1,
+                        blocks(cap),
+                        2 * blocks(cap),
+                        LogitRows::Last,
+                    )),
                 )
             },
         },
@@ -122,7 +133,13 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    StepSpec::step(paged_step(1, prompt, cap, cap, LogitRows::Last)),
+                    StepSpec::step(paged_step(
+                        1,
+                        prompt,
+                        blocks(cap),
+                        blocks(cap),
+                        LogitRows::Last,
+                    )),
                 )
             },
         },
@@ -131,7 +148,13 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    StepSpec::step(paged_step(2, prompt, cap, 2 * cap, LogitRows::Last)),
+                    StepSpec::step(paged_step(
+                        2,
+                        prompt,
+                        blocks(cap),
+                        2 * blocks(cap),
+                        LogitRows::Last,
+                    )),
                 )
             },
         },

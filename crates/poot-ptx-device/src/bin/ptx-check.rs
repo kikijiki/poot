@@ -287,7 +287,10 @@ enum Input<'a> {
 }
 
 /// [`run_inputs`] over all-F32 inputs.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a one-shot CLI probe: the context, kernel entry, host inputs, output length and launch shape are the probe's independent knobs, one call per case"
+)]
 fn run(
     ctx: &PtxContext,
     dir: &str,
@@ -318,7 +321,10 @@ fn upload_i32(ctx: &PtxContext, data: &[i32]) -> Result<PtxBuffer, PtxError> {
 /// Load `<dir>/<label>.ptx`, dispatch `entry` through the PtxContext with read-only `inputs` (uploaded as
 /// their own element kind) and one writable F32 output of `out_len` (allocated), and return the output. `label`
 /// names it for the profiler + the per-kernel device-time line.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a one-shot CLI probe: the context, kernel entry, host inputs, output length and launch shape are the probe's independent knobs, one call per case"
+)]
 fn run_inputs(
     ctx: &PtxContext,
     dir: &str,
@@ -352,7 +358,6 @@ fn run_inputs(
         .collect();
     let kernel = ptx_kernel(&ptx, entry, &elements);
     ctx.dispatch_dev(
-        label,
         &kernel,
         block,
         threads,
@@ -379,7 +384,10 @@ fn det_fill(n: usize, seed: u64) -> Vec<f32> {
 }
 
 /// The textbook two-pass decode attention: `softmax(scale * q.k + mask) @ v` per head, GQA `kv = h / n_rep`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a host reference for the probe: q/k/v/mask plus the head, repeat, capacity, width and scale scalars the kernel under test takes, kept positional to mirror it"
+)]
 fn attention_decode_ref(
     q: &[f32],
     k: &[f32],
@@ -460,7 +468,6 @@ fn graph_probe(dir: &str) -> i32 {
     // warm up outside capture: the first dispatch loads + JITs the module (cuModuleLoadData), which must
     // not happen mid-capture.
     ctx.dispatch_dev(
-        "add",
         &kernel,
         [64, 1, 1],
         [a.len() as u32, 1, 1],
@@ -475,7 +482,6 @@ fn graph_probe(dir: &str) -> i32 {
     // capture one dispatch (c = a + b) into a replayable graph.
     ctx.begin_capture().expect("begin_capture");
     ctx.dispatch_dev(
-        "add",
         &kernel,
         [64, 1, 1],
         [a.len() as u32, 1, 1],

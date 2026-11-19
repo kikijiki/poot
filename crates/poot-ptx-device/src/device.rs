@@ -23,10 +23,9 @@ use poot_target::{Backend, BufferStorage, TargetId};
 
 use crate::PtxGpuError;
 
-/// One loaded kernel: its compiled code and the plan key the native function cache and dispatch
-/// labels use.
+/// One loaded kernel: its compiled code. The native function cache keys on the PTX text hash and entry
+/// name, so the plan key [`poot_executor::Device::load_kernel`] passes is not kept.
 pub struct PtxKernel {
-    key: String,
     compiled: CompiledKernel,
 }
 
@@ -141,11 +140,12 @@ impl Device for PtxDevice {
         buffer.elem_count()
     }
 
-    fn load_kernel(&mut self, key: &str, kernel: CompiledKernel) -> Result<PtxKernel, PtxGpuError> {
-        Ok(PtxKernel {
-            key: key.to_string(),
-            compiled: kernel,
-        })
+    fn load_kernel(
+        &mut self,
+        _key: &str,
+        kernel: CompiledKernel,
+    ) -> Result<PtxKernel, PtxGpuError> {
+        Ok(PtxKernel { compiled: kernel })
     }
 
     fn begin(&mut self) -> Result<(), PtxGpuError> {
@@ -176,7 +176,6 @@ impl Device for PtxDevice {
         let ins: Vec<&PtxBuffer> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.buffer).collect();
         let in_lens: Vec<usize> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.elems).collect();
         Ok(self.ctx.dispatch_dev(
-            &d.kernel.key,
             &d.kernel.compiled,
             workgroup,
             threads,

@@ -8,7 +8,10 @@
 //! (those sources compile through pootc's Stable MIR path and are not clippy-linted), so oracle and kernel
 //! can be diffed. `u` is always `(x as f32 + 0.5) / 4294967296.0` for a `u32` `x`, so it is finite and
 //! `.clamp()` and `.max().min()` are equivalent here.
-#![allow(clippy::manual_clamp)]
+#![allow(
+    clippy::manual_clamp,
+    reason = "the oracle mirrors the kernel's `u.max(a).min(b)` formula line for line (see above)"
+)]
 
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
@@ -784,7 +787,6 @@ fn assert_trap_traps_on_ptx() {
     let data_buf = ctx.upload_f32(&data).expect("upload data");
     let out_buf = ctx.alloc_f32(idx_ok.len()).expect("alloc out");
     ctx.dispatch_dev(
-        "assert_trap_ok",
         &ptx_kernel,
         [idx_ok.len() as u32, 1, 1],
         [idx_ok.len() as u32, 1, 1],
@@ -813,7 +815,6 @@ fn assert_trap_traps_on_ptx() {
     let idx_bad_buf = ctx.upload_i32(&idx_bad).expect("upload idx (bad)");
     let out_bad_buf = ctx.alloc_f32(idx_bad.len()).expect("alloc out (bad)");
     ctx.dispatch_dev(
-        "assert_trap_fault",
         &ptx_kernel,
         [idx_bad.len() as u32, 1, 1],
         [idx_bad.len() as u32, 1, 1],
@@ -1794,7 +1795,10 @@ fn imported_sample_gumbel_argmax_batched_matches_cpu_oracle() {
 
     // (batch, vocab, per-row (seed, temperature, min_p)): several seeds/temperatures plus a min-p row
     // that masks out most of the vocab (min_p=0.9 keeps only tokens within a tight band of the row max).
-    #[expect(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "a fixture table of (rows, vocab, per-row parameters) literals read once; a named type would only restate the tuple"
+    )]
     let cases: [(usize, usize, &[(u32, f32, f32)]); 3] = [
         (1, 200, &[(12345, 0.8, 0.0)]),
         (
@@ -1903,7 +1907,10 @@ fn imported_sample_truncated_gumbel_argmax_batched_matches_cpu_oracle() {
     };
 
     // (batch, vocab, per-row (seed, temperature, min_p, top_k)): top_k=0.0 means disabled.
-    #[expect(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "a fixture table of (rows, vocab, per-row parameters) literals read once; a named type would only restate the tuple"
+    )]
     let cases: [(usize, usize, &[(u32, f32, f32, f32)]); 3] = [
         (1, 200, &[(12345, 0.8, 0.0, 0.0)]),
         (
@@ -2018,7 +2025,10 @@ fn imported_sample_topp_gumbel_argmax_batched_matches_cpu_oracle() {
     // (batch, vocab, per-row (seed, temperature, min_p, top_k, top_p)); top_k/top_p = 0.0/1.0 = disabled.
     // Logits decay by a clear step per index (`peak - step*i`), so the cumulative mass has wide gaps
     // between the top few tokens and the chosen top_p values sit well inside a gap.
-    #[expect(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "a fixture table of (rows, vocab, per-row parameters) literals read once; a named type would only restate the tuple"
+    )]
     let cases: [(usize, usize, &[(u32, f32, f32, f32, f32)]); 5] = [
         (1, 200, &[(12345, 0.8, 0.0, 0.0, 1.0)]),
         (

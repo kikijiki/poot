@@ -42,8 +42,13 @@ use crate::helpers::{copy, elem, ld, slice_dtype, slice_f32};
 enum KeyRows {
     /// Dense operands: the element offsets of the row's `(batch, head)` plane in `k`, `k_shared` and `v`.
     Dense { k: Local, shared: Local, v: Local },
-    /// Pools read through the slot map parameter `read`, whose words for this batch row start at `read_base`.
-    Paged { read: Local, read_base: Local },
+    /// Pools read through the block table parameter `read`, whose words for this batch row start at
+    /// `read_base`, each covering `block` positions.
+    Paged {
+        read: Local,
+        read_base: Local,
+        block: usize,
+    },
 }
 
 /// A key a block-selected row considers: its position, and whether the row reads it.
@@ -316,12 +321,14 @@ pub(super) fn clustered_body(
         }
     };
     let k_shared = match key {
-        KeyLayout::Single | KeyLayout::Paged => None,
+        KeyLayout::Single | KeyLayout::Paged { .. } => None,
         KeyLayout::Split { .. } => Some(next_param(kv.param())),
     };
     let read = match key {
         KeyLayout::Single | KeyLayout::Split { .. } => None,
-        KeyLayout::Paged => Some(next_param(ld(slice_dtype(Ty::I32, false), false))),
+        KeyLayout::Paged { block } => {
+            Some((next_param(ld(slice_dtype(Ty::I32, false), false)), block))
+        }
     };
     let len = match bound {
         KeyBound::Static => None,
@@ -340,7 +347,7 @@ pub(super) fn clustered_body(
     );
     let mut c = Cfg::new(params);
     let shared_dim = match key {
-        KeyLayout::Single | KeyLayout::Paged => 0,
+        KeyLayout::Single | KeyLayout::Paged { .. } => 0,
         KeyLayout::Split { shared_dim } => shared_dim,
     };
     let head_dim = dk - shared_dim;
@@ -439,17 +446,18 @@ pub(super) fn clustered_body(
             })
             .collect();
 
-        // A dense key's rows start at its `(batch, head)` plane; a paged key has no plane: its slot map starts
-        // at the batch row and the pool row of key `t` comes from the slot it names.
+        // A dense key's rows start at its `(batch, head)` plane; a paged key has no plane: its block table starts
+        // at the batch row and the pool row of key `t` comes from the slot its block names.
         let rows_of = match read {
             None => KeyRows::Dense {
                 k: uc(c, BinOp::Mul, kv_row, lk * head_dim),
                 shared: uc(c, BinOp::Mul, b, lk * shared_dim),
                 v: uc(c, BinOp::Mul, kv_row, lk * dv),
             },
-            Some(read) => KeyRows::Paged {
+            Some((read, block)) => KeyRows::Paged {
                 read,
-                read_base: uc(c, BinOp::Mul, b, lk),
+                read_base: uc(c, BinOp::Mul, b, lk / block),
+                block,
             },
         };
 
@@ -628,16 +636,24 @@ pub(super) fn clustered_body(
                         let value = uc(c, BinOp::Mul, t, dv);
                         (ubin(c, BinOp::Add, k, key), ubin(c, BinOp::Add, v, value))
                     }
-                    KeyRows::Paged { read, read_base } => {
-                        let at = ubin(c, BinOp::Add, read_base, t);
+                    KeyRows::Paged {
+                        read,
+                        read_base,
+                        block,
+                    } => {
+                        let entry = uc(c, BinOp::Div, t, block);
+                        let at = ubin(c, BinOp::Add, read_base, entry);
                         let word = c.let_(Ty::I32, Rvalue::Use(copy(elem(read, at))));
-                        let slot = c.let_(
+                        let block_id = c.let_(
                             Ty::Usize,
                             Rvalue::Cast {
                                 to: Ty::Usize,
                                 operand: local_op(word),
                             },
                         );
+                        let first = uc(c, BinOp::Mul, block_id, block);
+                        let within = uc(c, BinOp::Rem, t, block);
+                        let slot = ubin(c, BinOp::Add, first, within);
                         let by_slot = uc(c, BinOp::Mul, slot, hkv);
                         let pool_row = ubin(c, BinOp::Add, by_slot, kv_head);
                         (

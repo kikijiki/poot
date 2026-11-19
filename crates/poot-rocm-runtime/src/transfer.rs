@@ -5,7 +5,7 @@ use crate::bindings::{
     HSA_AMD_MEMORY_POOL_INFO_LOCATION, HSA_QUEUE_TYPE_MULTI, hsa_agent_t, hsa_amd_memory_pool_t,
     hsa_queue_t, hsa_status_t,
 };
-use crate::buffer::{Pool, RocmAlloc, checked_byte_range, checked_copy, checked_layout};
+use crate::buffer::{Pool, RocmAlloc};
 use crate::context::{
     Held, HsaShutdownGuard, StagingBuffer, TimeoutLeaks, UploadStrategy, memory_domain_for_pool,
 };
@@ -30,6 +30,7 @@ use crate::{
     RocmContextOptions, RocmError, bindings, publication,
 };
 use poot_runtime_common::BufferRole;
+use poot_runtime_common::{checked_byte_range, checked_copy, checked_layout};
 use poot_target::BufferStorage;
 use poot_target::MemoryDomain;
 use std::ffi::c_void;
@@ -701,7 +702,7 @@ impl RocmContext {
         storage: BufferStorage,
         role: BufferRole,
     ) -> Result<RocmBuffer, RocmError> {
-        let element_bytes = checked_layout(op, elems, storage)?;
+        let element_bytes = checked_layout::<RocmError>(op, elems, storage)?;
         // Whole 4-byte words: a kernel addresses storage by word (the device's state copy among them), so
         // an odd-width buffer (3 bf16, 5 raw bytes) owns the word its last element sits in, as wgpu and
         // Vulkan allocate.
@@ -804,52 +805,50 @@ impl RocmContext {
         byte_offset: usize,
         data: &[u8],
     ) -> Result<(), RocmError> {
-        checked_copy(
+        let range = checked_copy(
             buf,
             "write_raw_bytes",
             BufferStorage::raw_bytes(),
             byte_offset,
             data.len(),
             false,
-            // SAFETY: `checked_copy` proved `[byte_offset, byte_offset + byte_len)` lies inside the live
-            // allocation and `byte_len` equals `data.len()`.
-            |range| unsafe {
-                let dst = (buf.alloc.as_ptr() as *mut u8).add(range.byte_offset);
-                self.upload_bytes_role_aware(
-                    buf.pool(),
-                    data.as_ptr(),
-                    dst as *mut c_void,
-                    range.byte_len,
-                )
-            },
-        )
+        )?;
+        // SAFETY: `checked_copy` proved `[byte_offset, byte_offset + byte_len)` lies inside the live
+        // allocation and `byte_len` equals `data.len()`.
+        unsafe {
+            let dst = (buf.alloc.as_ptr() as *mut u8).add(range.byte_offset);
+            self.upload_bytes_role_aware(
+                buf.pool(),
+                data.as_ptr(),
+                dst as *mut c_void,
+                range.byte_len,
+            )
+        }
     }
 
     /// Download the contents of `buf` into `out`, which must be sized to `buf.elem_count()`. Through
     /// whichever pool `buf` was allocated from (Card 547a). Synchronizes first so any queued kernel
     /// that wrote the buffer has completed.
     pub fn download_f32(&self, buf: &RocmBuffer, out: &mut [f32]) -> Result<(), RocmError> {
-        checked_copy(
+        let range = checked_copy(
             buf,
             "download_f32",
             BufferStorage::f32(),
             0,
             out.len(),
             true,
-            |range| {
-                self.synchronize()?;
-                // SAFETY: `checked_copy` proved `out` covers the whole live allocation, so `byte_len`
-                // bytes are readable from it and writable into `out`; the queue is drained.
-                unsafe {
-                    self.download_bytes_role_aware(
-                        buf.pool(),
-                        buf.alloc.as_ptr() as *const c_void,
-                        out.as_mut_ptr() as *mut u8,
-                        range.byte_len,
-                    )
-                }
-            },
-        )
+        )?;
+        self.synchronize()?;
+        // SAFETY: `checked_copy` proved `out` covers the whole live allocation, so `byte_len`
+        // bytes are readable from it and writable into `out`; the queue is drained.
+        unsafe {
+            self.download_bytes_role_aware(
+                buf.pool(),
+                buf.alloc.as_ptr() as *const c_void,
+                out.as_mut_ptr() as *mut u8,
+                range.byte_len,
+            )
+        }
     }
 
     /// Overwrite `len` bytes of `buf` from byte `offset`, through whichever pool it was allocated from
@@ -1043,27 +1042,25 @@ pub(crate) mod test_only {
         /// Download packed i32/u32 words without changing their bit representation. Through whichever
         /// pool `buf` was allocated from (Card 547a).
         pub fn download_i32(&self, buf: &RocmBuffer, out: &mut [i32]) -> Result<(), RocmError> {
-            checked_copy(
+            let range = checked_copy(
                 buf,
                 "download_i32",
                 BufferStorage::i32(),
                 0,
                 out.len(),
                 true,
-                |range| {
-                    self.synchronize()?;
-                    // SAFETY: `checked_copy` proved `out` covers the whole live allocation, so `byte_len`
-                    // bytes are readable from it and writable into `out`; the queue is drained.
-                    unsafe {
-                        self.download_bytes_role_aware(
-                            buf.pool(),
-                            buf.alloc.as_ptr() as *const c_void,
-                            out.as_mut_ptr() as *mut u8,
-                            range.byte_len,
-                        )
-                    }
-                },
-            )
+            )?;
+            self.synchronize()?;
+            // SAFETY: `checked_copy` proved `out` covers the whole live allocation, so `byte_len`
+            // bytes are readable from it and writable into `out`; the queue is drained.
+            unsafe {
+                self.download_bytes_role_aware(
+                    buf.pool(),
+                    buf.alloc.as_ptr() as *const c_void,
+                    out.as_mut_ptr() as *mut u8,
+                    range.byte_len,
+                )
+            }
         }
     }
 }

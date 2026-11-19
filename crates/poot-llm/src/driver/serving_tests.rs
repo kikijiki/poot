@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::driver::RowSpeculation;
+use crate::driver::block_table::BLOCK_SIZE;
 use crate::driver::error::{InvalidRequest, PreparedSetRefusal};
 use crate::driver::lora::{AdapterSet, AdapterSource, AdapterSpec, LoraError, LoraIdx};
 use crate::driver::speculate::NotSpeculated;
@@ -630,14 +631,16 @@ fn release_skips_recurrent_state_and_registers_dense_prefixes() {
 }
 
 /// POOT-1148: the KV write map is forward: one entry per flat token (`rows * width`), the pool slot the
-/// token's position reads through the same step's read map, and -1 for a masked row, so the append costs the
+/// token's position reads through its sequence's block table, and -1 for a masked row, so the append costs the
 /// tokens and not the pool. Two live rows step in a three-row entry, at positions 0 and then 1, and in
-/// swapped order.
-/// Mutation: write token `t` at the slot of the NEXT position (`map[position + 1]` in
-/// `Driver::run_plans`): the entries differ from `read[row * CAP + position]` and the first assert goes red.
+/// swapped order. The block table the driver wrote to the device (`kv.table`, one range per change) is what
+/// names each block; the write map is the slot of the token's position in it.
+/// Mutation: write token `t` at the slot of the NEXT position (`position + 1` in `Driver::step_columns`):
+/// the entries differ from the table's slot of the token's position and the first assert goes red.
 #[test]
 fn the_kv_write_map_names_each_tokens_slot_and_pads_masked_rows() {
     const CAP: usize = 64;
+    let blocks = CAP / BLOCK_SIZE;
     let rig = paged_rig(RigOptions::default());
     let rows = [nz(1), nz(3)];
     let mut rig = rig
@@ -646,16 +649,32 @@ fn the_kv_write_map_names_each_tokens_slot_and_pads_masked_rows() {
     let a = open_one(&mut rig, &[1], AdapterRef::Base);
     let b = open_one(&mut rig, &[2], AdapterRef::Base);
 
-    // The read map of the last step: row `r`'s `CAP` logical positions to pool slots, three rows.
-    let read_of = |rig: &Rig<Serving>| -> Vec<i32> {
-        last_step_inputs(rig)
-            .into_iter()
-            .find(|words| words.len() == 3 * CAP)
-            .expect("the step binds its read map")
+    // The device's block table of sequence slot `slot`, replayed from the ranges the driver wrote into the
+    // state buffer: each write is `(byte offset, bytes)` into the `[seqs, blocks]` I32 table.
+    let table_of = |rig: &Rig<Serving>, slot: usize| -> Vec<i32> {
+        let world = rig.world.borrow();
+        let mut table = vec![0i32; blocks];
+        for (&(offset, _), bytes) in world.state_writes.iter().zip(&world.state_bytes) {
+            let (row, from) = (offset / 4 / blocks, offset / 4 % blocks);
+            if row == slot {
+                for (entry, word) in bytes.as_chunks::<4>().0.iter().enumerate() {
+                    table[from + entry] = i32::from_le_bytes(*word);
+                }
+            }
+        }
+        table
     };
-    let check = |rig: &Rig<Serving>, positions: [usize; 2]| {
-        let read = read_of(rig);
-        let want = vec![read[positions[0]], read[CAP + positions[1]], -1];
+    let slot_of = |rig: &Rig<Serving>, slot: usize, position: usize| -> i32 {
+        table_of(rig, slot)[position / BLOCK_SIZE] * BLOCK_SIZE as i32
+            + (position % BLOCK_SIZE) as i32
+    };
+    // Sequences `a` and `b` hold the slots they were opened in, 0 and 1.
+    let check = |rig: &Rig<Serving>, rows: [(usize, usize); 2]| {
+        let want: Vec<i32> = rows
+            .iter()
+            .map(|&(slot, position)| slot_of(rig, slot, position))
+            .chain([-1])
+            .collect();
         let inputs = last_step_inputs(rig);
         assert!(
             inputs.contains(&want),
@@ -668,17 +687,12 @@ fn the_kv_write_map_names_each_tokens_slot_and_pads_masked_rows() {
         &mut [(a, PREFILL1, plain()), (b, PREFILL1, plain())],
     )
     .unwrap();
-    check(&rig, [0, 0]);
+    check(&rig, [(0, 0), (1, 0)]);
     step_rows(&mut rig, &mut [(a, DECODE, plain()), (b, DECODE, plain())]).unwrap();
-    check(&rig, [1, 1]);
+    check(&rig, [(0, 1), (1, 1)]);
     // Swapped rows: the map follows the step's row order, not the sequences' slots.
     step_rows(&mut rig, &mut [(b, DECODE, plain()), (a, DECODE, plain())]).unwrap();
-    let read = read_of(&rig);
-    let want = vec![read[2], read[CAP + 2], -1];
-    assert!(
-        last_step_inputs(&rig).contains(&want),
-        "swapped rows: {want:?}"
-    );
+    check(&rig, [(1, 2), (0, 2)]);
 }
 
 /// POOT-1074 SC-001: admitting a sequence into a recurrent model zeroes that sequence's state row,
@@ -699,6 +713,62 @@ fn opening_a_recurrent_sequence_zeroes_its_state_row() {
     open_one(&mut rig, &[1], AdapterRef::Base);
     let writes = rig.world.borrow().state_writes[before..].to_vec();
     assert_eq!(writes, [(0, 16)]);
+}
+
+/// POOT-1240 SC-002: the host upload of a paged step is the blocks the sequence gained, not the capacity. A
+/// sequence's whole table is written once, when its blocks are reserved (`ceil(reserved / BLOCK)` entries); every
+/// later step, a decode inside the reservation included, writes no table byte, and the step's own inputs are the
+/// same bytes at capacity 64 as at 512. Mutation: have `DeviceTable::first_stale` answer `Some(0)` (rebuild the
+/// row each step): the decode steps write the whole row again and the zero-byte assertion goes red.
+#[test]
+fn a_paged_step_uploads_the_blocks_a_sequence_gained_and_nothing_per_capacity() {
+    let mut per_capacity = Vec::new();
+    for capacity in [64usize, 512] {
+        let rig = paged_rig(RigOptions {
+            capacity,
+            max_positions: 1024,
+            ..RigOptions::default()
+        });
+        let mut rig = rig
+            .prepare(&shapes(pool(40, 1), &[nz(1)], &[Head::GREEDY], &[]))
+            .unwrap();
+        let table_bytes = |rig: &Rig<Serving>| -> usize {
+            rig.world
+                .borrow()
+                .state_writes
+                .iter()
+                .map(|&(_, len)| len)
+                .sum()
+        };
+        let input_bytes = |rig: &Rig<Serving>| -> usize {
+            rig.world.borrow().last.inputs.iter().map(Vec::len).sum()
+        };
+        let a = open_one(&mut rig, &[1], AdapterRef::Base);
+        // Opening reserves the prompt and `max_new = 16` tokens: 17 positions, two blocks.
+        step_rows(&mut rig, &mut [(a, PREFILL1, plain())]).unwrap();
+        let admission = table_bytes(&rig);
+        assert_eq!(
+            admission,
+            2 * std::mem::size_of::<i32>(),
+            "capacity {capacity}: the reservation's two blocks are the only entries written"
+        );
+        let mut decode = Vec::new();
+        for _ in 0..8 {
+            let before = table_bytes(&rig);
+            step_rows(&mut rig, &mut [(a, DECODE, plain())]).unwrap();
+            assert_eq!(
+                table_bytes(&rig),
+                before,
+                "capacity {capacity}: a decode inside the reservation writes no table byte"
+            );
+            decode.push(input_bytes(&rig));
+        }
+        per_capacity.push(decode);
+    }
+    assert_eq!(
+        per_capacity[0], per_capacity[1],
+        "a decode step binds the same bytes at capacity 64 and 512"
+    );
 }
 
 /// Every input the last step bound, read as the i32 words an index slot is stored as.

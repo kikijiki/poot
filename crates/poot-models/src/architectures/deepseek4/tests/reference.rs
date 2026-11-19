@@ -312,7 +312,10 @@ impl Reference {
     /// The compressed entries of window `w` of a compressor: `rate` positions of `kv`/`gate`
     /// (raw histories), pooled disjointly or, for `overlapping`, with the previous window's first
     /// half; normed and rotated at the window's first position.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model-builder helper: the builder, step and layer coordinates and the module's tensors are distinct graph values; called once per layer from one place"
+    )]
     fn window_entry(
         &self,
         prefix: &str,

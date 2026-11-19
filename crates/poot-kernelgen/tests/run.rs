@@ -102,7 +102,10 @@ fn ptx(body: &Body, name: &str) -> String {
 }
 
 /// An attention request over dense f32 operands with the Llama scale `0.5`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a test fixture builder over the attention kernel's own parameters, in the kernel's argument order"
+)]
 fn attention_spec(
     batch: usize,
     hq: usize,

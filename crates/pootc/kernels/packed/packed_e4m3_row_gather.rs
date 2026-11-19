@@ -9,7 +9,7 @@
 //! the next row in the *next* lane, not mid-lane. This is the only portable E4M3FN read on wgpu (the
 //! SPIR-V emitter has no 8-bit float scalar type).
 //!
-//! Decode matches `poot_quant::scalar::e4m3fn_to_f32` exactly: subnormal `m * 2^-9`, finite
+//! Decode matches `poot_tensor::float::e4m3fn_to_f32` exactly: subnormal `m * 2^-9`, finite
 //! `+-2^(e-7) * (1 + m/8)`, and the canonical positive NaN for `e == 15 && m == 7`, so a device row is
 //! bit-identical to the CPU oracle's row. The NaN test is spelled as two nested `if`s rather than one
 //! `e == 15 && m == 7` condition: a two-operand `&&` in a condition at this depth makes `pootc`'s llc

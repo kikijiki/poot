@@ -29,8 +29,6 @@ use crate::model::{FamilyKey, ModelError, ModelOutput};
 /// `Slot::Activation` tag of the real-token mask ([`StepInput::RealTokens`]), `[rows, tokens]` I32:
 /// 1 for a fed token, 0 for padding.
 pub const REAL_TOKENS_TAG: &str = "attention_mask";
-/// `Slot::SlotMap` tag of a paged step's read map ([`StepInput::KvReadMap`]).
-const KV_READ_TAG: &str = "read";
 /// `Slot::WriteMap` tag of a paged step's write map ([`StepInput::KvWriteMap`]).
 const KV_WRITE_TAG: &str = "write";
 /// `Slot::Activation` tag of a paged step's `[rows]` state read index ([`StepInput::StateReadRows`]).
@@ -104,11 +102,10 @@ pub enum StepInput {
     Positions,
     /// 1 for a fed token, 0 for padding, `[rows, tokens]`.
     RealTokens,
-    /// A paged step's read map: each row's logical position to its pool slot, `[rows, capacity]`.
-    KvReadMap,
     /// A paged step's write map: each flat token's pool slot, or -1 for padding, `[rows * tokens]`.
     KvWriteMap,
-    /// The recurrent state pool row each step row continues, `[rows]`.
+    /// The pool row each step row continues, `[rows]`: its sequence's recurrent state row and, under a paged
+    /// layout, its row of the KV block table.
     StateReadRows,
     /// The recurrent state pool row each step row's result is written to, or -1, `[rows]`.
     StateWriteRows,
@@ -121,7 +118,6 @@ impl StepInput {
             StepInput::Tokens => SlotKey::new(Slot::Token, None),
             StepInput::Positions => SlotKey::new(Slot::Pos, None),
             StepInput::RealTokens => SlotKey::new(Slot::Activation, Some(REAL_TOKENS_TAG)),
-            StepInput::KvReadMap => SlotKey::new(Slot::SlotMap, Some(KV_READ_TAG)),
             StepInput::KvWriteMap => SlotKey::new(Slot::WriteMap, Some(KV_WRITE_TAG)),
             StepInput::StateReadRows => SlotKey::new(Slot::Activation, Some(STATE_READ_TAG)),
             StepInput::StateWriteRows => SlotKey::new(Slot::WriteMap, Some(STATE_WRITE_TAG)),
@@ -130,11 +126,10 @@ impl StepInput {
 
     /// The step kind `key` is declared as, if it is one.
     pub fn of_slot(key: &SlotKey) -> Option<Self> {
-        const ALL: [StepInput; 7] = [
+        const ALL: [StepInput; 6] = [
             StepInput::Tokens,
             StepInput::Positions,
             StepInput::RealTokens,
-            StepInput::KvReadMap,
             StepInput::KvWriteMap,
             StepInput::StateReadRows,
             StepInput::StateWriteRows,
@@ -1160,13 +1155,18 @@ impl ProgramSpec {
     /// declared group of its kind (positional, blocked, recurrent or handoff; the axis of a positional
     /// cache follows the layout and is not compared), and every declared group has a pair. A hand-off
     /// carry exists only when the step's shape asks for one, so a declared hand-off group may be absent;
-    /// the driver checks it against the shape.
+    /// the driver checks it against the shape. A paged step's block table is not a group: the step declares it.
     pub fn check_states(
         &self,
         graph: impl IntoIterator<Item = StateRole>,
     ) -> Result<(), StateMismatch> {
         use std::mem::discriminant;
-        let roles: Vec<StateRole> = graph.into_iter().collect();
+        // A paged step's block table is a fact of the layout, declared by the step itself in every program
+        // that traces one, not a state a family carries.
+        let roles: Vec<StateRole> = graph
+            .into_iter()
+            .filter(|&role| role != StateRole::BlockTable)
+            .collect();
         for &role in &roles {
             if !self
                 .states
@@ -1467,7 +1467,6 @@ mod tests {
             StepInput::Tokens,
             StepInput::Positions,
             StepInput::RealTokens,
-            StepInput::KvReadMap,
             StepInput::KvWriteMap,
             StepInput::StateReadRows,
             StepInput::StateWriteRows,

@@ -6,7 +6,7 @@
 //! equation runs (this file carries no walk of its own, and now no admission table either - only
 //! the carrier).
 
-use poot_quant::scalar::bf16_to_f32;
+use poot_tensor::float::bf16_to_f32;
 use std::sync::Arc;
 
 /// Row-major BF16 words, possibly permuted, over words an equation derived.

@@ -1,6 +1,7 @@
 //! Behavioral allocation check for the exact-I32 selected cast.
 //!
-//! This binary installs a counting global allocator. It records every allocation at or above
+//! This binary installs its own counting global allocator, not `poot_test_util::alloc_count`: that one sums
+//! bytes, while this check needs each large allocation's pointer and size. It records every allocation at or above
 //! `LARGE_BYTES` made on the test thread while one selected cast runs. The cast path must make exactly
 //! one allocation for the published f32 result and no other allocation of comparable size, so a `Vec`
 //! staging buffer, a `to_vec` copy, or a collected temporary shows up as an extra record whatever it is

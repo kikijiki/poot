@@ -1934,6 +1934,30 @@ impl Builder {
         Ok(self.handle(id))
     }
 
+    /// A carried [`StateRole::BlockTable`] state `name` whose every word the host writes lies in `range`
+    /// (the pool's block count, so a block id is a block of the pool): the declared range is a fact
+    /// [`crate::value_ranges`] proves downstream, and the executor checks each host write against it.
+    pub fn block_table_state(
+        &self,
+        name: &str,
+        aval: TensorType,
+        range: IndexRange,
+    ) -> Result<Traced, BuilderError> {
+        let id = self.append_input(
+            AllocationSite::InputRecord,
+            aval.shape.len(),
+            name.len(),
+            0,
+            InputTable::Const,
+            || {
+                ValueMeta::with_identity(aval, Storage::State, Identity::Named(name.to_string()))
+                    .with_state_role(StateRole::BlockTable)
+                    .with_range(Some(range))
+            },
+        )?;
+        Ok(self.handle(id))
+    }
+
     // primitive emitters
     //
     // Each infers the output type host-side and appends an eqn. An infer failure is a trace-time error
@@ -2310,25 +2334,30 @@ impl Builder {
         )
     }
 
-    /// Declare the read map `tag` of a paged KV pool of `pool_slots` slots: a [`Slot::SlotMap`] I32
-    /// `[rows, capacity]` input mapping row `r`'s logical position to the pool slot holding its K/V. Its
-    /// words are declared in `[0, pool_slots)`, so the bound range is a checked fact: a word outside the pool
-    /// is refused at the bind, and attention reads the pool through the map in place on the strength of it.
-    pub fn read_map(
+    /// Declare the block table `tag` of a paged KV pool of `pool_blocks` blocks as a per-step input: a
+    /// [`Slot::SlotMap`] I32 `[rows, blocks]` input naming the pool block of each of row `r`'s blocks. Its words
+    /// are declared in `[0, pool_blocks)`, so the bound range is a checked fact: a word outside the pool is
+    /// refused at the bind, and attention reads the pool through the table in place on the strength of it. (A
+    /// serving step carries its table as the [`StateRole::BlockTable`] state instead, whose host writes are
+    /// range-checked the same way; this input is for a test graph that binds a fresh table each step.)
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn block_table_slot(
         &self,
         tag: &str,
         rows: usize,
-        capacity: usize,
-        pool_slots: usize,
+        blocks: usize,
+        pool_blocks: usize,
     ) -> Result<Traced, BuilderError> {
-        let range = IndexRange::below(pool_slots).ok_or(BuilderError::Requirement {
-            operation: "read map",
-            requirement: Requirement::AtLeastOne { what: "pool slots" },
+        let range = IndexRange::below(pool_blocks).ok_or(BuilderError::Requirement {
+            operation: "block table",
+            requirement: Requirement::AtLeastOne {
+                what: "pool blocks",
+            },
         })?;
         self.slot_named_ranged(
             Slot::SlotMap,
             tag,
-            TensorType::new(vec![rows, capacity], DType::I32),
+            TensorType::new(vec![rows, blocks], DType::I32),
             range,
         )
     }

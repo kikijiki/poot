@@ -13,6 +13,7 @@
     reason = "the contained child sets a parent-death signal and closes inherited descriptors in the forked child"
 )]
 
+pub mod alloc_count;
 pub mod checkpoints;
 pub mod contained_child;
 pub mod device_caps;

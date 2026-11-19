@@ -104,7 +104,7 @@ pub fn decompose(
                 (KvBound::Live, &[operand, len]) => (Some(operand), Some(len)),
                 _ => return Ok(None),
             };
-            // The paged form is the dense one over the views its slot map gathers out of the pools. A key or
+            // The paged form is the dense one over the views its block table gathers out of the pools. A key or
             // value stored narrower than the query is widened to it where it is read.
             let dtype = operands[0].dtype;
             let (keys, v) = match (attrs.key, extra_key) {
@@ -119,9 +119,13 @@ pub fn decompose(
                     },
                     widened(&b, v, dtype)?,
                 ),
-                (KeyLayout::Paged, Some(read)) => (
-                    ops::AttentionKeys::Single(widened(&b, ops::paged_view(&b, k, read)?, dtype)?),
-                    widened(&b, ops::paged_view(&b, v, read)?, dtype)?,
+                (KeyLayout::Paged { block }, Some(table)) => (
+                    ops::AttentionKeys::Single(widened(
+                        &b,
+                        ops::paged_view(&b, k, table, block)?,
+                        dtype,
+                    )?),
+                    widened(&b, ops::paged_view(&b, v, table, block)?, dtype)?,
                 ),
                 _ => return Ok(None),
             };
@@ -196,6 +200,9 @@ pub fn decompose(
             match (attrs.family, inputs.as_slice()) {
                 (ScanFamily::DeltaRule, &[q, k, v, g, beta, s_in]) => {
                     ops::scan_delta_rule_packed(&b, q, k, v, g, beta, s_in, attrs.chunk)?
+                }
+                (ScanFamily::Kda, &[q, k, v, g, beta, s_in]) => {
+                    ops::scan_kda_packed(&b, q, k, v, g, beta, s_in)?
                 }
                 (ScanFamily::Ssd, &[x, b_in, c_in, delta, a, d, h_in]) => {
                     ops::scan_ssd_packed(&b, x, b_in, c_in, delta, a, d, h_in, attrs.chunk)?
@@ -876,9 +883,11 @@ pub(crate) mod tests {
                 ],
             ),
             (
-                // A paged key: two `[S, Hkv, D]` pools read through the `[B, Lk]` slot map.
+                // A paged key: two `[S, Hkv, D]` pools read through the `[B, Lk / block]` block table.
                 OpKind::Attention(AttentionAttrs {
-                    key: KeyLayout::Paged,
+                    key: KeyLayout::Paged {
+                        block: std::num::NonZeroUsize::new(2).unwrap(),
+                    },
                     ..AttentionAttrs::new(2, 0.5, None)
                 }),
                 vec![
@@ -886,7 +895,7 @@ pub(crate) mod tests {
                     f32(&[9, 2, 8]),
                     f32(&[9, 2, 8]),
                     f32(&[2, 1, 1, 6]),
-                    typed(&[2, 6], i32),
+                    typed(&[2, 3], i32),
                 ],
             ),
             (

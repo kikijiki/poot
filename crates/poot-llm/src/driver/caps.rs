@@ -426,6 +426,7 @@ impl<S: State> Driver<S> {
             match self.runtime.executor.unload(exe) {
                 Ok(()) => {
                     self.runtime.adapter_exes.remove(&generation);
+                    self.runtime.tables.remove(&exe);
                 }
                 Err(error) => outcome = Err(error.into()),
             }
@@ -514,7 +515,10 @@ impl<S: State> Driver<S> {
     }
 
     /// The key of the `step` entry of `tokens` tokens per row over `rows` rows that binds `carried`.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the compiled-program cache key: each field is one axis of the key (role, KV, rows, head, adapters, carried state), constructed in one place"
+    )]
     fn step_key(
         &self,
         role: ModelRole,

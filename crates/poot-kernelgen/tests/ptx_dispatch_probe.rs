@@ -54,7 +54,6 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
     let out_buf = ctx.alloc_f32(256).expect("allocate C fragment tile");
 
     ctx.dispatch_dev(
-        "wmma_tile_ptx",
         &kernel,
         body.workgroup_size,
         body.workgroup_size, // one warp, one tile: threads == block
@@ -70,7 +69,7 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
 
     // CPU oracle: round A/B to f16 (the WMMA load narrows on the way in), f32-accumulate, k=0..16 -
     // matching the RADV coopmat sibling probe's oracle shape (`coopmat_dispatch_probe.rs`).
-    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(x));
+    let round = |x: f32| poot_tensor::float::f16_to_f32(poot_quant::scalar::f32_to_f16(x));
     let ra: Vec<f32> = a_data.iter().map(|&x| round(x)).collect();
     let rb: Vec<f32> = b_data.iter().map(|&x| round(x)).collect();
     let mut max_abs = 0.0f32;
@@ -150,7 +149,6 @@ fn run_attention_over_keys_on_ptx(
     buffers.extend(len_buf.as_ref());
     let counts: Vec<usize> = buffers.iter().map(|buffer| buffer.elem_count()).collect();
     ctx.dispatch_dev(
-        name,
         &kernel,
         body.workgroup_size,
         generated.launch.grid,

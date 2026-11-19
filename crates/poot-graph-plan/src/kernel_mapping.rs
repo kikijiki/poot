@@ -238,7 +238,10 @@ pub(crate) fn map_unary(site: Site<'_>, op: GUnOp) -> Result<kg::FusedScalarOp, 
 /// The one GPU finalizer: check the launch of `planned` is the one its choice declared, then check every kernel it dispatches against
 /// `caps`. Takes the plan by `&mut` so the launch-owning families run it at their own tail while the
 /// dispatcher runs it after its match. An AIE target finalizes through [`finalize_aie`].
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the planned dispatch plus the equation's output facts and the device context, each borrowed from a different owner at the call site"
+)]
 pub(crate) fn finalize(
     planned: &mut Planned,
     g: GraphTables<'_>,
@@ -396,7 +399,10 @@ fn check_launch_ownership(planned: &Planned, backend: Backend) -> Result<(), Pla
 }
 
 /// The typed E4M3FN packed-dispatch ceiling check.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the planned dispatch plus the equation's output facts and the device context, each borrowed from a different owner at the call site"
+)]
 fn check_e4m3_dispatch_ceiling(
     planned: &Planned,
     g: GraphTables<'_>,

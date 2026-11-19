@@ -46,7 +46,7 @@ use poot_llm::driver::{
     SeqRequest, ServingShapes, StepRow, Warm, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::model::{KvLayout, Model, StepShape, StepSpec, TraceError};
+use poot_models::model::{KV_BLOCK, KvLayout, Model, StepShape, StepSpec, TraceError};
 use poot_models::registry::{ConfigSource, Fixture, Registry, RegistryError};
 use poot_quant::weights::WeightStore;
 use poot_runtime_common::{BufferRole, DeviceBackend};
@@ -574,14 +574,15 @@ impl Executor for Counting {
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.inner.reset_state(exe, scope)
     }
-    fn write_state_row(
+    fn write_state_range(
         &mut self,
         exe: ExecutableId,
         name: &str,
         row: usize,
+        from: usize,
         values: poot_tensor::HostView<'_>,
     ) -> Result<(), ExecError> {
-        self.inner.write_state_row(exe, name, row, values)
+        self.inner.write_state_range(exe, name, row, from, values)
     }
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         self.inner.remove_entry(exe, entry)
@@ -870,7 +871,7 @@ fn bits(values: &[f32]) -> Vec<u32> {
 }
 
 /// One paged step of the fixture on the oracle: row `r` feeds `feed[r]` at positions `start..` and owns
-/// pool slots `r * CAPACITY ..`, so no two rows share a slot. Returns the last token's logits of every row
+/// pool slots `r * CAPACITY ..` (the blocks of its own region), so no two rows share a slot. Returns the last token's logits of every row
 /// and the carried pool.
 fn oracle_paged_step(
     model: &dyn Model,
@@ -899,8 +900,20 @@ fn oracle_paged_step(
             })
             .collect();
     }
-    let read: Vec<i32> = (0..rows)
-        .flat_map(|r| (0..CAPACITY).map(move |p| (r * CAPACITY + p) as i32))
+    // Row `r`'s blocks are the pool blocks `r * blocks ..`: its block table is the identity over its own region.
+    let blocks = CAPACITY / KV_BLOCK;
+    let table: Vec<i32> = (0..rows * blocks).map(|block| block as i32).collect();
+    // The block table is the host's: bound anew every step.
+    *state = graph
+        .state()
+        .zip(state.iter())
+        .map(|((input, _), carried)| {
+            if graph.state_role(input) == Some(poot_graph_ir::StateRole::BlockTable) {
+                HostTensor::i32(graph.aval(input).shape.clone(), table.clone())
+            } else {
+                carried.clone()
+            }
+        })
         .collect();
     // Flat token `r * n + j` is written at row `r`'s slot of position `start + j`.
     let write: Vec<i32> = (0..rows)
@@ -924,8 +937,8 @@ fn oracle_paged_step(
             ),
         ),
         (
-            SlotKey::new(Slot::SlotMap, Some("read")),
-            HostTensor::i32(vec![rows, CAPACITY], read),
+            SlotKey::new(Slot::Activation, Some("state_read")),
+            HostTensor::i32(vec![rows], (0..rows as i32).collect()),
         ),
         (
             SlotKey::new(Slot::WriteMap, Some("write")),

@@ -281,6 +281,9 @@ struct StateBuffer<D: Device> {
     /// The role the first graph to declare this state traced it with: whether the leading axis is
     /// a row axis [`StateScope::Row`] addresses.
     role: StateRole,
+    /// The range every word of an I32 state lies in, which the host's writes are checked against (a block
+    /// table's block ids); `None` for a state that declares none.
+    range: Option<poot_graph_ir::IndexRange>,
     storage: BufferStorage,
     bytes: usize,
     /// This state buffer's native device-element count (Card 547b): never arena-shared, so always
@@ -1599,8 +1602,14 @@ impl<D: Device> Engine<D> {
                     let role = g
                         .state_role(id)
                         .expect("a validated graph gives every state input a role");
-                    let (idx, elems) =
-                        self.state_buffer(exe, name, meta.aval.clone(), role, storage)?;
+                    let (idx, elems) = self.state_buffer(
+                        exe,
+                        name,
+                        meta.aval.clone(),
+                        role,
+                        meta.range(),
+                        storage,
+                    )?;
                     (Loc::State(idx), elems)
                 }
                 Storage::Const => {
@@ -2152,6 +2161,7 @@ impl<D: Device> Engine<D> {
         name: String,
         aval: TensorType,
         role: StateRole,
+        range: Option<poot_graph_ir::IndexRange>,
         storage: BufferStorage,
     ) -> Result<(usize, usize), ExecError> {
         if let Some((index, existing)) = self
@@ -2178,6 +2188,7 @@ impl<D: Device> Engine<D> {
             name,
             aval,
             role,
+            range,
             storage,
             bytes,
             elems,
@@ -3263,7 +3274,10 @@ impl<D: Device> Engine<D> {
     /// `device_label` only for a sampled step - counters-only mode (or a step `consume_sample_
     /// decision` skips) costs only the cumulative-counter update below, as the type's own doc
     /// already claimed.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one recorded step's timing: the entry and the replay, encode, wait and wall durations are distinct measurements written to one record"
+    )]
     fn record_step_timing(
         &mut self,
         exe: ExecutableId,
@@ -4022,11 +4036,12 @@ impl<D: Device> Executor for Engine<D> {
         Ok(())
     }
 
-    fn write_state_row(
+    fn write_state_range(
         &mut self,
         exe: ExecutableId,
         name: &str,
         row: usize,
+        from: usize,
         values: poot_tensor::HostView<'_>,
     ) -> Result<(), ExecError> {
         self.check_not_poisoned()?;
@@ -4058,22 +4073,49 @@ impl<D: Device> Executor for Engine<D> {
             .into());
         }
         let row_elems = state.aval.numel() / rows;
-        if values.dtype() != state.aval.dtype || values.elems() != row_elems {
+        if values.dtype() != state.aval.dtype
+            || from
+                .checked_add(values.elems())
+                .is_none_or(|end| end > row_elems)
+        {
             return Err(BindError::StateRowValues {
                 name: name.to_string(),
                 expected: state.aval.dtype,
-                expected_len: row_elems,
+                row_len: row_elems,
+                from,
                 got: values.dtype(),
                 got_len: values.elems(),
             }
             .into());
+        }
+        // A state that declares a range is read unchecked by a kernel that stands on it: no word outside it
+        // reaches the device.
+        if let Some(range) = state.range {
+            let words = values
+                .bytes()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| i32::from_le_bytes(*word));
+            for (at, word) in words.enumerate() {
+                if !range.contains(word) {
+                    return Err(BindError::StateWordOutOfRange {
+                        name: name.to_string(),
+                        at,
+                        word,
+                        range,
+                    }
+                    .into());
+                }
+            }
         }
         let encoded = crate::lanes::encode_host(state.aval.dtype, values.bytes(), state.storage)
             .ok_or(LoadError::Unimplemented(
                 "a state row in a lane the host cannot encode",
             ))?;
         let row_bytes = state.bytes / rows;
-        if encoded.len() != row_bytes {
+        let elem_bytes = row_bytes / row_elems;
+        if encoded.len() != values.elems() * elem_bytes {
             return Err(BindError::StateRow {
                 name: name.to_string(),
                 row,
@@ -4081,8 +4123,13 @@ impl<D: Device> Executor for Engine<D> {
             }
             .into());
         }
-        crate::device::write_slice(device, &state.buffer, row * row_bytes, &encoded)
-            .map_err(device_error(label))?;
+        crate::device::write_slice(
+            device,
+            &state.buffer,
+            row * row_bytes + from * elem_bytes,
+            &encoded,
+        )
+        .map_err(device_error(label))?;
         *host_write_bytes += encoded.len() as u64;
         Ok(())
     }
@@ -7585,7 +7632,7 @@ mod weight_source_tests {
     /// leading axis and a row of another dtype or length are typed refusals that write nothing; every step
     /// is one host wait and a step output read is counted by its bytes.
     ///
-    /// Mutation: write the row at offset 0 in `write_state_row`; the offset assertion goes red.
+    /// Mutation: write the row at offset 0 in `write_state_range`; the offset assertion goes red.
     #[test]
     fn the_host_seeds_one_row_of_a_carried_state() {
         use poot_graph_ir::StateRole;
@@ -7623,7 +7670,7 @@ mod weight_source_tests {
         let view = poot_tensor::HostView::new(DType::F32, 2 * WIDTH, &row).unwrap();
         let before = engine.device().writes.len();
         engine
-            .write_state_row(exe, "sampler.history", 2, view)
+            .write_state_range(exe, "sampler.history", 2, 0, view)
             .unwrap();
         let device = engine.device();
         assert_eq!(device.writes.len(), before + 1, "one write");
@@ -7634,10 +7681,10 @@ mod weight_source_tests {
             "pool row 2 starts after two rows of two channels of {WIDTH} floats"
         );
 
-        let refused = |engine: &mut Engine<Recorder>, name: &str, at: usize, view| {
+        let refused = |engine: &mut Engine<Recorder>, name: &str, at: usize, from: usize, view| {
             let before = engine.device().writes.len();
             let error = engine
-                .write_state_row(exe, name, at, view)
+                .write_state_range(exe, name, at, from, view)
                 .expect_err("a refused write");
             assert_eq!(
                 engine.device().writes.len(),
@@ -7650,21 +7697,22 @@ mod weight_source_tests {
             }
         };
         assert!(matches!(
-            refused(&mut engine, "sampler.nothing", 0, view),
+            refused(&mut engine, "sampler.nothing", 0, 0, view),
             BindError::UnknownState { .. }
         ));
         assert!(matches!(
-            refused(&mut engine, "sampler.history", POOL, view),
+            refused(&mut engine, "sampler.history", POOL, 0, view),
             BindError::StateRow { rows: POOL, .. }
         ));
+        // A range that starts inside the row but runs past its end is refused; the same values from the start fit.
         let short = poot_tensor::HostView::new(DType::F32, WIDTH, &row[..WIDTH * 4]).unwrap();
         assert!(matches!(
-            refused(&mut engine, "sampler.history", 0, short),
-            BindError::StateRowValues { .. }
+            refused(&mut engine, "sampler.history", 0, WIDTH + 1, short),
+            BindError::StateRowValues { from, .. } if from == WIDTH + 1
         ));
         let words = poot_tensor::HostView::new(DType::I32, 2 * WIDTH, &row).unwrap();
         assert!(matches!(
-            refused(&mut engine, "sampler.history", 0, words),
+            refused(&mut engine, "sampler.history", 0, 0, words),
             BindError::StateRowValues { .. }
         ));
 
@@ -7676,6 +7724,96 @@ mod weight_source_tests {
             .step(exe, entry, &StepInputs::new(), &mut NoSync)
             .unwrap();
         assert_eq!(engine.stats().waits, waits + 2, "a step waits once");
+    }
+
+    /// POOT-1240: the host updates a block table by the entries that changed, not by the row. The range lands
+    /// at its own byte offset inside the row (`row * row_bytes + from * 4`) and costs only its own bytes; a
+    /// range past the row's end and a word outside the range the state declares (a block the pool does not
+    /// hold, which the attention kernel would read unchecked) are typed refusals that write nothing.
+    ///
+    /// Mutation: skip the declared-range check in `write_state_range`; the out-of-range write lands and the
+    /// refusal assertion goes red. Or write at `row * row_bytes` alone: the offset assertion goes red.
+    #[test]
+    fn the_host_writes_a_range_of_a_block_table_row_inside_its_declared_range() {
+        use poot_graph_ir::{IndexRange, StateRole};
+        const SEQS: usize = 3;
+        const BLOCKS: usize = 8;
+        const POOL_BLOCKS: usize = 5;
+        let mut engine = Engine::new(Recorder::default());
+        let b = Builder::for_tests();
+        let table = b
+            .block_table_state(
+                "kv.table",
+                TensorType::new(vec![SEQS, BLOCKS], DType::I32),
+                IndexRange::below(POOL_BLOCKS).unwrap(),
+            )
+            .unwrap();
+        let slot = b
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![1]))
+            .unwrap();
+        let graph = b
+            .finish(poot_graph_ir::Outputs::new(slot).with_state(&[(table, table)]))
+            .unwrap();
+        assert_eq!(graph.state_role(table.id()), Some(StateRole::BlockTable));
+        let program = compile(&engine, &graph);
+        let weights = store(vec![]);
+        let exe = engine
+            .load_weights(Arc::clone(&weights), map(&weights, vec![]))
+            .unwrap();
+        engine.add_entry(exe, &program).unwrap();
+
+        let words =
+            |values: &[i32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let good = words(&[4, 0, 2]);
+        let view = poot_tensor::HostView::new(DType::I32, 3, &good).unwrap();
+        let before = engine.device().writes.len();
+        let bytes_before = engine.stats().host_write_bytes;
+        engine
+            .write_state_range(exe, "kv.table", 1, 2, view)
+            .unwrap();
+        let device = engine.device();
+        assert_eq!(device.writes.len(), before + 1, "one write");
+        assert_eq!(device.writes[before].1, good, "the entries' own bytes");
+        assert_eq!(
+            device.write_offsets[before],
+            (BLOCKS + 2) * 4,
+            "row 1, entry 2"
+        );
+        assert_eq!(
+            engine.stats().host_write_bytes - bytes_before,
+            12,
+            "three entries cost three words, not the row"
+        );
+
+        let mut refused = |from: usize, values: &[i32]| {
+            let bytes = words(values);
+            let view = poot_tensor::HostView::new(DType::I32, values.len(), &bytes).unwrap();
+            let before = engine.device().writes.len();
+            let error = engine
+                .write_state_range(exe, "kv.table", 0, from, view)
+                .expect_err("a refused write");
+            assert_eq!(
+                engine.device().writes.len(),
+                before,
+                "a refusal writes nothing"
+            );
+            match error {
+                ExecError::Bind(error) => *error,
+                other => panic!("expected a bind refusal, got {other}"),
+            }
+        };
+        assert!(matches!(
+            refused(0, &[1, POOL_BLOCKS as i32, 2]),
+            BindError::StateWordOutOfRange { at: 1, word, .. } if word == POOL_BLOCKS as i32
+        ));
+        assert!(matches!(
+            refused(0, &[-1]),
+            BindError::StateWordOutOfRange { word: -1, .. }
+        ));
+        assert!(matches!(
+            refused(BLOCKS - 1, &[1, 2]),
+            BindError::StateRowValues { from, .. } if from == BLOCKS - 1
+        ));
     }
 
     /// A late-input fixture: `y = x + 1` (exported), `out = y * 2 + late`, over F32 `[2]` slots `x` and
@@ -7941,17 +8079,19 @@ mod weight_source_tests {
         ));
     }
 
-    /// POOT-1149: the paged attention kernel reads its pools through the read map without a bound check, so a
-    /// map word outside the pool is refused at the bind, naming the slot, the word and its index, before
+    /// POOT-1149: the paged attention kernel reads its pools through the block table without a bound check, so a
+    /// table word outside the pool is refused at the bind, naming the slot, the word and its index, before
     /// anything dispatches; the same step with every word in the pool runs.
     ///
-    /// Mutation: declare the read map unranged in `Builder::read_map` (`slot_named` instead of
-    /// `slot_named_ranged`): the word-4 step binds and the first assertion goes red with "expected a typed
+    /// Mutation: declare the table unranged in `Builder::block_table_slot` (`slot_named` instead of
+    /// `slot_named_ranged`): the out-of-pool step binds and the first assertion goes red with "expected a typed
     /// range refusal".
     #[test]
-    fn a_paged_read_map_word_outside_the_pool_is_a_typed_bind_refusal() {
+    fn a_paged_block_table_word_outside_the_pool_is_a_typed_bind_refusal() {
         use poot_graph_ir::{ForwardSlotMap, StateRole};
+        const BLOCK: usize = 2;
         const SLOTS: usize = 4;
+        const POOL_BLOCKS: usize = SLOTS / BLOCK;
         let mut engine = Engine::new(Recorder::default());
         let b = Builder::for_tests();
         let pool = |name: &str| {
@@ -7968,17 +8108,18 @@ mod weight_source_tests {
                 .unwrap()
         };
         let write = b.write_map("write", 1, SLOTS).unwrap();
-        let read = b.read_map("read", 1, 3, SLOTS).unwrap();
+        let read = b.block_table_slot("read", 1, 2, POOL_BLOCKS).unwrap();
         let k_written = b
             .scatter_update(k_pool, activation("new_k", vec![1, 2, 4]), write)
             .unwrap();
         let v_written = b
             .scatter_update(v_pool, activation("new_v", vec![1, 2, 4]), write)
             .unwrap();
-        let k = poot_graph_ir::ops::paged_view(&b, k_written, read).unwrap();
-        let v = poot_graph_ir::ops::paged_view(&b, v_written, read).unwrap();
+        let block = std::num::NonZeroUsize::new(BLOCK).unwrap();
+        let k = poot_graph_ir::ops::paged_view(&b, k_written, read, block).unwrap();
+        let v = poot_graph_ir::ops::paged_view(&b, v_written, read, block).unwrap();
         let q = activation("q", vec![1, 2, 1, 4]);
-        let mask = activation("mask", vec![1, 1, 1, 3]);
+        let mask = activation("mask", vec![1, 1, 1, 4]);
         let out = poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, 0.5, mask).unwrap();
         let graph = b
             .finish(
@@ -7994,12 +8135,12 @@ mod weight_source_tests {
         let entry = engine.add_entry(exe, &program).unwrap();
 
         let floats = |n: usize| vec![0u8; n * 4];
-        let (new_rows, q_row, mask_row) = (floats(8), floats(8), floats(3));
+        let (new_rows, q_row, mask_row) = (floats(8), floats(8), floats(4));
         let words =
-            |words: [i32; 3]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+            |words: [i32; 2]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
         let write_map = ForwardSlotMap::new(vec![2], SLOTS).unwrap();
         let read_key = SlotKey::new(Slot::SlotMap, Some("read"));
-        let mut step = |read_words: [i32; 3]| {
+        let mut step = |read_words: [i32; 2]| {
             let read_bytes = words(read_words);
             fn f32_view(bytes: &[u8]) -> poot_tensor::HostView<'_> {
                 poot_tensor::HostView::new(DType::F32, bytes.len() / 4, bytes).unwrap()
@@ -8022,29 +8163,29 @@ mod weight_source_tests {
             );
             inputs.push(
                 SlotKey::new(Slot::Activation, Some("mask")),
-                &[1, 1, 1, 3],
+                &[1, 1, 1, 4],
                 f32_view(&mask_row),
             );
             inputs.push_write_map(SlotKey::new(Slot::WriteMap, Some("write")), &write_map);
             inputs.push(
                 read_key.clone(),
-                &[1, 3],
-                poot_tensor::HostView::new(DType::I32, 3, &read_bytes).unwrap(),
+                &[1, 2],
+                poot_tensor::HostView::new(DType::I32, 2, &read_bytes).unwrap(),
             );
             engine.step(exe, entry, &inputs, &mut NoSync).map(|_| ())
         };
-        match step([0, SLOTS as i32, 1]) {
+        match step([0, POOL_BLOCKS as i32]) {
             Err(ExecError::Bind(error)) => assert!(
                 matches!(
                     *error,
                     BindError::Range { ref key, index: 1, value, .. }
-                        if *key == read_key && value == SLOTS as i32
+                        if *key == read_key && value == POOL_BLOCKS as i32
                 ),
                 "{error:?}"
             ),
             other => panic!("expected a typed range refusal, got {other:?}"),
         }
-        match step([0, -1, 1]) {
+        match step([0, -1]) {
             Err(ExecError::Bind(error)) => assert!(
                 matches!(
                     *error,
@@ -8059,7 +8200,7 @@ mod weight_source_tests {
             other => panic!("expected a typed range refusal, got {other:?}"),
         }
         assert!(
-            step([0, SLOTS as i32 - 1, 1]).is_ok(),
+            step([0, POOL_BLOCKS as i32 - 1]).is_ok(),
             "every word in the pool steps"
         );
     }

@@ -395,7 +395,14 @@ impl<'a> Sharder<'a> {
                 Layout::Split(axis)
             }
             // The sampler's history is the same on every rank: the suffix draws from logits every rank holds.
-            Storage::State if self.g.state_role(input) == Some(StateRole::Sampler) => Layout::Whole,
+            Storage::State
+                if matches!(
+                    self.g.state_role(input),
+                    Some(StateRole::Sampler | StateRole::BlockTable)
+                ) =>
+            {
+                Layout::Whole
+            }
             Storage::State => match &self.states {
                 None => {
                     self.origin.insert(input, input);

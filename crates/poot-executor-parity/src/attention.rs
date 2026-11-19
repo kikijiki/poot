@@ -166,17 +166,20 @@ fn alibi_prefill_case(name: &'static str, softcap: Option<f32>) -> AlibiCase {
 
 // ---- Paged attention reads the KV pools in place ----
 
-/// Batch rows, pool slots and positions of the paged fixture. The pool holds more slots than the rows
-/// together read, so a slot map that addressed the pool by position would read the wrong rows.
+/// Batch rows, pool blocks and positions of the paged fixture. The pool holds more blocks than the rows
+/// together read, so a block table that addressed the pool by position would read the wrong rows.
 const PAGED_BATCH: usize = 2;
-const PAGED_SLOTS: usize = 12;
-const PAGED_CAP: usize = 6;
+const PAGED_BLOCK: usize = 4;
+const PAGED_BLOCKS: usize = 4;
+const PAGED_SLOTS: usize = PAGED_BLOCKS * PAGED_BLOCK;
+const PAGED_CAP: usize = 8;
 
-/// A GQA decode (four query heads over two key heads, two batch rows) over the `[12, 2, 4]` K and V pools of
-/// a paged cache, read through the production `[2, 6]` read map ([`Builder::read_map`]) the way the models
-/// trace it. Two steps bind two different scattered maps over the same pools, so the second is a replay that
-/// must follow the new map, not the one the recording read. Row 1 sees all six positions, row 0 only four;
-/// the positions past a row's length name slot 0, as the engine's map does for a position not written yet.
+/// A GQA decode (four query heads over two key heads, two batch rows) over the `[16, 2, 4]` K and V pools of
+/// a paged cache, read through a `[2, 2]` block table of four-slot blocks ([`Builder::block_table_slot`]) the
+/// way the models trace it. Two steps bind two different scattered tables over the same pools, so the second
+/// is a replay that must follow the new table, not the one the recording read. Row 1 sees all eight positions,
+/// row 0 only four; the blocks past a row's length name block 0, as the engine's table does for a block not
+/// written yet.
 /// The program must plan one attention equation over the pools themselves: no gather, no transpose.
 pub fn paged_attention_fixture() -> Fixture {
     let b = Builder::for_tests();
@@ -193,10 +196,11 @@ pub fn paged_attention_fixture() -> Fixture {
         .constant("mask", TensorType::f32(vec![PAGED_BATCH, 1, 1, PAGED_CAP]))
         .unwrap();
     let read = b
-        .read_map("read", PAGED_BATCH, PAGED_CAP, PAGED_SLOTS)
+        .block_table_slot("read", PAGED_BATCH, PAGED_CAP / PAGED_BLOCK, PAGED_BLOCKS)
         .unwrap();
-    let k = poot_graph_ir::ops::paged_view(&b, k_pool, read).unwrap();
-    let v = poot_graph_ir::ops::paged_view(&b, v_pool, read).unwrap();
+    let block = std::num::NonZeroUsize::new(PAGED_BLOCK).unwrap();
+    let k = poot_graph_ir::ops::paged_view(&b, k_pool, read, block).unwrap();
+    let v = poot_graph_ir::ops::paged_view(&b, v_pool, read, block).unwrap();
     let y = attention_masked(&b, q, k, v, HQ / HKV, 1.0 / (D as f32).sqrt(), mask).unwrap();
     let read = read.id();
     let graph = b.finish(y).unwrap();
@@ -235,16 +239,13 @@ pub fn paged_attention_fixture() -> Fixture {
         ],
         0,
     );
-    let maps: [[i32; PAGED_BATCH * PAGED_CAP]; 2] = [
-        [3, 7, 1, 10, 0, 0, 2, 5, 8, 11, 4, 9],
-        [9, 4, 11, 6, 0, 0, 10, 1, 7, 3, 5, 2],
-    ];
+    let maps: [[i32; PAGED_BATCH * PAGED_CAP / PAGED_BLOCK]; 2] = [[3, 0, 1, 2], [2, 0, 3, 1]];
     fixture.steps = maps
         .iter()
         .map(|words| {
             vec![StepFixture {
                 key: key.clone(),
-                tensor: HostTensor::i32(vec![PAGED_BATCH, PAGED_CAP], words.to_vec()),
+                tensor: HostTensor::i32(vec![PAGED_BATCH, PAGED_CAP / PAGED_BLOCK], words.to_vec()),
             }]
         })
         .collect();

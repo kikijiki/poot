@@ -581,7 +581,10 @@ fn reads_narrow_operands(op: &OpKind) -> bool {
     )
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the planner entry threads the graph, equation, output facts and target plus the per-compile policy (views, limits, pins, output) that the lowering dispatch hands each arm unchanged"
+)]
 fn plan_eqn_policy(
     g: &Graph,
     eqn: &Eqn,
@@ -639,7 +642,10 @@ fn out_numel_saturating(shape: &[usize]) -> usize {
 /// [`Graph::aval`] of `eqn.out` (card 525 R469-019: no entry point takes a caller-supplied shape that
 /// could disagree with the graph's own inferred one). It reads only the value table, so it is not generic
 /// over the validation channel and is compiled once in this crate.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the planner entry threads the graph, equation, output facts and target plus the per-compile policy (views, limits, pins, output) that the lowering dispatch hands each arm unchanged"
+)]
 pub(crate) fn plan_eqn_views_impl(
     graph: &Graph,
     eqn: &Eqn,
@@ -721,7 +727,10 @@ pub(crate) fn plan_eqn_views_impl(
 /// against the target's own limits. Every other family's lowering reads GPU capabilities ([`DeviceCaps`])
 /// and is refused with [`Capability::GpuOnly`]; a collective is a cut between stage programs on every
 /// target.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the planner entry threads the graph, equation, output facts and target plus the per-compile policy (views, limits, pins, output) that the lowering dispatch hands each arm unchanged"
+)]
 fn plan_aie_eqn(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -874,7 +883,10 @@ pub(crate) fn operand_demand(g: GraphTables<'_>, eqn: &Eqn, position: usize) -> 
 /// A GPU target's per-equation planner body: one thin dispatch table. It runs the shared dtype/storage
 /// guards, routes each op family to its owned function and applies the shared launch-shaping postamble
 /// (`finalize`).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the planner entry threads the graph, equation, output facts and target plus the per-compile policy (views, limits, pins, output) that the lowering dispatch hands each arm unchanged"
+)]
 fn plan_gpu_eqn(
     g: GraphTables<'_>,
     eqn: &Eqn,

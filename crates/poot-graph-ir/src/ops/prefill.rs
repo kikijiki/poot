@@ -44,7 +44,10 @@ pub fn attention_prefill(
 /// [`attention_prefill`] with optional Gemma2/Grok attention-logit softcapping. `Some(c)` applies
 /// `c * tanh(scores / c)` ([`softcap`]) to the scaled `Q K^T` scores BEFORE the causal mask and softmax;
 /// `None` is byte-identical to [`attention_prefill`] (no extra eqns). One definition.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn attention_prefill_softcap(
     b: &Builder,
@@ -464,7 +467,10 @@ pub fn cumulative_log_decay_scan(
 /// (FR-005, [`zero_pad_seq`]) and the output truncated back to `L`; the padded tail is inert (zero
 /// `k`/`v`/`beta` never contribute, zero `g` never changes cumulative decay). Returns
 /// `(o [1,H_v,L,D], s_out [1,H_v,D,D])`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn gdn_prefill_chunked(
     b: &Builder,
@@ -586,7 +592,10 @@ pub fn gdn_prefill_chunked(
 /// `concat(o, s_out)` along the sequence axis, `[1, H, L + D, D]` (one value, so the single-result `Eqn` and
 /// `Decomposition` carry it; `crate::ScanLayout` names the rows). The chain is [`gdn_prefill_chunked`]
 /// itself with its triangular tables computed in-graph, so there is one semantic definition.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn scan_delta_rule_packed(
     b: &Builder,
@@ -611,6 +620,46 @@ pub fn scan_delta_rule_packed(
         chunk,
     )?;
     b.concat(2, &[o, s_out])
+}
+
+/// The packed definition of `OpKind::Scan` over [`ScanFamily::Kda`](crate::ScanFamily): the token-by-token
+/// recurrence, `concat(o, s_out)` along the sequence axis, `[1, H, L + D, D]`. Per token `t` (`q`, `k`, `v`
+/// `[1,H,1,D]` slices, `beta` `[1,H,1,1]`): row `i` of the state decays by `exp(g[t, i])`, then
+/// `S += k^T (beta * (v - k S))`, and `o_t = q S`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn scan_kda_packed(
+    b: &Builder,
+    q: Traced,
+    k: Traced,
+    v: Traced,
+    g: Traced,
+    beta: Traced,
+    s_in: Traced,
+) -> Result<Traced, BuilderError> {
+    let len = b.aval(q)?.shape[2];
+    let mut state = s_in;
+    let mut outs = Vec::with_capacity(len);
+    for t in 0..len {
+        let at = |y: Traced| b.slice(y, 2, t, t + 1); // [1, H, 1, ..]
+        let (q, k, v) = (at(q)?, at(k)?, at(v)?);
+        // Row `i` of the state, the key channel, decays by `exp(g[i])`.
+        let decay = b.transpose(b.unary(UnOp::Exp, at(g)?)?, vec![0, 1, 3, 2])?; // [1, H, D, 1]
+        state = b.binary(BinOp::Mul, state, decay)?;
+        let read = b.matmul(k, state)?; // [1, H, 1, D]
+        let delta = b.binary(BinOp::Mul, at(beta)?, b.binary(BinOp::Sub, v, read)?)?;
+        state = b.binary(
+            BinOp::Add,
+            state,
+            b.matmul(b.transpose(k, vec![0, 1, 3, 2])?, delta)?,
+        )?;
+        outs.push(b.matmul(q, state)?);
+    }
+    let o = if len == 1 {
+        outs[0]
+    } else {
+        b.concat(2, &outs)?
+    };
+    b.concat(2, &[o, state])
 }
 
 /// The lower triangle (`row >= col + shift`, as F32 ones) as `[1, 1, c, c]`, computed from `Iota`.

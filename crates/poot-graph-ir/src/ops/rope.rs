@@ -164,7 +164,10 @@ pub fn rope_sectioned(
 /// If every `cos_secs[j]` is the same row (all position ids equal), the slices partition `[0, half)`
 /// and `[half, rot)` exactly once with no arithmetic, so the row is reconstructed bit-exactly and the
 /// result matches [`rope`]/[`rope_prefill`].
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 pub fn rope_sectioned_partial(
     b: &Builder,
     x: Traced,

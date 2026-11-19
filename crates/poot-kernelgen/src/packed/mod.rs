@@ -4008,7 +4008,6 @@ mod ptx_tests {
             let metadata_buf = upload_u32(&ctx, &[k as u32]);
             let out_buf = ctx.alloc_f32(ids.len() * k).expect("allocate out");
             ctx.dispatch_dev(
-                &name,
                 &kernel,
                 body.workgroup_size,
                 [(ids.len() * k) as u32, 1, 1],
@@ -4076,7 +4075,6 @@ mod ptx_tests {
         // doc comment above).
         let threads = schedule.grid_threads(blocks, m_per_block, out_per_block) as u32;
         ctx.dispatch_dev(
-            &name,
             &kernel,
             body.workgroup_size,
             [threads, 1, 1],
@@ -4158,7 +4156,6 @@ mod ptx_tests {
             let metadata_buf = upload_u32(&ctx, &[k as u32]);
             let out_buf = ctx.alloc_f32(ids.len() * k).expect("allocate out");
             ctx.dispatch_dev(
-                &name,
                 &kernel,
                 body.workgroup_size,
                 [(ids.len() * k) as u32, 1, 1],
@@ -4356,7 +4353,6 @@ mod planar_ptx_tests {
         let arg_lens: Vec<usize> = arg_refs.iter().map(|b| b.elem_count()).collect();
         let threads = schedule.grid_threads(1, m, out_rows) as u32;
         ctx.dispatch_dev(
-            &name,
             &kernel,
             body.workgroup_size,
             [threads, 1, 1],

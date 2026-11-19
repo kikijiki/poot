@@ -125,7 +125,10 @@ pub(crate) fn epilogue_head_lowers(
 /// (`const_lanes.packed(position)`, the storage plan's choice); anything else is a typed refusal. A region whose last
 /// step narrows its f32 result (POOT-1448) is an f32 epilogue with a narrow store, which `stores_narrow` says the
 /// body that runs it has; without it the step is refused.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 pub(super) fn epilogue_of(
     site: Site<'_>,
     g: GraphTables<'_>,
@@ -272,7 +275,10 @@ pub(super) fn matmul_cost_shape(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> Opti
 }
 
 /// Plan one matmul-family equation (`MatMul`, or a `ContractionEpilogue` over a `MatMul` head).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -616,7 +622,10 @@ fn wave_aligned_chunk(tiles: usize, max_per_dispatch: usize, units: usize, row: 
 /// Plan an `M > 1` dense contraction over `weight` as the register-tiled GEMM ([`register_tiled_launch`]), with
 /// `epilogue` (f32) applied to each output before its store: one generated request per dispatch, a split plan when
 /// the launch is several.
-#[expect(clippy::too_many_arguments)] // the shape, both operands' storage, the epilogue and the device
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shape, both operands' storage, the epilogue and the device"
+)]
 pub(super) fn dense_tiled_plan(
     site: Site<'_>,
     backend: Backend,

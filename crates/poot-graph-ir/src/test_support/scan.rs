@@ -63,6 +63,19 @@ impl ScanFixture {
         }
     }
 
+    /// A Kimi-delta-rule scan of `heads` heads over `len` tokens with head width `d`: the decay is per key
+    /// channel. The definition is token by token, so the chunk is one position.
+    pub fn kda(heads: usize, len: usize, d: usize) -> Self {
+        Self {
+            family: ScanFamily::Kda,
+            heads,
+            len,
+            width: d,
+            state_rows: d,
+            chunk: 1,
+        }
+    }
+
     /// An SSD scan of `heads` heads over `len` tokens with head width `p` and state size `n`, processed in chunks of `chunk`.
     pub fn ssd(heads: usize, len: usize, p: usize, n: usize, chunk: usize) -> Self {
         Self {
@@ -78,7 +91,7 @@ impl ScanFixture {
     /// The carried state's rows: `D` for the delta rule, `N` for SSD.
     pub fn state_rows_of(&self) -> usize {
         match self.family {
-            ScanFamily::DeltaRule => self.width,
+            ScanFamily::DeltaRule | ScanFamily::Kda => self.width,
             ScanFamily::Ssd => self.state_rows,
         }
     }
@@ -99,6 +112,14 @@ impl ScanFixture {
                 ("k", vec![1, h, l, w]),
                 ("v", vec![1, h, l, w]),
                 ("g", vec![1, h, l, 1]),
+                ("beta", vec![1, h, l, 1]),
+                ("s", vec![1, h, w, w]),
+            ],
+            ScanFamily::Kda => vec![
+                ("q", vec![1, h, l, w]),
+                ("k", vec![1, h, l, w]),
+                ("v", vec![1, h, l, w]),
+                ("g", vec![1, h, l, w]),
                 ("beta", vec![1, h, l, 1]),
                 ("s", vec![1, h, w, w]),
             ],
@@ -135,6 +156,20 @@ impl ScanFixture {
                 fill(numel(2), seed + 3),
                 (0..heads * len)
                     .map(|i| -0.05 - 0.03 * ((i * 5 + i / len) % 4) as f32)
+                    .collect(),
+                (0..heads * len)
+                    .map(|i| 0.3 + 0.5 * (((i * 3 + i / len) % 4) as f32 / 4.0))
+                    .collect(),
+                fill(numel(5), seed + 4),
+            ],
+            ScanFamily::Kda => vec![
+                unit_rows(fill(numel(0), seed + 1), width(0)),
+                unit_rows(fill(numel(1), seed + 2), width(1)),
+                fill(numel(2), seed + 3),
+                // A different mild negative log-gate per channel, so a kernel that applied one decay to every
+                // row of the state reads wrong.
+                (0..heads * len * self.width)
+                    .map(|i| -0.02 - 0.015 * ((i * 7 + i / self.width) % 5) as f32)
                     .collect(),
                 (0..heads * len)
                     .map(|i| 0.3 + 0.5 * (((i * 3 + i / len) % 4) as f32 / 4.0))
@@ -235,7 +270,7 @@ impl ScanFixture {
     /// the per-head scalars are kept), for stepping a long sequence in pieces.
     pub fn window(&self, inputs: &ScanInputs, from: usize, count: usize) -> ScanInputs {
         let per_position = match self.family {
-            ScanFamily::DeltaRule => 5,
+            ScanFamily::DeltaRule | ScanFamily::Kda => 5,
             ScanFamily::Ssd => 4,
         };
         let operands = self
@@ -269,7 +304,7 @@ impl ScanFixture {
             ..
         } = *self;
         let rows = match self.family {
-            ScanFamily::DeltaRule => width,
+            ScanFamily::DeltaRule | ScanFamily::Kda => width,
             ScanFamily::Ssd => rows,
         };
         let op = &inputs.operands;
@@ -300,6 +335,30 @@ impl ScanFixture {
                             let o: f64 = (0..width)
                                 .map(|r| at(0, row + r) * scale * s[r * width + j])
                                 .sum();
+                            y[row + j] = o as f32;
+                        }
+                    }
+                    ScanFamily::Kda => {
+                        let row = pos * width;
+                        let beta = at(4, pos);
+                        // Row `r` of the state decays by `exp(g[t, r])`.
+                        for r in 0..width {
+                            let decay = at(3, row + r).exp();
+                            s[r * width..(r + 1) * width]
+                                .iter_mut()
+                                .for_each(|x| *x *= decay);
+                        }
+                        for j in 0..width {
+                            let kv: f64 =
+                                (0..width).map(|r| at(1, row + r) * s[r * width + j]).sum();
+                            let delta = beta * (at(2, row + j) - kv);
+                            for r in 0..width {
+                                s[r * width + j] += at(1, row + r) * delta;
+                            }
+                        }
+                        for j in 0..width {
+                            let o: f64 =
+                                (0..width).map(|r| at(0, row + r) * s[r * width + j]).sum();
                             y[row + j] = o as f32;
                         }
                     }

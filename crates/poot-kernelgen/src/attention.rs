@@ -359,10 +359,14 @@ pub enum KeyLayout {
         shared_dim: usize,
     },
     /// The keys and values stay in their paged pools: `k` is a `[S, Hkv, Dk]` pool, `v` a `[S, Hkv, Dv]` pool,
-    /// and the `I32 [B, Lk]` `read` parameter that follows `mask` names the pool slot of each position. Key
-    /// `t` of batch row `b` and key head `g` is row `(read[b * Lk + t] * Hkv + g)` of its pool. Every word of
-    /// `read` must be a slot of the pool: the kernel does not clamp it.
-    Paged,
+    /// and the `I32 [B, ceil(Lk / block)]` `read` parameter that follows `mask` is the block table: key `t` of
+    /// batch row `b` and key head `g` is row `(slot * Hkv + g)` of its pool, `slot = read[b * nblk + t /
+    /// block] * block + t % block`, `nblk` the table's width. Every word of `read` must be a block of the pool:
+    /// the kernel does not clamp it.
+    Paged {
+        /// The positions each table entry covers , and the slots of one pool block.
+        block: usize,
+    },
 }
 
 /// Which keys a row visits.
@@ -610,6 +614,20 @@ fn validate(spec: &AttentionSpec) -> Result<(), KernelGenError> {
             value: spec.hq,
             divisor: spec.n_rep,
         });
+    }
+    // A paged key's block table covers `lk / block` whole blocks.
+    if let KeyLayout::Paged { block } = spec.key {
+        if block == 0 {
+            return Err(bad("block", block, 1));
+        }
+        if !spec.lk.is_multiple_of(block) {
+            return Err(KernelGenError::NotDivisible {
+                generator: GENERATOR,
+                dim: "lk".to_string(),
+                value: spec.lk,
+                divisor: block,
+            });
+        }
     }
     // More splits than candidate keys is a grid of workgroups that can never have a key to walk.
     if splits > spec.candidates() {

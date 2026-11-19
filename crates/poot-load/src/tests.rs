@@ -4,8 +4,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use poot_quant::scalar::{e4m3fn_to_f32, e8m0_to_f32, f16_to_f32};
+use poot_quant::scalar::e8m0_to_f32;
 use poot_quant::weights::{WeightEntry, WeightStore};
+use poot_tensor::float::{e4m3fn_to_f32, f16_to_f32};
 use safetensors::pack_quantized_linears;
 use safetensors::test_only::load_weight_store_bytes;
 

@@ -125,7 +125,10 @@ impl Context {
     /// count from the plan, index-aligned with `ins` plus `out` last: the length buffer this builds
     /// carries these, never `DeviceBuffer::elem_count()` (an arena slot's buffer is sized to its
     /// largest occupant, which can exceed this particular dispatch's operand).
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the dispatch contract's own tuple: kernel, workgroup and thread shape, each input with its planned length, and the output with its length"
+    )]
     pub(crate) fn build_dispatch_objects(
         &self,
         key: &str,
@@ -233,7 +236,10 @@ impl Context {
     /// elsewhere (SF-2). The caller (poot-wgpu-device's `DecodeCache`) holds the returned [`CachedDispatch`] and
     /// re-encodes it every step via
     /// [`Context::submit_cached`].
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the dispatch contract's own tuple: kernel, workgroup and thread shape, each input with its planned length, and the output with its length"
+    )]
     pub fn build_cached_dispatch(
         &self,
         label: &str,
@@ -1096,6 +1102,8 @@ mod step_encode_allocation_tests {
 /// that crate's own `#[global_allocator]`). `#[cfg(test)]`-gated, so it is absent from the library
 /// any production or dependent crate links against.
 #[cfg(test)]
+/// Counts allocator calls into two interleaved buckets, not bytes, so it is its own allocator rather than
+/// `poot_test_util::alloc_count`.
 mod alloc_counting {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;

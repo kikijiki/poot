@@ -56,7 +56,10 @@ pub fn linear_attention_decode_gated(
 /// state dim), `delta[1,Hq,1,1]` (input-dependent timestep), `a_param`/`d_skip[1,Hq,1,1]` (learned
 /// per-head A / D), `h_in[1,Hq,N,P]` (carried SSM state). Returns `(y[1,Hq,1,P], h_out[1,Hq,N,P])`.
 /// Pure primitive composition; the SSM block for nemotron_h / Mamba2 hybrid layers.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn mamba2_ssd_decode(
     b: &Builder,
@@ -103,7 +106,10 @@ pub fn mamba2_ssd_decode(
 /// (`[1,Hq,L,1]`), `a_param`/`d_skip[1,Hq,1,1]` (learned per-head A / D), `h_in[1,Hq,N,P]` (carried
 /// SSM state), `tril[1,Hq,L,L]` (lower-triangular ones including the diagonal, per-head-broadcast, as
 /// [`decay_mask_from_cumlog`] expects). Returns `(y[1,Hq,L,P], h_out[1,Hq,N,P])`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn mamba2_ssd_prefill(
     b: &Builder,
@@ -152,7 +158,10 @@ pub fn mamba2_ssd_prefill(
 /// `concat(y, h_out)` along the sequence axis, `[1, Hq, L + N, P]`. A sequence of at most one chunk is
 /// exactly `mamba2_ssd_prefill`; a longer one is the same recurrence with the O(L^2) mask bounded to
 /// `chunk^2`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a graph-ir builder method: the builder plus the op's operands and attributes in the op's own order; each is a distinct graph value or scalar the op's shape rule reads"
+)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn scan_ssd_packed(
     b: &Builder,
@@ -351,10 +360,13 @@ fn conv_taps(
 ///
 /// `q`/`k`/`v[1,H,1,D]`, `g`/`beta[1,H,1,1]` (scalar per head), `s_in[1,H,D,D]` (recurrent
 /// state). Returns `(o[1,H,1,D], s_out[1,H,D,D])`. Wire `s_out` back as the carried state via
-/// `finish_with_state`. Pure primitive composition; no new IR primitive.
+/// `finish_with_state`. Pure primitive composition; no new IR primitive. Since POOT-1240 no model traces it: the
+/// decode step is the length-1 [`ScanFamily::DeltaRule`](crate::ScanFamily) scan, and this single-token chain is
+/// the sequential reference the tests compare that scan against.
 ///
 /// Qwen3-Next repeats q/k from H_k=16 to H_v=32 heads before this call (forward-pass doc sec 3.3);
 /// all inputs are at the V-head count.
+#[cfg(any(test, feature = "test-support"))]
 pub fn gated_delta_net_decode(
     b: &Builder,
     q: Traced,    // [1, H, 1, D]  L2-normed query (caller normalizes)

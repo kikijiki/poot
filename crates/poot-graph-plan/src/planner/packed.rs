@@ -109,7 +109,10 @@ pub(super) fn dense_cost_shapes(
 }
 
 /// Plan one packed-reader equation (DenseContraction/DenseRowGather).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -381,7 +384,10 @@ pub(super) fn plan(
 /// The dense decode GEMV over an `[N, K]` weight held in `weight` storage, with `epilogue` applied to each column's
 /// sum: one generated body per storage, launch and epilogue, shape-generic (`K` and `N` ride in its metadata), so
 /// every weight dtype and backend takes the same loop nest (Card 727).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a per-op planner arm: the graph, equation and output facts plus the lowering context (backend, device caps, limits, pins, constant lanes) every arm receives alike from the dispatch in `planner.rs`"
+)]
 fn dense_gemv(
     site: Site<'_>,
     backend: Backend,

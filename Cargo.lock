@@ -2125,6 +2125,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

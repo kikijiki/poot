@@ -446,9 +446,9 @@ fn a_cap_below_one_projection_row_is_a_typed_refusal_naming_the_constant() {
 
 /// POOT-1564 SC-i: the planned decode graph dispatches few slices and no transpose of a constant, on every
 /// backend with strided views. The slices left are the ones that must exist: each GDN layer's new conv window
-/// (a pinned state commit) and each attention layer's query/gate split (a merge of axes across a stride gap),
-/// at most 85 per step at 48 GDN and 16 attention layers (from 421; the design's bound is 90). The q/k/v
-/// splits, the conv taps and the conv-kernel transposes are views. Mutation: make `Reshape` non-composable
+/// (a pinned state commit) and its q/k/v operands of the recurrence (the scan, which decode shares with
+/// prefill since POOT-1240, reads dense operands), and each attention layer's query/gate split (a merge of
+/// axes across a stride gap). The conv taps and the conv-kernel transposes are views. Mutation: make `Reshape` non-composable
 /// again (drop it from `is_movement_view_candidate`): the slice dispatches return to 27 on this fixture and
 /// the conv-kernel transposes dispatch.
 #[test]
@@ -479,7 +479,7 @@ fn qwen35_decode_plans_few_slices() {
         };
         let slices = dispatched(|op| matches!(op, OpKind::Slice { .. }));
         assert!(
-            slices <= gdn_layers + 2 * attention_layers,
+            slices <= 4 * gdn_layers + 2 * attention_layers,
             "{backend:?}: {slices} slice dispatches for {gdn_layers} GDN and {attention_layers} attention layers"
         );
         let constant_transposes = planned

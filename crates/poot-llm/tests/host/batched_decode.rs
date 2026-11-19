@@ -6,15 +6,17 @@
 //! equivalence check on CPU eval: the batch axis must not leak across rows. No checkpoint, runs in
 //! milliseconds.
 
-use crate::common::{slot_maps, step, token_pos, zero_state};
-use poot_models::model::{LogitRows, StepSpec};
+use crate::common::{paged_slots, step, token_pos, with_table, zero_state};
+use poot_models::model::{KV_BLOCK, LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step as step_shape};
 use poot_models::test_support::weight_map::MappedModel;
 use poot_tensor::HostTensor;
 
 const VOCAB: usize = 32;
 const BATCH: usize = 3;
-const CAP: usize = 8;
+/// Three whole KV blocks, so a paged row holds several.
+const CAP: usize = 3 * KV_BLOCK.get();
+const BLOCK: usize = KV_BLOCK.get();
 
 /// Deterministic pseudo-random fill seeded by a name (so a given cache gets identical data in the
 /// batched graph and every single-row graph) - an LCG over a cheap string hash, mapped to [-1, 1].
@@ -37,7 +39,7 @@ fn tiny() -> MappedModel {
         .dims(16, 24, 2)
         .heads(4, 2)
         .head_dim(4)
-        .max_positions(32)
+        .max_positions(64)
         .f32_model()
 }
 
@@ -55,14 +57,20 @@ fn token_stream(n_steps: usize) -> Vec<Vec<i32>> {
 /// Drive `rows = BATCH` decode from zero caches over `n_steps` (all rows advance one token each) on the
 /// contiguous layout and on the paged layout `pooled` describes, and assert the logits agree.
 ///
-/// `read(r, t)` is the pool slot of row `r`'s logical position `t`; a position past the step is never read
-/// unmasked. The write map sends each pool slot to the flat token index writing it (or -1).
+/// `block_of(r, i)` is the pool block of row `r`'s logical block `i`; a block past the step is never read
+/// past the live prefix and points at block 0 (in range, masked out). The pool holds `pool_blocks` blocks.
 fn assert_paged_matches_contiguous(
     label: &str,
-    pool_slots: usize,
+    pool_blocks: usize,
     n_steps: usize,
-    read: impl Fn(usize, usize) -> usize,
+    block_of: impl Fn(usize, usize) -> usize,
 ) {
+    let pool_slots = pool_blocks * BLOCK;
+    let slot_of = |r: usize, t: usize| (block_of(r, t / BLOCK) * BLOCK + t % BLOCK) as i32;
+    let table: Vec<i32> = (0..BATCH)
+        .flat_map(|r| (0..CAP / BLOCK).map(move |i| (r, i)))
+        .map(|(r, i)| block_of(r, i) as i32)
+        .collect();
     let m = tiny();
     let toks = token_stream(n_steps);
     let cont = m
@@ -79,15 +87,19 @@ fn assert_paged_matches_contiguous(
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
-    // The paged state is smaller than the per-row caches only when the pool is sized for live usage.
-    let numel =
-        |g: &poot_graph_ir::Graph| -> usize { g.state().map(|(si, _)| g.aval(si).numel()).sum() };
+    // The paged KV state is smaller than the per-row caches only when the pool is sized for live usage.
+    let cache_numel = |g: &poot_graph_ir::Graph| -> usize {
+        g.state()
+            .filter(|&(si, _)| g.state_role(si) != Some(poot_graph_ir::StateRole::BlockTable))
+            .map(|(si, _)| g.aval(si).numel())
+            .sum()
+    };
     if pool_slots < BATCH * CAP {
         assert!(
-            numel(&paged) < numel(&cont),
+            cache_numel(&paged) < cache_numel(&cont),
             "shared pool ({}) must be smaller than per-row caches ({})",
-            numel(&paged),
-            numel(&cont)
+            cache_numel(&paged),
+            cache_numel(&cont)
         );
     }
 
@@ -99,14 +111,10 @@ fn assert_paged_matches_contiguous(
         let (cl, next) = step(&m, &cont, &slots, &c_state);
         c_state = next;
 
-        let read_map: Vec<i32> = (0..BATCH)
-            .flat_map(|r| (0..CAP).map(move |t| (r, t)))
-            .map(|(r, t)| read(r, t) as i32)
-            .collect();
-        let write: Vec<i32> = (0..BATCH).map(|r| read(r, s) as i32).collect();
-        let mut paged_slots = token_pos(BATCH, 1, ids, &pos);
-        paged_slots.extend(slot_maps(BATCH, CAP, read_map, write));
-        let (pl, next) = step(&m, &paged, &paged_slots, &p_state);
+        let write: Vec<i32> = (0..BATCH).map(|r| slot_of(r, s)).collect();
+        let mut inputs = token_pos(BATCH, 1, ids, &pos);
+        inputs.extend(paged_slots(BATCH, write));
+        let (pl, next) = step(&m, &paged, &inputs, &with_table(&paged, &p_state, &table));
         p_state = next;
 
         assert_eq!(cl.shape(), pl.shape());
@@ -131,18 +139,27 @@ fn assert_paged_matches_contiguous(
 /// several steps. Tiny synthetic config, CPU eval.
 #[test]
 fn batched_paged_matches_batched_contiguous() {
-    assert_paged_matches_contiguous("paged", BATCH * CAP, 5, |r, t| r * CAP + (CAP - 1 - t));
+    // Twenty steps cross each row's first block boundary; each row's blocks sit reversed in its own region.
+    let blocks = CAP / BLOCK;
+    assert_paged_matches_contiguous("paged", BATCH * blocks, 20, |r, i| {
+        r * blocks + (blocks - 1 - i)
+    });
 }
 
-/// 046b shared-pool oracle: all rows share one pool of `pool_slots` slots sized for the aggregate live usage
-/// (`pool_slots = 15 < B*cap = 24`), with rows interleaved in the pool (slot for (row r, pos t) = t*B + r),
-/// a shared, non-block-diagonal layout, so one pool sized for aggregate usage is math-preserving. Positions
-/// past the live prefix point at slot 0 (in range, masked out).
+/// 046b shared-pool oracle: all rows share one pool sized for the aggregate live usage (7 blocks < B * 3 = 9),
+/// with rows interleaved in the pool (block for (row r, logical block i) = 1 + i*B + r), a shared,
+/// non-block-diagonal layout, so one pool sized for aggregate usage is math-preserving. Blocks past the live
+/// prefix point at block 0 (in range, masked out).
 #[test]
 fn batched_shared_pool_matches_batched_contiguous() {
-    let n_steps = 5;
-    assert_paged_matches_contiguous("shared-pool", BATCH * n_steps, n_steps, |r, t| {
-        if t < n_steps { t * BATCH + r } else { 0 }
+    // Twenty steps fill two of each row's three blocks.
+    let (n_steps, live_blocks) = (20, 2);
+    assert_paged_matches_contiguous("shared-pool", 1 + BATCH * live_blocks, n_steps, |r, i| {
+        if i < live_blocks {
+            1 + i * BATCH + r
+        } else {
+            0
+        }
     });
 }
 

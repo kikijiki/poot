@@ -152,7 +152,7 @@ fn arithmetic_scalar(scalar: Scalar, dtype: DType) -> Result<VpuScalar, Capabili
         DType::F16 => {
             let bits = poot_quant::scalar::f32_to_f16(value);
             if !value.is_nan()
-                && poot_quant::scalar::f16_to_f32(bits).is_finite() == value.is_finite()
+                && poot_tensor::float::f16_to_f32(bits).is_finite() == value.is_finite()
             {
                 Ok(VpuScalar::F16(bits))
             } else {

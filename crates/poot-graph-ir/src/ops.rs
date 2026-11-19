@@ -84,18 +84,20 @@ pub use prefill::{attention_prefill, attention_prefill_softcap, rope_prefill};
 #[cfg(any(test, feature = "test-support"))]
 pub use prefill::{
     cumulative_log_decay_scan, gdn_prefill_chunked, lower_triangle, scan_delta_rule_packed,
-    unit_lower_triangular_inverse,
+    scan_kda_packed, unit_lower_triangular_inverse,
 };
 pub use rope::{rope, rope_partial, rope_sectioned, rope_sectioned_partial};
 #[cfg(any(test, feature = "test-support"))]
 pub use rope::{rope_batched, rope_sectioned_batched};
 pub use selected_attention::{selected_attention, selected_block_mask};
+pub use ssm::causal_conv1d_windowed;
+#[cfg(any(test, feature = "test-support"))]
+pub use ssm::gated_delta_net_decode;
 #[cfg(any(test, feature = "test-support"))]
 pub use ssm::{
     causal_conv1d_decode, causal_conv1d_prefill, causal_conv1d_prefill_dilated,
     linear_attention_decode_gated, mamba2_ssd_decode,
 };
-pub use ssm::{causal_conv1d_windowed, gated_delta_net_decode};
 #[cfg(any(test, feature = "test-support"))]
 pub use ssm::{mamba2_ssd_prefill, scan_ssd_packed};
 pub use u64_hash::{U64HashError, u64_mul_i32_const, u64_rem_u32, u64_xor};

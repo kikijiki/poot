@@ -40,7 +40,7 @@ A `Graph` is private; it is read through accessors and changed only through a ch
 | `State`      | A buffer carried across decode steps: the KV cache                                                           |
 | `Computed`   | A compiler-defined constant, such as a folded `Iota`                                                         |
 
-**Slots.** `Token` and `Pos` carry the step's ids and absolute positions. `SlotMap` and `WriteMap` carry paged KV reads and writes, each declaring the range of the words it holds, which the bind checks. Other roles (the adapter index, the expert pool, the sampler inputs) are defined by the pass or feature that declares them. The attention mask is not a slot: it is computed in-graph from `Pos`.
+**Slots.** `Token` and `Pos` carry the step's ids and absolute positions. `WriteMap` carries the paged KV writes, declaring the range of the words it holds, which the bind checks; the paged reads go through a block table, a carried state (`StateRole::BlockTable`) whose host writes are checked against its declared range the same way. Other roles (the adapter index, the expert pool, the sampler inputs) are defined by the pass or feature that declares them. The attention mask is not a slot: it is computed in-graph from `Pos`.
 
 **State.** A state buffer is pre-allocated to `cap` per layer. `Graph::state()` pairs each `state_in` with a `state_out` of the same type. The executor overwrites the buffer with `state_out` (the JAX `donate_argnums` contract), which also orders the KV read before the KV write.
 

@@ -21,9 +21,9 @@ test-support = []
 ash.workspace = true
 poot-target.workspace = true
 thiserror.workspace = true
-# The library only dispatches the .spv bytes it is given. These are for the `poot-vulkan-check`
-# binary, which compiles poot's `add` kernel and checks it against the CPU oracle (spec 133 Verification). They
-# are ordinary dependencies because a `[[bin]]` target cannot use `[dev-dependencies]`.
+# `poot-codegen` and `poot-kernel-ir` are the library's own: its context, kernel and error types name them. The
+# `poot-vulkan-check` binary also uses them to compile poot's `add` kernel and check it against the CPU oracle
+# (spec 133 Verification).
 poot-codegen.workspace = true
 poot-kernel-ir.workspace = true
 poot-runtime-common.workspace = true

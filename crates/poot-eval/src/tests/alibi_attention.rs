@@ -68,7 +68,10 @@ fn alibi_row_ref(slopes: &[f32], cap: usize, pos: usize) -> Vec<f32> {
 
 /// Hand-rolled reference: per-head softmax(scale*q.k^T + bias) @ v, GQA via n_rep, as a direct Rust loop
 /// independent of `attention_masked`'s decomposition (same style as `gemma2_decode_ref`).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a test reference taking the operand data and the head/width scalars the op under test takes, in the op's own argument order"
+)]
 fn attention_alibi_ref(
     q: &[f32],
     k: &[f32],
@@ -208,7 +211,10 @@ fn alibi_prefill_ref(slopes: &[f32], l: usize) -> Vec<f32> {
 
 /// Hand-rolled prefill reference: per-head, per-row `softmax(scale*q.k^T + bias[h,row,:]) @ v`, GQA via
 /// n_rep; the decode twin is [`attention_alibi_ref`].
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a test reference taking the operand data and the head/width scalars the op under test takes, in the op's own argument order"
+)]
 fn prefill_alibi_ref(
     q: &[f32],
     k: &[f32],

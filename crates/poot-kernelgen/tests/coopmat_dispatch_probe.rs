@@ -100,7 +100,7 @@ fn coopmat_tile_dispatches_and_matches_cpu_on_radv() {
 
     // CPU oracle: round A/B to f16 (the coopmat load narrows on the way in), f32-accumulate,
     // k=0..16 - matching the NVPTX WMMA sibling probe's oracle shape (`probe_tc_matmul`).
-    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(x));
+    let round = |x: f32| poot_tensor::float::f16_to_f32(poot_quant::scalar::f32_to_f16(x));
     let ra: Vec<f32> = a_data.iter().map(|&x| round(x)).collect();
     let rb: Vec<f32> = b_data.iter().map(|&x| round(x)).collect();
     let mut max_abs = 0.0f32;

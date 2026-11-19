@@ -45,7 +45,7 @@ Verified on the AMD Strix Halo iGPU under RADV only.
 
 The decode dispatch sequence is captured once into a CUDA graph and replayed per token with one `cuGraphLaunch`. Kernel arguments point at stable slot buffers the host rewrites in place.
 
-PTX can also drive several GPUs from one executor as a layer pipeline: each stage is its own CUDA graph on its own device, and activations crossing a stage boundary are copied peer to peer. Only point-to-point transfers are supported; reductions and gathers are refused. This is not used for serving.
+PTX can drive several GPUs from one executor. A layer pipeline gives each stage its own CUDA graph on its own device, and activations crossing a stage boundary are copied peer to peer. Tensor parallelism divides each layer over the ranks and joins the partial results with `AllReduce` and `AllGather` between stages, which `PtxDevice` implements over the same peer copies. Both placements serve requests: see [Tensor parallelism](../serve/tensor-parallelism.md). A route that would stage through the host cannot be captured into a CUDA graph and is refused.
 
 Verified on NVIDIA L40S through rented pods.
 
